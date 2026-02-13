@@ -1,0 +1,59 @@
+{
+  "enableAllProjectMcpServers": true,
+  "awsAuthRefresh": "aws sso login --profile claude",
+  "env": {
+    "AWS_PROFILE": "claude",
+    "CLAUDE_CODE_USE_BEDROCK": "1"
+  },
+  "permissions": {
+    "additionalDirectories": [
+      "..",
+      "../src"
+    ],
+    "allow": [
+      "Bash(just:*)",
+      "Bash(uv:*)",
+      "Bash(git:*)",
+      "Bash(docker:*)",
+      "Bash(psql:*)",
+      "Bash(pytest:*)",
+      "Bash(python:*)",
+      "Bash(.venv/bin/python:*)",
+      "Bash(cd:*)",
+      "Bash(ls:*)",
+      "Bash(cat:*)",
+      "Bash(readlink:*)",
+      "Bash(md5:*)",
+      "Bash(ln:*)",
+      "Bash(grep:*)",
+      "Bash(find:*)",
+      "Bash(wc:*)",
+      "Bash(gh pr view:*)",
+      "Bash(tmux:*)",
+      "Bash(claude:*)",
+      "Read(../.vscode/**)",
+      "Read(../src/**)",
+      "Read(../iac/**)",
+      "Read(../tools/**)",
+      "mcp__ide__getDiagnostics",
+      "mcp__context7__resolve-library-id",
+      "mcp__context7__query-docs",
+      "mcp__jira__get_issue",
+      "mcp__jira__jql_search",
+      "mcp__git__git_status",
+      "mcp__git__git_log",
+      "mcp__git__git_diff",
+      "mcp__git__git_diff_staged",
+      "mcp__git__git_diff_unstaged",
+      "mcp__git__git_show",
+      "mcp__git__git_branch",
+      "mcp__postgres__query",
+      "mcp__sqlalchemy-docs__*",
+      "mcp__fastapi-docs__*",
+      "mcp__pytest-docs__*",
+      "mcp__pydantic-docs__*",
+      "mcp__baz__*",
+      "mcp__terraform-mcp__*"
+    ]
+  }
+}
