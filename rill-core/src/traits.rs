@@ -31,6 +31,12 @@ pub trait Source: Send + Sync {
     fn should_emit_watermark(&self) -> bool {
         false
     }
+
+    /// Called after a successful checkpoint. Sources that track offsets
+    /// (e.g. Kafka) use this to commit offsets to the external system.
+    async fn on_checkpoint_complete(&mut self) -> anyhow::Result<()> {
+        Ok(())
+    }
 }
 
 /// A sink that consumes elements from a stream.

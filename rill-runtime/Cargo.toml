@@ -18,8 +18,15 @@ tracing-subscriber.workspace = true
 metrics.workspace = true
 metrics-exporter-prometheus.workspace = true
 
+[features]
+kafka = ["rill-core/kafka"]
+
 [lints]
 workspace = true
+
+[[example]]
+name = "kafka_transform"
+required-features = ["kafka"]
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full"] }

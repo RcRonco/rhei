@@ -66,6 +66,8 @@ impl Executor {
         F::Output: Clone,
         K: Sink<Input = F::Output>,
     {
+        let checkpoint_interval: u64 = 100;
+        let mut batches_since_checkpoint: u64 = 0;
         let mut batch_count: u64 = 0;
         let mut element_count: u64 = 0;
 
@@ -97,9 +99,22 @@ impl Executor {
                 metrics::histogram!("executor_element_duration_seconds")
                     .record(elem_start.elapsed().as_secs_f64());
             }
+
+            batches_since_checkpoint += 1;
+            if batches_since_checkpoint >= checkpoint_interval {
+                let ckpt_start = std::time::Instant::now();
+                for op in operators.iter_mut() {
+                    op.async_op.context_mut().checkpoint().await?;
+                }
+                metrics::histogram!("executor_checkpoint_duration_seconds")
+                    .record(ckpt_start.elapsed().as_secs_f64());
+                source.on_checkpoint_complete().await?;
+                sink.flush().await?;
+                batches_since_checkpoint = 0;
+            }
         }
 
-        // Checkpoint all operator state
+        // Final checkpoint for bounded sources
         let ckpt_start = std::time::Instant::now();
         for op in operators.iter_mut() {
             op.async_op.context_mut().checkpoint().await?;
@@ -107,6 +122,7 @@ impl Executor {
         metrics::histogram!("executor_checkpoint_duration_seconds")
             .record(ckpt_start.elapsed().as_secs_f64());
 
+        source.on_checkpoint_complete().await?;
         sink.flush().await?;
         tracing::info!(
             batches = batch_count,

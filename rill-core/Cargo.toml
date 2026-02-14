@@ -18,6 +18,10 @@ object_store.workspace = true
 bytes.workspace = true
 tracing.workspace = true
 metrics.workspace = true
+rdkafka = { workspace = true, optional = true }
+
+[features]
+kafka = ["rdkafka"]
 
 [lints]
 workspace = true
