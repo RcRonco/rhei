@@ -171,13 +171,23 @@ fn cmd_run_tui(log_level: String) -> anyhow::Result<()> {
             .expect("TUI mode should provide metrics_rx");
         let log_rx = handles.log_rx.expect("TUI mode should provide log_rx");
 
+        // Build the logical plan for the demo pipeline
+        let plan = rill_core::graph::StreamGraph::new()
+            .source("SensorSource")
+            .filter("RangeFilter")
+            .key_by("BySensorId")
+            .operator("TumblingWindow")
+            .map("FormatAvg")
+            .sink("LogSink")
+            .build();
+
         // Spawn a demo pipeline in the background
         let pipeline_handle = tokio::spawn(async {
             run_demo_pipeline().await
         });
 
         // Run the TUI on the main task
-        let app = tui::TuiApp::new(metrics_rx, log_rx);
+        let app = tui::TuiApp::new(metrics_rx, log_rx, Some(plan));
         let tui_result = app.run().await;
 
         // Cancel pipeline on TUI exit

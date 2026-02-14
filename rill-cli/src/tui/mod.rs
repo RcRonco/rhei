@@ -4,6 +4,7 @@
 //! from the decoupled data layer in `rill-runtime` (no UI deps there).
 
 mod dashboard;
+mod graph_view;
 mod log_viewer;
 
 use std::collections::VecDeque;
@@ -20,10 +21,12 @@ use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout};
 
+use rill_core::graph::LogicalPlan;
 use rill_runtime::metrics_snapshot::MetricsSnapshot;
 use rill_runtime::tracing_capture::LogEntry;
 
 use self::dashboard::render_dashboard;
+use self::graph_view::render_graph;
 use self::log_viewer::render_log_viewer;
 
 const MAX_LOG_ENTRIES: usize = 500;
@@ -35,6 +38,7 @@ pub struct TuiApp {
     log_rx: tokio::sync::mpsc::Receiver<LogEntry>,
     logs: VecDeque<LogEntry>,
     snapshot: MetricsSnapshot,
+    graph: Option<LogicalPlan>,
     log_scroll: usize,
     auto_scroll: bool,
     quit: bool,
@@ -45,12 +49,14 @@ impl TuiApp {
     pub fn new(
         metrics_rx: tokio::sync::watch::Receiver<MetricsSnapshot>,
         log_rx: tokio::sync::mpsc::Receiver<LogEntry>,
+        graph: Option<LogicalPlan>,
     ) -> Self {
         Self {
             metrics_rx,
             log_rx,
             logs: VecDeque::with_capacity(MAX_LOG_ENTRIES),
             snapshot: MetricsSnapshot::default(),
+            graph,
             log_scroll: 0,
             auto_scroll: true,
             quit: false,
@@ -149,15 +155,30 @@ impl TuiApp {
     }
 
     fn render(&self, frame: &mut ratatui::Frame<'_>) {
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(10), // Dashboard
-                Constraint::Min(5),    // Log viewer
-            ])
-            .split(frame.area());
+        if let Some(plan) = &self.graph {
+            let chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Length(3),  // Graph
+                    Constraint::Length(10), // Dashboard
+                    Constraint::Min(5),    // Log viewer
+                ])
+                .split(frame.area());
 
-        render_dashboard(frame, chunks[0], &self.snapshot);
-        render_log_viewer(frame, chunks[1], &self.logs, self.log_scroll);
+            render_graph(frame, chunks[0], plan);
+            render_dashboard(frame, chunks[1], &self.snapshot);
+            render_log_viewer(frame, chunks[2], &self.logs, self.log_scroll);
+        } else {
+            let chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Length(10), // Dashboard
+                    Constraint::Min(5),    // Log viewer
+                ])
+                .split(frame.area());
+
+            render_dashboard(frame, chunks[0], &self.snapshot);
+            render_log_viewer(frame, chunks[1], &self.logs, self.log_scroll);
+        }
     }
 }
