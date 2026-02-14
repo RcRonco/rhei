@@ -6,12 +6,14 @@ use async_trait::async_trait;
 use crate::traits::Sink;
 
 /// A sink that writes each element to stdout.
+#[derive(Debug)]
 pub struct PrintSink<T> {
     prefix: Option<String>,
     _marker: PhantomData<T>,
 }
 
 impl<T> PrintSink<T> {
+    /// Creates a new `PrintSink` with no prefix.
     pub fn new() -> Self {
         Self {
             prefix: None,
@@ -19,6 +21,7 @@ impl<T> PrintSink<T> {
         }
     }
 
+    /// Sets a prefix that is prepended to each printed line.
     pub fn with_prefix(mut self, prefix: impl Into<String>) -> Self {
         self.prefix = Some(prefix.into());
         self

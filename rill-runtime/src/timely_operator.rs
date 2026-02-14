@@ -21,15 +21,27 @@ pub struct TimelyAsyncOperator<F: StreamFunction + 'static> {
     last_checkpoint_epoch: Option<u64>,
 }
 
+impl<F: StreamFunction + 'static> std::fmt::Debug for TimelyAsyncOperator<F> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TimelyAsyncOperator")
+            .field("retained_caps", &self.retained_caps)
+            .field("last_checkpoint_epoch", &self.last_checkpoint_epoch)
+            .finish_non_exhaustive()
+    }
+}
+
 /// Lightweight token tracking a retained epoch. We don't store an actual
 /// `timely::progress::Capability` here because `Capability` is `!Send`
 /// (contains `Rc`). Instead the caller manages capabilities externally
 /// and this struct just tracks which epochs are logically retained.
+#[derive(Debug)]
 pub struct CapabilityToken {
+    /// The epoch (logical timestamp) this token retains.
     pub epoch: u64,
 }
 
 impl<F: StreamFunction + 'static> TimelyAsyncOperator<F> {
+    /// Wraps the given `AsyncOperator` with Timely capability tracking.
     pub fn new(inner: AsyncOperator<F>) -> Self {
         Self {
             inner,
@@ -41,10 +53,9 @@ impl<F: StreamFunction + 'static> TimelyAsyncOperator<F> {
     /// Process an input element, marking the epoch as retained.
     /// Returns immediately-completed outputs.
     pub fn process(&mut self, input: F::Input, epoch: u64) -> Vec<F::Output> {
-        if !self.retained_caps.contains_key(&epoch) {
-            self.retained_caps
-                .insert(epoch, CapabilityToken { epoch });
-        }
+        self.retained_caps
+            .entry(epoch)
+            .or_insert(CapabilityToken { epoch });
         self.inner.process_element(input, Some(epoch))
     }
 
@@ -76,8 +87,7 @@ impl<F: StreamFunction + 'static> TimelyAsyncOperator<F> {
 
         let should_checkpoint = match (min_frontier, self.last_checkpoint_epoch) {
             (Some(current), Some(last)) => current > last,
-            (Some(_), None) => true,
-            (None, _) => true, // empty frontier = computation done
+            (Some(_), None) | (None, _) => true, // new or computation done
         };
 
         if should_checkpoint && !self.inner.has_pending() {

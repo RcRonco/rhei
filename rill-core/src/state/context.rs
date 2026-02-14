@@ -3,15 +3,24 @@ use super::memtable::MemTable;
 
 /// Operator-scoped state context.
 ///
-/// Reads go through the L1 MemTable first (read-your-own-writes). On miss the
-/// request falls through to the backend. Writes always go to the MemTable
+/// Reads go through the L1 `MemTable` first (read-your-own-writes). On miss the
+/// request falls through to the backend. Writes always go to the `MemTable`
 /// (synchronous, fast). Dirty entries are flushed to the backend on checkpoint.
 pub struct StateContext {
     memtable: MemTable,
     backend: Box<dyn StateBackend>,
 }
 
+impl std::fmt::Debug for StateContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StateContext")
+            .field("memtable", &self.memtable)
+            .finish_non_exhaustive()
+    }
+}
+
 impl StateContext {
+    /// Creates a new `StateContext` backed by the given state backend.
     pub fn new(backend: Box<dyn StateBackend>) -> Self {
         Self {
             memtable: MemTable::new(),
@@ -67,6 +76,7 @@ impl StateContext {
         let dirty_count = dirty.len();
 
         tracing::info!(dirty_keys = dirty_count, "checkpointing state");
+        #[allow(clippy::cast_precision_loss)]
         metrics::gauge!("state_checkpoint_dirty_keys").set(dirty_count as f64);
 
         for (key, value) in dirty {

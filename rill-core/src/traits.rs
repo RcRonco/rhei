@@ -9,15 +9,19 @@ use crate::state::context::StateContext;
 /// output elements.
 #[async_trait]
 pub trait StreamFunction: Send + Sync {
+    /// The element type consumed by this operator.
     type Input: Send;
+    /// The element type produced by this operator.
     type Output: Send;
 
+    /// Processes a single input element and returns zero or more output elements.
     async fn process(&mut self, input: Self::Input, ctx: &mut StateContext) -> Vec<Self::Output>;
 }
 
 /// A source that produces elements into a stream.
 #[async_trait]
 pub trait Source: Send + Sync {
+    /// The element type produced by this source.
     type Output: Send;
 
     /// Pull the next batch of elements. Returns `None` when exhausted.
@@ -32,10 +36,13 @@ pub trait Source: Send + Sync {
 /// A sink that consumes elements from a stream.
 #[async_trait]
 pub trait Sink: Send + Sync {
+    /// The element type consumed by this sink.
     type Input: Send;
 
+    /// Writes a single element to the sink.
     async fn write(&mut self, input: Self::Input) -> anyhow::Result<()>;
 
+    /// Flushes any buffered data. Default implementation is a no-op.
     async fn flush(&mut self) -> anyhow::Result<()> {
         Ok(())
     }

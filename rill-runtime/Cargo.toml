@@ -2,6 +2,7 @@
 name = "rill-runtime"
 version = "0.1.0"
 edition = "2024"
+license = "Apache-2.0"
 
 [dependencies]
 anyhow.workspace = true
@@ -16,6 +17,9 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 metrics.workspace = true
 metrics-exporter-prometheus.workspace = true
+
+[lints]
+workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full"] }

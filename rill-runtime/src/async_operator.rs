@@ -32,11 +32,22 @@ fn noop_waker() -> Waker {
 pub struct AsyncOperator<F: StreamFunction> {
     func: F,
     ctx: StateContext,
+    #[allow(clippy::type_complexity)]
     pending: VecDeque<(BoxFuture<Vec<F::Output>>, Option<u64>)>,
     stash: Stash<F::Input>,
 }
 
+impl<F: StreamFunction> std::fmt::Debug for AsyncOperator<F> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AsyncOperator")
+            .field("pending_count", &self.pending.len())
+            .field("stash_len", &self.stash.len())
+            .finish_non_exhaustive()
+    }
+}
+
 impl<F: StreamFunction + 'static> AsyncOperator<F> {
+    /// Create a new async operator wrapping the given stream function and state context.
     pub fn new(func: F, ctx: StateContext) -> Self {
         Self {
             func,
@@ -48,11 +59,7 @@ impl<F: StreamFunction + 'static> AsyncOperator<F> {
 
     /// Process an input element. Returns outputs that completed immediately.
     /// Elements whose futures are pending are stashed for later.
-    pub fn process_element(
-        &mut self,
-        input: F::Input,
-        capability: Option<u64>,
-    ) -> Vec<F::Output> {
+    pub fn process_element(&mut self, input: F::Input, capability: Option<u64>) -> Vec<F::Output> {
         let mut completed = Vec::new();
 
         // First, drain any completed pending futures
@@ -133,8 +140,8 @@ mod tests {
     use super::*;
     use async_trait::async_trait;
     use rill_core::state::local_backend::LocalBackend;
-    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     struct PassThrough;
 

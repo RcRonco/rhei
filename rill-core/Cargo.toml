@@ -2,6 +2,7 @@
 name = "rill-core"
 version = "0.1.0"
 edition = "2024"
+license = "Apache-2.0"
 
 [dependencies]
 anyhow.workspace = true
@@ -17,6 +18,9 @@ object_store.workspace = true
 bytes.workspace = true
 tracing.workspace = true
 metrics.workspace = true
+
+[lints]
+workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full"] }

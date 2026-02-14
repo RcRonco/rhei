@@ -6,11 +6,13 @@ use std::collections::VecDeque;
 /// cache miss requiring a backend fetch), the event and its capability are
 /// stashed here. Events are processed in FIFO order to preserve per-key
 /// ordering guarantees.
+#[derive(Debug)]
 pub struct Stash<T> {
     queue: VecDeque<(T, Option<u64>)>,
 }
 
 impl<T> Stash<T> {
+    /// Creates an empty stash.
     pub fn new() -> Self {
         Self {
             queue: VecDeque::new(),
@@ -32,10 +34,12 @@ impl<T> Stash<T> {
         self.queue.front()
     }
 
+    /// Returns `true` if the stash contains no elements.
     pub fn is_empty(&self) -> bool {
         self.queue.is_empty()
     }
 
+    /// Returns the number of elements currently stashed.
     pub fn len(&self) -> usize {
         self.queue.len()
     }

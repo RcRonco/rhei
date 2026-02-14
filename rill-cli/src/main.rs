@@ -11,7 +11,7 @@ struct Cli {
     #[arg(long, global = true)]
     json_logs: bool,
 
-    /// Log level filter (e.g. "info", "debug", "rill_core=trace")
+    /// Log level filter (e.g. `"info"`, `"debug"`, `"rill_core=trace"`)
     #[arg(long, global = true, default_value = "info")]
     log_level: String,
 

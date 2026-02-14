@@ -10,6 +10,7 @@ use rill_core::traits::{Sink, Source, StreamFunction};
 use crate::async_operator::AsyncOperator;
 
 /// Configuration for tiered storage on the executor.
+#[derive(Debug)]
 struct TieredStorageConfig {
     l3: Arc<SlateDbBackend>,
     foyer_config: TieredBackendConfig,
@@ -19,12 +20,14 @@ struct TieredStorageConfig {
 ///
 /// In Phase 1, this is a simple sequential executor that processes elements
 /// through the pipeline stages. Full Timely dataflow integration comes later.
+#[derive(Debug)]
 pub struct Executor {
     checkpoint_dir: std::path::PathBuf,
     tiered: Option<TieredStorageConfig>,
 }
 
 impl Executor {
+    /// Create a new executor with the given checkpoint directory.
     pub fn new(checkpoint_dir: std::path::PathBuf) -> Self {
         Self {
             checkpoint_dir,
@@ -32,7 +35,7 @@ impl Executor {
         }
     }
 
-    /// Configure tiered storage (L2 Foyer + L3 SlateDB) for this executor.
+    /// Configure tiered storage (L2 Foyer + L3 `SlateDB`) for this executor.
     ///
     /// When set, `create_context` will produce contexts backed by a per-operator
     /// `PrefixedBackend` wrapping a `TieredBackend`.
@@ -43,10 +46,7 @@ impl Executor {
         foyer_config: TieredBackendConfig,
     ) -> Self {
         self.checkpoint_dir = checkpoint_dir;
-        self.tiered = Some(TieredStorageConfig {
-            l3,
-            foyer_config,
-        });
+        self.tiered = Some(TieredStorageConfig { l3, foyer_config });
         self
     }
 
@@ -57,7 +57,7 @@ impl Executor {
     pub async fn run_linear<S, F, K>(
         &self,
         source: &mut S,
-        operators: &mut Vec<OperatorSlot<F>>,
+        operators: &mut [OperatorSlot<F>],
         sink: &mut K,
     ) -> anyhow::Result<()>
     where
@@ -81,7 +81,7 @@ impl Executor {
                 let mut current: Vec<F::Output> = Vec::new();
 
                 // Feed through first operator
-                if let Some(op) = operators.first_mut() {
+                if let Some(op) = operators.get_mut(0) {
                     let results = op.async_op.process_element(item, None);
                     current = results;
                 }
@@ -110,7 +110,11 @@ impl Executor {
             .record(ckpt_start.elapsed().as_secs_f64());
 
         sink.flush().await?;
-        tracing::info!(batches = batch_count, elements = element_count, "pipeline completed");
+        tracing::info!(
+            batches = batch_count,
+            elements = element_count,
+            "pipeline completed"
+        );
         Ok(())
     }
 
@@ -119,6 +123,7 @@ impl Executor {
     /// Bridges async Source/Sink to sync channels, wraps the operator in a
     /// `TimelyAsyncOperator`, and runs `timely::execute_directly()` inside
     /// `spawn_blocking`. Each source batch is one epoch.
+    #[allow(clippy::too_many_lines)]
     pub async fn run_dataflow<S, F, K>(
         &self,
         source: S,
@@ -140,8 +145,8 @@ impl Executor {
         let sink_tx = crate::bridge::sink_bridge(sink, &rt);
 
         // Extract the first operator
+        let mut operators = operators.into_iter();
         let inner_op = operators
-            .into_iter()
             .next()
             .expect("at least one operator required")
             .async_op;
@@ -159,19 +164,18 @@ impl Executor {
             timely::execute_directly(move |worker| {
                 use timely::container::CapacityContainerBuilder;
                 use timely::dataflow::channels::pact::Pipeline;
+                use timely::dataflow::operators::Inspect;
                 use timely::dataflow::operators::core::probe::Probe;
+                use timely::dataflow::operators::generic::OutputBuilder;
                 use timely::dataflow::operators::generic::builder_rc::OperatorBuilder;
                 use timely::dataflow::operators::generic::operator::Operator;
-                use timely::dataflow::operators::generic::OutputBuilder;
-                use timely::dataflow::operators::Inspect;
                 use timely::scheduling::Scheduler;
 
                 // Unwrap Mutex wrappers (single-threaded from here)
                 let mut source_rx = source_rx.into_inner().unwrap();
                 let inner_op = inner_op.into_inner().unwrap();
 
-                let timely_op =
-                    crate::timely_operator::TimelyAsyncOperator::new(inner_op);
+                let timely_op = crate::timely_operator::TimelyAsyncOperator::new(inner_op);
 
                 let rt_op = rt_clone.clone();
 
@@ -186,15 +190,11 @@ impl Executor {
                     // firing until the channel disconnects. The generic `source`
                     // helper uses `build` (fires once), which is insufficient
                     // for multi-batch streaming.
-                    let mut source_builder = OperatorBuilder::new(
-                        "Source".to_owned(),
-                        scope.clone(),
-                    );
-                    let (output, stream) = source_builder
-                        .new_output::<Vec<F::Input>>();
+                    let mut source_builder =
+                        OperatorBuilder::new("Source".to_owned(), scope.clone());
+                    let (output, stream) = source_builder.new_output::<Vec<F::Input>>();
                     let mut output = OutputBuilder::from(output);
-                    let activator =
-                        scope.activator_for(source_builder.operator_info().address);
+                    let activator = scope.activator_for(source_builder.operator_info().address);
                     source_builder.set_notify(false);
 
                     source_builder.build_reschedule(move |mut capabilities| {
@@ -222,15 +222,11 @@ impl Executor {
                                     activator.activate();
                                     true
                                 }
-                                Err(
-                                    tokio::sync::mpsc::error::TryRecvError::Empty,
-                                ) => {
+                                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
                                     activator.activate();
                                     true
                                 }
-                                Err(
-                                    tokio::sync::mpsc::error::TryRecvError::Disconnected,
-                                ) => {
+                                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
                                     cap = None;
                                     false
                                 }
@@ -239,41 +235,37 @@ impl Executor {
                     });
 
                     // --- Operator: unary_frontier wrapping TimelyAsyncOperator ---
-                    let processed = stream.unary_frontier::<
-                        CapacityContainerBuilder<Vec<F::Output>>,
-                        _,
-                        _,
-                        _,
-                    >(
-                        Pipeline,
-                        "AsyncOp",
-                        move |_init_cap, _info| {
-                            let mut timely_op = timely_op;
-                            move |(input, frontier), output| {
-                                input.for_each(|cap, data| {
-                                    let epoch = *cap.time();
-                                    for item in data.drain(..) {
-                                        let results = timely_op.process(item, epoch);
-                                        if !results.is_empty() {
-                                            let mut session = output.session(&cap);
-                                            for r in results {
-                                                session.give(r);
+                    let processed = stream
+                        .unary_frontier::<CapacityContainerBuilder<Vec<F::Output>>, _, _, _>(
+                            Pipeline,
+                            "AsyncOp",
+                            move |_init_cap, _info| {
+                                let mut timely_op = timely_op;
+                                move |(input, frontier), output| {
+                                    input.for_each(|cap, data| {
+                                        let epoch = *cap.time();
+                                        for item in data.drain(..) {
+                                            let results = timely_op.process(item, epoch);
+                                            if !results.is_empty() {
+                                                let mut session = output.session(&cap);
+                                                for r in results {
+                                                    session.give(r);
+                                                }
                                             }
                                         }
+                                    });
+
+                                    if timely_op.has_pending() {
+                                        let _results = timely_op.poll_pending();
                                     }
-                                });
 
-                                if timely_op.has_pending() {
-                                    let _results = timely_op.poll_pending();
+                                    let frontier_vec: Vec<u64> =
+                                        frontier.frontier().iter().copied().collect();
+                                    timely_op.release_finished_epochs(&frontier_vec);
+                                    timely_op.maybe_checkpoint(&frontier_vec, &rt_op);
                                 }
-
-                                let frontier_vec: Vec<u64> =
-                                    frontier.frontier().iter().copied().collect();
-                                timely_op.release_finished_epochs(&frontier_vec);
-                                timely_op.maybe_checkpoint(&frontier_vec, &rt_op);
-                            }
-                        },
-                    );
+                            },
+                        );
 
                     // --- Sink: inspect + probe ---
                     processed
@@ -305,10 +297,7 @@ impl Executor {
     /// `PrefixedBackend(TieredBackend)`. Otherwise falls back to `LocalBackend`.
     pub async fn create_context(&self, operator_name: &str) -> anyhow::Result<StateContext> {
         if let Some(ref tiered) = self.tiered {
-            let foyer_dir = tiered
-                .foyer_config
-                .foyer_dir
-                .join(operator_name);
+            let foyer_dir = tiered.foyer_config.foyer_dir.join(operator_name);
 
             let config = TieredBackendConfig {
                 foyer_dir,
@@ -330,12 +319,16 @@ impl Executor {
 }
 
 /// Holds an operator wrapped in its async executor.
+#[derive(Debug)]
 pub struct OperatorSlot<F: StreamFunction + 'static> {
+    /// Human-readable name identifying this operator in the pipeline.
     pub name: String,
+    /// The async operator instance that processes elements.
     pub async_op: AsyncOperator<F>,
 }
 
 impl<F: StreamFunction + 'static> OperatorSlot<F> {
+    /// Create a new operator slot with the given name, function, and state context.
     pub fn new(name: impl Into<String>, func: F, ctx: StateContext) -> Self {
         Self {
             name: name.into(),
@@ -406,10 +399,7 @@ mod tests {
         let executor = Executor::new(dir.clone());
         let ctx = executor.create_context("word_counter").await.unwrap();
 
-        let mut source = VecSource::new(vec![
-            "hello world".to_string(),
-            "hello rill".to_string(),
-        ]);
+        let mut source = VecSource::new(vec!["hello world".to_string(), "hello rill".to_string()]);
 
         let mut operators = vec![OperatorSlot::new("word_counter", WordCounter, ctx)];
 
@@ -498,10 +488,7 @@ mod tests {
         let executor = Executor::new(dir.clone());
         let ctx = executor.create_context("word_counter").await.unwrap();
 
-        let source = VecSource::new(vec![
-            "hello world".to_string(),
-            "hello rill".to_string(),
-        ]);
+        let source = VecSource::new(vec!["hello world".to_string(), "hello rill".to_string()]);
 
         let operators = vec![OperatorSlot::new("word_counter", WordCounter, ctx)];
 

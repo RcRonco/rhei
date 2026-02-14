@@ -12,7 +12,16 @@ pub struct PrefixedBackend {
     inner: Box<dyn StateBackend>,
 }
 
+impl std::fmt::Debug for PrefixedBackend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PrefixedBackend")
+            .field("prefix", &self.prefix)
+            .finish_non_exhaustive()
+    }
+}
+
 impl PrefixedBackend {
+    /// Wraps `inner` so that every key is prefixed with `prefix/`.
     pub fn new(prefix: impl Into<String>, inner: Box<dyn StateBackend>) -> Self {
         let mut prefix_bytes = prefix.into().into_bytes();
         prefix_bytes.push(b'/');

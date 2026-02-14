@@ -1,0 +1,79 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: Check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+      - name: Cache dependencies
+        uses: Swatinem/rust-cache@v2
+      - name: Run cargo check
+        run: cargo check --workspace --all-targets
+
+  test:
+    name: Test (${{ matrix.toolchain }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        toolchain: [stable, nightly]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install Rust (${{ matrix.toolchain }})
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.toolchain }}
+      - name: Cache dependencies
+        uses: Swatinem/rust-cache@v2
+      - name: Run tests
+        run: cargo test --workspace
+
+  fmt:
+    name: Format
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install Rust (stable) + rustfmt
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install Rust (stable) + clippy
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Cache dependencies
+        uses: Swatinem/rust-cache@v2
+      - name: Run clippy
+        run: cargo clippy --workspace --all-targets --no-deps -- -D warnings
+
+  deny:
+    name: Cargo Deny
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Check licenses, advisories, bans, and sources
+        uses: EmbarkStudios/cargo-deny-action@v2

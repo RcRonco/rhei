@@ -4,12 +4,14 @@ use std::collections::{HashMap, HashSet};
 ///
 /// All writes go here first (synchronous, fast). Dirty keys are flushed to the
 /// backend during checkpoint.
+#[derive(Debug)]
 pub struct MemTable {
     data: HashMap<Vec<u8>, Option<Vec<u8>>>,
     dirty: HashSet<Vec<u8>>,
 }
 
 impl MemTable {
+    /// Creates an empty memtable.
     pub fn new() -> Self {
         Self {
             data: HashMap::new(),
@@ -17,6 +19,7 @@ impl MemTable {
         }
     }
 
+    /// Looks up a key. Returns `None` on cache miss, `Some(None)` for a tombstone, or `Some(Some(v))` for a value.
     pub fn get(&self, key: &[u8]) -> Option<Option<&Vec<u8>>> {
         // Returns:
         //   None           -> key not in memtable (cache miss)
@@ -25,11 +28,13 @@ impl MemTable {
         self.data.get(key).map(|v| v.as_ref())
     }
 
+    /// Inserts a key-value pair and marks the key as dirty.
     pub fn put(&mut self, key: Vec<u8>, value: Vec<u8>) {
         self.dirty.insert(key.clone());
         self.data.insert(key, Some(value));
     }
 
+    /// Records a tombstone for the key and marks it as dirty.
     pub fn delete(&mut self, key: Vec<u8>) {
         self.dirty.insert(key.clone());
         self.data.insert(key, None);

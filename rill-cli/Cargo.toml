@@ -2,6 +2,7 @@
 name = "rill-cli"
 version = "0.1.0"
 edition = "2024"
+license = "Apache-2.0"
 
 [dependencies]
 anyhow.workspace = true
@@ -10,3 +11,6 @@ rill-core = { path = "../rill-core" }
 rill-runtime = { path = "../rill-runtime" }
 tokio.workspace = true
 tracing.workspace = true
+
+[lints]
+workspace = true

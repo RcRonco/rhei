@@ -6,6 +6,7 @@ use crate::traits::Source;
 ///
 /// Elements are emitted in batches. A watermark should be emitted every
 /// `watermark_interval` records.
+#[derive(Debug)]
 pub struct VecSource<T: Send> {
     items: Vec<T>,
     pos: usize,
@@ -16,6 +17,7 @@ pub struct VecSource<T: Send> {
 }
 
 impl<T: Send> VecSource<T> {
+    /// Creates a new `VecSource` from the given items.
     pub fn new(items: Vec<T>) -> Self {
         Self {
             items,
@@ -27,11 +29,13 @@ impl<T: Send> VecSource<T> {
         }
     }
 
+    /// Sets the number of elements emitted per batch (default: 1).
     pub fn with_batch_size(mut self, size: usize) -> Self {
         self.batch_size = size;
         self
     }
 
+    /// Sets the number of records between watermark emissions (default: 10).
     pub fn with_watermark_interval(mut self, interval: usize) -> Self {
         self.watermark_interval = interval;
         self

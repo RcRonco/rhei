@@ -5,16 +5,22 @@ use object_store::path::Path;
 
 use super::backend::StateBackend;
 
-/// L3 backend wrapping a SlateDB instance on object storage.
+/// L3 backend wrapping a `SlateDB` instance on object storage.
 ///
-/// SlateDB is durable by default (writes go to a WAL backed by the object store),
+/// `SlateDB` is durable by default (writes go to a WAL backed by the object store),
 /// so `checkpoint()` is a no-op here.
 pub struct SlateDbBackend {
     db: slatedb::Db,
 }
 
+impl std::fmt::Debug for SlateDbBackend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SlateDbBackend").finish_non_exhaustive()
+    }
+}
+
 impl SlateDbBackend {
-    /// Open (or create) a SlateDB database at the given object-store path.
+    /// Open (or create) a `SlateDB` database at the given object-store path.
     pub async fn open(
         path: impl Into<Path>,
         object_store: Arc<dyn object_store::ObjectStore>,

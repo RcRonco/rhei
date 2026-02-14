@@ -5,10 +5,11 @@ use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 
 /// Configuration for the observability stack.
+#[derive(Debug)]
 pub struct TelemetryConfig {
     /// If set, start a Prometheus HTTP exporter on this address.
     pub metrics_addr: Option<SocketAddr>,
-    /// `tracing` env-filter string (e.g. "info", "rill_core=debug").
+    /// `tracing` env-filter string (e.g. `"info"`, `"rill_core=debug"`).
     pub log_filter: String,
     /// Emit logs as JSON instead of human-readable format.
     pub json_logs: bool,
@@ -29,8 +30,8 @@ impl Default for TelemetryConfig {
 /// This should be called once at process startup. Calling it more than once will
 /// result in an error (the global subscriber can only be set once).
 pub fn init(config: TelemetryConfig) -> anyhow::Result<()> {
-    let env_filter = EnvFilter::try_new(&config.log_filter)
-        .unwrap_or_else(|_| EnvFilter::new("info"));
+    let env_filter =
+        EnvFilter::try_new(&config.log_filter).unwrap_or_else(|_| EnvFilter::new("info"));
 
     if config.json_logs {
         tracing_subscriber::registry()

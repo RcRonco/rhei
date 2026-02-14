@@ -8,6 +8,7 @@ use super::backend::StateBackend;
 use super::slatedb_backend::SlateDbBackend;
 
 /// Configuration for the L2 Foyer disk cache layer.
+#[derive(Debug)]
 pub struct TieredBackendConfig {
     /// Directory for Foyer's on-disk cache files.
     pub foyer_dir: PathBuf,
@@ -27,17 +28,25 @@ impl Default for TieredBackendConfig {
     }
 }
 
-/// L2 + L3 backend: Foyer HybridCache (disk/memory) in front of SlateDB (object storage).
+/// L2 + L3 backend: Foyer `HybridCache` (disk/memory) in front of `SlateDB` (object storage).
 ///
-/// Read path: L2 Foyer → L3 SlateDB → backfill L2 on hit.
+/// Read path: L2 Foyer → L3 `SlateDB` → backfill L2 on hit.
 /// Write path: write-through to L3, update L2.
 pub struct TieredBackend {
     l2: HybridCache<Vec<u8>, Vec<u8>>,
     l3: Arc<SlateDbBackend>,
 }
 
+impl std::fmt::Debug for TieredBackend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TieredBackend")
+            .field("l3", &self.l3)
+            .finish_non_exhaustive()
+    }
+}
+
 impl TieredBackend {
-    /// Build a new TieredBackend with a Foyer disk cache and L3 SlateDB backend.
+    /// Build a new `TieredBackend` with a Foyer disk cache and L3 `SlateDB` backend.
     pub async fn open(
         config: TieredBackendConfig,
         l3: Arc<SlateDbBackend>,
@@ -52,8 +61,7 @@ impl TieredBackend {
             .memory(config.foyer_memory_capacity)
             .storage()
             .with_engine_config(
-                foyer::BlockEngineConfig::new(device)
-                    .with_block_size(4 * 1024 * 1024), // 4 MiB blocks
+                foyer::BlockEngineConfig::new(device).with_block_size(4 * 1024 * 1024), // 4 MiB blocks
             )
             .build()
             .await?;
@@ -61,7 +69,7 @@ impl TieredBackend {
         Ok(Self { l2, l3 })
     }
 
-    /// Build a TieredBackend with a pre-built HybridCache (useful for testing).
+    /// Build a `TieredBackend` with a pre-built `HybridCache` (useful for testing).
     pub fn with_cache(l2: HybridCache<Vec<u8>, Vec<u8>>, l3: Arc<SlateDbBackend>) -> Self {
         Self { l2, l3 }
     }
@@ -131,7 +139,7 @@ mod tests {
     use super::*;
     use object_store::memory::InMemory;
 
-    /// Build a memory-only HybridCache for fast tests (no disk I/O).
+    /// Build a memory-only `HybridCache` for fast tests (no disk I/O).
     /// Skips `.with_engine_config()` so foyer treats storage as noop.
     async fn memory_only_cache() -> HybridCache<Vec<u8>, Vec<u8>> {
         HybridCacheBuilder::new()
@@ -167,11 +175,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn l3_fallback_and_backfill() {
         let store = Arc::new(InMemory::new());
-        let l3 = Arc::new(
-            SlateDbBackend::open("test_fallback", store)
-                .await
-                .unwrap(),
-        );
+        let l3 = Arc::new(SlateDbBackend::open("test_fallback", store).await.unwrap());
 
         // Write directly to L3, bypassing L2
         l3.put(b"deep", b"value").await.unwrap();

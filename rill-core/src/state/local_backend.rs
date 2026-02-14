@@ -14,6 +14,7 @@ use super::backend::StateBackend;
 ///
 /// An optional `latency` can be configured to simulate slow backends (e.g. S3)
 /// during testing.
+#[derive(Debug)]
 pub struct LocalBackend {
     data: Mutex<HashMap<Vec<u8>, Vec<u8>>>,
     path: PathBuf,
@@ -21,6 +22,7 @@ pub struct LocalBackend {
 }
 
 impl LocalBackend {
+    /// Opens or creates a local backend at the given path, optionally with simulated latency.
     pub fn new(path: PathBuf, latency: Option<Duration>) -> anyhow::Result<Self> {
         let data = if path.exists() {
             let contents = std::fs::read_to_string(&path)?;
