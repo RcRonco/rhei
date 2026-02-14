@@ -11,10 +11,32 @@
   - [x] `Filter`, `Map`, `FlatMap` — stateless combinators
 - [ ] Fluent pipeline builder API (`stream.join(...).window(...).aggregate(...)`)
 - [ ] Multi-operator chaining in `run_dataflow` (currently single-operator only)
-- [ ] Real connectors: Kafka source/sink, file source/sink, HTTP sink
-- [ ] Schema registry integration (Avro, Protobuf)
 - [ ] Hot-reload operator logic without full pipeline restart
 - [ ] `rill-cli` improvements: deploy, inspect running pipelines, replay from checkpoint
+
+## Integrations
+
+- [ ] Kafka source/sink
+  - [ ] Consumer group source with partition-aware offset tracking
+  - [ ] Transactional producer sink (exactly-once via checkpoint coordination)
+  - [ ] Schema Registry integration (Avro, Protobuf deserialization)
+- [ ] Redis Streams source/sink
+  - [ ] Consumer group source with acknowledgment
+  - [ ] Stream/pub-sub sink
+  - [ ] Redis as lookup/enrichment source for joins
+- [ ] Amazon SQS source/sink
+  - [ ] Long-polling source with visibility timeout management
+  - [ ] Batched sink with message deduplication
+  - [ ] Dead-letter queue integration
+- [ ] Google Pub/Sub source/sink
+  - [ ] Streaming pull source with flow control
+  - [ ] Batched publish sink with ordering keys
+- [ ] File source/sink
+  - [ ] JSON lines, CSV, Parquet formats
+  - [ ] Local filesystem and S3/GCS/Azure via `object_store`
+- [ ] HTTP webhook sink
+  - [ ] Batched POST with configurable retry/backoff
+- [ ] Standard I/O source/sink (stdin/stdout for unix pipe composition)
 
 ## Observability
 
