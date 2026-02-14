@@ -1,8 +1,19 @@
+use std::sync::Arc;
+
 use rill_core::state::context::StateContext;
 use rill_core::state::local_backend::LocalBackend;
+use rill_core::state::prefixed_backend::PrefixedBackend;
+use rill_core::state::slatedb_backend::SlateDbBackend;
+use rill_core::state::tiered_backend::{TieredBackend, TieredBackendConfig};
 use rill_core::traits::{Sink, Source, StreamFunction};
 
 use crate::async_operator::AsyncOperator;
+
+/// Configuration for tiered storage on the executor.
+struct TieredStorageConfig {
+    l3: Arc<SlateDbBackend>,
+    foyer_config: TieredBackendConfig,
+}
 
 /// Materializes a `LogicalPlan` into an executable pipeline.
 ///
@@ -10,11 +21,33 @@ use crate::async_operator::AsyncOperator;
 /// through the pipeline stages. Full Timely dataflow integration comes later.
 pub struct Executor {
     checkpoint_dir: std::path::PathBuf,
+    tiered: Option<TieredStorageConfig>,
 }
 
 impl Executor {
     pub fn new(checkpoint_dir: std::path::PathBuf) -> Self {
-        Self { checkpoint_dir }
+        Self {
+            checkpoint_dir,
+            tiered: None,
+        }
+    }
+
+    /// Configure tiered storage (L2 Foyer + L3 SlateDB) for this executor.
+    ///
+    /// When set, `create_context` will produce contexts backed by a per-operator
+    /// `PrefixedBackend` wrapping a `TieredBackend`.
+    pub fn with_tiered_storage(
+        mut self,
+        checkpoint_dir: std::path::PathBuf,
+        l3: Arc<SlateDbBackend>,
+        foyer_config: TieredBackendConfig,
+    ) -> Self {
+        self.checkpoint_dir = checkpoint_dir;
+        self.tiered = Some(TieredStorageConfig {
+            l3,
+            foyer_config,
+        });
+        self
     }
 
     /// Run a simple linear pipeline: source -> operators -> sink.
@@ -33,8 +66,18 @@ impl Executor {
         F::Output: Clone,
         K: Sink<Input = F::Output>,
     {
+        let _span = tracing::info_span!("run_linear").entered();
+        let mut batch_count: u64 = 0;
+        let mut element_count: u64 = 0;
+
         while let Some(batch) = source.next_batch().await {
+            batch_count += 1;
+            metrics::counter!("executor_batches_total").increment(1);
+
             for item in batch {
+                element_count += 1;
+                let elem_start = std::time::Instant::now();
+
                 let mut current: Vec<F::Output> = Vec::new();
 
                 // Feed through first operator
@@ -50,25 +93,54 @@ impl Executor {
                 for output in current {
                     sink.write(output).await?;
                 }
+
+                metrics::histogram!("executor_element_duration_seconds")
+                    .record(elem_start.elapsed().as_secs_f64());
             }
         }
 
+        metrics::counter!("executor_elements_total").increment(element_count);
+
         // Checkpoint all operator state
+        let ckpt_start = std::time::Instant::now();
         for op in operators.iter_mut() {
             op.async_op.context_mut().checkpoint().await?;
         }
+        metrics::histogram!("executor_checkpoint_duration_seconds")
+            .record(ckpt_start.elapsed().as_secs_f64());
 
         sink.flush().await?;
+        tracing::info!(batches = batch_count, elements = element_count, "pipeline completed");
         Ok(())
     }
 
-    /// Create a `StateContext` backed by the local filesystem.
-    pub fn create_context(&self, operator_name: &str) -> anyhow::Result<StateContext> {
-        let path = self
-            .checkpoint_dir
-            .join(format!("{operator_name}.checkpoint.json"));
-        let backend = LocalBackend::new(path, None)?;
-        Ok(StateContext::new(Box::new(backend)))
+    /// Create a `StateContext` for the given operator.
+    ///
+    /// When tiered storage is configured, produces a context backed by
+    /// `PrefixedBackend(TieredBackend)`. Otherwise falls back to `LocalBackend`.
+    pub async fn create_context(&self, operator_name: &str) -> anyhow::Result<StateContext> {
+        if let Some(ref tiered) = self.tiered {
+            let foyer_dir = tiered
+                .foyer_config
+                .foyer_dir
+                .join(operator_name);
+
+            let config = TieredBackendConfig {
+                foyer_dir,
+                foyer_memory_capacity: tiered.foyer_config.foyer_memory_capacity,
+                foyer_disk_capacity: tiered.foyer_config.foyer_disk_capacity,
+            };
+
+            let tiered_backend = TieredBackend::open(config, tiered.l3.clone()).await?;
+            let prefixed = PrefixedBackend::new(operator_name, Box::new(tiered_backend));
+            Ok(StateContext::new(Box::new(prefixed)))
+        } else {
+            let path = self
+                .checkpoint_dir
+                .join(format!("{operator_name}.checkpoint.json"));
+            let backend = LocalBackend::new(path, None)?;
+            Ok(StateContext::new(Box::new(backend)))
+        }
     }
 }
 
@@ -147,7 +219,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
 
         let executor = Executor::new(dir.clone());
-        let ctx = executor.create_context("word_counter").unwrap();
+        let ctx = executor.create_context("word_counter").await.unwrap();
 
         let mut source = VecSource::new(vec![
             "hello world".to_string(),
@@ -189,7 +261,7 @@ mod tests {
         // First run
         {
             let executor = Executor::new(dir.clone());
-            let ctx = executor.create_context("counter").unwrap();
+            let ctx = executor.create_context("counter").await.unwrap();
 
             let mut source = VecSource::new(vec!["hello world".to_string()]);
             let mut operators = vec![OperatorSlot::new("counter", WordCounter, ctx)];
@@ -210,7 +282,7 @@ mod tests {
         // Second run — state should be restored from checkpoint
         {
             let executor = Executor::new(dir.clone());
-            let ctx = executor.create_context("counter").unwrap();
+            let ctx = executor.create_context("counter").await.unwrap();
 
             let mut source = VecSource::new(vec!["hello rill".to_string()]);
             let mut operators = vec![OperatorSlot::new("counter", WordCounter, ctx)];

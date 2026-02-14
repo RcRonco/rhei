@@ -7,6 +7,14 @@ use clap::{Parser, Subcommand};
 #[derive(Parser)]
 #[command(name = "rill", about = "Rill stream processing CLI")]
 struct Cli {
+    /// Emit logs as JSON
+    #[arg(long, global = true)]
+    json_logs: bool,
+
+    /// Log level filter (e.g. "info", "debug", "rill_core=trace")
+    #[arg(long, global = true, default_value = "info")]
+    log_level: String,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -24,6 +32,12 @@ enum Commands {
 
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
+
+    rill_runtime::telemetry::init(rill_runtime::telemetry::TelemetryConfig {
+        metrics_addr: None,
+        log_filter: cli.log_level.clone(),
+        json_logs: cli.json_logs,
+    })?;
 
     match cli.command {
         Commands::New { name } => cmd_new(&name),
@@ -78,7 +92,7 @@ impl StreamFunction for MyOperator {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let executor = Executor::new("./checkpoints".into());
-    let ctx = executor.create_context("my_operator")?;
+    let ctx = executor.create_context("my_operator").await?;
 
     let mut source = VecSource::new(vec![
         "hello world".to_string(),

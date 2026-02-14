@@ -11,6 +11,13 @@ futures.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
+foyer.workspace = true
+slatedb.workspace = true
+object_store.workspace = true
+bytes.workspace = true
+tracing.workspace = true
+metrics.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full"] }
+tempfile.workspace = true

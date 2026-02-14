@@ -21,11 +21,20 @@ impl StateContext {
 
     /// Get a value — checks memtable first, then falls back to backend.
     pub async fn get(&mut self, key: &[u8]) -> anyhow::Result<Option<Vec<u8>>> {
-        // Check memtable first
-        match self.memtable.get(key) {
-            Some(Some(v)) => Ok(Some(v.clone())),
-            Some(None) => Ok(None), // tombstone — key was deleted
+        metrics::counter!("state_gets_total").increment(1);
+        let start = std::time::Instant::now();
+
+        let result = match self.memtable.get(key) {
+            Some(Some(v)) => {
+                metrics::counter!("state_l1_hits_total").increment(1);
+                Ok(Some(v.clone()))
+            }
+            Some(None) => {
+                metrics::counter!("state_l1_hits_total").increment(1);
+                Ok(None) // tombstone — key was deleted
+            }
             None => {
+                metrics::counter!("state_l1_misses_total").increment(1);
                 // Cache miss — fetch from backend
                 let result = self.backend.get(key).await?;
                 if let Some(ref v) = result {
@@ -33,29 +42,45 @@ impl StateContext {
                 }
                 Ok(result)
             }
-        }
+        };
+
+        metrics::histogram!("state_get_duration_seconds").record(start.elapsed().as_secs_f64());
+        result
     }
 
     /// Put a value — writes to memtable only (synchronous).
     pub fn put(&mut self, key: &[u8], value: &[u8]) {
+        metrics::counter!("state_puts_total").increment(1);
         self.memtable.put(key.to_vec(), value.to_vec());
     }
 
     /// Delete a key — marks as deleted in memtable.
     pub fn delete(&mut self, key: &[u8]) {
+        metrics::counter!("state_deletes_total").increment(1);
         self.memtable.delete(key.to_vec());
     }
 
     /// Flush dirty entries from memtable to backend, then trigger backend checkpoint.
     pub async fn checkpoint(&mut self) -> anyhow::Result<()> {
+        let start = std::time::Instant::now();
         let dirty = self.memtable.flush();
+        let dirty_count = dirty.len();
+
+        tracing::info!(dirty_keys = dirty_count, "checkpointing state");
+        metrics::gauge!("state_checkpoint_dirty_keys").set(dirty_count as f64);
+
         for (key, value) in dirty {
             match value {
                 Some(v) => self.backend.put(&key, &v).await?,
                 None => self.backend.delete(&key).await?,
             }
         }
-        self.backend.checkpoint().await
+        self.backend.checkpoint().await?;
+
+        metrics::counter!("state_checkpoints_total").increment(1);
+        metrics::histogram!("state_checkpoint_duration_seconds")
+            .record(start.elapsed().as_secs_f64());
+        Ok(())
     }
 }
 

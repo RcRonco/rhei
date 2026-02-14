@@ -8,3 +8,5 @@ anyhow.workspace = true
 clap.workspace = true
 rill-core = { path = "../rill-core" }
 rill-runtime = { path = "../rill-runtime" }
+tokio.workspace = true
+tracing.workspace = true
