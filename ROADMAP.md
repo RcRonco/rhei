@@ -5,19 +5,19 @@
 - [x] Reusable operator library (`rill-core/src/operators/`)
   - [x] `TemporalJoin<L, R, K, O>` — key-based join with configurable timeout
   - [x] `TumblingWindow<T, A>` — fixed-size time windows with pluggable aggregator
-  - [ ] `SlidingWindow<T, A>` — overlapping time windows
+  - [x] `SlidingWindow<T, A>` — overlapping time windows
   - [x] `SessionWindow<T, A>` — gap-based windows per key
   - [x] `KeyedState<K, V>` — typed state wrapper over `StateContext` with automatic serde
   - [x] `Filter`, `Map`, `FlatMap` — stateless combinators
 - [ ] Fluent pipeline builder API (`stream.join(...).window(...).aggregate(...)`)
-- [ ] Multi-operator chaining in `run_dataflow` (currently single-operator only)
+- [x] Multi-operator chaining in `run_dataflow` (currently single-operator only)
 - [ ] Hot-reload operator logic without full pipeline restart
 - [ ] `rill-cli` improvements: deploy, inspect running pipelines, replay from checkpoint
 
 ## Integrations
 
-- [ ] Kafka source/sink
-  - [ ] Consumer group source with partition-aware offset tracking
+- [x] Kafka source/sink
+  - [x] Consumer group source with partition-aware offset tracking
   - [ ] Transactional producer sink (exactly-once via checkpoint coordination)
   - [ ] Schema Registry integration (Avro, Protobuf deserialization)
 - [ ] Redis Streams source/sink
@@ -42,7 +42,7 @@
 
 - [ ] Structured tracing spans per-operator and per-epoch
 - [ ] Prometheus metrics exporter endpoint
-- [ ] Backpressure metrics (stash depth, pending future count, channel utilization)
+- [x] Backpressure metrics (stash depth, pending future count, channel utilization)
 - [ ] Throughput and latency histograms per operator
 - [ ] State size metrics (memtable entries, L2/L3 hit rates, checkpoint size)
 - [ ] Dead-letter queue for failed/dropped elements with diagnostics
@@ -64,7 +64,7 @@
 
 - [ ] Exactly-once semantics with two-phase commit on source/sink
 - [ ] Checkpoint versioning and backward-compatible state migration
-- [ ] Graceful shutdown: drain in-flight, checkpoint, then exit
+- [x] Graceful shutdown: drain in-flight, checkpoint, then exit
 - [ ] Restart from checkpoint with offset tracking (Kafka consumer offsets)
 - [ ] Watermark propagation for out-of-order event handling
 - [ ] Late-event policy (drop, redirect to side output, or update)
