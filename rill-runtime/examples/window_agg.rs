@@ -143,6 +143,7 @@ async fn main() -> anyhow::Result<()> {
         "tumbling_window",
         TumblingWindow { window_size: 10 },
         ctx,
+        Some(tokio::runtime::Handle::current()),
     )];
     let sink: PrintSink<String> = PrintSink::new().with_prefix("output");
 

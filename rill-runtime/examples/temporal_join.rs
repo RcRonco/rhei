@@ -175,7 +175,7 @@ async fn main() -> anyhow::Result<()> {
         },
     ]);
 
-    let operators = vec![OperatorSlot::new("temporal_join", TemporalJoin, ctx)];
+    let operators = vec![OperatorSlot::new("temporal_join", TemporalJoin, ctx, Some(tokio::runtime::Handle::current()))];
     let sink: PrintSink<String> = PrintSink::new().with_prefix("output");
 
     executor

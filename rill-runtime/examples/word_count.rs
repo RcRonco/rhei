@@ -54,7 +54,7 @@ async fn main() -> anyhow::Result<()> {
         "hello world again".to_string(),
     ]);
 
-    let mut operators = vec![OperatorSlot::new("word_counter", WordCounter, ctx)];
+    let mut operators = vec![OperatorSlot::new("word_counter", WordCounter, ctx, Some(tokio::runtime::Handle::current()))];
     let mut sink: PrintSink<String> = PrintSink::new().with_prefix("output");
 
     executor

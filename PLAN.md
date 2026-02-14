@@ -46,7 +46,7 @@ Create the fluent API that allows users to define a logical dataflow graph. This
 - [x]  The graph object contains the correct nodes and edges in memory.
 
 ## ⚙️ Runtime & Execution (Worker B - Runtime Engineer)
-### Issue B-1: Async Operator Wrapper (The "Shell") ⚠️ Partial
+### Issue B-1: Async Operator Wrapper (The "Shell") ✅
 Priority: 🔴 Critical
 
 #### Description
@@ -54,16 +54,16 @@ Timely Dataflow operators are synchronous. We need a generic wrapper operator th
 
 #### Tasks
 - [x]  Create AsyncOperator struct (standalone, not yet wrapping a Timely scope).
-- []  Accept a tokio::runtime::Handle.
-- []  Implement the timely::operator::Operator trait (not yet integrated — currently uses a sequential executor).
+- [x]  Accept a tokio::runtime::Handle.
+- [x]  Implement the timely::operator::Operator trait (integrated via TimelyAsyncOperator).
 - [x]  Logic to check for Future completion non-blockingly.
 
 #### Acceptance Criteria
 - [x]  Unit test: An operator that sleeps for 10ms (async) does NOT block the thread (verified by a heartbeat or second operator running concurrently).
-- []  AsyncOperator is integrated into Timely dataflow as a real operator.
+- [x]  AsyncOperator is integrated into Timely dataflow as a real operator.
 
 #### Note
-The AsyncOperator and Executor currently run as a sequential loop (Phase 1 placeholder). Timely is a declared dependency but is not used anywhere yet. Full Timely dataflow integration is a Phase 2 task.
+AsyncOperator accepts an optional `tokio::runtime::Handle`. On the hot path (L1 cache hit), futures resolve synchronously. On the cold path (state miss), the runtime handle drives futures to completion via `block_in_place`. Timely integration is provided by `TimelyAsyncOperator`.
 
 ### Issue B-2: Event Stashing & Retry Logic ✅
 Priority: 🟠 High
@@ -80,23 +80,23 @@ When the AsyncOperator hits a state miss (S3 fetch), it must "stash" the incomin
 - [x]  Ordering is preserved (Event A arrives before B; if A fetches state, B waits or is stashed behind A).
 - [x]  No capabilities are dropped prematurely (which would cause downstream logic to close windows too early).
 
-### Issue B-3: Timely Dataflow Integration
+### Issue B-3: Timely Dataflow Integration ⚠️ Partial
 Priority: 🔴 Critical
 
 #### Description
 Replace the sequential `Executor::run_linear()` loop with a real Timely dataflow graph. Wire `AsyncOperator` as a Timely operator, use Timely progress tracking (capabilities/frontiers), and enable multi-worker parallelism.
 
 #### Tasks
-- []  Create a Timely worker that materializes a LogicalPlan into Timely operators.
-- []  Implement an async-bridging Timely operator using AsyncOperator + Stash.
-- []  Wire Source/Sink traits as Timely input/output operators.
-- []  Use Timely capabilities for watermark/progress tracking.
-- []  Support multi-worker execution.
+- [ ]  Create a Timely worker that materializes a LogicalPlan into Timely operators.
+- [x]  Implement an async-bridging Timely operator using AsyncOperator + Stash.
+- [x]  Wire Source/Sink traits as Timely input/output operators.
+- [x]  Use Timely capabilities for watermark/progress tracking.
+- [ ]  Support multi-worker execution.
 
 #### Acceptance Criteria
-- []  Word-count example runs on Timely with correct results.
-- []  Multi-worker execution produces the same results as single-worker.
-- []  Checkpoint barriers integrate with Timely progress tracking.
+- [x]  Word-count example runs on Timely with correct results.
+- [ ]  Multi-worker execution produces the same results as single-worker.
+- [x]  Checkpoint barriers integrate with Timely progress tracking.
 
 ## 💾 State & Storage
 ### Issue C-1: Local File Backend Implementation ✅

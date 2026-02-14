@@ -21,7 +21,11 @@ pub mod bridge;
 pub mod executor;
 /// FIFO event stash for pending state fetches.
 pub mod stash;
+/// Decoupled metrics snapshot data layer for dashboards and exporters.
+pub mod metrics_snapshot;
 /// Tracing and Prometheus metrics initialization.
 pub mod telemetry;
 /// Timely-aware async operator with capability management.
 pub mod timely_operator;
+/// Log capture layer for dashboards and log aggregation.
+pub mod tracing_capture;

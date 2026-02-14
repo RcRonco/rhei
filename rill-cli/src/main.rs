@@ -4,6 +4,8 @@ use std::process::Command;
 
 use clap::{Parser, Subcommand};
 
+mod tui;
+
 #[derive(Parser)]
 #[command(name = "rill", about = "Rill stream processing CLI")]
 struct Cli {
@@ -27,21 +29,47 @@ enum Commands {
         name: String,
     },
     /// Run the current Rill project
-    Run,
+    Run {
+        /// Launch the TUI dashboard instead of shelling out to cargo
+        #[arg(long)]
+        tui: bool,
+    },
 }
 
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
-    rill_runtime::telemetry::init(rill_runtime::telemetry::TelemetryConfig {
-        metrics_addr: None,
-        log_filter: cli.log_level.clone(),
-        json_logs: cli.json_logs,
-    })?;
-
     match cli.command {
-        Commands::New { name } => cmd_new(&name),
-        Commands::Run => cmd_run(),
+        Commands::New { name } => {
+            let _telemetry =
+                rill_runtime::telemetry::init(rill_runtime::telemetry::TelemetryConfig {
+                    metrics_addr: None,
+                    log_filter: cli.log_level.clone(),
+                    json_logs: cli.json_logs,
+                    tui: false,
+                })?;
+            cmd_new(&name)
+        }
+        Commands::Run { tui: true } => {
+            let handles =
+                rill_runtime::telemetry::init(rill_runtime::telemetry::TelemetryConfig {
+                    metrics_addr: None,
+                    log_filter: cli.log_level.clone(),
+                    json_logs: false,
+                    tui: true,
+                })?;
+            cmd_run_tui(handles)
+        }
+        Commands::Run { tui: false } => {
+            let _telemetry =
+                rill_runtime::telemetry::init(rill_runtime::telemetry::TelemetryConfig {
+                    metrics_addr: None,
+                    log_filter: cli.log_level.clone(),
+                    json_logs: cli.json_logs,
+                    tui: false,
+                })?;
+            cmd_run()
+        }
     }
 }
 
@@ -100,7 +128,7 @@ async fn main() -> anyhow::Result<()> {
     ]);
 
     let mut operators = vec![
-        OperatorSlot::new("my_operator", MyOperator, ctx),
+        OperatorSlot::new("my_operator", MyOperator, ctx, Some(tokio::runtime::Handle::current())),
     ];
 
     let mut sink: PrintSink<String> = PrintSink::new();
@@ -132,4 +160,101 @@ fn cmd_run() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+fn cmd_run_tui(handles: rill_runtime::telemetry::TelemetryHandles) -> anyhow::Result<()> {
+    let rt = tokio::runtime::Runtime::new()?;
+
+    rt.block_on(async {
+        let metrics_rx = handles
+            .metrics_rx
+            .expect("TUI mode should provide metrics_rx");
+        let log_rx = handles.log_rx.expect("TUI mode should provide log_rx");
+
+        // Spawn a demo pipeline in the background
+        let pipeline_handle = tokio::spawn(async {
+            run_demo_pipeline().await
+        });
+
+        // Run the TUI on the main task
+        let app = tui::TuiApp::new(metrics_rx, log_rx);
+        let tui_result = app.run().await;
+
+        // Cancel pipeline on TUI exit
+        pipeline_handle.abort();
+
+        tui_result
+    })
+}
+
+/// Built-in demo pipeline for TUI mode (word count).
+async fn run_demo_pipeline() -> anyhow::Result<()> {
+    use async_trait::async_trait;
+    use rill_core::connectors::print_sink::PrintSink;
+    use rill_core::connectors::vec_source::VecSource;
+    use rill_core::state::context::StateContext;
+    use rill_core::traits::StreamFunction;
+    use rill_runtime::executor::{Executor, OperatorSlot};
+
+    struct WordCounter;
+
+    #[async_trait]
+    impl StreamFunction for WordCounter {
+        type Input = String;
+        type Output = String;
+
+        async fn process(&mut self, input: String, ctx: &mut StateContext) -> Vec<String> {
+            let mut outputs = Vec::new();
+            for word in input.split_whitespace() {
+                let key = word.as_bytes();
+                let count = match ctx.get(key).await.unwrap_or(None) {
+                    Some(bytes) => {
+                        let n = u64::from_le_bytes(bytes.try_into().unwrap_or([0; 8]));
+                        n + 1
+                    }
+                    None => 1,
+                };
+                ctx.put(key, &count.to_le_bytes());
+                outputs.push(format!("{word}: {count}"));
+            }
+            outputs
+        }
+    }
+
+    let dir = std::env::temp_dir().join("rill_tui_demo");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir)?;
+
+    let executor = Executor::new(dir.clone());
+    let ctx = executor.create_context("word_counter").await?;
+
+    // Generate many batches so the pipeline runs for a while
+    let mut data = Vec::new();
+    for i in 0..100 {
+        data.push(format!("hello world batch {i}"));
+        data.push(format!("rill stream processing round {i}"));
+    }
+
+    let mut source = VecSource::new(data);
+    let mut operators = vec![OperatorSlot::new(
+        "word_counter",
+        WordCounter,
+        ctx,
+        Some(tokio::runtime::Handle::current()),
+    )];
+    let mut sink: PrintSink<String> = PrintSink::new();
+
+    // Small delay so TUI renders before pipeline starts
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    tracing::info!("demo pipeline starting");
+    executor
+        .run_linear(&mut source, &mut operators, &mut sink)
+        .await?;
+    tracing::info!("demo pipeline completed");
+
+    // Keep alive so TUI stays up until user quits
+    loop {
+        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+    }
 }

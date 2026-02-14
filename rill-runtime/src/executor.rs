@@ -66,7 +66,6 @@ impl Executor {
         F::Output: Clone,
         K: Sink<Input = F::Output>,
     {
-        let _span = tracing::info_span!("run_linear").entered();
         let mut batch_count: u64 = 0;
         let mut element_count: u64 = 0;
 
@@ -137,7 +136,7 @@ impl Executor {
         F::Output: Clone + 'static,
         K: Sink<Input = F::Output> + 'static,
     {
-        let _span = tracing::info_span!("run_dataflow").entered();
+        tracing::info!("starting dataflow");
         let rt = tokio::runtime::Handle::current();
 
         // Bridge async source/sink to sync channels
@@ -329,10 +328,19 @@ pub struct OperatorSlot<F: StreamFunction + 'static> {
 
 impl<F: StreamFunction + 'static> OperatorSlot<F> {
     /// Create a new operator slot with the given name, function, and state context.
-    pub fn new(name: impl Into<String>, func: F, ctx: StateContext) -> Self {
+    ///
+    /// Pass `Some(tokio::runtime::Handle::current())` to enable cold-path async
+    /// completion (state misses). Pass `None` for tests that only exercise the
+    /// synchronous hot path.
+    pub fn new(
+        name: impl Into<String>,
+        func: F,
+        ctx: StateContext,
+        rt: Option<tokio::runtime::Handle>,
+    ) -> Self {
         Self {
             name: name.into(),
-            async_op: AsyncOperator::new(func, ctx),
+            async_op: AsyncOperator::new(func, ctx, rt),
         }
     }
 }
@@ -401,7 +409,7 @@ mod tests {
 
         let mut source = VecSource::new(vec!["hello world".to_string(), "hello rill".to_string()]);
 
-        let mut operators = vec![OperatorSlot::new("word_counter", WordCounter, ctx)];
+        let mut operators = vec![OperatorSlot::new("word_counter", WordCounter, ctx, Some(tokio::runtime::Handle::current()))];
 
         let collected = Arc::new(Mutex::new(Vec::new()));
         let mut sink = CollectSink {
@@ -439,7 +447,7 @@ mod tests {
             let ctx = executor.create_context("counter").await.unwrap();
 
             let mut source = VecSource::new(vec!["hello world".to_string()]);
-            let mut operators = vec![OperatorSlot::new("counter", WordCounter, ctx)];
+            let mut operators = vec![OperatorSlot::new("counter", WordCounter, ctx, Some(tokio::runtime::Handle::current()))];
             let collected = Arc::new(Mutex::new(Vec::new()));
             let mut sink = CollectSink {
                 collected: collected.clone(),
@@ -460,7 +468,7 @@ mod tests {
             let ctx = executor.create_context("counter").await.unwrap();
 
             let mut source = VecSource::new(vec!["hello rill".to_string()]);
-            let mut operators = vec![OperatorSlot::new("counter", WordCounter, ctx)];
+            let mut operators = vec![OperatorSlot::new("counter", WordCounter, ctx, Some(tokio::runtime::Handle::current()))];
             let collected = Arc::new(Mutex::new(Vec::new()));
             let mut sink = CollectSink {
                 collected: collected.clone(),
@@ -490,7 +498,7 @@ mod tests {
 
         let source = VecSource::new(vec!["hello world".to_string(), "hello rill".to_string()]);
 
-        let operators = vec![OperatorSlot::new("word_counter", WordCounter, ctx)];
+        let operators = vec![OperatorSlot::new("word_counter", WordCounter, ctx, Some(tokio::runtime::Handle::current()))];
 
         let collected = Arc::new(Mutex::new(Vec::new()));
         let sink = CollectSink {
@@ -531,7 +539,7 @@ mod tests {
             let ctx = executor.create_context("counter").await.unwrap();
 
             let source = VecSource::new(vec!["hello world".to_string()]);
-            let operators = vec![OperatorSlot::new("counter", WordCounter, ctx)];
+            let operators = vec![OperatorSlot::new("counter", WordCounter, ctx, Some(tokio::runtime::Handle::current()))];
             let collected = Arc::new(Mutex::new(Vec::new()));
             let sink = CollectSink {
                 collected: collected.clone(),
@@ -554,7 +562,7 @@ mod tests {
             let ctx = executor.create_context("counter").await.unwrap();
 
             let source = VecSource::new(vec!["hello rill".to_string()]);
-            let operators = vec![OperatorSlot::new("counter", WordCounter, ctx)];
+            let operators = vec![OperatorSlot::new("counter", WordCounter, ctx, Some(tokio::runtime::Handle::current()))];
             let collected = Arc::new(Mutex::new(Vec::new()));
             let sink = CollectSink {
                 collected: collected.clone(),

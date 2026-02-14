@@ -3,7 +3,6 @@ use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll, Wake, Waker};
 
-use futures::FutureExt;
 use rill_core::state::context::StateContext;
 use rill_core::traits::StreamFunction;
 
@@ -26,12 +25,13 @@ fn noop_waker() -> Waker {
 /// Timely worker thread.
 ///
 /// - **Hot path:** If the future completes synchronously (L1 cache hit),
-///   `now_or_never()` resolves it immediately — no scheduling overhead.
+///   a single poll resolves it immediately — no scheduling overhead.
 /// - **Cold path:** If the future is pending (state miss -> backend fetch),
-///   the element is stashed and the future is polled on subsequent ticks.
+///   the runtime handle drives it to completion via `block_in_place`.
 pub struct AsyncOperator<F: StreamFunction> {
     func: F,
     ctx: StateContext,
+    rt: Option<tokio::runtime::Handle>,
     #[allow(clippy::type_complexity)]
     pending: VecDeque<(BoxFuture<Vec<F::Output>>, Option<u64>)>,
     stash: Stash<F::Input>,
@@ -48,10 +48,15 @@ impl<F: StreamFunction> std::fmt::Debug for AsyncOperator<F> {
 
 impl<F: StreamFunction + 'static> AsyncOperator<F> {
     /// Create a new async operator wrapping the given stream function and state context.
-    pub fn new(func: F, ctx: StateContext) -> Self {
+    ///
+    /// When `rt` is `Some`, the cold path (pending futures from state misses) will
+    /// be driven to completion via the Tokio runtime. When `None`, pending futures
+    /// are dropped with a warning.
+    pub fn new(func: F, ctx: StateContext, rt: Option<tokio::runtime::Handle>) -> Self {
         Self {
             func,
             ctx,
+            rt,
             pending: VecDeque::new(),
             stash: Stash::new(),
         }
@@ -108,22 +113,26 @@ impl<F: StreamFunction + 'static> AsyncOperator<F> {
 
     fn process_stash(&mut self, output: &mut Vec<F::Output>) {
         while let Some((input, _cap)) = self.stash.pop() {
-            // Attempt synchronous processing via now_or_never.
-            // If state is in L1 memtable, the future completes on the first poll.
-            let result = {
-                let fut = self.func.process(input, &mut self.ctx);
-                fut.now_or_never()
-            };
+            let fut = self.func.process(input, &mut self.ctx);
+            let mut fut = std::pin::pin!(fut);
 
-            match result {
-                Some(results) => {
+            // Try a single synchronous poll first (hot path).
+            let waker = noop_waker();
+            let mut cx = Context::from_waker(&waker);
+            match fut.as_mut().poll(&mut cx) {
+                Poll::Ready(results) => {
                     output.extend(results);
                 }
-                None => {
-                    // The future didn't complete synchronously.
-                    // In a full Timely integration, we'd spawn this onto
-                    // the Tokio runtime. For now, break and retry next tick.
-                    break;
+                Poll::Pending => {
+                    // Cold path: the future needs async I/O (state miss).
+                    // Drive it to completion via the Tokio runtime.
+                    if let Some(ref rt) = self.rt {
+                        let results = tokio::task::block_in_place(|| rt.block_on(fut));
+                        output.extend(results);
+                    } else {
+                        tracing::warn!("future pending but no runtime handle — dropping element");
+                        break;
+                    }
                 }
             }
         }
@@ -166,7 +175,7 @@ mod tests {
 
         let backend = LocalBackend::new(path.clone(), None).unwrap();
         let ctx = StateContext::new(Box::new(backend));
-        let mut op = AsyncOperator::new(PassThrough, ctx);
+        let mut op = AsyncOperator::new(PassThrough, ctx, None);
 
         let results = op.process_element("hello".to_string(), Some(0));
         assert_eq!(results, vec!["hello".to_string()]);
@@ -190,7 +199,7 @@ mod tests {
 
         let backend = LocalBackend::new(path.clone(), None).unwrap();
         let ctx = StateContext::new(Box::new(backend));
-        let mut op = AsyncOperator::new(PassThrough, ctx);
+        let mut op = AsyncOperator::new(PassThrough, ctx, Some(tokio::runtime::Handle::current()));
 
         // This should not block — PassThrough completes synchronously
         let _ = op.process_element("test".to_string(), Some(0));
