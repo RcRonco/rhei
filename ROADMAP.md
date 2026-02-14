@@ -2,13 +2,13 @@
 
 ## Developer Experience
 
-- [ ] Reusable operator library (`rill-core/src/operators/`)
-  - [ ] `TemporalJoin<L, R, K, O>` — key-based join with configurable timeout
-  - [ ] `TumblingWindow<T, A>` — fixed-size time windows with pluggable aggregator
+- [x] Reusable operator library (`rill-core/src/operators/`)
+  - [x] `TemporalJoin<L, R, K, O>` — key-based join with configurable timeout
+  - [x] `TumblingWindow<T, A>` — fixed-size time windows with pluggable aggregator
   - [ ] `SlidingWindow<T, A>` — overlapping time windows
-  - [ ] `SessionWindow<T, A>` — gap-based windows per key
-  - [ ] `KeyedState<K, V>` — typed state wrapper over `StateContext` with automatic serde
-  - [ ] `Filter`, `Map`, `FlatMap` — stateless combinators
+  - [x] `SessionWindow<T, A>` — gap-based windows per key
+  - [x] `KeyedState<K, V>` — typed state wrapper over `StateContext` with automatic serde
+  - [x] `Filter`, `Map`, `FlatMap` — stateless combinators
 - [ ] Fluent pipeline builder API (`stream.join(...).window(...).aggregate(...)`)
 - [ ] Multi-operator chaining in `run_dataflow` (currently single-operator only)
 - [ ] Real connectors: Kafka source/sink, file source/sink, HTTP sink

@@ -18,6 +18,8 @@ pub mod connectors;
 pub mod event;
 /// Logical execution plan builder ([`StreamGraph`](graph::StreamGraph)).
 pub mod graph;
+/// Reusable stream processing operators ([`operators::MapOp`], [`operators::TumblingWindow`], etc.).
+pub mod operators;
 /// Tiered state management (memtable, local, Foyer, `SlateDB`).
 pub mod state;
 /// Core stream processing traits ([`StreamFunction`](traits::StreamFunction),
