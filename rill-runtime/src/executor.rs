@@ -8,6 +8,7 @@ use rill_core::state::tiered_backend::{TieredBackend, TieredBackendConfig};
 use rill_core::traits::{Sink, Source, StreamFunction};
 
 use crate::async_operator::AsyncOperator;
+use crate::shutdown::ShutdownHandle;
 
 /// Configuration for tiered storage on the executor.
 #[derive(Debug)]
@@ -66,6 +67,44 @@ impl Executor {
         F::Output: Clone,
         K: Sink<Input = F::Output>,
     {
+        self.run_linear_inner(source, operators, sink, None).await
+    }
+
+    /// Run a linear pipeline with graceful shutdown support.
+    ///
+    /// When the [`ShutdownHandle`] fires, the executor finishes the current
+    /// batch, checkpoints all operator state, commits source offsets, flushes
+    /// the sink, and returns `Ok(())`.
+    pub async fn run_linear_with_shutdown<S, F, K>(
+        &self,
+        source: &mut S,
+        operators: &mut [OperatorSlot<F>],
+        sink: &mut K,
+        shutdown: ShutdownHandle,
+    ) -> anyhow::Result<()>
+    where
+        S: Source<Output = F::Input>,
+        F: StreamFunction + 'static,
+        F::Output: Clone,
+        K: Sink<Input = F::Output>,
+    {
+        self.run_linear_inner(source, operators, sink, Some(shutdown))
+            .await
+    }
+
+    async fn run_linear_inner<S, F, K>(
+        &self,
+        source: &mut S,
+        operators: &mut [OperatorSlot<F>],
+        sink: &mut K,
+        shutdown: Option<ShutdownHandle>,
+    ) -> anyhow::Result<()>
+    where
+        S: Source<Output = F::Input>,
+        F: StreamFunction + 'static,
+        F::Output: Clone,
+        K: Sink<Input = F::Output>,
+    {
         let checkpoint_interval: u64 = 100;
         let mut batches_since_checkpoint: u64 = 0;
         let mut batch_count: u64 = 0;
@@ -112,9 +151,17 @@ impl Executor {
                 sink.flush().await?;
                 batches_since_checkpoint = 0;
             }
+
+            // Check for shutdown after processing each batch
+            if let Some(ref handle) = shutdown
+                && handle.is_shutdown()
+            {
+                tracing::info!("shutdown requested, performing final checkpoint...");
+                break;
+            }
         }
 
-        // Final checkpoint for bounded sources
+        // Final checkpoint
         let ckpt_start = std::time::Instant::now();
         for op in operators.iter_mut() {
             op.async_op.context_mut().checkpoint().await?;
@@ -137,6 +184,8 @@ impl Executor {
     /// Bridges async Source/Sink to sync channels, wraps the operator in a
     /// `TimelyAsyncOperator`, and runs `timely::execute_directly()` inside
     /// `spawn_blocking`. Each source batch is one epoch.
+    ///
+    /// For multi-operator chaining, use [`run_dataflow_chain`](Self::run_dataflow_chain).
     #[allow(clippy::too_many_lines)]
     pub async fn run_dataflow<S, F, K>(
         &self,
@@ -167,13 +216,9 @@ impl Executor {
 
         let rt_clone = rt.clone();
 
-        // Wrap !Sync captures in Mutex so the closure satisfies
-        // execute_directly's Send+Sync bound. We unwrap them immediately
-        // inside the single-threaded timely worker.
         let source_rx = std::sync::Mutex::new(source_rx);
         let inner_op = std::sync::Mutex::new(inner_op);
 
-        // Run Timely computation in a blocking thread
         tokio::task::spawn_blocking(move || {
             timely::execute_directly(move |worker| {
                 use timely::container::CapacityContainerBuilder;
@@ -185,7 +230,6 @@ impl Executor {
                 use timely::dataflow::operators::generic::operator::Operator;
                 use timely::scheduling::Scheduler;
 
-                // Unwrap Mutex wrappers (single-threaded from here)
                 let mut source_rx = source_rx.into_inner().unwrap();
                 let inner_op = inner_op.into_inner().unwrap();
 
@@ -193,17 +237,8 @@ impl Executor {
 
                 let rt_op = rt_clone.clone();
 
-                // Capture index so we can explicitly drop the dataflow after
-                // the probe loop. Without this, execute_directly's post-closure
-                // loop calls step_or_park(None) → std::thread::park() which
-                // hangs forever on spawn_blocking threads.
                 let dataflow_index = worker.next_dataflow_index();
                 let probe = worker.dataflow::<u64, _, _>(|scope| {
-                    // --- Source operator: drains channel, emits with capability ---
-                    // Uses build_reschedule + Activator so the operator keeps
-                    // firing until the channel disconnects. The generic `source`
-                    // helper uses `build` (fires once), which is insufficient
-                    // for multi-batch streaming.
                     let mut source_builder =
                         OperatorBuilder::new("Source".to_owned(), scope.clone());
                     let (output, stream) = source_builder.new_output::<Vec<F::Input>>();
@@ -248,7 +283,6 @@ impl Executor {
                         }
                     });
 
-                    // --- Operator: unary_frontier wrapping TimelyAsyncOperator ---
                     let processed = stream
                         .unary_frontier::<CapacityContainerBuilder<Vec<F::Output>>, _, _, _>(
                             Pipeline,
@@ -281,8 +315,223 @@ impl Executor {
                             },
                         );
 
-                    // --- Sink: inspect + probe ---
                     processed
+                        .inspect(move |item: &F::Output| {
+                            let _ = sink_tx.blocking_send(item.clone());
+                        })
+                        .probe()
+                });
+
+                while !probe.done() {
+                    worker.step();
+                }
+
+                worker.drop_dataflow(dataflow_index);
+            });
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("dataflow execution failed: {e}"))?;
+
+        Ok(())
+    }
+
+    /// Run a Timely dataflow pipeline with multiple chained operators.
+    ///
+    /// Like [`run_dataflow`](Self::run_dataflow), but chains all operators
+    /// as sequential Timely stages. Requires `F::Output: Into<F::Input>` so
+    /// intermediate results can flow between stages.
+    #[allow(clippy::too_many_lines)]
+    pub async fn run_dataflow_chain<S, F, K>(
+        &self,
+        source: S,
+        operators: Vec<OperatorSlot<F>>,
+        sink: K,
+    ) -> anyhow::Result<()>
+    where
+        S: Source<Output = F::Input> + 'static,
+        F: StreamFunction + 'static,
+        F::Input: Clone + 'static,
+        F::Output: Clone + Into<F::Input> + 'static,
+        K: Sink<Input = F::Output> + 'static,
+    {
+        assert!(!operators.is_empty(), "at least one operator required");
+        tracing::info!(operators = operators.len(), "starting dataflow");
+        let rt = tokio::runtime::Handle::current();
+
+        // Bridge async source/sink to sync channels
+        let source_rx = crate::bridge::source_bridge(source, &rt);
+        let sink_tx = crate::bridge::sink_bridge(sink, &rt);
+
+        // Collect all operators
+        let async_ops: Vec<AsyncOperator<F>> =
+            operators.into_iter().map(|slot| slot.async_op).collect();
+
+        let rt_clone = rt.clone();
+
+        // Wrap !Sync captures in Mutex so the closure satisfies
+        // execute_directly's Send+Sync bound. We unwrap them immediately
+        // inside the single-threaded timely worker.
+        let source_rx = std::sync::Mutex::new(source_rx);
+        let async_ops = std::sync::Mutex::new(async_ops);
+
+        // Run Timely computation in a blocking thread
+        tokio::task::spawn_blocking(move || {
+            timely::execute_directly(move |worker| {
+                use timely::container::CapacityContainerBuilder;
+                use timely::dataflow::channels::pact::Pipeline;
+                use timely::dataflow::operators::Inspect;
+                use timely::dataflow::operators::core::probe::Probe;
+                use timely::dataflow::operators::generic::OutputBuilder;
+                use timely::dataflow::operators::generic::builder_rc::OperatorBuilder;
+                use timely::dataflow::operators::generic::operator::Operator;
+                use timely::scheduling::Scheduler;
+
+                // Unwrap Mutex wrappers (single-threaded from here)
+                let mut source_rx = source_rx.into_inner().unwrap();
+                let async_ops = async_ops.into_inner().unwrap();
+
+                let rt_op = rt_clone.clone();
+
+                // Capture index so we can explicitly drop the dataflow after
+                // the probe loop. Without this, execute_directly's post-closure
+                // loop calls step_or_park(None) → std::thread::park() which
+                // hangs forever on spawn_blocking threads.
+                let dataflow_index = worker.next_dataflow_index();
+                let probe = worker.dataflow::<u64, _, _>(|scope| {
+                    // --- Source operator: drains channel, emits with capability ---
+                    let mut source_builder =
+                        OperatorBuilder::new("Source".to_owned(), scope.clone());
+                    let (output, stream) = source_builder.new_output::<Vec<F::Input>>();
+                    let mut output = OutputBuilder::from(output);
+                    let activator = scope.activator_for(source_builder.operator_info().address);
+                    source_builder.set_notify(false);
+
+                    source_builder.build_reschedule(move |mut capabilities| {
+                        let mut cap = Some(capabilities.pop().unwrap());
+                        let mut epoch: u64 = 0;
+
+                        move |_frontiers| {
+                            if cap.is_none() {
+                                return false;
+                            }
+
+                            match source_rx.try_recv() {
+                                Ok(batch) => {
+                                    if let Some(ref c) = cap {
+                                        let mut handle = output.activate();
+                                        let mut session = handle.session(c);
+                                        for item in batch {
+                                            session.give(item);
+                                        }
+                                    }
+                                    epoch += 1;
+                                    if let Some(ref mut c) = cap {
+                                        c.downgrade(&epoch);
+                                    }
+                                    activator.activate();
+                                    true
+                                }
+                                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
+                                    activator.activate();
+                                    true
+                                }
+                                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                                    cap = None;
+                                    false
+                                }
+                            }
+                        }
+                    });
+
+                    // --- Chain operators as sequential Timely stages ---
+                    // The first operator consumes F::Input and produces F::Output.
+                    // Subsequent operators consume F::Output (converted to F::Input
+                    // via Into) and produce F::Output.
+                    let mut timely_ops: Vec<_> = async_ops
+                        .into_iter()
+                        .map(crate::timely_operator::TimelyAsyncOperator::new)
+                        .collect();
+
+                    // First operator: Stream<F::Input> -> Stream<F::Output>
+                    let first_op = timely_ops.remove(0);
+                    let rt_first = rt_op.clone();
+                    let mut current = stream
+                        .unary_frontier::<CapacityContainerBuilder<Vec<F::Output>>, _, _, _>(
+                            Pipeline,
+                            "AsyncOp_0",
+                            move |_init_cap, _info| {
+                                let mut timely_op = first_op;
+                                let rt = rt_first;
+                                move |(input, frontier), output| {
+                                    input.for_each(|cap, data| {
+                                        let epoch = *cap.time();
+                                        for item in data.drain(..) {
+                                            let results = timely_op.process(item, epoch);
+                                            if !results.is_empty() {
+                                                let mut session = output.session(&cap);
+                                                for r in results {
+                                                    session.give(r);
+                                                }
+                                            }
+                                        }
+                                    });
+
+                                    if timely_op.has_pending() {
+                                        let _results = timely_op.poll_pending();
+                                    }
+
+                                    let frontier_vec: Vec<u64> =
+                                        frontier.frontier().iter().copied().collect();
+                                    timely_op.release_finished_epochs(&frontier_vec);
+                                    timely_op.maybe_checkpoint(&frontier_vec, &rt);
+                                }
+                            },
+                        );
+
+                    // Remaining operators: each takes Stream<F::Output>, converts
+                    // via Into<F::Input>, processes, and produces Stream<F::Output>.
+                    for (i, op) in timely_ops.into_iter().enumerate() {
+                        let rt_chain = rt_op.clone();
+                        let name = format!("AsyncOp_{}", i + 1);
+                        current = current
+                            .unary_frontier::<CapacityContainerBuilder<Vec<F::Output>>, _, _, _>(
+                                Pipeline,
+                                &name,
+                                move |_init_cap, _info| {
+                                    let mut timely_op = op;
+                                    let rt = rt_chain;
+                                    move |(input, frontier), output| {
+                                        input.for_each(|cap, data| {
+                                            let epoch = *cap.time();
+                                            for item in data.drain(..) {
+                                                let converted: F::Input = item.into();
+                                                let results =
+                                                    timely_op.process(converted, epoch);
+                                                if !results.is_empty() {
+                                                    let mut session =
+                                                        output.session(&cap);
+                                                    for r in results {
+                                                        session.give(r);
+                                                    }
+                                                }
+                                            }
+                                        });
+
+                                        if timely_op.has_pending() {
+                                            let _results = timely_op.poll_pending();
+                                        }
+
+                                        let frontier_vec: Vec<u64> =
+                                            frontier.frontier().iter().copied().collect();
+                                        timely_op.release_finished_epochs(&frontier_vec);
+                                        timely_op.maybe_checkpoint(&frontier_vec, &rt);
+                                    }
+                                },
+                            );
+                    }
+
+                    // --- Sink: inspect + probe ---
+                    current
                         .inspect(move |item: &F::Output| {
                             let _ = sink_tx.blocking_send(item.clone());
                         })
