@@ -554,6 +554,21 @@ impl Executor {
         Ok(())
     }
 
+    /// Create a fluent pipeline builder starting with the given source.
+    ///
+    /// ```ignore
+    /// executor
+    ///     .pipeline(source)
+    ///     .filter(|line: &String| !line.is_empty())
+    ///     .operator("word_counter", WordCounter, ctx)
+    ///     .map(|result: String| format!("[output] {result}"))
+    ///     .sink(sink)
+    ///     .await?;
+    /// ```
+    pub fn pipeline<S: Source>(&self, source: S) -> crate::pipeline::PipelineSource<'_, S> {
+        crate::pipeline::PipelineSource::new(self, source)
+    }
+
     /// Create a `StateContext` for the given operator.
     ///
     /// When tiered storage is configured, produces a context backed by

@@ -1,8 +1,17 @@
-//! Word-count example demonstrating typed state with [`KeyedState`].
+//! Word-count example demonstrating the fluent pipeline builder.
 //!
-//! Uses [`KeyedState<K, V>`](rill_core::operators::KeyedState) for ergonomic
-//! typed state access instead of manual byte serialization. Compare with the
-//! raw `StateContext` byte API to see the improvement.
+//! Uses the pipeline builder API to compose a filter, a stateful operator,
+//! and a map step into a single type-safe pipeline:
+//!
+//! ```ignore
+//! executor
+//!     .pipeline(source)
+//!     .filter(|line: &String| !line.is_empty())
+//!     .operator("word_counter", WordCounter, ctx)
+//!     .map(|result: String| format!("[output] {result}"))
+//!     .sink(PrintSink::new())
+//!     .await?;
+//! ```
 //!
 //! Run with: `cargo run -p rill-runtime --example word_count`
 
@@ -12,7 +21,7 @@ use rill_core::connectors::vec_source::VecSource;
 use rill_core::operators::KeyedState;
 use rill_core::state::context::StateContext;
 use rill_core::traits::StreamFunction;
-use rill_runtime::executor::{Executor, OperatorSlot};
+use rill_runtime::executor::Executor;
 
 /// A stateful word-count operator using [`KeyedState`] for typed state access.
 ///
@@ -50,23 +59,18 @@ async fn main() -> anyhow::Result<()> {
     let executor = Executor::new(dir.clone());
     let ctx = executor.create_context("word_counter").await?;
 
-    let mut source = VecSource::new(vec![
+    let source = VecSource::new(vec![
         "hello world".to_string(),
         "hello rill".to_string(),
         "rill is a stream processor".to_string(),
         "hello world again".to_string(),
     ]);
 
-    let mut operators = vec![OperatorSlot::new(
-        "word_counter",
-        WordCounter,
-        ctx,
-        Some(tokio::runtime::Handle::current()),
-    )];
-    let mut sink: PrintSink<String> = PrintSink::new().with_prefix("output");
-
     executor
-        .run_linear(&mut source, &mut operators, &mut sink)
+        .pipeline(source)
+        .operator("word_counter", WordCounter, ctx)
+        .map(|result: String| format!("[output] {result}"))
+        .sink(PrintSink::new())
         .await?;
 
     let _ = std::fs::remove_dir_all(&dir);

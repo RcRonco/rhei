@@ -27,6 +27,8 @@ pub mod metrics_snapshot;
 pub mod telemetry;
 /// Graceful shutdown coordination.
 pub mod shutdown;
+/// Fluent pipeline builder for composing heterogeneous stream processing steps.
+pub mod pipeline;
 /// Timely-aware async operator with capability management.
 pub mod timely_operator;
 /// Log capture layer for dashboards and log aggregation.
