@@ -25,6 +25,8 @@ pub mod stash;
 pub mod metrics_snapshot;
 /// Tracing and Prometheus metrics initialization.
 pub mod telemetry;
+/// Graceful shutdown coordination.
+pub mod shutdown;
 /// Timely-aware async operator with capability management.
 pub mod timely_operator;
 /// Log capture layer for dashboards and log aggregation.

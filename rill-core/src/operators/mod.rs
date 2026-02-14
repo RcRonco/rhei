@@ -6,7 +6,7 @@
 //! - **Stateless combinators:** [`MapOp`], [`FlatMapOp`], [`FilterOp`]
 //! - **Typed state:** [`KeyedState`] — ergonomic wrapper over [`StateContext`](crate::state::context::StateContext)
 //! - **Aggregation:** [`Aggregator`] trait with built-in [`Count`], [`Sum`], [`Avg`]
-//! - **Windowing:** [`TumblingWindow`], [`SessionWindow`]
+//! - **Windowing:** [`TumblingWindow`], [`SlidingWindow`], [`SessionWindow`]
 //! - **Joins:** [`TemporalJoin`] with [`JoinSide`]
 
 pub mod aggregator;
@@ -14,6 +14,7 @@ pub mod filter;
 pub mod keyed_state;
 pub mod map;
 pub mod session_window;
+pub mod sliding_window;
 pub mod temporal_join;
 pub mod tumbling_window;
 
@@ -22,5 +23,6 @@ pub use filter::FilterOp;
 pub use keyed_state::KeyedState;
 pub use map::{FlatMapOp, MapOp};
 pub use session_window::SessionWindow;
+pub use sliding_window::SlidingWindow;
 pub use temporal_join::{JoinSide, TemporalJoin};
 pub use tumbling_window::{TumblingWindow, WindowOutput};
