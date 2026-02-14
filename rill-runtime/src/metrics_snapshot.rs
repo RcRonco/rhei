@@ -45,6 +45,10 @@ pub struct MetricsSnapshot {
     pub element_duration_p50: f64,
     /// Latest element processing duration p99 (seconds).
     pub element_duration_p99: f64,
+    /// Current stash depth (elements waiting for processing).
+    pub stash_depth: f64,
+    /// Current number of pending async futures.
+    pub pending_futures: f64,
     /// Time since pipeline started.
     pub uptime: Duration,
 }
@@ -66,6 +70,8 @@ impl Default for MetricsSnapshot {
             checkpoint_duration_secs: 0.0,
             element_duration_p50: 0.0,
             element_duration_p99: 0.0,
+            stash_depth: 0.0,
+            pending_futures: 0.0,
             uptime: Duration::ZERO,
         }
     }
@@ -132,6 +138,8 @@ impl MetricsHandle {
         let checkpoint_duration_secs = get_f64(&gauges, "executor_checkpoint_duration_seconds");
         let element_duration_p50 = get_f64(&gauges, "executor_element_duration_p50");
         let element_duration_p99 = get_f64(&gauges, "executor_element_duration_p99");
+        let stash_depth = get_f64(&gauges, "backpressure_stash_depth");
+        let pending_futures = get_f64(&gauges, "backpressure_pending_futures");
 
         let uptime = self.inner.start_time.elapsed();
 
@@ -150,6 +158,8 @@ impl MetricsHandle {
             checkpoint_duration_secs,
             element_duration_p50,
             element_duration_p99,
+            stash_depth,
+            pending_futures,
             uptime,
         }
     }

@@ -152,7 +152,7 @@ impl TuiApp {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(9),  // Dashboard
+                Constraint::Length(10), // Dashboard
                 Constraint::Min(5),    // Log viewer
             ])
             .split(frame.area());

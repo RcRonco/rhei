@@ -76,6 +76,7 @@ impl<F: StreamFunction + 'static> AsyncOperator<F> {
         // Try to process stashed items
         self.process_stash(&mut completed);
 
+        self.report_backpressure();
         completed
     }
 
@@ -84,6 +85,7 @@ impl<F: StreamFunction + 'static> AsyncOperator<F> {
         let mut completed = Vec::new();
         self.drain_completed(&mut completed);
         self.process_stash(&mut completed);
+        self.report_backpressure();
         completed
     }
 
@@ -135,6 +137,14 @@ impl<F: StreamFunction + 'static> AsyncOperator<F> {
                     }
                 }
             }
+        }
+    }
+
+    fn report_backpressure(&self) {
+        #[allow(clippy::cast_precision_loss)]
+        {
+            metrics::gauge!("backpressure_stash_depth").set(self.stash.len() as f64);
+            metrics::gauge!("backpressure_pending_futures").set(self.pending.len() as f64);
         }
     }
 

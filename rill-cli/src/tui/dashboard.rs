@@ -54,7 +54,8 @@ pub fn render_dashboard(frame: &mut Frame<'_>, area: Rect, snap: &MetricsSnapsho
             Constraint::Length(1), // Elements / Batches
             Constraint::Length(1), // Separator
             Constraint::Length(1), // Cache / Latency
-            Constraint::Length(1), // Cache / Latency row 2
+            Constraint::Length(1), // State / Checkpoint
+            Constraint::Length(1), // Backpressure
         ])
         .split(inner);
 
@@ -125,7 +126,7 @@ pub fn render_dashboard(frame: &mut Frame<'_>, area: Rect, snap: &MetricsSnapsho
     ]);
     frame.render_widget(Paragraph::new(latency_row1), cols[1]);
 
-    // Row 6: Checkpoint info
+    // Row 6: State / Checkpoint
     let cols2 = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
@@ -142,4 +143,14 @@ pub fn render_dashboard(frame: &mut Frame<'_>, area: Rect, snap: &MetricsSnapsho
         Span::styled(format!("{:.2}s", snap.checkpoint_duration_secs), Style::default().fg(Color::White)),
     ]);
     frame.render_widget(Paragraph::new(ckpt), cols2[1]);
+
+    // Row 7: Backpressure
+    let backpressure = Line::from(vec![
+        Span::styled(" Stash  ", Style::default().fg(Color::DarkGray)),
+        Span::styled(format!("{:.0}", snap.stash_depth), Style::default().fg(if snap.stash_depth > 0.0 { Color::Yellow } else { Color::White })),
+        Span::raw("      "),
+        Span::styled("Pending  ", Style::default().fg(Color::DarkGray)),
+        Span::styled(format!("{:.0}", snap.pending_futures), Style::default().fg(if snap.pending_futures > 0.0 { Color::Yellow } else { Color::White })),
+    ]);
+    frame.render_widget(Paragraph::new(backpressure), rows[7]);
 }
