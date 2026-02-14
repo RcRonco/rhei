@@ -50,16 +50,7 @@ fn main() -> anyhow::Result<()> {
                 })?;
             cmd_new(&name)
         }
-        Commands::Run { tui: true } => {
-            let handles =
-                rill_runtime::telemetry::init(rill_runtime::telemetry::TelemetryConfig {
-                    metrics_addr: None,
-                    log_filter: cli.log_level.clone(),
-                    json_logs: false,
-                    tui: true,
-                })?;
-            cmd_run_tui(handles)
-        }
+        Commands::Run { tui: true } => cmd_run_tui(cli.log_level),
         Commands::Run { tui: false } => {
             let _telemetry =
                 rill_runtime::telemetry::init(rill_runtime::telemetry::TelemetryConfig {
@@ -162,10 +153,19 @@ fn cmd_run() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn cmd_run_tui(handles: rill_runtime::telemetry::TelemetryHandles) -> anyhow::Result<()> {
+fn cmd_run_tui(log_level: String) -> anyhow::Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
 
     rt.block_on(async {
+        // Initialize telemetry inside the runtime so tokio::spawn works
+        let handles =
+            rill_runtime::telemetry::init(rill_runtime::telemetry::TelemetryConfig {
+                metrics_addr: None,
+                log_filter: log_level,
+                json_logs: false,
+                tui: true,
+            })?;
+
         let metrics_rx = handles
             .metrics_rx
             .expect("TUI mode should provide metrics_rx");
@@ -187,37 +187,81 @@ fn cmd_run_tui(handles: rill_runtime::telemetry::TelemetryHandles) -> anyhow::Re
     })
 }
 
-/// Built-in demo pipeline for TUI mode (word count).
+/// Built-in demo pipeline for TUI mode.
+///
+/// Simulates a real-time sensor aggregation pipeline: 5 sensors emit readings
+/// every 150 ms, aggregated into 10-second tumbling windows using the
+/// operators library.
 async fn run_demo_pipeline() -> anyhow::Result<()> {
-    use async_trait::async_trait;
-    use rill_core::connectors::print_sink::PrintSink;
-    use rill_core::connectors::vec_source::VecSource;
-    use rill_core::state::context::StateContext;
-    use rill_core::traits::StreamFunction;
-    use rill_runtime::executor::{Executor, OperatorSlot};
+    use std::fmt;
+    use std::marker::PhantomData;
 
-    struct WordCounter;
+    use async_trait::async_trait;
+    use rill_core::operators::{Avg, TumblingWindow, WindowOutput};
+    use rill_core::traits::{Sink, Source};
+    use rill_runtime::executor::{Executor, OperatorSlot};
+    use serde::{Deserialize, Serialize};
+
+    #[derive(Clone, Serialize, Deserialize)]
+    struct SensorReading {
+        sensor_id: String,
+        value: f64,
+        timestamp: u64,
+    }
+
+    /// Generates sensor readings in real time, one batch per tick.
+    struct SimulatedSensorSource {
+        tick: u64,
+        max_ticks: u64,
+    }
 
     #[async_trait]
-    impl StreamFunction for WordCounter {
-        type Input = String;
-        type Output = String;
+    impl Source for SimulatedSensorSource {
+        type Output = SensorReading;
 
-        async fn process(&mut self, input: String, ctx: &mut StateContext) -> Vec<String> {
-            let mut outputs = Vec::new();
-            for word in input.split_whitespace() {
-                let key = word.as_bytes();
-                let count = match ctx.get(key).await.unwrap_or(None) {
-                    Some(bytes) => {
-                        let n = u64::from_le_bytes(bytes.try_into().unwrap_or([0; 8]));
-                        n + 1
-                    }
-                    None => 1,
-                };
-                ctx.put(key, &count.to_le_bytes());
-                outputs.push(format!("{word}: {count}"));
+        async fn next_batch(&mut self) -> Option<Vec<SensorReading>> {
+            if self.tick >= self.max_ticks {
+                return None;
             }
-            outputs
+            // Pace the data so the TUI has something to watch
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+
+            let sensors = [
+                ("temp-1", 22.0),
+                ("temp-2", 18.0),
+                ("pressure-1", 1013.0),
+                ("humidity-1", 65.0),
+                ("temp-3", 25.0),
+            ];
+
+            let t = self.tick as f64;
+            let readings = sensors
+                .iter()
+                .map(|&(id, base)| {
+                    let variation = (t * 0.7).sin() * 2.0 + (t * 1.3).cos() * 1.5;
+                    SensorReading {
+                        sensor_id: id.to_string(),
+                        value: base + variation,
+                        timestamp: self.tick,
+                    }
+                })
+                .collect();
+
+            self.tick += 1;
+            Some(readings)
+        }
+    }
+
+    /// Routes operator output into the TUI log viewer via `tracing::info!`.
+    struct LoggingSink<T>(PhantomData<fn(T)>);
+
+    #[async_trait]
+    impl<T: Send + Sync + fmt::Display + 'static> Sink for LoggingSink<T> {
+        type Input = T;
+
+        async fn write(&mut self, input: T) -> anyhow::Result<()> {
+            tracing::info!("{input}");
+            Ok(())
         }
     }
 
@@ -226,32 +270,37 @@ async fn run_demo_pipeline() -> anyhow::Result<()> {
     std::fs::create_dir_all(&dir)?;
 
     let executor = Executor::new(dir.clone());
-    let ctx = executor.create_context("word_counter").await?;
+    let ctx = executor.create_context("tumbling_window").await?;
 
-    // Generate many batches so the pipeline runs for a while
-    let mut data = Vec::new();
-    for i in 0..100 {
-        data.push(format!("hello world batch {i}"));
-        data.push(format!("rill stream processing round {i}"));
-    }
+    // 500 ticks × 150 ms ≈ 75 seconds of simulated sensor data
+    let mut source = SimulatedSensorSource {
+        tick: 0,
+        max_ticks: 500,
+    };
 
-    let mut source = VecSource::new(data);
+    let op = TumblingWindow::builder()
+        .window_size(10)
+        .key_fn(|r: &SensorReading| r.sensor_id.clone())
+        .time_fn(|r: &SensorReading| r.timestamp)
+        .aggregator(Avg::new(|r: &SensorReading| r.value))
+        .build();
+
     let mut operators = vec![OperatorSlot::new(
-        "word_counter",
-        WordCounter,
+        "tumbling_window",
+        op,
         ctx,
         Some(tokio::runtime::Handle::current()),
     )];
-    let mut sink: PrintSink<String> = PrintSink::new();
+    let mut sink: LoggingSink<WindowOutput<f64>> = LoggingSink(PhantomData);
 
-    // Small delay so TUI renders before pipeline starts
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    // Let the TUI render before data starts flowing
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
-    tracing::info!("demo pipeline starting");
+    tracing::info!("sensor aggregation pipeline started — 5 sensors, 10s tumbling windows");
     executor
         .run_linear(&mut source, &mut operators, &mut sink)
         .await?;
-    tracing::info!("demo pipeline completed");
+    tracing::info!("pipeline completed");
 
     // Keep alive so TUI stays up until user quits
     loop {

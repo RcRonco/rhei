@@ -75,6 +75,7 @@ impl Executor {
 
             for item in batch {
                 element_count += 1;
+                metrics::counter!("executor_elements_total").increment(1);
                 let elem_start = std::time::Instant::now();
 
                 let mut current: Vec<F::Output> = Vec::new();
@@ -97,8 +98,6 @@ impl Executor {
                     .record(elem_start.elapsed().as_secs_f64());
             }
         }
-
-        metrics::counter!("executor_elements_total").increment(element_count);
 
         // Checkpoint all operator state
         let ckpt_start = std::time::Instant::now();

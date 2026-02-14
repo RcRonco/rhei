@@ -110,11 +110,11 @@ impl MetricsHandle {
 
         let elements_total = get(&counters, "executor_elements_total");
         let batches_total = get(&counters, "executor_batches_total");
-        let state_get_total = get(&counters, "state_get_total");
-        let state_put_total = get(&counters, "state_put_total");
-        let l1_hits = get(&counters, "state_l1_hit");
-        let l2_hits = get(&counters, "state_l2_hit");
-        let l3_hits = get(&counters, "state_l3_hit");
+        let state_get_total = get(&counters, "state_gets_total");
+        let state_put_total = get(&counters, "state_puts_total");
+        let l1_hits = get(&counters, "state_l1_hits_total");
+        let l2_hits = get(&counters, "state_l2_hits_total");
+        let l3_hits = get(&counters, "state_l3_hits_total");
 
         let total_lookups = l1_hits + l2_hits + l3_hits;
         let (l1_rate, l2_rate, l3_rate) = if total_lookups > 0 {
@@ -298,9 +298,9 @@ mod tests {
     fn hit_rate_computation() {
         let (recorder, handle) = SnapshotRecorder::new();
 
-        let l1_key = Key::from_name("state_l1_hit");
-        let l2_key = Key::from_name("state_l2_hit");
-        let l3_key = Key::from_name("state_l3_hit");
+        let l1_key = Key::from_name("state_l1_hits_total");
+        let l2_key = Key::from_name("state_l2_hits_total");
+        let l3_key = Key::from_name("state_l3_hits_total");
         let c1 = recorder.register_counter(&l1_key, &Metadata::new("", metrics::Level::INFO, None));
         let c2 = recorder.register_counter(&l2_key, &Metadata::new("", metrics::Level::INFO, None));
         let c3 = recorder.register_counter(&l3_key, &Metadata::new("", metrics::Level::INFO, None));
