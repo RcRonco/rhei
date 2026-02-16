@@ -17,7 +17,8 @@ Users never interact with Timely Dataflow, exchange pacts, capabilities, or work
 A lightweight, copyable handle representing a point in the dataflow graph. `T` is the element type flowing through that point.
 
 ```rust
-let orders: Stream<Order> = executor.source(kafka_orders);
+let graph = DataflowGraph::new();
+let orders: Stream<Order> = graph.source(kafka_orders);
 let parsed: Stream<ParsedOrder> = orders.map(parse_order);
 ```
 
@@ -42,7 +43,7 @@ let enriched: KeyedStream<EnrichedOrder> = keyed.operator("enrich", EnrichOp);
 
 ### `Executor`
 
-Owns the dataflow graph. Configures workers and checkpointing. Compiles and runs the pipeline.
+Configures workers and checkpointing. Compiles and runs a `DataflowGraph`.
 
 ```rust
 let executor = Executor::builder()
@@ -50,9 +51,9 @@ let executor = Executor::builder()
     .workers(4)
     .build();
 
-// ... build dataflow ...
+// ... build dataflow on a DataflowGraph ...
 
-executor.run().await?;
+executor.run(graph).await?;
 ```
 
 ---
@@ -62,8 +63,8 @@ executor.run().await?;
 ### Sources
 
 ```rust
-let orders = executor.source(KafkaSource::new(broker, group, &["orders"])?);
-let readings = executor.source(VecSource::new(data));
+let orders = graph.source(KafkaSource::new(broker, group, &["orders"])?);
+let readings = graph.source(VecSource::new(data));
 ```
 
 A source produces a `Stream<S::Output>`. Multiple sources are independent — they run concurrently.
@@ -173,12 +174,8 @@ enriched.sink(PrintSink::new());
 ### Building and Running
 
 ```rust
-let executor = Executor::builder()
-    .checkpoint_dir("./checkpoints")
-    .workers(4)
-    .build();
-
-let orders = executor.source(kafka_source);
+let graph = DataflowGraph::new();
+let orders = graph.source(kafka_source);
 let processed = orders
     .map(parse)
     .key_by(|o| o.customer_id.clone())
@@ -186,7 +183,12 @@ let processed = orders
     .map(format_output);
 processed.sink(kafka_sink);
 
-executor.run().await?;
+let executor = Executor::builder()
+    .checkpoint_dir("./checkpoints")
+    .workers(4)
+    .build();
+
+executor.run(graph).await?;
 ```
 
 `.run()` compiles the dataflow graph, validates it (every stream must reach a sink or be explicitly dropped), and executes it. The method returns when all sources are exhausted or shutdown is triggered.
@@ -194,7 +196,7 @@ executor.run().await?;
 ### Shutdown
 
 ```rust
-executor.run_with_shutdown(shutdown_handle).await?;
+executor.run_with_shutdown(graph, shutdown_handle).await?;
 ```
 
 On shutdown signal: finish current batches, checkpoint all operators, commit source offsets, flush sinks, return.
@@ -249,16 +251,13 @@ When `workers == 1`, the entire pipeline runs as a simple async loop. No threads
 Two Kafka topics, per-leg transforms, temporal join on composite key, custom stateful enrichment, Kafka sink:
 
 ```rust
-let executor = Executor::builder()
-    .checkpoint_dir("./checkpoints")
-    .workers(8)
-    .build();
+let graph = DataflowGraph::new();
 
 // Sources
-let raw_orders = executor.source(
+let raw_orders = graph.source(
     KafkaSource::new("localhost:9092", "rill-app", &["orders"])?
 );
-let raw_shipments = executor.source(
+let raw_shipments = graph.source(
     KafkaSource::new("localhost:9092", "rill-app", &["shipments"])?
 );
 
@@ -306,7 +305,12 @@ let output = enriched.map(|r: EnrichedRecord| {
 output.sink(KafkaSink::new("localhost:9092", "enriched-orders")?);
 
 // Run
-executor.run().await?;
+let executor = Executor::builder()
+    .checkpoint_dir("./checkpoints")
+    .workers(8)
+    .build();
+
+executor.run(graph).await?;
 ```
 
 Execution plan compiled by the executor (8 workers):

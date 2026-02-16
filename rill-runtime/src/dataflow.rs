@@ -1,28 +1,31 @@
 //! Dataflow graph API for building stream processing pipelines.
 //!
-//! Provides [`Stream<T>`] and [`KeyedStream<T>`] as lightweight, copyable handles
-//! into a dataflow graph owned by the [`Executor`](crate::executor::Executor).
-//! Operations like `.map()`, `.filter()`, `.key_by()`, and `.operator()` add
-//! nodes to the graph. [`Executor::run()`] compiles and executes the graph.
+//! Provides [`DataflowGraph`] as a standalone builder and [`Stream<T>`] /
+//! [`KeyedStream<T>`] as lightweight, copyable handles into it. Operations
+//! like `.map()`, `.filter()`, `.key_by()`, and `.operator()` add nodes to
+//! the graph. Pass the finished graph to
+//! [`Executor::run()`](crate::executor::Executor::run) for execution.
 //!
 //! ```ignore
+//! let graph = DataflowGraph::new();
+//! let orders = graph.source(kafka_source);
+//! orders
+//!     .map(parse)
+//!     .key_by(|o| o.customer_id.clone())
+//!     .operator("enrich", EnrichOp)
+//!     .map(format_output)
+//!     .sink(kafka_sink);
+//!
 //! let executor = Executor::builder()
 //!     .checkpoint_dir("./checkpoints")
 //!     .workers(4)
 //!     .build();
 //!
-//! let orders = executor.source(kafka_source);
-//! let processed = orders
-//!     .map(parse)
-//!     .key_by(|o| o.customer_id.clone())
-//!     .operator("enrich", EnrichOp)
-//!     .map(format_output);
-//! processed.sink(kafka_sink);
-//!
-//! executor.run().await?;
+//! executor.run(graph).await?;
 //! ```
 
 use std::any::Any;
+use std::cell::RefCell;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::marker::PhantomData;
@@ -182,35 +185,64 @@ pub(crate) struct GraphNode {
 }
 
 /// The dataflow graph: a collection of nodes connected by edges.
-pub(crate) struct DataflowGraph {
-    pub nodes: Vec<GraphNode>,
+///
+/// Build a graph by calling [`source()`](Self::source) to create entry points,
+/// then chaining transforms and sinks on the returned [`Stream`] handles.
+/// Pass the finished graph to [`Executor::run()`](crate::executor::Executor::run)
+/// for execution.
+///
+/// Uses interior mutability (`RefCell`) so stream handles can add nodes
+/// via shared `&DataflowGraph` references. Graph construction is
+/// single-threaded — no `Mutex` needed.
+pub struct DataflowGraph {
+    // Debug: just show node count to avoid requiring Debug on NodeKind.
+    nodes: RefCell<Vec<GraphNode>>,
+}
+
+impl std::fmt::Debug for DataflowGraph {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DataflowGraph")
+            .field("node_count", &self.nodes.borrow().len())
+            .finish()
+    }
 }
 
 impl DataflowGraph {
+    /// Create a new empty dataflow graph.
     pub fn new() -> Self {
-        Self { nodes: Vec::new() }
+        Self {
+            nodes: RefCell::new(Vec::new()),
+        }
+    }
+
+    /// Add a data source to the dataflow. Returns a [`Stream`] handle.
+    pub fn source<S>(&self, source: S) -> Stream<'_, S::Output>
+    where
+        S: Source + 'static,
+        S::Output: Send + 'static,
+    {
+        let id = self.add_node(NodeKind::Source(Box::new(SourceWrapper(source))), vec![]);
+        Stream::new(self, id)
     }
 
     /// Add a node and return its ID.
-    pub fn add_node(&mut self, kind: NodeKind, inputs: Vec<NodeId>) -> NodeId {
-        let id = NodeId(self.nodes.len());
-        self.nodes.push(GraphNode { id, kind, inputs });
+    pub(crate) fn add_node(&self, kind: NodeKind, inputs: Vec<NodeId>) -> NodeId {
+        let mut nodes = self.nodes.borrow_mut();
+        let id = NodeId(nodes.len());
+        nodes.push(GraphNode { id, kind, inputs });
         id
+    }
+
+    /// Consume the graph and return the raw node list for compilation.
+    pub(crate) fn into_nodes(self) -> Vec<GraphNode> {
+        self.nodes.into_inner()
     }
 }
 
-/// Create a source node in the graph and return a typed [`Stream`] handle.
-pub(crate) fn add_source<S>(
-    executor: &crate::executor::Executor,
-    source: S,
-) -> Stream<'_, S::Output>
-where
-    S: Source + 'static,
-    S::Output: Send + 'static,
-{
-    let node_id =
-        executor.add_graph_node(NodeKind::Source(Box::new(SourceWrapper(source))), vec![]);
-    Stream::new(executor, node_id)
+impl Default for DataflowGraph {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 // ── Stream handle ────────────────────────────────────────────────────
@@ -224,7 +256,7 @@ where
 /// on `Stream`. For stateful operators, first call `.key_by()` to get a
 /// [`KeyedStream`].
 pub struct Stream<'a, T> {
-    executor: &'a crate::executor::Executor,
+    graph: &'a DataflowGraph,
     node_id: NodeId,
     _phantom: PhantomData<T>,
 }
@@ -245,9 +277,9 @@ impl<T> Clone for Stream<'_, T> {
 impl<T> Copy for Stream<'_, T> {}
 
 impl<'a, T: Send + 'static> Stream<'a, T> {
-    pub(crate) fn new(executor: &'a crate::executor::Executor, node_id: NodeId) -> Self {
+    pub(crate) fn new(graph: &'a DataflowGraph, node_id: NodeId) -> Self {
         Self {
-            executor,
+            graph,
             node_id,
             _phantom: PhantomData,
         }
@@ -264,9 +296,9 @@ impl<'a, T: Send + 'static> Stream<'a, T> {
             vec![Box::new(f(typed)) as Box<dyn Any + Send>]
         });
         let node_id = self
-            .executor
-            .add_graph_node(NodeKind::Transform(transform), vec![self.node_id]);
-        Stream::new(self.executor, node_id)
+            .graph
+            .add_node(NodeKind::Transform(transform), vec![self.node_id]);
+        Stream::new(self.graph, node_id)
     }
 
     /// Drop elements that don't match the predicate.
@@ -283,9 +315,9 @@ impl<'a, T: Send + 'static> Stream<'a, T> {
             }
         });
         let node_id = self
-            .executor
-            .add_graph_node(NodeKind::Transform(transform), vec![self.node_id]);
-        Stream::new(self.executor, node_id)
+            .graph
+            .add_node(NodeKind::Transform(transform), vec![self.node_id]);
+        Stream::new(self.graph, node_id)
     }
 
     /// One-to-many transform.
@@ -302,9 +334,9 @@ impl<'a, T: Send + 'static> Stream<'a, T> {
                 .collect()
         });
         let node_id = self
-            .executor
-            .add_graph_node(NodeKind::Transform(transform), vec![self.node_id]);
-        Stream::new(self.executor, node_id)
+            .graph
+            .add_node(NodeKind::Transform(transform), vec![self.node_id]);
+        Stream::new(self.graph, node_id)
     }
 
     /// Partition elements by key. Returns a [`KeyedStream`] that supports
@@ -321,17 +353,17 @@ impl<'a, T: Send + 'static> Stream<'a, T> {
             key_fn(typed)
         });
         let node_id = self
-            .executor
-            .add_graph_node(NodeKind::KeyBy(erased_key_fn), vec![self.node_id]);
-        KeyedStream::new(self.executor, node_id)
+            .graph
+            .add_node(NodeKind::KeyBy(erased_key_fn), vec![self.node_id]);
+        KeyedStream::new(self.graph, node_id)
     }
 
     /// Combine two streams of the same type. The result is an unkeyed `Stream`.
     pub fn merge(self, other: Stream<'a, T>) -> Stream<'a, T> {
         let node_id = self
-            .executor
-            .add_graph_node(NodeKind::Merge, vec![self.node_id, other.node_id]);
-        Stream::new(self.executor, node_id)
+            .graph
+            .add_node(NodeKind::Merge, vec![self.node_id, other.node_id]);
+        Stream::new(self.graph, node_id)
     }
 
     /// Terminal: write elements to a sink.
@@ -339,7 +371,7 @@ impl<'a, T: Send + 'static> Stream<'a, T> {
     where
         K: Sink<Input = T> + 'static,
     {
-        self.executor.add_graph_node(
+        self.graph.add_node(
             NodeKind::Sink(Box::new(SinkWrapper(sink))),
             vec![self.node_id],
         );
@@ -354,7 +386,7 @@ impl<'a, T: Send + 'static> Stream<'a, T> {
 /// `.filter()`, `.flat_map()`) preserve the partitioning. Calling
 /// `.key_by()` again re-partitions (triggers a new exchange).
 pub struct KeyedStream<'a, T> {
-    executor: &'a crate::executor::Executor,
+    graph: &'a DataflowGraph,
     node_id: NodeId,
     _phantom: PhantomData<T>,
 }
@@ -375,9 +407,9 @@ impl<T> Clone for KeyedStream<'_, T> {
 impl<T> Copy for KeyedStream<'_, T> {}
 
 impl<'a, T: Send + 'static> KeyedStream<'a, T> {
-    pub(crate) fn new(executor: &'a crate::executor::Executor, node_id: NodeId) -> Self {
+    pub(crate) fn new(graph: &'a DataflowGraph, node_id: NodeId) -> Self {
         Self {
-            executor,
+            graph,
             node_id,
             _phantom: PhantomData,
         }
@@ -394,9 +426,9 @@ impl<'a, T: Send + 'static> KeyedStream<'a, T> {
             vec![Box::new(f(typed)) as Box<dyn Any + Send>]
         });
         let node_id = self
-            .executor
-            .add_graph_node(NodeKind::Transform(transform), vec![self.node_id]);
-        KeyedStream::new(self.executor, node_id)
+            .graph
+            .add_node(NodeKind::Transform(transform), vec![self.node_id]);
+        KeyedStream::new(self.graph, node_id)
     }
 
     /// Drop elements that don't match the predicate (preserves partitioning).
@@ -413,9 +445,9 @@ impl<'a, T: Send + 'static> KeyedStream<'a, T> {
             }
         });
         let node_id = self
-            .executor
-            .add_graph_node(NodeKind::Transform(transform), vec![self.node_id]);
-        KeyedStream::new(self.executor, node_id)
+            .graph
+            .add_node(NodeKind::Transform(transform), vec![self.node_id]);
+        KeyedStream::new(self.graph, node_id)
     }
 
     /// One-to-many transform (preserves partitioning).
@@ -432,9 +464,9 @@ impl<'a, T: Send + 'static> KeyedStream<'a, T> {
                 .collect()
         });
         let node_id = self
-            .executor
-            .add_graph_node(NodeKind::Transform(transform), vec![self.node_id]);
-        KeyedStream::new(self.executor, node_id)
+            .graph
+            .add_node(NodeKind::Transform(transform), vec![self.node_id]);
+        KeyedStream::new(self.graph, node_id)
     }
 
     /// Add a stateful operator. The operator is cloned per worker, and each
@@ -446,14 +478,14 @@ impl<'a, T: Send + 'static> KeyedStream<'a, T> {
         Func: StreamFunction<Input = T> + Clone + 'static,
         Func::Output: 'static,
     {
-        let node_id = self.executor.add_graph_node(
+        let node_id = self.graph.add_node(
             NodeKind::Operator {
                 name: name.to_string(),
                 op: Box::new(OperatorWrapper(func)),
             },
             vec![self.node_id],
         );
-        KeyedStream::new(self.executor, node_id)
+        KeyedStream::new(self.graph, node_id)
     }
 
     /// Re-partition by a new key (triggers a new exchange).
@@ -466,9 +498,9 @@ impl<'a, T: Send + 'static> KeyedStream<'a, T> {
             key_fn(typed)
         });
         let node_id = self
-            .executor
-            .add_graph_node(NodeKind::KeyBy(erased_key_fn), vec![self.node_id]);
-        KeyedStream::new(self.executor, node_id)
+            .graph
+            .add_node(NodeKind::KeyBy(erased_key_fn), vec![self.node_id]);
+        KeyedStream::new(self.graph, node_id)
     }
 
     /// Terminal: write elements to a sink.
@@ -476,7 +508,7 @@ impl<'a, T: Send + 'static> KeyedStream<'a, T> {
     where
         K: Sink<Input = T> + 'static,
     {
-        self.executor.add_graph_node(
+        self.graph.add_node(
             NodeKind::Sink(Box::new(SinkWrapper(sink))),
             vec![self.node_id],
         );
@@ -508,9 +540,8 @@ pub(crate) struct CompiledPipeline {
 ///
 /// For V1, supports linear topologies: source → [transforms] → sink.
 /// Fan-out and merge are detected and return an error.
-pub(crate) fn compile(mut graph: DataflowGraph) -> anyhow::Result<Vec<CompiledPipeline>> {
-    let sink_ids: Vec<NodeId> = graph
-        .nodes
+pub(crate) fn compile(mut nodes: Vec<GraphNode>) -> anyhow::Result<Vec<CompiledPipeline>> {
+    let sink_ids: Vec<NodeId> = nodes
         .iter()
         .filter(|n| matches!(n.kind, NodeKind::Sink(_)))
         .map(|n| n.id)
@@ -528,7 +559,7 @@ pub(crate) fn compile(mut graph: DataflowGraph) -> anyhow::Result<Vec<CompiledPi
         let mut current = *sink_id;
         loop {
             path.push(current);
-            let node = &graph.nodes[current.0];
+            let node = &nodes[current.0];
             if node.inputs.is_empty() {
                 break;
             }
@@ -542,7 +573,7 @@ pub(crate) fn compile(mut graph: DataflowGraph) -> anyhow::Result<Vec<CompiledPi
         if path.len() < 2 {
             anyhow::bail!("degenerate pipeline: fewer than 2 nodes");
         }
-        if !matches!(graph.nodes[path[0].0].kind, NodeKind::Source(_)) {
+        if !matches!(nodes[path[0].0].kind, NodeKind::Source(_)) {
             anyhow::bail!(
                 "pipeline does not start with a source (found node {:?})",
                 path[0]
@@ -552,7 +583,7 @@ pub(crate) fn compile(mut graph: DataflowGraph) -> anyhow::Result<Vec<CompiledPi
         // Extract middle segments.
         let mut segments = Vec::new();
         for &node_id in &path[1..path.len() - 1] {
-            let kind = std::mem::replace(&mut graph.nodes[node_id.0].kind, NodeKind::Merge);
+            let kind = std::mem::replace(&mut nodes[node_id.0].kind, NodeKind::Merge);
             match kind {
                 NodeKind::Transform(f) => segments.push(Segment::Transform(f)),
                 NodeKind::KeyBy(f) => segments.push(Segment::Exchange(f)),
@@ -568,11 +599,8 @@ pub(crate) fn compile(mut graph: DataflowGraph) -> anyhow::Result<Vec<CompiledPi
         }
 
         // Extract source and sink.
-        let source_kind = std::mem::replace(&mut graph.nodes[path[0].0].kind, NodeKind::Merge);
-        let sink_kind = std::mem::replace(
-            &mut graph.nodes[path[path.len() - 1].0].kind,
-            NodeKind::Merge,
-        );
+        let source_kind = std::mem::replace(&mut nodes[path[0].0].kind, NodeKind::Merge);
+        let sink_kind = std::mem::replace(&mut nodes[path[path.len() - 1].0].kind, NodeKind::Merge);
         let NodeKind::Source(source) = source_kind else {
             anyhow::bail!("expected source node");
         };
@@ -913,7 +941,7 @@ pub(crate) async fn run_graph(
     executor: &crate::executor::Executor,
     shutdown: Option<ShutdownHandle>,
 ) -> anyhow::Result<()> {
-    let pipelines = compile(graph)?;
+    let pipelines = compile(graph.into_nodes())?;
 
     if pipelines.len() == 1 {
         let pipeline = pipelines.into_iter().next().unwrap();
@@ -958,17 +986,18 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
 
-        let executor = crate::executor::Executor::new(dir.clone());
+        let graph = super::DataflowGraph::new();
         let source = VecSource::new(vec![1i32, 2, 3]);
         let collected = Arc::new(Mutex::new(Vec::new()));
 
-        let stream = executor.source(source);
+        let stream = graph.source(source);
         let doubled = stream.map(|x: i32| x * 2);
         doubled.sink(CollectSink {
             collected: collected.clone(),
         });
 
-        executor.run().await.unwrap();
+        let executor = crate::executor::Executor::new(dir.clone());
+        executor.run(graph).await.unwrap();
         assert_eq!(*collected.lock().unwrap(), vec![2, 4, 6]);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -979,16 +1008,17 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
 
-        let executor = crate::executor::Executor::new(dir.clone());
+        let graph = super::DataflowGraph::new();
         let source = VecSource::new(vec![1i32, 2, 3, 4, 5]);
         let collected = Arc::new(Mutex::new(Vec::new()));
 
-        let stream = executor.source(source);
+        let stream = graph.source(source);
         stream.filter(|x: &i32| x % 2 == 0).sink(CollectSink {
             collected: collected.clone(),
         });
 
-        executor.run().await.unwrap();
+        let executor = crate::executor::Executor::new(dir.clone());
+        executor.run(graph).await.unwrap();
         assert_eq!(*collected.lock().unwrap(), vec![2, 4]);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -999,18 +1029,19 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
 
-        let executor = crate::executor::Executor::new(dir.clone());
+        let graph = super::DataflowGraph::new();
         let source = VecSource::new(vec!["hello world".to_string(), "foo bar".to_string()]);
         let collected = Arc::new(Mutex::new(Vec::new()));
 
-        let stream = executor.source(source);
+        let stream = graph.source(source);
         stream
             .flat_map(|line: String| line.split_whitespace().map(String::from).collect())
             .sink(CollectSink {
                 collected: collected.clone(),
             });
 
-        executor.run().await.unwrap();
+        let executor = crate::executor::Executor::new(dir.clone());
+        executor.run(graph).await.unwrap();
         assert_eq!(
             *collected.lock().unwrap(),
             vec!["hello", "world", "foo", "bar"]
@@ -1024,11 +1055,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
 
-        let executor = crate::executor::Executor::new(dir.clone());
+        let graph = super::DataflowGraph::new();
         let source = VecSource::new(vec![1i32, 2, 3, 4, 5]);
         let collected = Arc::new(Mutex::new(Vec::new()));
 
-        let stream = executor.source(source);
+        let stream = graph.source(source);
         stream
             .filter(|x: &i32| x % 2 == 0)
             .map(|x: i32| x * 10)
@@ -1036,7 +1067,8 @@ mod tests {
                 collected: collected.clone(),
             });
 
-        executor.run().await.unwrap();
+        let executor = crate::executor::Executor::new(dir.clone());
+        executor.run(graph).await.unwrap();
         assert_eq!(*collected.lock().unwrap(), vec![20, 40]);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1073,11 +1105,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
 
-        let executor = crate::executor::Executor::new(dir.clone());
+        let graph = super::DataflowGraph::new();
         let source = VecSource::new(vec!["hello world".to_string(), "hello rill".to_string()]);
         let collected = Arc::new(Mutex::new(Vec::new()));
 
-        let stream = executor.source(source);
+        let stream = graph.source(source);
         stream
             .flat_map(|line: String| line.split_whitespace().map(String::from).collect())
             .key_by(|word: &String| word.clone())
@@ -1086,7 +1118,8 @@ mod tests {
                 collected: collected.clone(),
             });
 
-        executor.run().await.unwrap();
+        let executor = crate::executor::Executor::new(dir.clone());
+        executor.run(graph).await.unwrap();
         let results = collected.lock().unwrap().clone();
         assert_eq!(results.len(), 4); // hello, world, hello, rill
         assert!(results.contains(&"hello: 1".to_string()));
@@ -1102,15 +1135,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
 
-        let executor = crate::executor::Executor::builder()
-            .checkpoint_dir(&dir)
-            .workers(2)
-            .build();
-
+        let graph = super::DataflowGraph::new();
         let source = VecSource::new(vec!["hello world".to_string(), "hello rill".to_string()]);
         let collected = Arc::new(Mutex::new(Vec::new()));
 
-        let stream = executor.source(source);
+        let stream = graph.source(source);
         stream
             .flat_map(|line: String| line.split_whitespace().map(String::from).collect())
             .key_by(|word: &String| word.clone())
@@ -1119,7 +1148,11 @@ mod tests {
                 collected: collected.clone(),
             });
 
-        executor.run().await.unwrap();
+        let executor = crate::executor::Executor::builder()
+            .checkpoint_dir(&dir)
+            .workers(2)
+            .build();
+        executor.run(graph).await.unwrap();
         let mut results = collected.lock().unwrap().clone();
         results.sort_unstable();
         assert_eq!(results.len(), 4);
@@ -1137,15 +1170,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
 
-        let executor = crate::executor::Executor::builder()
-            .checkpoint_dir(&dir)
-            .workers(2)
-            .build();
-
+        let graph = super::DataflowGraph::new();
         let source = VecSource::new(vec![1i32, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
         let collected = Arc::new(Mutex::new(Vec::new()));
 
-        let stream = executor.source(source);
+        let stream = graph.source(source);
         stream
             .filter(|x: &i32| x % 2 == 0)
             .key_by(|x: &i32| x.to_string())
@@ -1154,7 +1183,11 @@ mod tests {
                 collected: collected.clone(),
             });
 
-        executor.run().await.unwrap();
+        let executor = crate::executor::Executor::builder()
+            .checkpoint_dir(&dir)
+            .workers(2)
+            .build();
+        executor.run(graph).await.unwrap();
         let mut results = collected.lock().unwrap().clone();
         results.sort_unstable();
         assert_eq!(results, vec![20, 40, 60, 80, 100]);
@@ -1167,20 +1200,20 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
 
-        let executor = crate::executor::Executor::builder()
-            .checkpoint_dir(&dir)
-            .workers(1)
-            .build();
-
+        let graph = super::DataflowGraph::new();
         let source = VecSource::new(vec![10i32, 20, 30]);
         let collected = Arc::new(Mutex::new(Vec::new()));
 
-        let stream = executor.source(source);
+        let stream = graph.source(source);
         stream.map(|x: i32| x + 1).sink(CollectSink {
             collected: collected.clone(),
         });
 
-        executor.run().await.unwrap();
+        let executor = crate::executor::Executor::builder()
+            .checkpoint_dir(&dir)
+            .workers(1)
+            .build();
+        executor.run(graph).await.unwrap();
         assert_eq!(*collected.lock().unwrap(), vec![11, 21, 31]);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1193,10 +1226,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
 
-        let executor = crate::executor::Executor::builder()
-            .checkpoint_dir(&dir)
-            .workers(4)
-            .build();
+        let graph = super::DataflowGraph::new();
 
         // Send "alpha" 5 times and "beta" 3 times.
         let source = VecSource::new(vec![
@@ -1211,7 +1241,7 @@ mod tests {
         ]);
         let collected = Arc::new(Mutex::new(Vec::new()));
 
-        let stream = executor.source(source);
+        let stream = graph.source(source);
         stream
             .key_by(|w: &String| w.clone())
             .operator("counter", WordCounter)
@@ -1219,7 +1249,11 @@ mod tests {
                 collected: collected.clone(),
             });
 
-        executor.run().await.unwrap();
+        let executor = crate::executor::Executor::builder()
+            .checkpoint_dir(&dir)
+            .workers(4)
+            .build();
+        executor.run(graph).await.unwrap();
         let results = collected.lock().unwrap().clone();
         assert_eq!(results.len(), 8);
         // Alpha should count up to 5, beta up to 3.
@@ -1234,11 +1268,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
 
-        let executor = crate::executor::Executor::new(dir.clone());
+        let graph = super::DataflowGraph::new();
         let source = VecSource::new(vec![1i32, 2, 3]);
         let collected = Arc::new(Mutex::new(Vec::new()));
 
-        let stream = executor.source(source);
+        let stream = graph.source(source);
         stream.map(|x: i32| x * 2).sink(CollectSink {
             collected: collected.clone(),
         });
@@ -1248,7 +1282,8 @@ mod tests {
         // before checking the flag, then stops early.
         trigger.shutdown();
 
-        executor.run_with_shutdown(handle).await.unwrap();
+        let executor = crate::executor::Executor::new(dir.clone());
+        executor.run_with_shutdown(graph, handle).await.unwrap();
         let results = collected.lock().unwrap().clone();
         // At least the first batch was processed; early termination is expected.
         assert!(!results.is_empty());

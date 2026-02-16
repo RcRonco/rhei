@@ -10,6 +10,7 @@
 use rill_core::connectors::print_sink::PrintSink;
 use rill_core::connectors::vec_source::VecSource;
 use rill_core::operators::{JoinSide, TemporalJoin};
+use rill_runtime::dataflow::DataflowGraph;
 use rill_runtime::executor::Executor;
 use serde::{Deserialize, Serialize};
 
@@ -36,7 +37,7 @@ async fn main() -> anyhow::Result<()> {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir)?;
 
-    let executor = Executor::builder().checkpoint_dir(&dir).build();
+    let graph = DataflowGraph::new();
 
     let source = VecSource::new(vec![
         // ORD-001 arrives first, no shipment yet → buffered
@@ -96,7 +97,7 @@ async fn main() -> anyhow::Result<()> {
         })
         .build();
 
-    let events = executor.source(source);
+    let events = graph.source(source);
     events
         .key_by(|side: &JoinSide<Order, Shipment>| match side {
             JoinSide::Left(o) => o.order_id.clone(),
@@ -105,7 +106,8 @@ async fn main() -> anyhow::Result<()> {
         .operator("temporal_join", op)
         .sink(PrintSink::<String>::new().with_prefix("output"));
 
-    executor.run().await?;
+    let executor = Executor::builder().checkpoint_dir(&dir).build();
+    executor.run(graph).await?;
 
     let _ = std::fs::remove_dir_all(&dir);
     Ok(())

@@ -1,4 +1,4 @@
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use rill_core::state::context::StateContext;
 use rill_core::state::local_backend::LocalBackend;
@@ -18,36 +18,28 @@ struct TieredStorageConfig {
     foyer_config: TieredBackendConfig,
 }
 
-/// Materializes a dataflow graph into an executable pipeline.
+/// Materializes a [`DataflowGraph`] into an executable pipeline.
 ///
-/// Use [`Executor::builder()`] to construct an executor, [`Executor::source()`]
-/// to add data sources, and [`Executor::run()`] to compile and execute.
+/// Use [`Executor::builder()`] to configure execution parameters, build the
+/// graph on a [`DataflowGraph`], then pass it to [`Executor::run()`].
 ///
 /// ```ignore
+/// let graph = DataflowGraph::new();
+/// let orders = graph.source(kafka_source);
+/// orders.map(parse).key_by(|o| o.id.clone()).operator("agg", Agg).sink(sink);
+///
 /// let executor = Executor::builder()
 ///     .checkpoint_dir("./checkpoints")
 ///     .workers(4)
 ///     .build();
 ///
-/// let orders = executor.source(kafka_source);
-/// orders.map(parse).key_by(|o| o.id.clone()).operator("agg", Agg).sink(sink);
-///
-/// executor.run().await?;
+/// executor.run(graph).await?;
 /// ```
+#[derive(Debug)]
 pub struct Executor {
     checkpoint_dir: std::path::PathBuf,
     tiered: Option<TieredStorageConfig>,
     workers: usize,
-    graph: Mutex<DataflowGraph>,
-}
-
-impl std::fmt::Debug for Executor {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Executor")
-            .field("checkpoint_dir", &self.checkpoint_dir)
-            .field("workers", &self.workers)
-            .finish_non_exhaustive()
-    }
 }
 
 /// Builder for [`Executor`].
@@ -78,7 +70,6 @@ impl ExecutorBuilder {
             checkpoint_dir: self.checkpoint_dir,
             tiered: self.tiered,
             workers: self.workers,
-            graph: Mutex::new(DataflowGraph::new()),
         }
     }
 }
@@ -101,7 +92,6 @@ impl Executor {
             checkpoint_dir,
             tiered: None,
             workers: 1,
-            graph: Mutex::new(DataflowGraph::new()),
         }
     }
 
@@ -123,38 +113,21 @@ impl Executor {
 
     // ── Dataflow graph API ───────────────────────────────────────
 
-    /// Add a data source to the dataflow. Returns a [`Stream`] handle.
-    pub fn source<S>(&self, source: S) -> dataflow::Stream<'_, S::Output>
-    where
-        S: Source + 'static,
-        S::Output: Send + 'static,
-    {
-        dataflow::add_source(self, source)
-    }
-
-    /// Compile and execute the dataflow graph.
+    /// Compile and execute a [`DataflowGraph`].
     ///
-    /// Call this after building the graph with [`source()`](Self::source),
-    /// stream transforms, and sinks.
-    pub async fn run(&self) -> anyhow::Result<()> {
-        let graph = std::mem::replace(&mut *self.graph.lock().unwrap(), DataflowGraph::new());
+    /// Build the graph first with [`DataflowGraph::source()`], stream
+    /// transforms, and sinks, then pass it here for execution.
+    pub async fn run(&self, graph: DataflowGraph) -> anyhow::Result<()> {
         dataflow::run_graph(graph, self, None).await
     }
 
-    /// Compile and execute the dataflow graph with graceful shutdown.
-    pub async fn run_with_shutdown(&self, shutdown: ShutdownHandle) -> anyhow::Result<()> {
-        let graph = std::mem::replace(&mut *self.graph.lock().unwrap(), DataflowGraph::new());
-        dataflow::run_graph(graph, self, Some(shutdown)).await
-    }
-
-    /// Add a node to the internal dataflow graph. Used by [`Stream`] and
-    /// [`KeyedStream`](crate::dataflow::KeyedStream) methods.
-    pub(crate) fn add_graph_node(
+    /// Compile and execute a [`DataflowGraph`] with graceful shutdown.
+    pub async fn run_with_shutdown(
         &self,
-        kind: dataflow::NodeKind,
-        inputs: Vec<dataflow::NodeId>,
-    ) -> dataflow::NodeId {
-        self.graph.lock().unwrap().add_node(kind, inputs)
+        graph: DataflowGraph,
+        shutdown: ShutdownHandle,
+    ) -> anyhow::Result<()> {
+        dataflow::run_graph(graph, self, Some(shutdown)).await
     }
 
     /// Configure tiered storage (L2 Foyer + L3 `SlateDB`) for this executor.

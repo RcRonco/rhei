@@ -10,6 +10,7 @@
 use rill_core::connectors::print_sink::PrintSink;
 use rill_core::connectors::vec_source::VecSource;
 use rill_core::operators::{Avg, TumblingWindow, WindowOutput};
+use rill_runtime::dataflow::DataflowGraph;
 use rill_runtime::executor::Executor;
 use serde::{Deserialize, Serialize};
 
@@ -27,7 +28,7 @@ async fn main() -> anyhow::Result<()> {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir)?;
 
-    let executor = Executor::builder().checkpoint_dir(&dir).build();
+    let graph = DataflowGraph::new();
 
     // Two sensors across three 10-second windows (0-9, 10-19, 20-29)
     let source = VecSource::new(vec![
@@ -92,13 +93,14 @@ async fn main() -> anyhow::Result<()> {
         .aggregator(Avg::new(|r: &SensorReading| r.value))
         .build();
 
-    let readings = executor.source(source);
+    let readings = graph.source(source);
     readings
         .key_by(|r: &SensorReading| r.sensor_id.clone())
         .operator("tumbling_window", op)
         .sink(PrintSink::<WindowOutput<f64>>::new().with_prefix("output"));
 
-    executor.run().await?;
+    let executor = Executor::builder().checkpoint_dir(&dir).build();
+    executor.run(graph).await?;
 
     let _ = std::fs::remove_dir_all(&dir);
     Ok(())

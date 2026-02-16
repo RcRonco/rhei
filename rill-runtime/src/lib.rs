@@ -17,7 +17,8 @@
 pub mod async_operator;
 /// Async-to-sync channel bridges for Timely dataflow integration.
 pub mod bridge;
-/// Dataflow graph API: [`Stream<T>`](dataflow::Stream), [`KeyedStream<T>`](dataflow::KeyedStream),
+/// Dataflow graph API: [`DataflowGraph`](dataflow::DataflowGraph),
+/// [`Stream<T>`](dataflow::Stream), [`KeyedStream<T>`](dataflow::KeyedStream),
 /// and type-erased execution engine.
 pub mod dataflow;
 /// Pipeline executor (linear and Timely dataflow modes).

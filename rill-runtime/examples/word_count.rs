@@ -11,6 +11,7 @@ use rill_core::connectors::vec_source::VecSource;
 use rill_core::operators::KeyedState;
 use rill_core::state::context::StateContext;
 use rill_core::traits::StreamFunction;
+use rill_runtime::dataflow::DataflowGraph;
 use rill_runtime::executor::Executor;
 
 /// A stateful word-count operator using [`KeyedState`] for typed state access.
@@ -57,11 +58,8 @@ async fn main() -> anyhow::Result<()> {
     // ── Single-worker ────────────────────────────────────────────────
     println!("=== Single-worker ===");
     {
-        let executor = Executor::builder()
-            .checkpoint_dir(dir.join("single"))
-            .build();
-
-        let stream = executor.source(VecSource::new(lines.clone()));
+        let graph = DataflowGraph::new();
+        let stream = graph.source(VecSource::new(lines.clone()));
         stream
             .flat_map(|line: String| line.split_whitespace().map(String::from).collect())
             .key_by(|word: &String| word.clone())
@@ -69,18 +67,17 @@ async fn main() -> anyhow::Result<()> {
             .map(|result: String| format!("[output] {result}"))
             .sink(PrintSink::new());
 
-        executor.run().await?;
+        let executor = Executor::builder()
+            .checkpoint_dir(dir.join("single"))
+            .build();
+        executor.run(graph).await?;
     }
 
     // ── Multi-worker (2 workers) ─────────────────────────────────────
     println!("\n=== Multi-worker (2 workers) ===");
     {
-        let executor = Executor::builder()
-            .checkpoint_dir(dir.join("multi"))
-            .workers(2)
-            .build();
-
-        let stream = executor.source(VecSource::new(lines));
+        let graph = DataflowGraph::new();
+        let stream = graph.source(VecSource::new(lines));
         stream
             .flat_map(|line: String| line.split_whitespace().map(String::from).collect())
             .key_by(|word: &String| word.clone())
@@ -88,7 +85,11 @@ async fn main() -> anyhow::Result<()> {
             .map(|result: String| format!("[output] {result}"))
             .sink(PrintSink::new());
 
-        executor.run().await?;
+        let executor = Executor::builder()
+            .checkpoint_dir(dir.join("multi"))
+            .workers(2)
+            .build();
+        executor.run(graph).await?;
     }
 
     let _ = std::fs::remove_dir_all(&dir);
