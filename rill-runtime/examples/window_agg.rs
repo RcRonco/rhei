@@ -1,23 +1,19 @@
-//! Tumbling window aggregation example using the operators library.
+//! Tumbling window aggregation example using the pipeline builder.
 //!
 //! Sensor readings are aggregated per-sensor over fixed 10-second tumbling
 //! windows using [`TumblingWindow`] with the built-in [`Avg`] aggregator.
 //! When a reading's timestamp crosses into a new window, the previous
 //! window's average is emitted.
 //!
-//! Uses `run_dataflow` to execute the pipeline as a Timely computation with
-//! epoch-based progress tracking and automatic checkpointing.
-//!
 //! Run with: `cargo run -p rill-runtime --example window_agg`
 
 use rill_core::connectors::print_sink::PrintSink;
 use rill_core::connectors::vec_source::VecSource;
 use rill_core::operators::{Avg, TumblingWindow, WindowOutput};
-use rill_runtime::executor::{Executor, OperatorSlot};
-use serde::{Deserialize, Serialize};
+use rill_runtime::executor::Executor;
 
 /// A single sensor reading with a logical timestamp.
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone)]
 struct SensorReading {
     sensor_id: String,
     value: f64,
@@ -96,15 +92,13 @@ async fn main() -> anyhow::Result<()> {
         .aggregator(Avg::new(|r: &SensorReading| r.value))
         .build();
 
-    let operators = vec![OperatorSlot::new(
-        "tumbling_window",
-        op,
-        ctx,
-        Some(tokio::runtime::Handle::current()),
-    )];
     let sink: PrintSink<WindowOutput<f64>> = PrintSink::new().with_prefix("output");
 
-    executor.run_dataflow(source, operators, sink).await?;
+    executor
+        .pipeline(source)
+        .operator("tumbling_window", op, ctx)
+        .sink(sink)
+        .await?;
 
     let _ = std::fs::remove_dir_all(&dir);
     Ok(())

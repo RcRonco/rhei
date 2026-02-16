@@ -18,7 +18,7 @@ use rill_core::connectors::kafka_source::KafkaSource;
 use rill_core::connectors::kafka_types::{KafkaMessage, KafkaRecord};
 use rill_core::state::context::StateContext;
 use rill_core::traits::StreamFunction;
-use rill_runtime::executor::{Executor, OperatorSlot};
+use rill_runtime::executor::Executor;
 
 /// Uppercases Kafka message payloads.
 struct Uppercase;
@@ -48,21 +48,16 @@ async fn main() -> anyhow::Result<()> {
     let executor = Executor::new(dir.clone());
     let ctx = executor.create_context("uppercase").await?;
 
-    let mut source =
+    let source =
         KafkaSource::new("localhost:9092", "rill-example", &["input-topic"])?.with_batch_size(100);
 
-    let mut operators = vec![OperatorSlot::new(
-        "uppercase",
-        Uppercase,
-        ctx,
-        Some(tokio::runtime::Handle::current()),
-    )];
-
-    let mut sink = KafkaSink::new("localhost:9092", "output-topic")?.with_buffer_capacity(100);
+    let sink = KafkaSink::new("localhost:9092", "output-topic")?.with_buffer_capacity(100);
 
     tracing::info!("starting kafka transform pipeline");
     executor
-        .run_linear(&mut source, &mut operators, &mut sink)
+        .pipeline(source)
+        .operator("uppercase", Uppercase, ctx)
+        .sink(sink)
         .await?;
 
     let _ = std::fs::remove_dir_all(&dir);
