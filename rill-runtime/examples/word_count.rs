@@ -1,8 +1,7 @@
-//! Word-count example demonstrating the fluent pipeline builder.
+//! Word-count example using the dataflow API.
 //!
-//! Shows two modes:
-//! 1. **Single-worker** — the original pipeline builder API with `.operator()`.
-//! 2. **Multi-worker** — the keyed pipeline with `.key_by()` and `.with_workers()`.
+//! Demonstrates `Stream`, `KeyedStream`, and stateful operators with
+//! automatic per-worker state context creation.
 //!
 //! Run with: `cargo run -p rill-runtime --example word_count`
 
@@ -55,37 +54,41 @@ async fn main() -> anyhow::Result<()> {
         "hello world again".to_string(),
     ];
 
-    // ── Single-worker pipeline (original API) ────────────────────────
-    println!("=== Single-worker pipeline ===");
+    // ── Single-worker ────────────────────────────────────────────────
+    println!("=== Single-worker ===");
     {
-        let executor = Executor::new(dir.clone());
-        let ctx = executor.create_context("word_counter").await?;
+        let executor = Executor::builder()
+            .checkpoint_dir(dir.join("single"))
+            .build();
 
-        executor
-            .pipeline(VecSource::new(lines.clone()))
-            .operator("word_counter", WordCounter, ctx)
-            .map(|result: String| format!("[output] {result}"))
-            .sink(PrintSink::new())
-            .await?;
-    }
-
-    // ── Multi-worker keyed pipeline ──────────────────────────────────
-    println!("\n=== Multi-worker keyed pipeline (2 workers) ===");
-    {
-        let dir2 = dir.join("keyed");
-        std::fs::create_dir_all(&dir2)?;
-        let executor = Executor::new(dir2).with_workers(2);
-
-        executor
-            .pipeline(VecSource::new(lines))
-            .flat_map(|line: String| {
-                line.split_whitespace().map(String::from).collect::<Vec<_>>()
-            })
+        let stream = executor.source(VecSource::new(lines.clone()));
+        stream
+            .flat_map(|line: String| line.split_whitespace().map(String::from).collect())
             .key_by(|word: &String| word.clone())
             .operator("word_counter", WordCounter)
             .map(|result: String| format!("[output] {result}"))
-            .sink(PrintSink::new())
-            .await?;
+            .sink(PrintSink::new());
+
+        executor.run().await?;
+    }
+
+    // ── Multi-worker (2 workers) ─────────────────────────────────────
+    println!("\n=== Multi-worker (2 workers) ===");
+    {
+        let executor = Executor::builder()
+            .checkpoint_dir(dir.join("multi"))
+            .workers(2)
+            .build();
+
+        let stream = executor.source(VecSource::new(lines));
+        stream
+            .flat_map(|line: String| line.split_whitespace().map(String::from).collect())
+            .key_by(|word: &String| word.clone())
+            .operator("word_counter", WordCounter)
+            .map(|result: String| format!("[output] {result}"))
+            .sink(PrintSink::new());
+
+        executor.run().await?;
     }
 
     let _ = std::fs::remove_dir_all(&dir);

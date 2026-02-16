@@ -6,8 +6,8 @@
 use std::fmt;
 use std::marker::PhantomData;
 
-use serde::de::DeserializeOwned;
 use serde::Serialize;
+use serde::de::DeserializeOwned;
 
 use crate::state::context::StateContext;
 

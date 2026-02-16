@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use rill_core::state::context::StateContext;
 use rill_core::state::local_backend::LocalBackend;
@@ -8,6 +8,7 @@ use rill_core::state::tiered_backend::{TieredBackend, TieredBackendConfig};
 use rill_core::traits::{Sink, Source, StreamFunction};
 
 use crate::async_operator::AsyncOperator;
+use crate::dataflow::{self, DataflowGraph};
 use crate::shutdown::ShutdownHandle;
 
 /// Configuration for tiered storage on the executor.
@@ -17,31 +18,97 @@ struct TieredStorageConfig {
     foyer_config: TieredBackendConfig,
 }
 
-/// Materializes a `LogicalPlan` into an executable pipeline.
+/// Materializes a dataflow graph into an executable pipeline.
 ///
-/// In Phase 1, this is a simple sequential executor that processes elements
-/// through the pipeline stages. Full Timely dataflow integration comes later.
-#[derive(Debug)]
+/// Use [`Executor::builder()`] to construct an executor, [`Executor::source()`]
+/// to add data sources, and [`Executor::run()`] to compile and execute.
+///
+/// ```ignore
+/// let executor = Executor::builder()
+///     .checkpoint_dir("./checkpoints")
+///     .workers(4)
+///     .build();
+///
+/// let orders = executor.source(kafka_source);
+/// orders.map(parse).key_by(|o| o.id.clone()).operator("agg", Agg).sink(sink);
+///
+/// executor.run().await?;
+/// ```
 pub struct Executor {
     checkpoint_dir: std::path::PathBuf,
     tiered: Option<TieredStorageConfig>,
     workers: usize,
+    graph: Mutex<DataflowGraph>,
+}
+
+impl std::fmt::Debug for Executor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Executor")
+            .field("checkpoint_dir", &self.checkpoint_dir)
+            .field("workers", &self.workers)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Builder for [`Executor`].
+#[derive(Debug)]
+pub struct ExecutorBuilder {
+    checkpoint_dir: std::path::PathBuf,
+    workers: usize,
+    tiered: Option<TieredStorageConfig>,
+}
+
+impl ExecutorBuilder {
+    /// Set the checkpoint directory.
+    pub fn checkpoint_dir(mut self, dir: impl Into<std::path::PathBuf>) -> Self {
+        self.checkpoint_dir = dir.into();
+        self
+    }
+
+    /// Set the number of parallel workers for keyed pipelines.
+    pub fn workers(mut self, n: usize) -> Self {
+        assert!(n >= 1, "worker count must be at least 1");
+        self.workers = n;
+        self
+    }
+
+    /// Build the executor.
+    pub fn build(self) -> Executor {
+        Executor {
+            checkpoint_dir: self.checkpoint_dir,
+            tiered: self.tiered,
+            workers: self.workers,
+            graph: Mutex::new(DataflowGraph::new()),
+        }
+    }
 }
 
 impl Executor {
+    /// Create a builder for configuring an executor.
+    pub fn builder() -> ExecutorBuilder {
+        ExecutorBuilder {
+            checkpoint_dir: std::path::PathBuf::from("./checkpoints"),
+            workers: 1,
+            tiered: None,
+        }
+    }
+
     /// Create a new executor with the given checkpoint directory.
+    ///
+    /// For more options, use [`Executor::builder()`].
     pub fn new(checkpoint_dir: std::path::PathBuf) -> Self {
         Self {
             checkpoint_dir,
             tiered: None,
             workers: 1,
+            graph: Mutex::new(DataflowGraph::new()),
         }
     }
 
     /// Set the number of parallel workers for keyed pipelines.
     ///
-    /// When `workers > 1`, [`KeyedPipeline`](crate::pipeline::KeyedPipeline) distributes
-    /// elements across worker tasks by hashing the key function output.
+    /// When `workers > 1`, [`KeyedStream`](crate::dataflow::KeyedStream) operators
+    /// run on parallel tokio tasks, distributed by key hash.
     /// Defaults to `1` (single-worker mode).
     pub fn with_workers(mut self, n: usize) -> Self {
         assert!(n >= 1, "worker count must be at least 1");
@@ -52,6 +119,42 @@ impl Executor {
     /// Returns the configured number of workers.
     pub fn workers(&self) -> usize {
         self.workers
+    }
+
+    // ── Dataflow graph API ───────────────────────────────────────
+
+    /// Add a data source to the dataflow. Returns a [`Stream`] handle.
+    pub fn source<S>(&self, source: S) -> dataflow::Stream<'_, S::Output>
+    where
+        S: Source + 'static,
+        S::Output: Send + 'static,
+    {
+        dataflow::add_source(self, source)
+    }
+
+    /// Compile and execute the dataflow graph.
+    ///
+    /// Call this after building the graph with [`source()`](Self::source),
+    /// stream transforms, and sinks.
+    pub async fn run(&self) -> anyhow::Result<()> {
+        let graph = std::mem::replace(&mut *self.graph.lock().unwrap(), DataflowGraph::new());
+        dataflow::run_graph(graph, self, None).await
+    }
+
+    /// Compile and execute the dataflow graph with graceful shutdown.
+    pub async fn run_with_shutdown(&self, shutdown: ShutdownHandle) -> anyhow::Result<()> {
+        let graph = std::mem::replace(&mut *self.graph.lock().unwrap(), DataflowGraph::new());
+        dataflow::run_graph(graph, self, Some(shutdown)).await
+    }
+
+    /// Add a node to the internal dataflow graph. Used by [`Stream`] and
+    /// [`KeyedStream`](crate::dataflow::KeyedStream) methods.
+    pub(crate) fn add_graph_node(
+        &self,
+        kind: dataflow::NodeKind,
+        inputs: Vec<dataflow::NodeId>,
+    ) -> dataflow::NodeId {
+        self.graph.lock().unwrap().add_node(kind, inputs)
     }
 
     /// Configure tiered storage (L2 Foyer + L3 `SlateDB`) for this executor.
@@ -523,11 +626,9 @@ impl Executor {
                                             let epoch = *cap.time();
                                             for item in data.drain(..) {
                                                 let converted: F::Input = item.into();
-                                                let results =
-                                                    timely_op.process(converted, epoch);
+                                                let results = timely_op.process(converted, epoch);
                                                 if !results.is_empty() {
-                                                    let mut session =
-                                                        output.session(&cap);
+                                                    let mut session = output.session(&cap);
                                                     for r in results {
                                                         session.give(r);
                                                     }
@@ -570,21 +671,6 @@ impl Executor {
         .map_err(|e| anyhow::anyhow!("dataflow execution failed: {e}"))?;
 
         Ok(())
-    }
-
-    /// Create a fluent pipeline builder starting with the given source.
-    ///
-    /// ```ignore
-    /// executor
-    ///     .pipeline(source)
-    ///     .filter(|line: &String| !line.is_empty())
-    ///     .operator("word_counter", WordCounter, ctx)
-    ///     .map(|result: String| format!("[output] {result}"))
-    ///     .sink(sink)
-    ///     .await?;
-    /// ```
-    pub fn pipeline<S: Source>(&self, source: S) -> crate::pipeline::PipelineSource<'_, S> {
-        crate::pipeline::PipelineSource::new(self, source)
     }
 
     /// Create a per-worker `StateContext` for the given operator.
@@ -719,7 +805,12 @@ mod tests {
 
         let mut source = VecSource::new(vec!["hello world".to_string(), "hello rill".to_string()]);
 
-        let mut operators = vec![OperatorSlot::new("word_counter", WordCounter, ctx, Some(tokio::runtime::Handle::current()))];
+        let mut operators = vec![OperatorSlot::new(
+            "word_counter",
+            WordCounter,
+            ctx,
+            Some(tokio::runtime::Handle::current()),
+        )];
 
         let collected = Arc::new(Mutex::new(Vec::new()));
         let mut sink = CollectSink {
@@ -757,7 +848,12 @@ mod tests {
             let ctx = executor.create_context("counter").await.unwrap();
 
             let mut source = VecSource::new(vec!["hello world".to_string()]);
-            let mut operators = vec![OperatorSlot::new("counter", WordCounter, ctx, Some(tokio::runtime::Handle::current()))];
+            let mut operators = vec![OperatorSlot::new(
+                "counter",
+                WordCounter,
+                ctx,
+                Some(tokio::runtime::Handle::current()),
+            )];
             let collected = Arc::new(Mutex::new(Vec::new()));
             let mut sink = CollectSink {
                 collected: collected.clone(),
@@ -778,7 +874,12 @@ mod tests {
             let ctx = executor.create_context("counter").await.unwrap();
 
             let mut source = VecSource::new(vec!["hello rill".to_string()]);
-            let mut operators = vec![OperatorSlot::new("counter", WordCounter, ctx, Some(tokio::runtime::Handle::current()))];
+            let mut operators = vec![OperatorSlot::new(
+                "counter",
+                WordCounter,
+                ctx,
+                Some(tokio::runtime::Handle::current()),
+            )];
             let collected = Arc::new(Mutex::new(Vec::new()));
             let mut sink = CollectSink {
                 collected: collected.clone(),
@@ -808,7 +909,12 @@ mod tests {
 
         let source = VecSource::new(vec!["hello world".to_string(), "hello rill".to_string()]);
 
-        let operators = vec![OperatorSlot::new("word_counter", WordCounter, ctx, Some(tokio::runtime::Handle::current()))];
+        let operators = vec![OperatorSlot::new(
+            "word_counter",
+            WordCounter,
+            ctx,
+            Some(tokio::runtime::Handle::current()),
+        )];
 
         let collected = Arc::new(Mutex::new(Vec::new()));
         let sink = CollectSink {
@@ -849,7 +955,12 @@ mod tests {
             let ctx = executor.create_context("counter").await.unwrap();
 
             let source = VecSource::new(vec!["hello world".to_string()]);
-            let operators = vec![OperatorSlot::new("counter", WordCounter, ctx, Some(tokio::runtime::Handle::current()))];
+            let operators = vec![OperatorSlot::new(
+                "counter",
+                WordCounter,
+                ctx,
+                Some(tokio::runtime::Handle::current()),
+            )];
             let collected = Arc::new(Mutex::new(Vec::new()));
             let sink = CollectSink {
                 collected: collected.clone(),
@@ -872,7 +983,12 @@ mod tests {
             let ctx = executor.create_context("counter").await.unwrap();
 
             let source = VecSource::new(vec!["hello rill".to_string()]);
-            let operators = vec![OperatorSlot::new("counter", WordCounter, ctx, Some(tokio::runtime::Handle::current()))];
+            let operators = vec![OperatorSlot::new(
+                "counter",
+                WordCounter,
+                ctx,
+                Some(tokio::runtime::Handle::current()),
+            )];
             let collected = Arc::new(Mutex::new(Vec::new()));
             let sink = CollectSink {
                 collected: collected.clone(),

@@ -158,13 +158,12 @@ fn cmd_run_tui(log_level: String) -> anyhow::Result<()> {
 
     rt.block_on(async {
         // Initialize telemetry inside the runtime so tokio::spawn works
-        let handles =
-            rill_runtime::telemetry::init(rill_runtime::telemetry::TelemetryConfig {
-                metrics_addr: None,
-                log_filter: log_level,
-                json_logs: false,
-                tui: true,
-            })?;
+        let handles = rill_runtime::telemetry::init(rill_runtime::telemetry::TelemetryConfig {
+            metrics_addr: None,
+            log_filter: log_level,
+            json_logs: false,
+            tui: true,
+        })?;
 
         let metrics_rx = handles
             .metrics_rx
@@ -182,9 +181,7 @@ fn cmd_run_tui(log_level: String) -> anyhow::Result<()> {
             .build();
 
         // Spawn a demo pipeline in the background
-        let pipeline_handle = tokio::spawn(async {
-            run_demo_pipeline().await
-        });
+        let pipeline_handle = tokio::spawn(async { run_demo_pipeline().await });
 
         // Run the TUI on the main task
         let app = tui::TuiApp::new(metrics_rx, log_rx, Some(plan));

@@ -39,9 +39,7 @@ impl StreamFunction for Uppercase {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter("info")
-        .init();
+    tracing_subscriber::fmt().with_env_filter("info").init();
 
     let dir = std::env::temp_dir().join("rill_kafka_transform_example");
     let _ = std::fs::remove_dir_all(&dir);
@@ -50,8 +48,8 @@ async fn main() -> anyhow::Result<()> {
     let executor = Executor::new(dir.clone());
     let ctx = executor.create_context("uppercase").await?;
 
-    let mut source = KafkaSource::new("localhost:9092", "rill-example", &["input-topic"])?
-        .with_batch_size(100);
+    let mut source =
+        KafkaSource::new("localhost:9092", "rill-example", &["input-topic"])?.with_batch_size(100);
 
     let mut operators = vec![OperatorSlot::new(
         "uppercase",
@@ -60,8 +58,7 @@ async fn main() -> anyhow::Result<()> {
         Some(tokio::runtime::Handle::current()),
     )];
 
-    let mut sink = KafkaSink::new("localhost:9092", "output-topic")?
-        .with_buffer_capacity(100);
+    let mut sink = KafkaSink::new("localhost:9092", "output-topic")?.with_buffer_capacity(100);
 
     tracing::info!("starting kafka transform pipeline");
     executor

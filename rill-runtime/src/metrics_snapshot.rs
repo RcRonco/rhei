@@ -10,9 +10,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use metrics::{
-    Counter, Gauge, Histogram, Key, KeyName, Metadata, Recorder, SharedString, Unit,
-};
+use metrics::{Counter, Gauge, Histogram, Key, KeyName, Metadata, Recorder, SharedString, Unit};
 
 /// Point-in-time snapshot of all pipeline metrics.
 #[derive(Debug, Clone)]
@@ -105,8 +103,7 @@ impl MetricsHandle {
         let gauges = self.inner.gauges.lock().unwrap();
 
         let get = |map: &HashMap<String, Arc<AtomicU64>>, key: &str| -> u64 {
-            map.get(key)
-                .map_or(0, |v| v.load(Ordering::Relaxed))
+            map.get(key).map_or(0, |v| v.load(Ordering::Relaxed))
         };
 
         let get_f64 = |map: &HashMap<String, Arc<AtomicU64>>, key: &str| -> f64 {
@@ -297,7 +294,8 @@ mod tests {
     fn recorder_tracks_counters() {
         let (recorder, handle) = SnapshotRecorder::new();
         let key = Key::from_name("executor_elements_total");
-        let counter = recorder.register_counter(&key, &Metadata::new("", metrics::Level::INFO, None));
+        let counter =
+            recorder.register_counter(&key, &Metadata::new("", metrics::Level::INFO, None));
         counter.increment(42);
 
         let snap = handle.snapshot();

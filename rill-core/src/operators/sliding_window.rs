@@ -215,11 +215,7 @@ where
     type Input = T;
     type Output = WindowOutput<A::Output>;
 
-    async fn process(
-        &mut self,
-        input: T,
-        ctx: &mut StateContext,
-    ) -> Vec<WindowOutput<A::Output>> {
+    async fn process(&mut self, input: T, ctx: &mut StateContext) -> Vec<WindowOutput<A::Output>> {
         let key = (self.key_fn)(&input);
         let timestamp = (self.time_fn)(&input);
         let mut outputs = Vec::new();
@@ -227,11 +223,7 @@ where
         // Load current active windows for this key
         let mut active: ActiveWindows = {
             let mut state = KeyedState::<String, ActiveWindows>::new(ctx, "sw_active");
-            state
-                .get(&key)
-                .await
-                .unwrap_or(None)
-                .unwrap_or_default()
+            state.get(&key).await.unwrap_or(None).unwrap_or_default()
         };
 
         // Close any windows whose end <= timestamp (the element has advanced past them)
@@ -242,8 +234,7 @@ where
                 // Window closed — emit its aggregate
                 let acc_key = format!("{key}:{win_start}");
                 let acc: Option<A::Accumulator> = {
-                    let mut state =
-                        KeyedState::<String, A::Accumulator>::new(ctx, "sw_acc");
+                    let mut state = KeyedState::<String, A::Accumulator>::new(ctx, "sw_acc");
                     state.get(&acc_key).await.unwrap_or(None)
                 };
                 if let Some(acc) = acc {
@@ -255,8 +246,7 @@ where
                     });
                 }
                 // Clean up accumulator
-                let mut state =
-                    KeyedState::<String, A::Accumulator>::new(ctx, "sw_acc");
+                let mut state = KeyedState::<String, A::Accumulator>::new(ctx, "sw_acc");
                 state.delete(&acc_key);
             } else {
                 still_active.push(win_start);
@@ -271,8 +261,7 @@ where
         for win_start in &window_starts {
             let acc_key = format!("{key}:{win_start}");
             let mut acc: A::Accumulator = {
-                let mut state =
-                    KeyedState::<String, A::Accumulator>::new(ctx, "sw_acc");
+                let mut state = KeyedState::<String, A::Accumulator>::new(ctx, "sw_acc");
                 state
                     .get(&acc_key)
                     .await
@@ -283,8 +272,7 @@ where
             self.aggregator.accumulate(&mut acc, &input);
 
             {
-                let mut state =
-                    KeyedState::<String, A::Accumulator>::new(ctx, "sw_acc");
+                let mut state = KeyedState::<String, A::Accumulator>::new(ctx, "sw_acc");
                 state.put(&acc_key, &acc);
             }
 

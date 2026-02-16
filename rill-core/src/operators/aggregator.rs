@@ -3,8 +3,8 @@
 use std::fmt;
 use std::marker::PhantomData;
 
-use serde::de::DeserializeOwned;
 use serde::Serialize;
+use serde::de::DeserializeOwned;
 
 /// A pluggable aggregation strategy for windowed operators.
 ///
@@ -108,6 +108,15 @@ where
 pub struct Avg<F, T> {
     extractor: F,
     _phantom: PhantomData<T>,
+}
+
+impl<F: Clone, T> Clone for Avg<F, T> {
+    fn clone(&self) -> Self {
+        Self {
+            extractor: self.extractor.clone(),
+            _phantom: PhantomData,
+        }
+    }
 }
 
 impl<F, T> fmt::Debug for Avg<F, T> {

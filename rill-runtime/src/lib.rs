@@ -17,18 +17,19 @@
 pub mod async_operator;
 /// Async-to-sync channel bridges for Timely dataflow integration.
 pub mod bridge;
+/// Dataflow graph API: [`Stream<T>`](dataflow::Stream), [`KeyedStream<T>`](dataflow::KeyedStream),
+/// and type-erased execution engine.
+pub mod dataflow;
 /// Pipeline executor (linear and Timely dataflow modes).
 pub mod executor;
-/// FIFO event stash for pending state fetches.
-pub mod stash;
 /// Decoupled metrics snapshot data layer for dashboards and exporters.
 pub mod metrics_snapshot;
-/// Tracing and Prometheus metrics initialization.
-pub mod telemetry;
 /// Graceful shutdown coordination.
 pub mod shutdown;
-/// Fluent pipeline builder for composing heterogeneous stream processing steps.
-pub mod pipeline;
+/// FIFO event stash for pending state fetches.
+pub mod stash;
+/// Tracing and Prometheus metrics initialization.
+pub mod telemetry;
 /// Timely-aware async operator with capability management.
 pub mod timely_operator;
 /// Log capture layer for dashboards and log aggregation.

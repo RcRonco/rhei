@@ -7,8 +7,8 @@
 use std::time::SystemTime;
 
 use tracing::Level;
-use tracing_subscriber::layer::Context;
 use tracing_subscriber::Layer;
+use tracing_subscriber::layer::Context;
 
 /// A captured log event with timestamp, level, target, and message.
 #[derive(Debug, Clone)]

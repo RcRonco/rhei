@@ -161,7 +161,7 @@ impl TuiApp {
                 .constraints([
                     Constraint::Length(3),  // Graph
                     Constraint::Length(10), // Dashboard
-                    Constraint::Min(5),    // Log viewer
+                    Constraint::Min(5),     // Log viewer
                 ])
                 .split(frame.area());
 
@@ -173,7 +173,7 @@ impl TuiApp {
                 .direction(Direction::Vertical)
                 .constraints([
                     Constraint::Length(10), // Dashboard
-                    Constraint::Min(5),    // Log viewer
+                    Constraint::Min(5),     // Log viewer
                 ])
                 .split(frame.area());
 
