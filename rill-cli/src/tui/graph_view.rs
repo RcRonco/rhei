@@ -52,7 +52,9 @@ pub fn render_graph(frame: &mut Frame<'_>, area: Rect, plan: &LogicalPlan) {
     }
 
     let line = Line::from(spans);
-    let paragraph = Paragraph::new(line).alignment(Alignment::Center).block(block);
+    let paragraph = Paragraph::new(line)
+        .alignment(Alignment::Center)
+        .block(block);
     frame.render_widget(paragraph, area);
 }
 

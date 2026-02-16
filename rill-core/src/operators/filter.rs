@@ -14,6 +14,15 @@ pub struct FilterOp<F, T> {
     _phantom: PhantomData<fn(T)>,
 }
 
+impl<F: Clone, T> Clone for FilterOp<F, T> {
+    fn clone(&self) -> Self {
+        Self {
+            predicate: self.predicate.clone(),
+            _phantom: PhantomData,
+        }
+    }
+}
+
 impl<F, T> fmt::Debug for FilterOp<F, T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("FilterOp").finish_non_exhaustive()

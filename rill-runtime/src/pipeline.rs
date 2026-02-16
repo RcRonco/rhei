@@ -267,10 +267,7 @@ where
     }
 
     /// Filter elements based on a predicate.
-    pub fn filter<F>(
-        self,
-        f: F,
-    ) -> PipelineWithSteps<'a, S, FilterStep<F, S::Output>, S::Output>
+    pub fn filter<F>(self, f: F) -> PipelineWithSteps<'a, S, FilterStep<F, S::Output>, S::Output>
     where
         F: FnMut(&S::Output) -> bool + Send,
     {
@@ -286,10 +283,7 @@ where
     }
 
     /// Apply a flat-map function to each element.
-    pub fn flat_map<F, O>(
-        self,
-        f: F,
-    ) -> PipelineWithSteps<'a, S, FlatMapStep<F, S::Output, O>, O>
+    pub fn flat_map<F, O>(self, f: F) -> PipelineWithSteps<'a, S, FlatMapStep<F, S::Output, O>, O>
     where
         F: FnMut(S::Output) -> Vec<O> + Send,
         O: Send,
@@ -554,11 +548,7 @@ mod tests {
         type Input = String;
         type Output = String;
 
-        async fn process(
-            &mut self,
-            input: String,
-            ctx: &mut StateContext,
-        ) -> Vec<String> {
+        async fn process(&mut self, input: String, ctx: &mut StateContext) -> Vec<String> {
             let mut outputs = Vec::new();
             for word in input.split_whitespace() {
                 let key = word.as_bytes();
@@ -653,10 +643,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
 
         let executor = crate::executor::Executor::new(dir.clone());
-        let source = VecSource::new(vec![
-            "hello world".to_string(),
-            "foo".to_string(),
-        ]);
+        let source = VecSource::new(vec!["hello world".to_string(), "foo".to_string()]);
         let collected = Arc::new(Mutex::new(Vec::new()));
 
         executor
@@ -668,10 +655,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(
-            *collected.lock().unwrap(),
-            vec!["hello", "world", "foo"]
-        );
+        assert_eq!(*collected.lock().unwrap(), vec!["hello", "world", "foo"]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -683,10 +667,7 @@ mod tests {
 
         let executor = crate::executor::Executor::new(dir.clone());
         let ctx = executor.create_context("word_counter").await.unwrap();
-        let source = VecSource::new(vec![
-            "hello world".to_string(),
-            "hello rill".to_string(),
-        ]);
+        let source = VecSource::new(vec!["hello world".to_string(), "hello rill".to_string()]);
         let collected = Arc::new(Mutex::new(Vec::new()));
 
         executor

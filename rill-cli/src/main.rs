@@ -33,6 +33,10 @@ enum Commands {
         /// Launch the TUI dashboard instead of shelling out to cargo
         #[arg(long)]
         tui: bool,
+
+        /// Number of Timely worker threads (default 1)
+        #[arg(long, default_value = "1")]
+        workers: usize,
     },
 }
 
@@ -50,8 +54,10 @@ fn main() -> anyhow::Result<()> {
                 })?;
             cmd_new(&name)
         }
-        Commands::Run { tui: true } => cmd_run_tui(cli.log_level),
-        Commands::Run { tui: false } => {
+        Commands::Run {
+            tui: true, workers, ..
+        } => cmd_run_tui(cli.log_level, workers),
+        Commands::Run { tui: false, .. } => {
             let _telemetry =
                 rill_runtime::telemetry::init(rill_runtime::telemetry::TelemetryConfig {
                     metrics_addr: None,
@@ -153,18 +159,17 @@ fn cmd_run() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn cmd_run_tui(log_level: String) -> anyhow::Result<()> {
+fn cmd_run_tui(log_level: String, workers: usize) -> anyhow::Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
 
     rt.block_on(async {
         // Initialize telemetry inside the runtime so tokio::spawn works
-        let handles =
-            rill_runtime::telemetry::init(rill_runtime::telemetry::TelemetryConfig {
-                metrics_addr: None,
-                log_filter: log_level,
-                json_logs: false,
-                tui: true,
-            })?;
+        let handles = rill_runtime::telemetry::init(rill_runtime::telemetry::TelemetryConfig {
+            metrics_addr: None,
+            log_filter: log_level,
+            json_logs: false,
+            tui: true,
+        })?;
 
         let metrics_rx = handles
             .metrics_rx
@@ -182,12 +187,10 @@ fn cmd_run_tui(log_level: String) -> anyhow::Result<()> {
             .build();
 
         // Spawn a demo pipeline in the background
-        let pipeline_handle = tokio::spawn(async {
-            run_demo_pipeline().await
-        });
+        let pipeline_handle = tokio::spawn(async { run_demo_pipeline().await });
 
         // Run the TUI on the main task
-        let app = tui::TuiApp::new(metrics_rx, log_rx, Some(plan));
+        let app = tui::TuiApp::new(metrics_rx, log_rx, Some(plan), workers);
         let tui_result = app.run().await;
 
         // Cancel pipeline on TUI exit

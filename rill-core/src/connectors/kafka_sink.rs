@@ -1,8 +1,8 @@
 use std::time::Duration;
 
 use async_trait::async_trait;
-use rdkafka::producer::{FutureProducer, FutureRecord};
 use rdkafka::ClientConfig;
+use rdkafka::producer::{FutureProducer, FutureRecord};
 
 use super::kafka_types::KafkaRecord;
 use crate::traits::Sink;

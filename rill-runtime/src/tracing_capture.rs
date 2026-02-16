@@ -7,8 +7,8 @@
 use std::time::SystemTime;
 
 use tracing::Level;
-use tracing_subscriber::layer::Context;
 use tracing_subscriber::Layer;
+use tracing_subscriber::layer::Context;
 
 /// A captured log event with timestamp, level, target, and message.
 #[derive(Debug, Clone)]
@@ -45,24 +45,91 @@ impl CapturingLayer {
 
 impl<S> Layer<S> for CapturingLayer
 where
-    S: tracing::Subscriber,
+    S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
 {
-    fn on_event(&self, event: &tracing::Event<'_>, _ctx: Context<'_, S>) {
+    fn on_event(&self, event: &tracing::Event<'_>, ctx: Context<'_, S>) {
         let metadata = event.metadata();
+
+        // Collect span fields (e.g. worker=0) from the current span scope
+        let mut span_prefix = String::new();
+        if let Some(scope) = ctx.event_scope(event) {
+            for span in scope {
+                let exts = span.extensions();
+                if let Some(fields) = exts.get::<SpanFields>()
+                    && !fields.0.is_empty()
+                {
+                    if !span_prefix.is_empty() {
+                        span_prefix.push(' ');
+                    }
+                    span_prefix.push_str(&fields.0);
+                }
+            }
+        }
 
         // Extract message from the event's fields
         let mut visitor = MessageVisitor(String::new());
         event.record(&mut visitor);
 
+        let message = if span_prefix.is_empty() {
+            visitor.0
+        } else {
+            format!("[{span_prefix}] {}", visitor.0)
+        };
+
         let entry = LogEntry {
             timestamp: SystemTime::now(),
             level: *metadata.level(),
             target: metadata.target().to_string(),
-            message: visitor.0,
+            message,
         };
 
         // Non-blocking send — drop if channel full
         let _ = self.tx.try_send(entry);
+    }
+
+    fn on_new_span(
+        &self,
+        attrs: &tracing::span::Attributes<'_>,
+        id: &tracing::span::Id,
+        ctx: Context<'_, S>,
+    ) {
+        let mut visitor = SpanFieldVisitor(String::new());
+        attrs.record(&mut visitor);
+        if let Some(span) = ctx.span(id) {
+            span.extensions_mut().insert(SpanFields(visitor.0));
+        }
+    }
+}
+
+/// Stored on each span to hold its formatted fields.
+struct SpanFields(String);
+
+/// Visitor that formats span fields as `key=value` pairs.
+struct SpanFieldVisitor(String);
+
+impl tracing::field::Visit for SpanFieldVisitor {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        use std::fmt::Write;
+        if !self.0.is_empty() {
+            self.0.push(' ');
+        }
+        let _ = write!(self.0, "{}={value:?}", field.name());
+    }
+
+    fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+        use std::fmt::Write;
+        if !self.0.is_empty() {
+            self.0.push(' ');
+        }
+        let _ = write!(self.0, "{}={value}", field.name());
+    }
+
+    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        use std::fmt::Write;
+        if !self.0.is_empty() {
+            self.0.push(' ');
+        }
+        let _ = write!(self.0, "{}={value}", field.name());
     }
 }
 

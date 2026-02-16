@@ -14,6 +14,15 @@ pub struct MapOp<F, I, O> {
     _phantom: PhantomData<fn(I) -> O>,
 }
 
+impl<F: Clone, I, O> Clone for MapOp<F, I, O> {
+    fn clone(&self) -> Self {
+        Self {
+            f: self.f.clone(),
+            _phantom: PhantomData,
+        }
+    }
+}
+
 impl<F, I, O> fmt::Debug for MapOp<F, I, O> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("MapOp").finish_non_exhaustive()
@@ -52,6 +61,15 @@ where
 pub struct FlatMapOp<F, I, O> {
     f: F,
     _phantom: PhantomData<fn(I) -> Vec<O>>,
+}
+
+impl<F: Clone, I, O> Clone for FlatMapOp<F, I, O> {
+    fn clone(&self) -> Self {
+        Self {
+            f: self.f.clone(),
+            _phantom: PhantomData,
+        }
+    }
 }
 
 impl<F, I, O> fmt::Debug for FlatMapOp<F, I, O> {

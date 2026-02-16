@@ -42,6 +42,7 @@ pub struct TuiApp {
     log_scroll: usize,
     auto_scroll: bool,
     quit: bool,
+    workers: usize,
 }
 
 impl TuiApp {
@@ -50,6 +51,7 @@ impl TuiApp {
         metrics_rx: tokio::sync::watch::Receiver<MetricsSnapshot>,
         log_rx: tokio::sync::mpsc::Receiver<LogEntry>,
         graph: Option<LogicalPlan>,
+        workers: usize,
     ) -> Self {
         Self {
             metrics_rx,
@@ -60,6 +62,7 @@ impl TuiApp {
             log_scroll: 0,
             auto_scroll: true,
             quit: false,
+            workers,
         }
     }
 
@@ -101,6 +104,7 @@ impl TuiApp {
                 // New metrics snapshot
                 Ok(()) = self.metrics_rx.changed() => {
                     self.snapshot = self.metrics_rx.borrow_and_update().clone();
+                    self.snapshot.workers = self.workers;
                 }
                 // New log entry
                 Some(entry) = self.log_rx.recv() => {
@@ -161,7 +165,7 @@ impl TuiApp {
                 .constraints([
                     Constraint::Length(3),  // Graph
                     Constraint::Length(10), // Dashboard
-                    Constraint::Min(5),    // Log viewer
+                    Constraint::Min(5),     // Log viewer
                 ])
                 .split(frame.area());
 
@@ -173,7 +177,7 @@ impl TuiApp {
                 .direction(Direction::Vertical)
                 .constraints([
                     Constraint::Length(10), // Dashboard
-                    Constraint::Min(5),    // Log viewer
+                    Constraint::Min(5),     // Log viewer
                 ])
                 .split(frame.area());
 

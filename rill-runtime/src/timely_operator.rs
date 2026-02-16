@@ -19,6 +19,7 @@ pub struct TimelyAsyncOperator<F: StreamFunction + 'static> {
     /// via a `ChangeBatch` so Timely sees frontier updates.
     retained_caps: HashMap<u64, CapabilityToken>,
     last_checkpoint_epoch: Option<u64>,
+    worker_index: usize,
 }
 
 impl<F: StreamFunction + 'static> std::fmt::Debug for TimelyAsyncOperator<F> {
@@ -47,6 +48,18 @@ impl<F: StreamFunction + 'static> TimelyAsyncOperator<F> {
             inner,
             retained_caps: HashMap::new(),
             last_checkpoint_epoch: None,
+            worker_index: 0,
+        }
+    }
+
+    /// Wraps the given `AsyncOperator` with Timely capability tracking and a
+    /// worker index for per-worker metrics.
+    pub fn with_worker_index(inner: AsyncOperator<F>, worker_index: usize) -> Self {
+        Self {
+            inner,
+            retained_caps: HashMap::new(),
+            last_checkpoint_epoch: None,
+            worker_index,
         }
     }
 
@@ -91,10 +104,17 @@ impl<F: StreamFunction + 'static> TimelyAsyncOperator<F> {
         };
 
         if should_checkpoint && !self.inner.has_pending() {
+            let worker = self.worker_index.to_string();
+            let ckpt_start = std::time::Instant::now();
             let ctx = self.inner.context_mut();
             if let Err(e) = rt.block_on(ctx.checkpoint()) {
-                tracing::error!("checkpoint failed: {e}");
+                tracing::error!(worker = self.worker_index, "checkpoint failed: {e}");
             }
+            metrics::histogram!(
+                "timely_checkpoint_duration_seconds",
+                "worker" => worker
+            )
+            .record(ckpt_start.elapsed().as_secs_f64());
             self.last_checkpoint_epoch = min_frontier;
         }
     }

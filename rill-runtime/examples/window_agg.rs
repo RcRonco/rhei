@@ -35,18 +35,58 @@ async fn main() -> anyhow::Result<()> {
 
     // Two sensors across three 10-second windows (0-9, 10-19, 20-29)
     let source = VecSource::new(vec![
-        SensorReading { sensor_id: "temp-1".into(), value: 22.5, timestamp: 1 },
-        SensorReading { sensor_id: "temp-2".into(), value: 18.3, timestamp: 2 },
-        SensorReading { sensor_id: "temp-1".into(), value: 23.1, timestamp: 5 },
-        SensorReading { sensor_id: "temp-2".into(), value: 19.0, timestamp: 7 },
+        SensorReading {
+            sensor_id: "temp-1".into(),
+            value: 22.5,
+            timestamp: 1,
+        },
+        SensorReading {
+            sensor_id: "temp-2".into(),
+            value: 18.3,
+            timestamp: 2,
+        },
+        SensorReading {
+            sensor_id: "temp-1".into(),
+            value: 23.1,
+            timestamp: 5,
+        },
+        SensorReading {
+            sensor_id: "temp-2".into(),
+            value: 19.0,
+            timestamp: 7,
+        },
         // These cross into window 10 → close window 0 for each sensor
-        SensorReading { sensor_id: "temp-1".into(), value: 24.0, timestamp: 12 },
-        SensorReading { sensor_id: "temp-2".into(), value: 17.5, timestamp: 13 },
-        SensorReading { sensor_id: "temp-1".into(), value: 23.8, timestamp: 18 },
-        SensorReading { sensor_id: "temp-2".into(), value: 20.1, timestamp: 19 },
+        SensorReading {
+            sensor_id: "temp-1".into(),
+            value: 24.0,
+            timestamp: 12,
+        },
+        SensorReading {
+            sensor_id: "temp-2".into(),
+            value: 17.5,
+            timestamp: 13,
+        },
+        SensorReading {
+            sensor_id: "temp-1".into(),
+            value: 23.8,
+            timestamp: 18,
+        },
+        SensorReading {
+            sensor_id: "temp-2".into(),
+            value: 20.1,
+            timestamp: 19,
+        },
         // These cross into window 20 → close window 10 for each sensor
-        SensorReading { sensor_id: "temp-1".into(), value: 25.0, timestamp: 22 },
-        SensorReading { sensor_id: "temp-2".into(), value: 21.0, timestamp: 25 },
+        SensorReading {
+            sensor_id: "temp-1".into(),
+            value: 25.0,
+            timestamp: 22,
+        },
+        SensorReading {
+            sensor_id: "temp-2".into(),
+            value: 21.0,
+            timestamp: 25,
+        },
     ]);
 
     let op = TumblingWindow::builder()

@@ -35,6 +35,13 @@ pub struct AsyncOperator<F: StreamFunction> {
     #[allow(clippy::type_complexity)]
     pending: VecDeque<(BoxFuture<Vec<F::Output>>, Option<u64>)>,
     stash: Stash<F::Input>,
+    /// When `true` (default), the cold path uses `tokio::task::block_in_place`
+    /// which requires running on a Tokio multi-thread runtime thread. When
+    /// `false`, uses `rt.block_on()` directly — required for Timely native
+    /// threads spawned by `timely::execute(Config::process(n))`.
+    use_block_in_place: bool,
+    /// Worker index for per-worker metrics labels.
+    worker_index: usize,
 }
 
 impl<F: StreamFunction> std::fmt::Debug for AsyncOperator<F> {
@@ -59,7 +66,20 @@ impl<F: StreamFunction + 'static> AsyncOperator<F> {
             rt,
             pending: VecDeque::new(),
             stash: Stash::new(),
+            use_block_in_place: true,
+            worker_index: 0,
         }
+    }
+
+    /// Set whether the cold path should use `block_in_place` (for Tokio threads)
+    /// or `rt.block_on()` directly (for Timely native threads).
+    pub fn set_use_block_in_place(&mut self, val: bool) {
+        self.use_block_in_place = val;
+    }
+
+    /// Set the worker index for per-worker metrics labels.
+    pub fn set_worker_index(&mut self, idx: usize) {
+        self.worker_index = idx;
     }
 
     /// Process an input element. Returns outputs that completed immediately.
@@ -129,7 +149,11 @@ impl<F: StreamFunction + 'static> AsyncOperator<F> {
                     // Cold path: the future needs async I/O (state miss).
                     // Drive it to completion via the Tokio runtime.
                     if let Some(ref rt) = self.rt {
-                        let results = tokio::task::block_in_place(|| rt.block_on(fut));
+                        let results = if self.use_block_in_place {
+                            tokio::task::block_in_place(|| rt.block_on(fut))
+                        } else {
+                            rt.block_on(fut)
+                        };
                         output.extend(results);
                     } else {
                         tracing::warn!("future pending but no runtime handle — dropping element");
@@ -141,10 +165,13 @@ impl<F: StreamFunction + 'static> AsyncOperator<F> {
     }
 
     fn report_backpressure(&self) {
+        let worker = self.worker_index.to_string();
         #[allow(clippy::cast_precision_loss)]
         {
-            metrics::gauge!("backpressure_stash_depth").set(self.stash.len() as f64);
-            metrics::gauge!("backpressure_pending_futures").set(self.pending.len() as f64);
+            metrics::gauge!("backpressure_stash_depth", "worker" => worker.clone())
+                .set(self.stash.len() as f64);
+            metrics::gauge!("backpressure_pending_futures", "worker" => worker)
+                .set(self.pending.len() as f64);
         }
     }
 
