@@ -25,6 +25,7 @@ struct TieredStorageConfig {
 pub struct Executor {
     checkpoint_dir: std::path::PathBuf,
     tiered: Option<TieredStorageConfig>,
+    workers: usize,
 }
 
 impl Executor {
@@ -33,7 +34,24 @@ impl Executor {
         Self {
             checkpoint_dir,
             tiered: None,
+            workers: 1,
         }
+    }
+
+    /// Set the number of parallel workers for keyed pipelines.
+    ///
+    /// When `workers > 1`, [`KeyedPipeline`](crate::pipeline::KeyedPipeline) distributes
+    /// elements across worker tasks by hashing the key function output.
+    /// Defaults to `1` (single-worker mode).
+    pub fn with_workers(mut self, n: usize) -> Self {
+        assert!(n >= 1, "worker count must be at least 1");
+        self.workers = n;
+        self
+    }
+
+    /// Returns the configured number of workers.
+    pub fn workers(&self) -> usize {
+        self.workers
     }
 
     /// Configure tiered storage (L2 Foyer + L3 `SlateDB`) for this executor.
@@ -567,6 +585,19 @@ impl Executor {
     /// ```
     pub fn pipeline<S: Source>(&self, source: S) -> crate::pipeline::PipelineSource<'_, S> {
         crate::pipeline::PipelineSource::new(self, source)
+    }
+
+    /// Create a per-worker `StateContext` for the given operator.
+    ///
+    /// The context is namespaced as `{operator_name}_w{worker_index}` so each
+    /// worker has isolated state.
+    pub async fn create_context_for_worker(
+        &self,
+        operator_name: &str,
+        worker_index: usize,
+    ) -> anyhow::Result<StateContext> {
+        let namespaced = format!("{operator_name}_w{worker_index}");
+        self.create_context(&namespaced).await
     }
 
     /// Create a `StateContext` for the given operator.

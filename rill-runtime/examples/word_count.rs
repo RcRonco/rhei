@@ -1,17 +1,8 @@
 //! Word-count example demonstrating the fluent pipeline builder.
 //!
-//! Uses the pipeline builder API to compose a filter, a stateful operator,
-//! and a map step into a single type-safe pipeline:
-//!
-//! ```ignore
-//! executor
-//!     .pipeline(source)
-//!     .filter(|line: &String| !line.is_empty())
-//!     .operator("word_counter", WordCounter, ctx)
-//!     .map(|result: String| format!("[output] {result}"))
-//!     .sink(PrintSink::new())
-//!     .await?;
-//! ```
+//! Shows two modes:
+//! 1. **Single-worker** — the original pipeline builder API with `.operator()`.
+//! 2. **Multi-worker** — the keyed pipeline with `.key_by()` and `.with_workers()`.
 //!
 //! Run with: `cargo run -p rill-runtime --example word_count`
 
@@ -27,6 +18,7 @@ use rill_runtime::executor::Executor;
 ///
 /// Splits each input line into words and maintains a running count for each
 /// word. Emits `"word: count"` strings.
+#[derive(Clone)]
 struct WordCounter;
 
 #[async_trait]
@@ -56,22 +48,45 @@ async fn main() -> anyhow::Result<()> {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir)?;
 
-    let executor = Executor::new(dir.clone());
-    let ctx = executor.create_context("word_counter").await?;
-
-    let source = VecSource::new(vec![
+    let lines = vec![
         "hello world".to_string(),
         "hello rill".to_string(),
         "rill is a stream processor".to_string(),
         "hello world again".to_string(),
-    ]);
+    ];
 
-    executor
-        .pipeline(source)
-        .operator("word_counter", WordCounter, ctx)
-        .map(|result: String| format!("[output] {result}"))
-        .sink(PrintSink::new())
-        .await?;
+    // ── Single-worker pipeline (original API) ────────────────────────
+    println!("=== Single-worker pipeline ===");
+    {
+        let executor = Executor::new(dir.clone());
+        let ctx = executor.create_context("word_counter").await?;
+
+        executor
+            .pipeline(VecSource::new(lines.clone()))
+            .operator("word_counter", WordCounter, ctx)
+            .map(|result: String| format!("[output] {result}"))
+            .sink(PrintSink::new())
+            .await?;
+    }
+
+    // ── Multi-worker keyed pipeline ──────────────────────────────────
+    println!("\n=== Multi-worker keyed pipeline (2 workers) ===");
+    {
+        let dir2 = dir.join("keyed");
+        std::fs::create_dir_all(&dir2)?;
+        let executor = Executor::new(dir2).with_workers(2);
+
+        executor
+            .pipeline(VecSource::new(lines))
+            .flat_map(|line: String| {
+                line.split_whitespace().map(String::from).collect::<Vec<_>>()
+            })
+            .key_by(|word: &String| word.clone())
+            .operator("word_counter", WordCounter)
+            .map(|result: String| format!("[output] {result}"))
+            .sink(PrintSink::new())
+            .await?;
+    }
 
     let _ = std::fs::remove_dir_all(&dir);
     Ok(())
