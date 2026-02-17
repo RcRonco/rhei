@@ -64,7 +64,7 @@ pub fn render_log_viewer(
             let level_str = format!("{:5}", entry.level);
             let color = level_color(entry.level);
 
-            ListItem::new(Line::from(vec![
+            let mut spans = vec![
                 Span::styled(time, Style::default().fg(Color::DarkGray)),
                 Span::raw(" "),
                 Span::styled(
@@ -72,8 +72,19 @@ pub fn render_log_viewer(
                     Style::default().fg(color).add_modifier(Modifier::BOLD),
                 ),
                 Span::raw(" "),
-                Span::styled(&entry.message, Style::default().fg(Color::White)),
-            ]))
+            ];
+            if let Some(w) = entry.worker {
+                spans.push(Span::styled(
+                    format!("[W{w}] "),
+                    Style::default().fg(Color::Magenta),
+                ));
+            }
+            spans.push(Span::styled(
+                &entry.message,
+                Style::default().fg(Color::White),
+            ));
+
+            ListItem::new(Line::from(spans))
         })
         .collect::<Vec<_>>()
         .into_iter()

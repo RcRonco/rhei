@@ -1,4 +1,9 @@
+use std::any::Any;
+
 use rill_core::traits::{Sink, Source};
+
+use crate::dataflow::ErasedSource;
+use crate::shutdown::ShutdownHandle;
 
 /// Bridges an async `Source` into a `tokio::sync::mpsc::Receiver` for use in Timely.
 ///
@@ -49,4 +54,32 @@ where
         }
     });
     tx
+}
+
+/// Bridges a type-erased [`ErasedSource`] into a `tokio::sync::mpsc::Receiver`.
+///
+/// Same pattern as [`source_bridge`] but for the type-erased dataflow path.
+/// When a `ShutdownHandle` is provided, the bridge stops reading from the
+/// source once shutdown is signalled.
+pub(crate) fn erased_source_bridge(
+    mut source: Box<dyn ErasedSource>,
+    rt: &tokio::runtime::Handle,
+    shutdown: Option<ShutdownHandle>,
+) -> tokio::sync::mpsc::Receiver<Vec<Box<dyn Any + Send>>> {
+    let (tx, rx) = tokio::sync::mpsc::channel(16);
+    rt.spawn(async move {
+        while let Some(batch) = source.next_batch().await {
+            if tx.send(batch).await.is_err() {
+                break; // receiver dropped
+            }
+            if let Some(ref handle) = shutdown
+                && handle.is_shutdown()
+            {
+                tracing::info!("shutdown requested, stopping source bridge");
+                break;
+            }
+        }
+        // tx drops here, closing the channel
+    });
+    rx
 }

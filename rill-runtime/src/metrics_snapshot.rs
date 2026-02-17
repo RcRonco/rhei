@@ -47,6 +47,8 @@ pub struct MetricsSnapshot {
     pub stash_depth: f64,
     /// Current number of pending async futures.
     pub pending_futures: f64,
+    /// Number of parallel workers.
+    pub workers: u64,
     /// Time since pipeline started.
     pub uptime: Duration,
 }
@@ -70,6 +72,7 @@ impl Default for MetricsSnapshot {
             element_duration_p99: 0.0,
             stash_depth: 0.0,
             pending_futures: 0.0,
+            workers: 0,
             uptime: Duration::ZERO,
         }
     }
@@ -137,6 +140,9 @@ impl MetricsHandle {
         let element_duration_p99 = get_f64(&gauges, "executor_element_duration_p99");
         let stash_depth = get_f64(&gauges, "backpressure_stash_depth");
         let pending_futures = get_f64(&gauges, "backpressure_pending_futures");
+        let workers_f64 = get_f64(&gauges, "executor_workers");
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let workers = workers_f64 as u64;
 
         let uptime = self.inner.start_time.elapsed();
 
@@ -157,6 +163,7 @@ impl MetricsHandle {
             element_duration_p99,
             stash_depth,
             pending_futures,
+            workers,
             uptime,
         }
     }

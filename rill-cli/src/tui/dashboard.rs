@@ -65,7 +65,12 @@ pub fn render_dashboard(frame: &mut Frame<'_>, area: Rect, snap: &MetricsSnapsho
         ])
         .split(inner);
 
-    // Row 0: Status + Uptime
+    // Row 0: Status + Workers + Uptime
+    let workers_str = if snap.workers > 0 {
+        format!("{}", snap.workers)
+    } else {
+        "—".to_string()
+    };
     let status_line = Line::from(vec![
         Span::styled(" Status: ", Style::default().fg(Color::DarkGray)),
         Span::styled(
@@ -74,7 +79,15 @@ pub fn render_dashboard(frame: &mut Frame<'_>, area: Rect, snap: &MetricsSnapsho
                 .fg(Color::Green)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::raw("        "),
+        Span::raw("    "),
+        Span::styled("Workers: ", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            workers_str,
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("    "),
         Span::styled("Uptime: ", Style::default().fg(Color::DarkGray)),
         Span::styled(
             format_uptime(snap.uptime),

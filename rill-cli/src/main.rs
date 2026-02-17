@@ -33,6 +33,10 @@ enum Commands {
         /// Launch the TUI dashboard instead of shelling out to cargo
         #[arg(long)]
         tui: bool,
+
+        /// Number of parallel Timely worker threads
+        #[arg(long, default_value = "1")]
+        workers: usize,
     },
 }
 
@@ -50,8 +54,8 @@ fn main() -> anyhow::Result<()> {
                 })?;
             cmd_new(&name)
         }
-        Commands::Run { tui: true } => cmd_run_tui(cli.log_level),
-        Commands::Run { tui: false } => {
+        Commands::Run { tui: true, workers } => cmd_run_tui(cli.log_level, workers),
+        Commands::Run { tui: false, .. } => {
             let _telemetry =
                 rill_runtime::telemetry::init(rill_runtime::telemetry::TelemetryConfig {
                     metrics_addr: None,
@@ -93,8 +97,10 @@ use rill_core::traits::StreamFunction;
 use rill_core::state::context::StateContext;
 use rill_core::connectors::vec_source::VecSource;
 use rill_core::connectors::print_sink::PrintSink;
-use rill_runtime::executor::{Executor, OperatorSlot};
+use rill_runtime::dataflow::DataflowGraph;
+use rill_runtime::executor::Executor;
 
+#[derive(Clone)]
 struct MyOperator;
 
 #[async_trait]
@@ -110,21 +116,19 @@ impl StreamFunction for MyOperator {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let executor = Executor::new("./checkpoints".into());
-    let ctx = executor.create_context("my_operator").await?;
-
-    let mut source = VecSource::new(vec![
+    let graph = DataflowGraph::new();
+    let source = VecSource::new(vec![
         "hello world".to_string(),
         "hello rill".to_string(),
     ]);
 
-    let mut operators = vec![
-        OperatorSlot::new("my_operator", MyOperator, ctx, Some(tokio::runtime::Handle::current())),
-    ];
+    graph.source(source)
+        .key_by(|s: &String| s.clone())
+        .operator("my_operator", MyOperator)
+        .sink(PrintSink::new());
 
-    let mut sink: PrintSink<String> = PrintSink::new();
-
-    executor.run_linear(&mut source, &mut operators, &mut sink).await?;
+    let executor = Executor::new("./checkpoints".into());
+    executor.run(graph).await?;
     Ok(())
 }
 "#;
@@ -153,7 +157,7 @@ fn cmd_run() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn cmd_run_tui(log_level: String) -> anyhow::Result<()> {
+fn cmd_run_tui(log_level: String, workers: usize) -> anyhow::Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
 
     rt.block_on(async {
@@ -181,7 +185,7 @@ fn cmd_run_tui(log_level: String) -> anyhow::Result<()> {
             .build();
 
         // Spawn a demo pipeline in the background
-        let pipeline_handle = tokio::spawn(async { run_demo_pipeline().await });
+        let pipeline_handle = tokio::spawn(async move { run_demo_pipeline(workers).await });
 
         // Run the TUI on the main task
         let app = tui::TuiApp::new(metrics_rx, log_rx, Some(plan));
@@ -199,14 +203,15 @@ fn cmd_run_tui(log_level: String) -> anyhow::Result<()> {
 /// Simulates a real-time sensor aggregation pipeline: 5 sensors emit readings
 /// every 150 ms, aggregated into 10-second tumbling windows using the
 /// operators library.
-async fn run_demo_pipeline() -> anyhow::Result<()> {
+async fn run_demo_pipeline(workers: usize) -> anyhow::Result<()> {
     use std::fmt;
     use std::marker::PhantomData;
 
     use async_trait::async_trait;
     use rill_core::operators::{Avg, TumblingWindow, WindowOutput};
     use rill_core::traits::{Sink, Source};
-    use rill_runtime::executor::{Executor, OperatorSlot};
+    use rill_runtime::dataflow::DataflowGraph;
+    use rill_runtime::executor::Executor;
     use serde::{Deserialize, Serialize};
 
     #[derive(Clone, Serialize, Deserialize)]
@@ -276,15 +281,6 @@ async fn run_demo_pipeline() -> anyhow::Result<()> {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir)?;
 
-    let executor = Executor::new(dir.clone());
-    let ctx = executor.create_context("tumbling_window").await?;
-
-    // 500 ticks × 150 ms ≈ 75 seconds of simulated sensor data
-    let mut source = SimulatedSensorSource {
-        tick: 0,
-        max_ticks: 500,
-    };
-
     let op = TumblingWindow::builder()
         .window_size(10)
         .key_fn(|r: &SensorReading| r.sensor_id.clone())
@@ -292,21 +288,30 @@ async fn run_demo_pipeline() -> anyhow::Result<()> {
         .aggregator(Avg::new(|r: &SensorReading| r.value))
         .build();
 
-    let mut operators = vec![OperatorSlot::new(
-        "tumbling_window",
-        op,
-        ctx,
-        Some(tokio::runtime::Handle::current()),
-    )];
-    let mut sink: LoggingSink<WindowOutput<f64>> = LoggingSink(PhantomData);
+    let graph = DataflowGraph::new();
+    // 500 ticks × 150 ms ≈ 75 seconds of simulated sensor data
+    let source = SimulatedSensorSource {
+        tick: 0,
+        max_ticks: 500,
+    };
+
+    graph
+        .source(source)
+        .key_by(|r: &SensorReading| r.sensor_id.clone())
+        .operator("tumbling_window", op)
+        .map(|w: WindowOutput<f64>| format!("{w}"))
+        .sink(LoggingSink::<String>(PhantomData));
+
+    let executor = Executor::builder()
+        .checkpoint_dir(dir.clone())
+        .workers(workers)
+        .build();
 
     // Let the TUI render before data starts flowing
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
     tracing::info!("sensor aggregation pipeline started — 5 sensors, 10s tumbling windows");
-    executor
-        .run_linear(&mut source, &mut operators, &mut sink)
-        .await?;
+    executor.run(graph).await?;
     tracing::info!("pipeline completed");
 
     // Keep alive so TUI stays up until user quits

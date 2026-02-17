@@ -36,6 +36,7 @@ use rill_core::state::context::StateContext;
 use rill_core::traits::{Sink, Source, StreamFunction};
 
 use crate::shutdown::ShutdownHandle;
+use crate::timely_operator::TimelyErasedOperator;
 
 // ── Node identity ────────────────────────────────────────────────────
 
@@ -718,6 +719,200 @@ fn split_at_first_exchange(
     (pre, None)
 }
 
+/// Wrapper around `Box<dyn Any + Send>` that satisfies Timely's `Clone` requirement.
+///
+/// Timely's `Container` trait requires `Clone` on the element type. With `Pipeline`
+/// pact and a linear (non-fan-out) dataflow, containers are never actually cloned —
+/// this bound exists for `Exchange` pact compatibility. The `Clone` impl panics if
+/// called, serving as a canary for accidental use with fan-out or Exchange pact.
+struct AnyItem(Box<dyn Any + Send>);
+
+impl Clone for AnyItem {
+    fn clone(&self) -> Self {
+        unreachable!("AnyItem::clone should never be called with Pipeline pact")
+    }
+}
+
+/// Build a Timely dataflow from compiled segments inside a worker scope.
+///
+/// Constructs: source operator → chain of transform/operator stages → sink terminal.
+/// Returns a probe for tracking completion.
+///
+/// - Transform segments become `unary` operators with Pipeline pact
+/// - Operator segments become `unary_frontier` operators wrapping [`TimelyErasedOperator`]
+/// - The source reads batches from an `mpsc::Receiver` (one batch = one epoch)
+/// - The sink sends items via an `mpsc::Sender`
+#[allow(clippy::too_many_lines)]
+fn build_timely_dataflow<A: timely::communication::Allocate>(
+    scope: &mut timely::dataflow::scopes::Child<'_, timely::worker::Worker<A>, u64>,
+    source_rx: &mut tokio::sync::mpsc::Receiver<Vec<Box<dyn Any + Send>>>,
+    segments: Vec<Segment>,
+    operator_contexts: &mut [Option<StateContext>],
+    sink_tx: tokio::sync::mpsc::Sender<Box<dyn Any + Send>>,
+    rt: tokio::runtime::Handle,
+) -> timely::dataflow::operators::probe::Handle<u64> {
+    use timely::container::CapacityContainerBuilder;
+    use timely::dataflow::channels::pact::Pipeline;
+    use timely::dataflow::operators::core::probe::Probe;
+    use timely::dataflow::operators::generic::OutputBuilder;
+    use timely::dataflow::operators::generic::builder_rc::OperatorBuilder;
+    use timely::dataflow::operators::generic::operator::Operator;
+    use timely::scheduling::Scheduler;
+
+    // --- Source operator: drains channel, emits with capability per batch ---
+    let mut source_builder = OperatorBuilder::new("Source".to_owned(), scope.clone());
+    let (output, stream) = source_builder.new_output::<Vec<AnyItem>>();
+    let mut output = OutputBuilder::from(output);
+    let activator = scope.activator_for(source_builder.operator_info().address);
+    source_builder.set_notify(false);
+
+    // Move source_rx into the closure by taking from the mutable ref.
+    let mut source_rx_owned = {
+        let (dummy_tx, dummy_rx) = tokio::sync::mpsc::channel(1);
+        drop(dummy_tx);
+        std::mem::replace(source_rx, dummy_rx)
+    };
+
+    source_builder.build_reschedule(move |mut capabilities| {
+        let mut cap = Some(capabilities.pop().unwrap());
+        let mut epoch: u64 = 0;
+
+        move |_frontiers| {
+            if cap.is_none() {
+                return false;
+            }
+
+            match source_rx_owned.try_recv() {
+                Ok(batch) => {
+                    #[allow(clippy::cast_possible_truncation)]
+                    let batch_len = batch.len() as u64;
+                    if let Some(ref c) = cap {
+                        let mut handle = output.activate();
+                        let mut session = handle.session(c);
+                        for item in batch {
+                            session.give(AnyItem(item));
+                        }
+                    }
+                    metrics::counter!("executor_batches_total").increment(1);
+                    metrics::counter!("executor_elements_total").increment(batch_len);
+                    epoch += 1;
+                    if let Some(ref mut c) = cap {
+                        c.downgrade(&epoch);
+                    }
+                    activator.activate();
+                    true
+                }
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
+                    activator.activate();
+                    true
+                }
+                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                    cap = None;
+                    false
+                }
+            }
+        }
+    });
+
+    // --- Chain segments as sequential Timely stages ---
+    let mut current: timely::dataflow::Stream<_, AnyItem> = stream;
+    let mut ctx_idx = 0;
+
+    for (i, segment) in segments.into_iter().enumerate() {
+        match segment {
+            Segment::Transform(f) => {
+                let name = format!("Transform_{i}");
+                current = current.unary::<CapacityContainerBuilder<Vec<AnyItem>>, _, _, _>(
+                    Pipeline,
+                    &name,
+                    move |_cap, _info| {
+                        let f = f;
+                        move |input, output| {
+                            input.for_each(|cap, data| {
+                                let mut session = output.session(&cap);
+                                for item in data.drain(..) {
+                                    for result in f(item.0) {
+                                        session.give(AnyItem(result));
+                                    }
+                                }
+                            });
+                        }
+                    },
+                );
+            }
+            Segment::Operator { name, op } => {
+                let stage_name = format!("Op_{i}_{name}");
+                let ctx = operator_contexts[ctx_idx]
+                    .take()
+                    .expect("missing StateContext for operator");
+                ctx_idx += 1;
+
+                let rt_op = rt.clone();
+                current = current
+                    .unary_frontier::<CapacityContainerBuilder<Vec<AnyItem>>, _, _, _>(
+                        Pipeline,
+                        &stage_name,
+                        move |_init_cap, _info| {
+                            let mut timely_op = TimelyErasedOperator::new(op, ctx);
+                            let rt = rt_op;
+                            move |(input, frontier), output| {
+                                input.for_each(|cap, data| {
+                                    let mut batch_durations = Vec::new();
+                                    for item in data.drain(..) {
+                                        let elem_start = std::time::Instant::now();
+                                        let results = timely_op.process(item.0, &rt);
+                                        batch_durations.push(elem_start.elapsed().as_secs_f64());
+                                        if !results.is_empty() {
+                                            let mut session = output.session(&cap);
+                                            for r in results {
+                                                session.give(AnyItem(r));
+                                            }
+                                        }
+                                    }
+                                    if !batch_durations.is_empty() {
+                                        batch_durations.sort_unstable_by(|a, b| {
+                                            a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
+                                        });
+                                        let len = batch_durations.len();
+                                        let p50 = batch_durations[len / 2];
+                                        let p99 = batch_durations[(len * 99 / 100).min(len - 1)];
+                                        metrics::gauge!("executor_element_duration_p50").set(p50);
+                                        metrics::gauge!("executor_element_duration_p99").set(p99);
+                                    }
+                                });
+
+                                let frontier_vec: Vec<u64> =
+                                    frontier.frontier().iter().copied().collect();
+                                timely_op.maybe_checkpoint(&frontier_vec, &rt);
+                            }
+                        },
+                    );
+            }
+            Segment::Exchange(_) => {
+                // Exchange segments are handled at the split level, not here.
+            }
+        }
+    }
+
+    // --- Sink terminal: send items via channel ---
+    current
+        .unary::<CapacityContainerBuilder<Vec<AnyItem>>, _, _, _>(
+            Pipeline,
+            "Sink",
+            move |_cap, _info| {
+                let sink_tx = sink_tx;
+                move |input, _output| {
+                    input.for_each(|_cap, data| {
+                        for item in data.drain(..) {
+                            let _ = sink_tx.blocking_send(item.0);
+                        }
+                    });
+                }
+            },
+        )
+        .probe()
+}
+
 /// Execute a compiled pipeline.
 pub(crate) async fn execute_pipeline(
     pipeline: CompiledPipeline,
@@ -759,54 +954,115 @@ pub(crate) async fn execute_pipeline(
     }
 }
 
-/// Single-worker execution: simple async loop.
+/// Single-worker execution: Timely-backed with `Config::process(1)`.
+///
+/// Bridges the source and sink to channels, runs all segments inside a
+/// Timely dataflow with Pipeline pact, providing frontier-based checkpointing.
+#[allow(clippy::too_many_lines)]
 async fn execute_single_worker(
-    mut source: Box<dyn ErasedSource>,
+    source: Box<dyn ErasedSource>,
     segments: Vec<Segment>,
-    mut sink: Box<dyn ErasedSink>,
+    sink: Box<dyn ErasedSink>,
     executor: &crate::executor::Executor,
     shutdown: Option<&ShutdownHandle>,
 ) -> anyhow::Result<()> {
-    let mut steps = materialize_steps(segments, executor, 0).await?;
+    let rt = tokio::runtime::Handle::current();
 
-    let checkpoint_interval: u64 = 100;
-    let mut batches_since_checkpoint: u64 = 0;
-
-    while let Some(batch) = source.next_batch().await {
-        for item in batch {
-            let outputs = apply_steps(item, &mut steps).await;
-            for output in outputs {
-                sink.write(output).await?;
+    // Extract operator names upfront to avoid holding &Segment across await.
+    let operator_names: Vec<String> = segments
+        .iter()
+        .filter_map(|seg| {
+            if let Segment::Operator { name, .. } = seg {
+                Some(name.clone())
+            } else {
+                None
             }
-        }
+        })
+        .collect();
 
-        batches_since_checkpoint += 1;
-        if batches_since_checkpoint >= checkpoint_interval {
-            for step in &mut steps {
-                step.checkpoint().await?;
-            }
-            source.on_checkpoint_complete().await?;
-            sink.flush().await?;
-            batches_since_checkpoint = 0;
-        }
-
-        if let Some(handle) = shutdown
-            && handle.is_shutdown()
-        {
-            tracing::info!("shutdown requested, performing final checkpoint...");
-            break;
-        }
+    // Pre-create StateContexts for operator segments (must be done on async task).
+    let mut operator_contexts: Vec<Option<StateContext>> = Vec::new();
+    for name in &operator_names {
+        let ctx = executor.create_context_for_worker(name, 0).await?;
+        operator_contexts.push(Some(ctx));
     }
 
-    for step in &mut steps {
-        step.checkpoint().await?;
-    }
-    source.on_checkpoint_complete().await?;
-    sink.flush().await?;
+    // Bridge source to channel.
+    let source_rx = crate::bridge::erased_source_bridge(source, &rt, shutdown.cloned());
+
+    // Create sink channel manually so we can await the sink task.
+    let (sink_tx, mut sink_rx) = tokio::sync::mpsc::channel::<Box<dyn Any + Send>>(16);
+    let sink_handle: tokio::task::JoinHandle<anyhow::Result<()>> = tokio::spawn(async move {
+        let mut sink = sink;
+        while let Some(item) = sink_rx.recv().await {
+            sink.write(item).await?;
+        }
+        sink.flush().await?;
+        Ok(())
+    });
+
+    // Package for the Timely closure (Fn, not FnOnce — use Mutex+Option+take).
+    let source_rx = std::sync::Mutex::new(Some(source_rx));
+    let segments = std::sync::Mutex::new(Some(segments));
+    let operator_contexts = std::sync::Mutex::new(Some(operator_contexts));
+    let sink_tx = std::sync::Mutex::new(Some(sink_tx));
+    let rt_clone = rt.clone();
+
+    metrics::gauge!("executor_workers").set(1.0);
+    tracing::info!(workers = 1, "pipeline started");
+
+    tokio::task::spawn_blocking(move || {
+        let guards = timely::execute::execute(timely::execute::Config::process(1), move |worker| {
+            let _span = tracing::info_span!("worker", worker = 0).entered();
+
+            // Take per-worker data.
+            let mut source_rx = source_rx.lock().unwrap().take().unwrap();
+            let segments = segments.lock().unwrap().take().unwrap();
+            let mut op_contexts = operator_contexts.lock().unwrap().take().unwrap();
+            let sink_tx = sink_tx.lock().unwrap().take().unwrap();
+            let rt = rt_clone.clone();
+
+            let dataflow_index = worker.next_dataflow_index();
+            let probe = worker.dataflow::<u64, _, _>(|scope| {
+                build_timely_dataflow(
+                    scope,
+                    &mut source_rx,
+                    segments,
+                    &mut op_contexts,
+                    sink_tx,
+                    rt,
+                )
+            });
+
+            while !probe.done() {
+                worker.step();
+            }
+
+            worker.drop_dataflow(dataflow_index);
+        })
+        .map_err(|e| anyhow::anyhow!("timely execution failed: {e}"))?;
+
+        // Drop guards to join worker threads. Sink sender is dropped here,
+        // signaling the sink task that no more items are coming.
+        drop(guards);
+        Ok::<(), anyhow::Error>(())
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("spawn_blocking failed: {e}"))??;
+
+    // Wait for the sink bridge task to finish writing and flushing.
+    sink_handle
+        .await
+        .map_err(|e| anyhow::anyhow!("sink task panicked: {e}"))??;
+
     Ok(())
 }
 
-/// Multi-worker execution: pre-exchange on main task, post-exchange per worker.
+/// Multi-worker execution: pre-exchange on Tokio task, post-exchange in Timely.
+///
+/// Pre-exchange transforms run in a Tokio task (stateless transforms + hash routing).
+/// Post-exchange segments run inside per-worker Timely dataflows with Pipeline pact,
+/// providing frontier tracking and epoch-based checkpointing.
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 async fn execute_multi_worker(
     mut source: Box<dyn ErasedSource>,
@@ -818,51 +1074,108 @@ async fn execute_multi_worker(
     n_workers: usize,
     shutdown: Option<&ShutdownHandle>,
 ) -> anyhow::Result<()> {
+    let rt = tokio::runtime::Handle::current();
     let channel_capacity = 256;
 
-    // Materialize pre-exchange steps on the main task.
+    // Materialize pre-exchange steps on the main task (pure async).
     let mut pre_steps = materialize_steps(pre_segments, executor, 0).await?;
 
-    // Per-worker input channels.
+    // Per-worker input channels (Tokio → Timely worker).
     let mut worker_txs = Vec::with_capacity(n_workers);
-    let mut worker_receivers = Vec::with_capacity(n_workers);
+    #[allow(clippy::type_complexity)]
+    let mut worker_receivers: Vec<
+        Option<tokio::sync::mpsc::Receiver<Vec<Box<dyn Any + Send>>>>,
+    > = Vec::with_capacity(n_workers);
     for _ in 0..n_workers {
-        let (tx, rx) = tokio::sync::mpsc::channel::<Box<dyn Any + Send>>(channel_capacity);
+        let (tx, rx) = tokio::sync::mpsc::channel::<Vec<Box<dyn Any + Send>>>(channel_capacity);
         worker_txs.push(tx);
-        worker_receivers.push(rx);
+        worker_receivers.push(Some(rx));
     }
 
-    // Output channel: workers → collector → sink.
+    // Output channel: Timely workers → collector → sink.
     let (output_tx, mut output_rx) =
         tokio::sync::mpsc::channel::<Box<dyn Any + Send>>(channel_capacity);
 
-    // Spawn worker tasks.
-    let mut worker_handles = Vec::with_capacity(n_workers);
+    // Extract operator names upfront to avoid holding &Segment across await.
+    let operator_names: Vec<String> = post_segments
+        .iter()
+        .filter_map(|seg| {
+            if let Segment::Operator { name, .. } = seg {
+                Some(name.clone())
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    // Pre-create per-worker segments and StateContexts.
+    let mut per_worker_segments: Vec<Option<Vec<Segment>>> = Vec::with_capacity(n_workers);
+    let mut per_worker_contexts: Vec<Option<Vec<Option<StateContext>>>> =
+        Vec::with_capacity(n_workers);
     for i in 0..n_workers {
         let cloned = clone_segments(&post_segments);
-        let mut steps = materialize_steps(cloned, executor, i).await?;
-        let mut rx = worker_receivers.pop().unwrap();
-        let out_tx = output_tx.clone();
+        let mut contexts = Vec::new();
+        for name in &operator_names {
+            let ctx = executor.create_context_for_worker(name, i).await?;
+            contexts.push(Some(ctx));
+        }
+        per_worker_segments.push(Some(cloned));
+        per_worker_contexts.push(Some(contexts));
+    }
 
-        let handle: tokio::task::JoinHandle<anyhow::Result<()>> = tokio::spawn(async move {
-            while let Some(item) = rx.recv().await {
-                let outputs = apply_steps(item, &mut steps).await;
-                for output in outputs {
-                    if out_tx.send(output).await.is_err() {
-                        return Ok(());
+    // Package per-worker data for Timely closure (Fn, not FnOnce).
+    let worker_receivers = std::sync::Mutex::new(worker_receivers);
+    let per_worker_segments = std::sync::Mutex::new(per_worker_segments);
+    let per_worker_contexts = std::sync::Mutex::new(per_worker_contexts);
+    let output_tx_arc = Arc::new(std::sync::Mutex::new(Some(output_tx)));
+
+    let rt_clone = rt.clone();
+
+    #[allow(clippy::cast_possible_truncation)]
+    metrics::gauge!("executor_workers").set(n_workers as f64);
+    tracing::info!(workers = n_workers, "pipeline started");
+
+    // Spawn Timely workers in a blocking thread.
+    let timely_handle: tokio::task::JoinHandle<anyhow::Result<()>> =
+        tokio::task::spawn_blocking(move || {
+            let guards = timely::execute::execute(
+                timely::execute::Config::process(n_workers),
+                move |worker| {
+                    let idx = worker.index();
+                    let _span = tracing::info_span!("worker", worker = idx).entered();
+
+                    // Take this worker's data.
+                    let mut source_rx = worker_receivers.lock().unwrap()[idx].take().unwrap();
+                    let segments = per_worker_segments.lock().unwrap()[idx].take().unwrap();
+                    let mut op_contexts = per_worker_contexts.lock().unwrap()[idx].take().unwrap();
+                    let sink_tx = output_tx_arc.lock().unwrap().as_ref().unwrap().clone();
+
+                    let rt = rt_clone.clone();
+
+                    let dataflow_index = worker.next_dataflow_index();
+                    let probe = worker.dataflow::<u64, _, _>(|scope| {
+                        build_timely_dataflow(
+                            scope,
+                            &mut source_rx,
+                            segments,
+                            &mut op_contexts,
+                            sink_tx,
+                            rt,
+                        )
+                    });
+
+                    while !probe.done() {
+                        worker.step();
                     }
-                }
-            }
-            // Input channel closed → final checkpoint for this worker.
-            for step in &mut steps {
-                step.checkpoint().await?;
-            }
+
+                    worker.drop_dataflow(dataflow_index);
+                },
+            )
+            .map_err(|e| anyhow::anyhow!("timely execution failed: {e}"))?;
+
+            drop(guards);
             Ok(())
         });
-        worker_handles.push(handle);
-    }
-    worker_handles.reverse();
-    drop(output_tx); // Workers hold the remaining clones.
 
     // Collector task: output channel → sink.
     let collector_handle: tokio::task::JoinHandle<anyhow::Result<()>> = tokio::spawn(async move {
@@ -874,11 +1187,21 @@ async fn execute_multi_worker(
         Ok(())
     });
 
-    // Main loop: source → pre-steps → hash key → route to worker.
+    // Main loop: source → pre-steps → hash key → route to per-worker channels.
+    // Each send is a batch (Vec) that becomes one Timely epoch.
     let checkpoint_interval: u64 = 100;
     let mut batches_since_checkpoint: u64 = 0;
 
     while let Some(batch) = source.next_batch().await {
+        #[allow(clippy::cast_possible_truncation)]
+        let batch_len = batch.len() as u64;
+        metrics::counter!("executor_batches_total").increment(1);
+        metrics::counter!("executor_elements_total").increment(batch_len);
+
+        // Apply pre-exchange transforms and bucket by worker.
+        let mut worker_buckets: Vec<Vec<Box<dyn Any + Send>>> =
+            (0..n_workers).map(|_| Vec::new()).collect();
+
         for item in batch {
             let mid_items = apply_steps(item, &mut pre_steps).await;
             for mid in mid_items {
@@ -887,9 +1210,14 @@ async fn execute_multi_worker(
                 key.hash(&mut hasher);
                 #[allow(clippy::cast_possible_truncation)]
                 let worker_idx = (hasher.finish() as usize) % n_workers;
-                if worker_txs[worker_idx].send(mid).await.is_err() {
-                    break;
-                }
+                worker_buckets[worker_idx].push(mid);
+            }
+        }
+
+        // Send non-empty buckets to workers as batches.
+        for (i, bucket) in worker_buckets.into_iter().enumerate() {
+            if !bucket.is_empty() && worker_txs[i].send(bucket).await.is_err() {
+                break;
             }
         }
 
@@ -915,16 +1243,18 @@ async fn execute_multi_worker(
         step.checkpoint().await?;
     }
 
-    // Close worker channels → workers drain and checkpoint.
+    // Close worker channels → Timely sources drop capabilities → dataflows complete.
     drop(worker_txs);
 
-    for handle in worker_handles {
-        handle
-            .await
-            .map_err(|e| anyhow::anyhow!("worker panicked: {e}"))??;
-    }
+    // Wait for Timely workers to finish.
+    timely_handle
+        .await
+        .map_err(|e| anyhow::anyhow!("timely workers panicked: {e}"))??;
 
     source.on_checkpoint_complete().await?;
+
+    // Drop the output_tx so collector sees channel close.
+    // (Timely workers already dropped their clones when exiting.)
 
     collector_handle
         .await
