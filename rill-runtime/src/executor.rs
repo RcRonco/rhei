@@ -33,7 +33,7 @@ use crate::compiler::{
     CompiledPipeline, Segment, clone_segments, compile, split_at_first_exchange,
 };
 use crate::dataflow::{
-    DataflowGraph, ErasedOperator, ErasedSink, ErasedSource, KeyFn, TransformFn,
+    DataflowGraph, ErasedOperator, ErasedSink, ErasedSource, KeyFn, TransformContext, TransformFn,
 };
 use crate::shutdown::ShutdownHandle;
 use crate::timely_operator::TimelyErasedOperator;
@@ -225,13 +225,14 @@ impl ExecStep {
 async fn apply_steps(
     item: Box<dyn Any + Send>,
     steps: &mut [ExecStep],
+    transform_ctx: &TransformContext,
 ) -> Vec<Box<dyn Any + Send>> {
     let mut items = vec![item];
     for step in steps.iter_mut() {
         let mut next = Vec::new();
         for item in items {
             match step {
-                ExecStep::Transform(f) => next.extend(f(item)),
+                ExecStep::Transform(f) => next.extend(f(item, transform_ctx)),
                 ExecStep::Operator { op, ctx, .. } => {
                     next.extend(op.process(item, ctx).await);
                 }
@@ -289,7 +290,7 @@ impl Clone for AnyItem {
 /// - Operator segments become `unary_frontier` operators wrapping [`TimelyErasedOperator`]
 /// - The source reads batches from an `mpsc::Receiver` (one batch = one epoch)
 /// - The sink sends items via an `mpsc::Sender`
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 fn build_timely_dataflow<A: timely::communication::Allocate>(
     scope: &mut timely::dataflow::scopes::Child<'_, timely::worker::Worker<A>, u64>,
     source_rx: &mut tokio::sync::mpsc::Receiver<Vec<Box<dyn Any + Send>>>,
@@ -297,6 +298,8 @@ fn build_timely_dataflow<A: timely::communication::Allocate>(
     operator_contexts: &mut [Option<StateContext>],
     sink_tx: tokio::sync::mpsc::Sender<Box<dyn Any + Send>>,
     rt: tokio::runtime::Handle,
+    worker_index: usize,
+    num_workers: usize,
 ) -> timely::dataflow::operators::probe::Handle<u64> {
     use timely::container::CapacityContainerBuilder;
     use timely::dataflow::channels::pact::Pipeline;
@@ -369,16 +372,21 @@ fn build_timely_dataflow<A: timely::communication::Allocate>(
         match segment {
             Segment::Transform(f) => {
                 let name = format!("Transform_{i}");
+                let ctx = TransformContext {
+                    worker_index,
+                    num_workers,
+                };
                 current = current.unary::<CapacityContainerBuilder<Vec<AnyItem>>, _, _, _>(
                     Pipeline,
                     &name,
                     move |_cap, _info| {
                         let f = f;
+                        let ctx = ctx;
                         move |input, output| {
                             input.for_each(|cap, data| {
                                 let mut session = output.session(&cap);
                                 for item in data.drain(..) {
-                                    for result in f(item.0) {
+                                    for result in f(item.0, &ctx) {
                                         session.give(AnyItem(result));
                                     }
                                 }
@@ -578,6 +586,8 @@ async fn execute_single_worker(
                     &mut op_contexts,
                     sink_tx,
                     rt,
+                    0,
+                    1,
                 )
             });
 
@@ -708,6 +718,8 @@ async fn execute_multi_worker(
                             &mut op_contexts,
                             sink_tx,
                             rt,
+                            idx,
+                            n_workers,
                         )
                     });
 
@@ -738,6 +750,11 @@ async fn execute_multi_worker(
     // Each send is a batch (Vec) that becomes one Timely epoch.
     let checkpoint_interval: u64 = 100;
     let mut batches_since_checkpoint: u64 = 0;
+    // Pre-exchange runs on the main async task: single reader, not a worker.
+    let pre_exchange_ctx = TransformContext {
+        worker_index: 0,
+        num_workers: 1,
+    };
 
     while let Some(batch) = source.next_batch().await {
         #[allow(clippy::cast_possible_truncation)]
@@ -750,7 +767,7 @@ async fn execute_multi_worker(
             (0..n_workers).map(|_| Vec::new()).collect();
 
         for item in batch {
-            let mid_items = apply_steps(item, &mut pre_steps).await;
+            let mid_items = apply_steps(item, &mut pre_steps, &pre_exchange_ctx).await;
             for mid in mid_items {
                 let key = key_fn(mid.as_ref());
                 let mut hasher = DefaultHasher::new();
@@ -1170,6 +1187,61 @@ mod tests {
         // All produced values must be valid doubles of the input.
         for &v in &results {
             assert!(v == 2 || v == 4 || v == 6);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn map_ctx_single_worker() {
+        let dir = temp_dir("map_ctx_single");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let graph = DataflowGraph::new();
+        let source = VecSource::new(vec![1i32, 2, 3]);
+        let collected = Arc::new(Mutex::new(Vec::new()));
+
+        let stream = graph.source(source);
+        stream
+            .map_ctx(|x: i32, ctx| format!("w{}:{x}", ctx.worker_index))
+            .sink(CollectSink {
+                collected: collected.clone(),
+            });
+
+        let executor = super::Executor::new(dir.clone());
+        executor.run(graph).await.unwrap();
+        assert_eq!(*collected.lock().unwrap(), vec!["w0:1", "w0:2", "w0:3"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn map_ctx_multi_worker() {
+        let dir = temp_dir("map_ctx_multi");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let graph = DataflowGraph::new();
+        let source = VecSource::new(vec![1i32, 2, 3, 4, 5, 6]);
+        let collected = Arc::new(Mutex::new(Vec::new()));
+
+        let stream = graph.source(source);
+        stream
+            .key_by(|x: &i32| x.to_string())
+            .map_ctx(|x: i32, ctx| (x, ctx.worker_index, ctx.num_workers))
+            .sink(CollectSink {
+                collected: collected.clone(),
+            });
+
+        let executor = super::Executor::builder()
+            .checkpoint_dir(&dir)
+            .workers(2)
+            .build();
+        executor.run(graph).await.unwrap();
+        let results = collected.lock().unwrap().clone();
+        assert_eq!(results.len(), 6);
+        for &(_, worker_idx, num_workers) in &results {
+            assert!(worker_idx < 2, "worker_index should be 0 or 1");
+            assert_eq!(num_workers, 2);
         }
         let _ = std::fs::remove_dir_all(&dir);
     }

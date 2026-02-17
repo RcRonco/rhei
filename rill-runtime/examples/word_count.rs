@@ -11,7 +11,7 @@ use rill_core::connectors::vec_source::VecSource;
 use rill_core::operators::KeyedState;
 use rill_core::state::context::StateContext;
 use rill_core::traits::StreamFunction;
-use rill_runtime::dataflow::DataflowGraph;
+use rill_runtime::dataflow::{DataflowGraph, TransformContext};
 use rill_runtime::executor::Executor;
 
 /// A stateful word-count operator using [`KeyedState`] for typed state access.
@@ -64,7 +64,9 @@ async fn main() -> anyhow::Result<()> {
             .flat_map(|line: String| line.split_whitespace().map(String::from).collect())
             .key_by(|word: &String| word.clone())
             .operator("word_counter", WordCounter)
-            .map(|result: String| format!("[output] {result}"))
+            .map_ctx(|result: String, ctx: &TransformContext| {
+                format!("[W{}] {result}", ctx.worker_index)
+            })
             .sink(PrintSink::new());
 
         let executor = Executor::builder()
@@ -74,20 +76,22 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // ── Multi-worker (2 workers) ─────────────────────────────────────
-    println!("\n=== Multi-worker (2 workers) ===");
+    println!("\n=== Multi-worker (3 workers) ===");
     {
         let graph = DataflowGraph::new();
         let stream = graph.source(VecSource::new(lines));
         stream
             .flat_map(|line: String| line.split_whitespace().map(String::from).collect())
-            .key_by(|word: &String| word.clone())
+            .key_by(|word: &String| word.to_lowercase())
             .operator("word_counter", WordCounter)
-            .map(|result: String| format!("[output] {result}"))
+            .map_ctx(|result: String, ctx: &TransformContext| {
+                format!("[W{}/{}] {result}", ctx.worker_index, ctx.num_workers)
+            })
             .sink(PrintSink::new());
 
         let executor = Executor::builder()
             .checkpoint_dir(dir.join("multi"))
-            .workers(2)
+            .workers(3)
             .build();
         executor.run(graph).await?;
     }

@@ -139,12 +139,27 @@ where
     }
 }
 
+// ── Transform context ────────────────────────────────────────────────
+
+/// Runtime context available to stateless transforms.
+///
+/// Passed to the `_ctx` variants of `.map()`, `.filter()`, and `.flat_map()`
+/// so user closures can observe worker-level metadata without requiring a
+/// full stateful operator.
+#[derive(Debug, Clone)]
+pub struct TransformContext {
+    /// Zero-based index of the current worker thread.
+    pub worker_index: usize,
+    /// Total number of worker threads in this execution.
+    pub num_workers: usize,
+}
+
 // ── Type-erased function types ───────────────────────────────────────
 
 /// Stateless transform: one item in, zero or more items out.
 /// `Arc` for sharing across workers without cloning the closure.
 pub(crate) type TransformFn =
-    Arc<dyn Fn(Box<dyn Any + Send>) -> Vec<Box<dyn Any + Send>> + Send + Sync>;
+    Arc<dyn Fn(Box<dyn Any + Send>, &TransformContext) -> Vec<Box<dyn Any + Send>> + Send + Sync>;
 
 /// Key extraction function.
 pub(crate) type KeyFn = Arc<dyn Fn(&dyn Any) -> String + Send + Sync>;
@@ -287,9 +302,25 @@ impl<'a, T: Send + 'static> Stream<'a, T> {
         F: Fn(T) -> O + Send + Sync + 'static,
         O: Send + 'static,
     {
-        let transform: TransformFn = Arc::new(move |item: Box<dyn Any + Send>| {
+        let transform: TransformFn = Arc::new(move |item: Box<dyn Any + Send>, _ctx| {
             let typed = *item.downcast::<T>().expect("type mismatch in map");
             vec![Box::new(f(typed)) as Box<dyn Any + Send>]
+        });
+        let node_id = self
+            .graph
+            .add_node(NodeKind::Transform(transform), vec![self.node_id]);
+        Stream::new(self.graph, node_id)
+    }
+
+    /// Transform each element with access to [`TransformContext`].
+    pub fn map_ctx<F, O>(self, f: F) -> Stream<'a, O>
+    where
+        F: Fn(T, &TransformContext) -> O + Send + Sync + 'static,
+        O: Send + 'static,
+    {
+        let transform: TransformFn = Arc::new(move |item: Box<dyn Any + Send>, ctx| {
+            let typed = *item.downcast::<T>().expect("type mismatch in map_ctx");
+            vec![Box::new(f(typed, ctx)) as Box<dyn Any + Send>]
         });
         let node_id = self
             .graph
@@ -302,9 +333,29 @@ impl<'a, T: Send + 'static> Stream<'a, T> {
     where
         F: Fn(&T) -> bool + Send + Sync + 'static,
     {
-        let transform: TransformFn = Arc::new(move |item: Box<dyn Any + Send>| {
+        let transform: TransformFn = Arc::new(move |item: Box<dyn Any + Send>, _ctx| {
             let typed = *item.downcast::<T>().expect("type mismatch in filter");
             if f(&typed) {
+                vec![Box::new(typed) as Box<dyn Any + Send>]
+            } else {
+                vec![]
+            }
+        });
+        let node_id = self
+            .graph
+            .add_node(NodeKind::Transform(transform), vec![self.node_id]);
+        Stream::new(self.graph, node_id)
+    }
+
+    /// Drop elements that don't match the predicate, with access to
+    /// [`TransformContext`].
+    pub fn filter_ctx<F>(self, f: F) -> Stream<'a, T>
+    where
+        F: Fn(&T, &TransformContext) -> bool + Send + Sync + 'static,
+    {
+        let transform: TransformFn = Arc::new(move |item: Box<dyn Any + Send>, ctx| {
+            let typed = *item.downcast::<T>().expect("type mismatch in filter_ctx");
+            if f(&typed, ctx) {
                 vec![Box::new(typed) as Box<dyn Any + Send>]
             } else {
                 vec![]
@@ -322,9 +373,28 @@ impl<'a, T: Send + 'static> Stream<'a, T> {
         F: Fn(T) -> Vec<O> + Send + Sync + 'static,
         O: Send + 'static,
     {
-        let transform: TransformFn = Arc::new(move |item: Box<dyn Any + Send>| {
+        let transform: TransformFn = Arc::new(move |item: Box<dyn Any + Send>, _ctx| {
             let typed = *item.downcast::<T>().expect("type mismatch in flat_map");
             f(typed)
+                .into_iter()
+                .map(|o| Box::new(o) as Box<dyn Any + Send>)
+                .collect()
+        });
+        let node_id = self
+            .graph
+            .add_node(NodeKind::Transform(transform), vec![self.node_id]);
+        Stream::new(self.graph, node_id)
+    }
+
+    /// One-to-many transform with access to [`TransformContext`].
+    pub fn flat_map_ctx<F, O>(self, f: F) -> Stream<'a, O>
+    where
+        F: Fn(T, &TransformContext) -> Vec<O> + Send + Sync + 'static,
+        O: Send + 'static,
+    {
+        let transform: TransformFn = Arc::new(move |item: Box<dyn Any + Send>, ctx| {
+            let typed = *item.downcast::<T>().expect("type mismatch in flat_map_ctx");
+            f(typed, ctx)
                 .into_iter()
                 .map(|o| Box::new(o) as Box<dyn Any + Send>)
                 .collect()
@@ -417,9 +487,26 @@ impl<'a, T: Send + 'static> KeyedStream<'a, T> {
         F: Fn(T) -> O + Send + Sync + 'static,
         O: Send + 'static,
     {
-        let transform: TransformFn = Arc::new(move |item: Box<dyn Any + Send>| {
+        let transform: TransformFn = Arc::new(move |item: Box<dyn Any + Send>, _ctx| {
             let typed = *item.downcast::<T>().expect("type mismatch in map");
             vec![Box::new(f(typed)) as Box<dyn Any + Send>]
+        });
+        let node_id = self
+            .graph
+            .add_node(NodeKind::Transform(transform), vec![self.node_id]);
+        KeyedStream::new(self.graph, node_id)
+    }
+
+    /// Transform each element with access to [`TransformContext`] (preserves
+    /// partitioning).
+    pub fn map_ctx<F, O>(self, f: F) -> KeyedStream<'a, O>
+    where
+        F: Fn(T, &TransformContext) -> O + Send + Sync + 'static,
+        O: Send + 'static,
+    {
+        let transform: TransformFn = Arc::new(move |item: Box<dyn Any + Send>, ctx| {
+            let typed = *item.downcast::<T>().expect("type mismatch in map_ctx");
+            vec![Box::new(f(typed, ctx)) as Box<dyn Any + Send>]
         });
         let node_id = self
             .graph
@@ -432,9 +519,29 @@ impl<'a, T: Send + 'static> KeyedStream<'a, T> {
     where
         F: Fn(&T) -> bool + Send + Sync + 'static,
     {
-        let transform: TransformFn = Arc::new(move |item: Box<dyn Any + Send>| {
+        let transform: TransformFn = Arc::new(move |item: Box<dyn Any + Send>, _ctx| {
             let typed = *item.downcast::<T>().expect("type mismatch in filter");
             if f(&typed) {
+                vec![Box::new(typed) as Box<dyn Any + Send>]
+            } else {
+                vec![]
+            }
+        });
+        let node_id = self
+            .graph
+            .add_node(NodeKind::Transform(transform), vec![self.node_id]);
+        KeyedStream::new(self.graph, node_id)
+    }
+
+    /// Drop elements that don't match the predicate, with access to
+    /// [`TransformContext`] (preserves partitioning).
+    pub fn filter_ctx<F>(self, f: F) -> KeyedStream<'a, T>
+    where
+        F: Fn(&T, &TransformContext) -> bool + Send + Sync + 'static,
+    {
+        let transform: TransformFn = Arc::new(move |item: Box<dyn Any + Send>, ctx| {
+            let typed = *item.downcast::<T>().expect("type mismatch in filter_ctx");
+            if f(&typed, ctx) {
                 vec![Box::new(typed) as Box<dyn Any + Send>]
             } else {
                 vec![]
@@ -452,9 +559,29 @@ impl<'a, T: Send + 'static> KeyedStream<'a, T> {
         F: Fn(T) -> Vec<O> + Send + Sync + 'static,
         O: Send + 'static,
     {
-        let transform: TransformFn = Arc::new(move |item: Box<dyn Any + Send>| {
+        let transform: TransformFn = Arc::new(move |item: Box<dyn Any + Send>, _ctx| {
             let typed = *item.downcast::<T>().expect("type mismatch in flat_map");
             f(typed)
+                .into_iter()
+                .map(|o| Box::new(o) as Box<dyn Any + Send>)
+                .collect()
+        });
+        let node_id = self
+            .graph
+            .add_node(NodeKind::Transform(transform), vec![self.node_id]);
+        KeyedStream::new(self.graph, node_id)
+    }
+
+    /// One-to-many transform with access to [`TransformContext`] (preserves
+    /// partitioning).
+    pub fn flat_map_ctx<F, O>(self, f: F) -> KeyedStream<'a, O>
+    where
+        F: Fn(T, &TransformContext) -> Vec<O> + Send + Sync + 'static,
+        O: Send + 'static,
+    {
+        let transform: TransformFn = Arc::new(move |item: Box<dyn Any + Send>, ctx| {
+            let typed = *item.downcast::<T>().expect("type mismatch in flat_map_ctx");
+            f(typed, ctx)
                 .into_iter()
                 .map(|o| Box::new(o) as Box<dyn Any + Send>)
                 .collect()
