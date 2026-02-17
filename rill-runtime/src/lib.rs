@@ -31,9 +31,10 @@
 pub mod async_operator;
 /// Async-to-sync channel bridges for Timely dataflow integration.
 pub mod bridge;
+/// Graph compilation: logical [`DataflowGraph`](dataflow::DataflowGraph) to executable segments.
+pub(crate) mod compiler;
 /// Dataflow graph API: [`DataflowGraph`](dataflow::DataflowGraph),
-/// [`Stream<T>`](dataflow::Stream), [`KeyedStream<T>`](dataflow::KeyedStream),
-/// and type-erased execution engine.
+/// [`Stream<T>`](dataflow::Stream), [`KeyedStream<T>`](dataflow::KeyedStream).
 pub mod dataflow;
 /// Pipeline executor with Timely-backed multi-worker support.
 pub mod executor;

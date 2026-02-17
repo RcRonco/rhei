@@ -75,7 +75,7 @@ pub fn render_log_viewer(
             ];
             if let Some(w) = entry.worker {
                 spans.push(Span::styled(
-                    format!("[W{w}] "),
+                    format!("Worker={w} "),
                     Style::default().fg(Color::Magenta),
                 ));
             }
