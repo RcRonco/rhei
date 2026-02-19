@@ -37,7 +37,7 @@ where
 impl<F, T> StreamFunction for FilterOp<F, T>
 where
     F: Fn(&T) -> bool + Send + Sync,
-    T: Send + 'static,
+    T: Clone + Send + 'static,
 {
     type Input = T;
     type Output = T;

@@ -1,8 +1,6 @@
-use std::any::Any;
-
 use rill_core::traits::{Sink, Source};
 
-use crate::dataflow::ErasedSource;
+use crate::dataflow::{AnyItem, ErasedSource};
 use crate::shutdown::ShutdownHandle;
 
 /// Bridges an async `Source` into a `tokio::sync::mpsc::Receiver` for use in Timely.
@@ -65,7 +63,7 @@ pub(crate) fn erased_source_bridge(
     mut source: Box<dyn ErasedSource>,
     rt: &tokio::runtime::Handle,
     shutdown: Option<ShutdownHandle>,
-) -> tokio::sync::mpsc::Receiver<Vec<Box<dyn Any + Send>>> {
+) -> tokio::sync::mpsc::Receiver<Vec<AnyItem>> {
     let (tx, rx) = tokio::sync::mpsc::channel(16);
     rt.spawn(async move {
         while let Some(batch) = source.next_batch().await {

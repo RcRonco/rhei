@@ -37,8 +37,8 @@ where
 impl<F, I, O> StreamFunction for MapOp<F, I, O>
 where
     F: Fn(I) -> O + Send + Sync,
-    I: Send + 'static,
-    O: Send + 'static,
+    I: Clone + Send + 'static,
+    O: Clone + Send + 'static,
 {
     type Input = I;
     type Output = O;
@@ -77,8 +77,8 @@ where
 impl<F, I, O> StreamFunction for FlatMapOp<F, I, O>
 where
     F: Fn(I) -> Vec<O> + Send + Sync,
-    I: Send + 'static,
-    O: Send + 'static,
+    I: Clone + Send + 'static,
+    O: Clone + Send + 'static,
 {
     type Input = I;
     type Output = O;

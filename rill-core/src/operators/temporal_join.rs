@@ -133,9 +133,9 @@ where
 #[async_trait]
 impl<L, R, O, KF, JF> StreamFunction for TemporalJoin<L, R, KF, JF>
 where
-    L: Serialize + DeserializeOwned + Send + Sync,
-    R: Serialize + DeserializeOwned + Send + Sync,
-    O: Send,
+    L: Clone + Serialize + DeserializeOwned + Send + Sync,
+    R: Clone + Serialize + DeserializeOwned + Send + Sync,
+    O: Clone + Send,
     KF: Fn(&JoinSide<L, R>) -> String + Send + Sync,
     JF: Fn(L, R) -> O + Send + Sync,
 {

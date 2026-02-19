@@ -17,6 +17,7 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 metrics.workspace = true
 metrics-exporter-prometheus.workspace = true
+seahash = "4"
 
 [features]
 kafka = ["rill-core/kafka"]

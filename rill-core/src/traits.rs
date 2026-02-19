@@ -10,9 +10,9 @@ use crate::state::context::StateContext;
 #[async_trait]
 pub trait StreamFunction: Send + Sync {
     /// The element type consumed by this operator.
-    type Input: Send;
+    type Input: Clone + Send;
     /// The element type produced by this operator.
-    type Output: Send;
+    type Output: Clone + Send;
 
     /// Processes a single input element and returns zero or more output elements.
     async fn process(&mut self, input: Self::Input, ctx: &mut StateContext) -> Vec<Self::Output>;

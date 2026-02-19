@@ -206,9 +206,9 @@ fn window_starts_for(timestamp: u64, window_size: u64, slide: u64) -> Vec<u64> {
 #[async_trait]
 impl<T, A, KF, TF> StreamFunction for SlidingWindow<T, A, KF, TF>
 where
-    T: Send + Sync,
+    T: Clone + Send + Sync,
     A: Aggregator<Input = T>,
-    A::Output: Send,
+    A::Output: Clone + Send,
     KF: Fn(&T) -> String + Send + Sync,
     TF: Fn(&T) -> u64 + Send + Sync,
 {

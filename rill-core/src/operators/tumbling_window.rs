@@ -187,9 +187,9 @@ where
 #[async_trait]
 impl<T, A, KF, TF> StreamFunction for TumblingWindow<T, A, KF, TF>
 where
-    T: Send + Sync,
+    T: Clone + Send + Sync,
     A: Aggregator<Input = T>,
-    A::Output: Send,
+    A::Output: Clone + Send,
     KF: Fn(&T) -> String + Send + Sync,
     TF: Fn(&T) -> u64 + Send + Sync,
 {

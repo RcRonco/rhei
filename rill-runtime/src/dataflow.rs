@@ -33,6 +33,73 @@ use async_trait::async_trait;
 use rill_core::state::context::StateContext;
 use rill_core::traits::{Sink, Source, StreamFunction};
 
+// ── Cloneable type-erased wrapper ────────────────────────────────────
+
+/// Object-safe trait for cloneable, type-erased values.
+///
+/// Implemented automatically for all `T: Clone + Any + Send`. This enables
+/// `AnyItem` to genuinely clone its contents, which is required for Timely's
+/// `Exchange` pact (used in distributed execution).
+pub(crate) trait CloneAnySend: Any + Send {
+    /// Clone the value into a new boxed trait object.
+    fn clone_box(&self) -> Box<dyn CloneAnySend>;
+    /// Convert to `Box<dyn Any + Send>` for downcasting.
+    fn into_any(self: Box<Self>) -> Box<dyn Any + Send>;
+    /// Borrow as `&dyn Any` for type checking and ref downcasting.
+    fn as_any_ref(&self) -> &dyn Any;
+}
+
+impl<T: Clone + Any + Send> CloneAnySend for T {
+    fn clone_box(&self) -> Box<dyn CloneAnySend> {
+        Box::new(self.clone())
+    }
+
+    fn into_any(self: Box<Self>) -> Box<dyn Any + Send> {
+        self
+    }
+
+    fn as_any_ref(&self) -> &dyn Any {
+        self
+    }
+}
+
+/// Cloneable, type-erased wrapper for pipeline elements.
+///
+/// All values flowing through the Timely dataflow are wrapped in `AnyItem`.
+/// With `Clone` bounds on `StreamFunction::Input`/`Output`, the clone is
+/// genuine (not a panic stub), enabling future use of Timely's `Exchange` pact.
+pub(crate) struct AnyItem(Box<dyn CloneAnySend>);
+
+impl Clone for AnyItem {
+    fn clone(&self) -> Self {
+        AnyItem(self.0.clone_box())
+    }
+}
+
+impl AnyItem {
+    /// Wrap a concrete typed value.
+    pub(crate) fn new<T: Clone + Send + 'static>(value: T) -> Self {
+        AnyItem(Box::new(value))
+    }
+
+    /// Consume and downcast to concrete type `T`. Panics on type mismatch.
+    pub(crate) fn downcast<T: 'static>(self) -> T {
+        *self
+            .0
+            .into_any()
+            .downcast::<T>()
+            .unwrap_or_else(|_| panic!("AnyItem: expected {}", std::any::type_name::<T>()))
+    }
+
+    /// Borrow and downcast to `&T`. Panics on type mismatch.
+    pub(crate) fn downcast_ref<T: 'static>(&self) -> &T {
+        self.0
+            .as_any_ref()
+            .downcast_ref::<T>()
+            .unwrap_or_else(|| panic!("AnyItem: expected &{}", std::any::type_name::<T>()))
+    }
+}
+
 // ── Node identity ────────────────────────────────────────────────────
 
 /// Opaque identifier for a node in the dataflow graph.
@@ -41,10 +108,10 @@ pub(crate) struct NodeId(pub(crate) usize);
 
 // ── Type-erased traits ───────────────────────────────────────────────
 
-/// Type-erased source: produces batches of `Box<dyn Any + Send>`.
+/// Type-erased source: produces batches of [`AnyItem`].
 #[async_trait]
 pub(crate) trait ErasedSource: Send {
-    async fn next_batch(&mut self) -> Option<Vec<Box<dyn Any + Send>>>;
+    async fn next_batch(&mut self) -> Option<Vec<AnyItem>>;
     async fn on_checkpoint_complete(&mut self) -> anyhow::Result<()>;
 }
 
@@ -55,16 +122,11 @@ struct SourceWrapper<S: Source>(S);
 impl<S> ErasedSource for SourceWrapper<S>
 where
     S: Source + 'static,
-    S::Output: 'static,
+    S::Output: Clone + 'static,
 {
-    async fn next_batch(&mut self) -> Option<Vec<Box<dyn Any + Send>>> {
+    async fn next_batch(&mut self) -> Option<Vec<AnyItem>> {
         let batch = self.0.next_batch().await?;
-        Some(
-            batch
-                .into_iter()
-                .map(|item| Box::new(item) as Box<dyn Any + Send>)
-                .collect(),
-        )
+        Some(batch.into_iter().map(AnyItem::new).collect())
     }
 
     async fn on_checkpoint_complete(&mut self) -> anyhow::Result<()> {
@@ -72,10 +134,10 @@ where
     }
 }
 
-/// Type-erased sink: consumes `Box<dyn Any + Send>`.
+/// Type-erased sink: consumes [`AnyItem`].
 #[async_trait]
 pub(crate) trait ErasedSink: Send {
-    async fn write(&mut self, item: Box<dyn Any + Send>) -> anyhow::Result<()>;
+    async fn write(&mut self, item: AnyItem) -> anyhow::Result<()>;
     async fn flush(&mut self) -> anyhow::Result<()>;
 }
 
@@ -88,8 +150,8 @@ where
     K: Sink + 'static,
     K::Input: 'static,
 {
-    async fn write(&mut self, item: Box<dyn Any + Send>) -> anyhow::Result<()> {
-        let typed = *item.downcast::<K::Input>().expect("type mismatch in sink");
+    async fn write(&mut self, item: AnyItem) -> anyhow::Result<()> {
+        let typed: K::Input = item.downcast();
         self.0.write(typed).await
     }
 
@@ -101,11 +163,7 @@ where
 /// Type-erased stateful operator. Must be cloneable for multi-worker.
 #[async_trait]
 pub(crate) trait ErasedOperator: Send {
-    async fn process(
-        &mut self,
-        input: Box<dyn Any + Send>,
-        ctx: &mut StateContext,
-    ) -> Vec<Box<dyn Any + Send>>;
+    async fn process(&mut self, input: AnyItem, ctx: &mut StateContext) -> Vec<AnyItem>;
     fn clone_erased(&self) -> Box<dyn ErasedOperator>;
 }
 
@@ -119,19 +177,10 @@ where
     F::Input: 'static,
     F::Output: 'static,
 {
-    async fn process(
-        &mut self,
-        input: Box<dyn Any + Send>,
-        ctx: &mut StateContext,
-    ) -> Vec<Box<dyn Any + Send>> {
-        let typed = *input
-            .downcast::<F::Input>()
-            .expect("type mismatch in operator");
+    async fn process(&mut self, input: AnyItem, ctx: &mut StateContext) -> Vec<AnyItem> {
+        let typed: F::Input = input.downcast();
         let results = self.0.process(typed, ctx).await;
-        results
-            .into_iter()
-            .map(|r| Box::new(r) as Box<dyn Any + Send>)
-            .collect()
+        results.into_iter().map(AnyItem::new).collect()
     }
 
     fn clone_erased(&self) -> Box<dyn ErasedOperator> {
@@ -156,13 +205,12 @@ pub struct TransformContext {
 
 // ── Type-erased function types ───────────────────────────────────────
 
-/// Stateless transform: one item in, zero or more items out.
+/// Stateless transform: one [`AnyItem`] in, zero or more out.
 /// `Arc` for sharing across workers without cloning the closure.
-pub(crate) type TransformFn =
-    Arc<dyn Fn(Box<dyn Any + Send>, &TransformContext) -> Vec<Box<dyn Any + Send>> + Send + Sync>;
+pub(crate) type TransformFn = Arc<dyn Fn(AnyItem, &TransformContext) -> Vec<AnyItem> + Send + Sync>;
 
 /// Key extraction function.
-pub(crate) type KeyFn = Arc<dyn Fn(&dyn Any) -> String + Send + Sync>;
+pub(crate) type KeyFn = Arc<dyn Fn(&AnyItem) -> String + Send + Sync>;
 
 // ── Graph nodes ──────────────────────────────────────────────────────
 
@@ -230,7 +278,7 @@ impl DataflowGraph {
     pub fn source<S>(&self, source: S) -> Stream<'_, S::Output>
     where
         S: Source + 'static,
-        S::Output: Send + 'static,
+        S::Output: Clone + Send + 'static,
     {
         let id = self.add_node(NodeKind::Source(Box::new(SourceWrapper(source))), vec![]);
         Stream::new(self, id)
@@ -287,7 +335,7 @@ impl<T> Clone for Stream<'_, T> {
 }
 impl<T> Copy for Stream<'_, T> {}
 
-impl<'a, T: Send + 'static> Stream<'a, T> {
+impl<'a, T: Clone + Send + 'static> Stream<'a, T> {
     pub(crate) fn new(graph: &'a DataflowGraph, node_id: NodeId) -> Self {
         Self {
             graph,
@@ -300,11 +348,11 @@ impl<'a, T: Send + 'static> Stream<'a, T> {
     pub fn map<F, O>(self, f: F) -> Stream<'a, O>
     where
         F: Fn(T) -> O + Send + Sync + 'static,
-        O: Send + 'static,
+        O: Clone + Send + 'static,
     {
-        let transform: TransformFn = Arc::new(move |item: Box<dyn Any + Send>, _ctx| {
-            let typed = *item.downcast::<T>().expect("type mismatch in map");
-            vec![Box::new(f(typed)) as Box<dyn Any + Send>]
+        let transform: TransformFn = Arc::new(move |item: AnyItem, _ctx| {
+            let typed: T = item.downcast();
+            vec![AnyItem::new(f(typed))]
         });
         let node_id = self
             .graph
@@ -316,11 +364,11 @@ impl<'a, T: Send + 'static> Stream<'a, T> {
     pub fn map_ctx<F, O>(self, f: F) -> Stream<'a, O>
     where
         F: Fn(T, &TransformContext) -> O + Send + Sync + 'static,
-        O: Send + 'static,
+        O: Clone + Send + 'static,
     {
-        let transform: TransformFn = Arc::new(move |item: Box<dyn Any + Send>, ctx| {
-            let typed = *item.downcast::<T>().expect("type mismatch in map_ctx");
-            vec![Box::new(f(typed, ctx)) as Box<dyn Any + Send>]
+        let transform: TransformFn = Arc::new(move |item: AnyItem, ctx| {
+            let typed: T = item.downcast();
+            vec![AnyItem::new(f(typed, ctx))]
         });
         let node_id = self
             .graph
@@ -333,10 +381,10 @@ impl<'a, T: Send + 'static> Stream<'a, T> {
     where
         F: Fn(&T) -> bool + Send + Sync + 'static,
     {
-        let transform: TransformFn = Arc::new(move |item: Box<dyn Any + Send>, _ctx| {
-            let typed = *item.downcast::<T>().expect("type mismatch in filter");
+        let transform: TransformFn = Arc::new(move |item: AnyItem, _ctx| {
+            let typed: T = item.downcast();
             if f(&typed) {
-                vec![Box::new(typed) as Box<dyn Any + Send>]
+                vec![AnyItem::new(typed)]
             } else {
                 vec![]
             }
@@ -353,10 +401,10 @@ impl<'a, T: Send + 'static> Stream<'a, T> {
     where
         F: Fn(&T, &TransformContext) -> bool + Send + Sync + 'static,
     {
-        let transform: TransformFn = Arc::new(move |item: Box<dyn Any + Send>, ctx| {
-            let typed = *item.downcast::<T>().expect("type mismatch in filter_ctx");
+        let transform: TransformFn = Arc::new(move |item: AnyItem, ctx| {
+            let typed: T = item.downcast();
             if f(&typed, ctx) {
-                vec![Box::new(typed) as Box<dyn Any + Send>]
+                vec![AnyItem::new(typed)]
             } else {
                 vec![]
             }
@@ -371,14 +419,11 @@ impl<'a, T: Send + 'static> Stream<'a, T> {
     pub fn flat_map<F, O>(self, f: F) -> Stream<'a, O>
     where
         F: Fn(T) -> Vec<O> + Send + Sync + 'static,
-        O: Send + 'static,
+        O: Clone + Send + 'static,
     {
-        let transform: TransformFn = Arc::new(move |item: Box<dyn Any + Send>, _ctx| {
-            let typed = *item.downcast::<T>().expect("type mismatch in flat_map");
-            f(typed)
-                .into_iter()
-                .map(|o| Box::new(o) as Box<dyn Any + Send>)
-                .collect()
+        let transform: TransformFn = Arc::new(move |item: AnyItem, _ctx| {
+            let typed: T = item.downcast();
+            f(typed).into_iter().map(AnyItem::new).collect()
         });
         let node_id = self
             .graph
@@ -390,14 +435,11 @@ impl<'a, T: Send + 'static> Stream<'a, T> {
     pub fn flat_map_ctx<F, O>(self, f: F) -> Stream<'a, O>
     where
         F: Fn(T, &TransformContext) -> Vec<O> + Send + Sync + 'static,
-        O: Send + 'static,
+        O: Clone + Send + 'static,
     {
-        let transform: TransformFn = Arc::new(move |item: Box<dyn Any + Send>, ctx| {
-            let typed = *item.downcast::<T>().expect("type mismatch in flat_map_ctx");
-            f(typed, ctx)
-                .into_iter()
-                .map(|o| Box::new(o) as Box<dyn Any + Send>)
-                .collect()
+        let transform: TransformFn = Arc::new(move |item: AnyItem, ctx| {
+            let typed: T = item.downcast();
+            f(typed, ctx).into_iter().map(AnyItem::new).collect()
         });
         let node_id = self
             .graph
@@ -414,8 +456,8 @@ impl<'a, T: Send + 'static> Stream<'a, T> {
     where
         KF: Fn(&T) -> String + Send + Sync + 'static,
     {
-        let erased_key_fn: KeyFn = Arc::new(move |item: &dyn Any| {
-            let typed = item.downcast_ref::<T>().expect("type mismatch in key_by");
+        let erased_key_fn: KeyFn = Arc::new(move |item: &AnyItem| {
+            let typed = item.downcast_ref::<T>();
             key_fn(typed)
         });
         let node_id = self
@@ -472,7 +514,7 @@ impl<T> Clone for KeyedStream<'_, T> {
 }
 impl<T> Copy for KeyedStream<'_, T> {}
 
-impl<'a, T: Send + 'static> KeyedStream<'a, T> {
+impl<'a, T: Clone + Send + 'static> KeyedStream<'a, T> {
     pub(crate) fn new(graph: &'a DataflowGraph, node_id: NodeId) -> Self {
         Self {
             graph,
@@ -485,11 +527,11 @@ impl<'a, T: Send + 'static> KeyedStream<'a, T> {
     pub fn map<F, O>(self, f: F) -> KeyedStream<'a, O>
     where
         F: Fn(T) -> O + Send + Sync + 'static,
-        O: Send + 'static,
+        O: Clone + Send + 'static,
     {
-        let transform: TransformFn = Arc::new(move |item: Box<dyn Any + Send>, _ctx| {
-            let typed = *item.downcast::<T>().expect("type mismatch in map");
-            vec![Box::new(f(typed)) as Box<dyn Any + Send>]
+        let transform: TransformFn = Arc::new(move |item: AnyItem, _ctx| {
+            let typed: T = item.downcast();
+            vec![AnyItem::new(f(typed))]
         });
         let node_id = self
             .graph
@@ -502,11 +544,11 @@ impl<'a, T: Send + 'static> KeyedStream<'a, T> {
     pub fn map_ctx<F, O>(self, f: F) -> KeyedStream<'a, O>
     where
         F: Fn(T, &TransformContext) -> O + Send + Sync + 'static,
-        O: Send + 'static,
+        O: Clone + Send + 'static,
     {
-        let transform: TransformFn = Arc::new(move |item: Box<dyn Any + Send>, ctx| {
-            let typed = *item.downcast::<T>().expect("type mismatch in map_ctx");
-            vec![Box::new(f(typed, ctx)) as Box<dyn Any + Send>]
+        let transform: TransformFn = Arc::new(move |item: AnyItem, ctx| {
+            let typed: T = item.downcast();
+            vec![AnyItem::new(f(typed, ctx))]
         });
         let node_id = self
             .graph
@@ -519,10 +561,10 @@ impl<'a, T: Send + 'static> KeyedStream<'a, T> {
     where
         F: Fn(&T) -> bool + Send + Sync + 'static,
     {
-        let transform: TransformFn = Arc::new(move |item: Box<dyn Any + Send>, _ctx| {
-            let typed = *item.downcast::<T>().expect("type mismatch in filter");
+        let transform: TransformFn = Arc::new(move |item: AnyItem, _ctx| {
+            let typed: T = item.downcast();
             if f(&typed) {
-                vec![Box::new(typed) as Box<dyn Any + Send>]
+                vec![AnyItem::new(typed)]
             } else {
                 vec![]
             }
@@ -539,10 +581,10 @@ impl<'a, T: Send + 'static> KeyedStream<'a, T> {
     where
         F: Fn(&T, &TransformContext) -> bool + Send + Sync + 'static,
     {
-        let transform: TransformFn = Arc::new(move |item: Box<dyn Any + Send>, ctx| {
-            let typed = *item.downcast::<T>().expect("type mismatch in filter_ctx");
+        let transform: TransformFn = Arc::new(move |item: AnyItem, ctx| {
+            let typed: T = item.downcast();
             if f(&typed, ctx) {
-                vec![Box::new(typed) as Box<dyn Any + Send>]
+                vec![AnyItem::new(typed)]
             } else {
                 vec![]
             }
@@ -557,14 +599,11 @@ impl<'a, T: Send + 'static> KeyedStream<'a, T> {
     pub fn flat_map<F, O>(self, f: F) -> KeyedStream<'a, O>
     where
         F: Fn(T) -> Vec<O> + Send + Sync + 'static,
-        O: Send + 'static,
+        O: Clone + Send + 'static,
     {
-        let transform: TransformFn = Arc::new(move |item: Box<dyn Any + Send>, _ctx| {
-            let typed = *item.downcast::<T>().expect("type mismatch in flat_map");
-            f(typed)
-                .into_iter()
-                .map(|o| Box::new(o) as Box<dyn Any + Send>)
-                .collect()
+        let transform: TransformFn = Arc::new(move |item: AnyItem, _ctx| {
+            let typed: T = item.downcast();
+            f(typed).into_iter().map(AnyItem::new).collect()
         });
         let node_id = self
             .graph
@@ -577,14 +616,11 @@ impl<'a, T: Send + 'static> KeyedStream<'a, T> {
     pub fn flat_map_ctx<F, O>(self, f: F) -> KeyedStream<'a, O>
     where
         F: Fn(T, &TransformContext) -> Vec<O> + Send + Sync + 'static,
-        O: Send + 'static,
+        O: Clone + Send + 'static,
     {
-        let transform: TransformFn = Arc::new(move |item: Box<dyn Any + Send>, ctx| {
-            let typed = *item.downcast::<T>().expect("type mismatch in flat_map_ctx");
-            f(typed, ctx)
-                .into_iter()
-                .map(|o| Box::new(o) as Box<dyn Any + Send>)
-                .collect()
+        let transform: TransformFn = Arc::new(move |item: AnyItem, ctx| {
+            let typed: T = item.downcast();
+            f(typed, ctx).into_iter().map(AnyItem::new).collect()
         });
         let node_id = self
             .graph
@@ -616,8 +652,8 @@ impl<'a, T: Send + 'static> KeyedStream<'a, T> {
     where
         KF: Fn(&T) -> String + Send + Sync + 'static,
     {
-        let erased_key_fn: KeyFn = Arc::new(move |item: &dyn Any| {
-            let typed = item.downcast_ref::<T>().expect("type mismatch in key_by");
+        let erased_key_fn: KeyFn = Arc::new(move |item: &AnyItem| {
+            let typed = item.downcast_ref::<T>();
             key_fn(typed)
         });
         let node_id = self

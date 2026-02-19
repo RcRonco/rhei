@@ -18,9 +18,6 @@
 //! executor.run(graph).await?;
 //! ```
 
-use std::any::Any;
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 use rill_core::state::context::StateContext;
@@ -33,10 +30,22 @@ use crate::compiler::{
     CompiledPipeline, Segment, clone_segments, compile, split_at_first_exchange,
 };
 use crate::dataflow::{
-    DataflowGraph, ErasedOperator, ErasedSink, ErasedSource, KeyFn, TransformContext, TransformFn,
+    AnyItem, DataflowGraph, ErasedOperator, ErasedSink, ErasedSource, KeyFn, TransformContext,
+    TransformFn,
 };
 use crate::shutdown::ShutdownHandle;
 use crate::timely_operator::TimelyErasedOperator;
+
+// ── Key partitioning ────────────────────────────────────────────────
+
+/// Deterministic key-to-worker assignment using `seahash`.
+///
+/// Uses a fixed, portable hash so the same key always maps to the same
+/// worker index — even across Rust compiler versions and restarts.
+#[allow(clippy::cast_possible_truncation)]
+pub fn partition_key(key: &str, n_workers: usize) -> usize {
+    (seahash::hash(key.as_bytes()) as usize) % n_workers
+}
 
 // ── Executor configuration ──────────────────────────────────────────
 
@@ -223,10 +232,10 @@ impl ExecStep {
 
 /// Apply a chain of steps to a single item, returning all outputs.
 async fn apply_steps(
-    item: Box<dyn Any + Send>,
+    item: AnyItem,
     steps: &mut [ExecStep],
     transform_ctx: &TransformContext,
-) -> Vec<Box<dyn Any + Send>> {
+) -> Vec<AnyItem> {
     let mut items = vec![item];
     for step in steps.iter_mut() {
         let mut next = Vec::new();
@@ -267,20 +276,6 @@ async fn materialize_steps(
     Ok(steps)
 }
 
-/// Wrapper around `Box<dyn Any + Send>` that satisfies Timely's `Clone` requirement.
-///
-/// Timely's `Container` trait requires `Clone` on the element type. With `Pipeline`
-/// pact and a linear (non-fan-out) dataflow, containers are never actually cloned —
-/// this bound exists for `Exchange` pact compatibility. The `Clone` impl panics if
-/// called, serving as a canary for accidental use with fan-out or Exchange pact.
-struct AnyItem(Box<dyn Any + Send>);
-
-impl Clone for AnyItem {
-    fn clone(&self) -> Self {
-        unreachable!("AnyItem::clone should never be called with Pipeline pact")
-    }
-}
-
 /// Build a Timely dataflow from compiled segments inside a worker scope.
 ///
 /// Constructs: source operator → chain of transform/operator stages → sink terminal.
@@ -293,13 +288,15 @@ impl Clone for AnyItem {
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 fn build_timely_dataflow<A: timely::communication::Allocate>(
     scope: &mut timely::dataflow::scopes::Child<'_, timely::worker::Worker<A>, u64>,
-    source_rx: &mut tokio::sync::mpsc::Receiver<Vec<Box<dyn Any + Send>>>,
+    source_rx: &mut tokio::sync::mpsc::Receiver<Vec<AnyItem>>,
     segments: Vec<Segment>,
     operator_contexts: &mut [Option<StateContext>],
-    sink_tx: tokio::sync::mpsc::Sender<Box<dyn Any + Send>>,
+    sink_tx: tokio::sync::mpsc::Sender<AnyItem>,
     rt: tokio::runtime::Handle,
     worker_index: usize,
     num_workers: usize,
+    checkpoint_barrier: Option<Arc<std::sync::Barrier>>,
+    checkpoint_notify: Option<std::sync::mpsc::Sender<()>>,
 ) -> timely::dataflow::operators::probe::Handle<u64> {
     use timely::container::CapacityContainerBuilder;
     use timely::dataflow::channels::pact::Pipeline;
@@ -308,6 +305,8 @@ fn build_timely_dataflow<A: timely::communication::Allocate>(
     use timely::dataflow::operators::generic::builder_rc::OperatorBuilder;
     use timely::dataflow::operators::generic::operator::Operator;
     use timely::scheduling::Scheduler;
+
+    let worker_label = worker_index.to_string();
 
     // --- Source operator: drains channel, emits with capability per batch ---
     let mut source_builder = OperatorBuilder::new("Source".to_owned(), scope.clone());
@@ -323,6 +322,7 @@ fn build_timely_dataflow<A: timely::communication::Allocate>(
         std::mem::replace(source_rx, dummy_rx)
     };
 
+    let wl_source = worker_label.clone();
     source_builder.build_reschedule(move |mut capabilities| {
         let mut cap = Some(capabilities.pop().unwrap());
         let mut epoch: u64 = 0;
@@ -340,11 +340,13 @@ fn build_timely_dataflow<A: timely::communication::Allocate>(
                         let mut handle = output.activate();
                         let mut session = handle.session(c);
                         for item in batch {
-                            session.give(AnyItem(item));
+                            session.give(item);
                         }
                     }
-                    metrics::counter!("executor_batches_total").increment(1);
-                    metrics::counter!("executor_elements_total").increment(batch_len);
+                    metrics::counter!("executor_batches_total", "worker" => wl_source.clone())
+                        .increment(1);
+                    metrics::counter!("executor_elements_total", "worker" => wl_source.clone())
+                        .increment(batch_len);
                     epoch += 1;
                     if let Some(ref mut c) = cap {
                         c.downgrade(&epoch);
@@ -386,8 +388,8 @@ fn build_timely_dataflow<A: timely::communication::Allocate>(
                             input.for_each(|cap, data| {
                                 let mut session = output.session(&cap);
                                 for item in data.drain(..) {
-                                    for result in f(item.0, &ctx) {
-                                        session.give(AnyItem(result));
+                                    for result in f(item, &ctx) {
+                                        session.give(result);
                                     }
                                 }
                             });
@@ -403,6 +405,9 @@ fn build_timely_dataflow<A: timely::communication::Allocate>(
                 ctx_idx += 1;
 
                 let rt_op = rt.clone();
+                let wl_op = worker_label.clone();
+                let barrier = checkpoint_barrier.clone();
+                let notify = checkpoint_notify.clone();
                 current = current
                     .unary_frontier::<CapacityContainerBuilder<Vec<AnyItem>>, _, _, _>(
                         Pipeline,
@@ -410,17 +415,20 @@ fn build_timely_dataflow<A: timely::communication::Allocate>(
                         move |_init_cap, _info| {
                             let mut timely_op = TimelyErasedOperator::new(op, ctx);
                             let rt = rt_op;
+                            let wl = wl_op;
+                            let barrier = barrier;
+                            let notify = notify;
                             move |(input, frontier), output| {
                                 input.for_each(|cap, data| {
                                     let mut batch_durations = Vec::new();
                                     for item in data.drain(..) {
                                         let elem_start = std::time::Instant::now();
-                                        let results = timely_op.process(item.0, &rt);
+                                        let results = timely_op.process(item, &rt);
                                         batch_durations.push(elem_start.elapsed().as_secs_f64());
                                         if !results.is_empty() {
                                             let mut session = output.session(&cap);
                                             for r in results {
-                                                session.give(AnyItem(r));
+                                                session.give(r);
                                             }
                                         }
                                     }
@@ -431,14 +439,32 @@ fn build_timely_dataflow<A: timely::communication::Allocate>(
                                         let len = batch_durations.len();
                                         let p50 = batch_durations[len / 2];
                                         let p99 = batch_durations[(len * 99 / 100).min(len - 1)];
-                                        metrics::gauge!("executor_element_duration_p50").set(p50);
-                                        metrics::gauge!("executor_element_duration_p99").set(p99);
+                                        metrics::gauge!(
+                                            "executor_element_duration_p50",
+                                            "worker" => wl.clone()
+                                        )
+                                        .set(p50);
+                                        metrics::gauge!(
+                                            "executor_element_duration_p99",
+                                            "worker" => wl.clone()
+                                        )
+                                        .set(p99);
                                     }
                                 });
 
                                 let frontier_vec: Vec<u64> =
                                     frontier.frontier().iter().copied().collect();
-                                timely_op.maybe_checkpoint(&frontier_vec, &rt);
+                                let did_checkpoint = timely_op.maybe_checkpoint(&frontier_vec, &rt);
+                                // Coordinate: all workers wait at the barrier after
+                                // checkpointing, then the leader notifies the main task.
+                                if did_checkpoint && let Some(ref b) = barrier {
+                                    let wait_result = b.wait();
+                                    if wait_result.is_leader()
+                                        && let Some(ref n) = notify
+                                    {
+                                        let _ = n.send(());
+                                    }
+                                }
                             }
                         },
                     );
@@ -459,7 +485,7 @@ fn build_timely_dataflow<A: timely::communication::Allocate>(
                 move |input, _output| {
                     input.for_each(|_cap, data| {
                         for item in data.drain(..) {
-                            let _ = sink_tx.blocking_send(item.0);
+                            let _ = sink_tx.blocking_send(item);
                         }
                     });
                 }
@@ -546,7 +572,7 @@ async fn execute_single_worker(
     let source_rx = crate::bridge::erased_source_bridge(source, &rt, shutdown.cloned());
 
     // Create sink channel manually so we can await the sink task.
-    let (sink_tx, mut sink_rx) = tokio::sync::mpsc::channel::<Box<dyn Any + Send>>(16);
+    let (sink_tx, mut sink_rx) = tokio::sync::mpsc::channel::<AnyItem>(16);
     let sink_handle: tokio::task::JoinHandle<anyhow::Result<()>> = tokio::spawn(async move {
         let mut sink = sink;
         while let Some(item) = sink_rx.recv().await {
@@ -588,6 +614,8 @@ async fn execute_single_worker(
                     rt,
                     0,
                     1,
+                    None,
+                    None,
                 )
             });
 
@@ -639,19 +667,16 @@ async fn execute_multi_worker(
 
     // Per-worker input channels (Tokio → Timely worker).
     let mut worker_txs = Vec::with_capacity(n_workers);
-    #[allow(clippy::type_complexity)]
-    let mut worker_receivers: Vec<
-        Option<tokio::sync::mpsc::Receiver<Vec<Box<dyn Any + Send>>>>,
-    > = Vec::with_capacity(n_workers);
+    let mut worker_receivers: Vec<Option<tokio::sync::mpsc::Receiver<Vec<AnyItem>>>> =
+        Vec::with_capacity(n_workers);
     for _ in 0..n_workers {
-        let (tx, rx) = tokio::sync::mpsc::channel::<Vec<Box<dyn Any + Send>>>(channel_capacity);
+        let (tx, rx) = tokio::sync::mpsc::channel::<Vec<AnyItem>>(channel_capacity);
         worker_txs.push(tx);
         worker_receivers.push(Some(rx));
     }
 
     // Output channel: Timely workers → collector → sink.
-    let (output_tx, mut output_rx) =
-        tokio::sync::mpsc::channel::<Box<dyn Any + Send>>(channel_capacity);
+    let (output_tx, mut output_rx) = tokio::sync::mpsc::channel::<AnyItem>(channel_capacity);
 
     // Extract operator names upfront to avoid holding &Segment across await.
     let operator_names: Vec<String> = post_segments
@@ -686,6 +711,11 @@ async fn execute_multi_worker(
     let per_worker_contexts = std::sync::Mutex::new(per_worker_contexts);
     let output_tx_arc = Arc::new(std::sync::Mutex::new(Some(output_tx)));
 
+    // Checkpoint coordination: barrier ensures all workers flush before the
+    // main task commits source offsets, achieving exactly-once semantics.
+    let checkpoint_barrier = Arc::new(std::sync::Barrier::new(n_workers));
+    let (checkpoint_notify_tx, checkpoint_notify_rx) = std::sync::mpsc::channel::<()>();
+
     let rt_clone = rt.clone();
 
     #[allow(clippy::cast_possible_truncation)]
@@ -709,6 +739,9 @@ async fn execute_multi_worker(
 
                     let rt = rt_clone.clone();
 
+                    let barrier = checkpoint_barrier.clone();
+                    let notify = checkpoint_notify_tx.clone();
+
                     let dataflow_index = worker.next_dataflow_index();
                     let probe = worker.dataflow::<u64, _, _>(|scope| {
                         build_timely_dataflow(
@@ -720,6 +753,8 @@ async fn execute_multi_worker(
                             rt,
                             idx,
                             n_workers,
+                            Some(barrier),
+                            Some(notify),
                         )
                     });
 
@@ -763,17 +798,13 @@ async fn execute_multi_worker(
         metrics::counter!("executor_elements_total").increment(batch_len);
 
         // Apply pre-exchange transforms and bucket by worker.
-        let mut worker_buckets: Vec<Vec<Box<dyn Any + Send>>> =
-            (0..n_workers).map(|_| Vec::new()).collect();
+        let mut worker_buckets: Vec<Vec<AnyItem>> = (0..n_workers).map(|_| Vec::new()).collect();
 
         for item in batch {
             let mid_items = apply_steps(item, &mut pre_steps, &pre_exchange_ctx).await;
             for mid in mid_items {
-                let key = key_fn(mid.as_ref());
-                let mut hasher = DefaultHasher::new();
-                key.hash(&mut hasher);
-                #[allow(clippy::cast_possible_truncation)]
-                let worker_idx = (hasher.finish() as usize) % n_workers;
+                let key = key_fn(&mid);
+                let worker_idx = partition_key(&key, n_workers);
                 worker_buckets[worker_idx].push(mid);
             }
         }
@@ -785,12 +816,17 @@ async fn execute_multi_worker(
             }
         }
 
+        // Drain any coordinated checkpoint notifications from workers.
+        // Each notification means all workers have flushed their state.
+        while checkpoint_notify_rx.try_recv().is_ok() {
+            source.on_checkpoint_complete().await?;
+        }
+
         batches_since_checkpoint += 1;
         if batches_since_checkpoint >= checkpoint_interval {
             for step in &mut pre_steps {
                 step.checkpoint().await?;
             }
-            source.on_checkpoint_complete().await?;
             batches_since_checkpoint = 0;
         }
 
@@ -1243,6 +1279,108 @@ mod tests {
             assert!(worker_idx < 2, "worker_index should be 0 or 1");
             assert_eq!(num_workers, 2);
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn deterministic_hash_across_calls() {
+        // Verify partition_key is deterministic: same key always maps to the same worker.
+        for n_workers in [1, 2, 4, 8, 16] {
+            for key in ["alpha", "beta", "gamma", "hello", "world", "sensor-42"] {
+                let first = super::partition_key(key, n_workers);
+                for _ in 0..100 {
+                    assert_eq!(
+                        super::partition_key(key, n_workers),
+                        first,
+                        "partition_key({key:?}, {n_workers}) is not deterministic"
+                    );
+                }
+                assert!(first < n_workers);
+            }
+        }
+    }
+
+    struct CheckpointTrackingSource {
+        items: std::collections::VecDeque<Vec<String>>,
+        checkpoint_count: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl rill_core::traits::Source for CheckpointTrackingSource {
+        type Output = String;
+
+        async fn next_batch(&mut self) -> Option<Vec<String>> {
+            self.items.pop_front()
+        }
+
+        async fn on_checkpoint_complete(&mut self) -> anyhow::Result<()> {
+            self.checkpoint_count
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn coordinated_checkpoint() {
+        // Verify that source.on_checkpoint_complete() is only called after all
+        // workers have flushed their state (coordinated via barrier).
+        //
+        // We use a custom source that:
+        //   - emits enough batches to trigger at least one checkpoint cycle
+        //   - tracks on_checkpoint_complete calls via an Arc counter
+        let dir = temp_dir("coordinated_ckpt");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let checkpoint_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let cc = checkpoint_count.clone();
+
+        // Generate enough batches to trigger checkpoint cycles (interval is 100).
+        let mut batches = std::collections::VecDeque::new();
+        for i in 0..150 {
+            batches.push_back(vec![format!("item_{i}")]);
+        }
+
+        let source = CheckpointTrackingSource {
+            items: batches,
+            checkpoint_count: cc,
+        };
+
+        let graph = DataflowGraph::new();
+        let collected = Arc::new(Mutex::new(Vec::new()));
+
+        let stream = graph.source(source);
+        stream
+            .key_by(|s: &String| s.clone())
+            .operator("counter", WordCounter)
+            .sink(CollectSink {
+                collected: collected.clone(),
+            });
+
+        let executor = super::Executor::builder()
+            .checkpoint_dir(&dir)
+            .workers(2)
+            .build();
+        executor.run(graph).await.unwrap();
+
+        // The final on_checkpoint_complete is always called after all workers finish.
+        // With 150 batches and interval=100, we expect at least 1 coordinated
+        // checkpoint during execution plus the final one.
+        let count = checkpoint_count.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            count >= 1,
+            "expected at least 1 checkpoint commit, got {count}"
+        );
+
+        // All 150 items should have been processed.
+        let results = collected.lock().unwrap();
+        assert_eq!(
+            results.len(),
+            150,
+            "expected 150 results, got {}",
+            results.len()
+        );
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

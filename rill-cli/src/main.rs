@@ -55,7 +55,10 @@ fn main() -> anyhow::Result<()> {
             cmd_new(&name)
         }
         Commands::Run { tui: true, workers } => cmd_run_tui(cli.log_level, workers),
-        Commands::Run { tui: false, .. } => {
+        Commands::Run {
+            tui: false,
+            workers,
+        } => {
             let _telemetry =
                 rill_runtime::telemetry::init(rill_runtime::telemetry::TelemetryConfig {
                     metrics_addr: None,
@@ -63,7 +66,7 @@ fn main() -> anyhow::Result<()> {
                     json_logs: cli.json_logs,
                     tui: false,
                 })?;
-            cmd_run()
+            cmd_run(workers)
         }
     }
 }
@@ -143,12 +146,15 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn cmd_run() -> anyhow::Result<()> {
+fn cmd_run(workers: usize) -> anyhow::Result<()> {
     if !Path::new("Cargo.toml").exists() {
         anyhow::bail!("No Cargo.toml found. Are you in a Rill project directory?");
     }
 
-    let status = Command::new("cargo").arg("run").status()?;
+    let status = Command::new("cargo")
+        .arg("run")
+        .env("RILL_WORKERS", workers.to_string())
+        .status()?;
 
     if !status.success() {
         anyhow::bail!("cargo run failed with status: {status}");
