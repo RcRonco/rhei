@@ -52,8 +52,8 @@ impl<F: StreamFunction + 'static> TimelyAsyncOperator<F> {
     }
 
     /// Process an input element, marking the epoch as retained.
-    /// Returns immediately-completed outputs.
-    pub fn process(&mut self, input: F::Input, epoch: u64) -> Vec<F::Output> {
+    /// Returns immediately-completed outputs and errors.
+    pub fn process(&mut self, input: F::Input, epoch: u64) -> (Vec<F::Output>, Vec<anyhow::Error>) {
         self.retained_caps
             .entry(epoch)
             .or_insert(CapabilityToken { epoch });
@@ -61,7 +61,7 @@ impl<F: StreamFunction + 'static> TimelyAsyncOperator<F> {
     }
 
     /// Poll pending futures and collect completed results.
-    pub fn poll_pending(&mut self) -> Vec<F::Output> {
+    pub fn poll_pending(&mut self) -> (Vec<F::Output>, Vec<anyhow::Error>) {
         self.inner.poll_pending()
     }
 
@@ -128,8 +128,17 @@ impl TimelyErasedOperator {
 
     /// Process a type-erased input item. Blocks on the Tokio runtime since
     /// we're running on a Timely worker thread (not a Tokio thread).
-    pub fn process(&mut self, input: AnyItem, rt: &tokio::runtime::Handle) -> Vec<AnyItem> {
-        rt.block_on(self.op.process(input, &mut self.ctx))
+    ///
+    /// Returns `(outputs, errors)`.
+    pub fn process(
+        &mut self,
+        input: AnyItem,
+        rt: &tokio::runtime::Handle,
+    ) -> (Vec<AnyItem>, Vec<anyhow::Error>) {
+        match rt.block_on(self.op.process(input, &mut self.ctx)) {
+            Ok(results) => (results, vec![]),
+            Err(e) => (vec![], vec![e]),
+        }
     }
 
     /// Checkpoint state when frontier advances past last checkpoint epoch.

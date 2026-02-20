@@ -30,12 +30,16 @@ impl StreamFunction for Uppercase {
     type Input = KafkaMessage;
     type Output = KafkaRecord;
 
-    async fn process(&mut self, input: KafkaMessage, _ctx: &mut StateContext) -> Vec<KafkaRecord> {
+    async fn process(
+        &mut self,
+        input: KafkaMessage,
+        _ctx: &mut StateContext,
+    ) -> anyhow::Result<Vec<KafkaRecord>> {
         let Some(payload) = input.payload else {
-            return vec![];
+            return Ok(vec![]);
         };
         let text = String::from_utf8_lossy(&payload).to_uppercase();
-        vec![KafkaRecord::new(text.into_bytes())]
+        Ok(vec![KafkaRecord::new(text.into_bytes())])
     }
 }
 

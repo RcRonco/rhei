@@ -37,7 +37,7 @@ use rill_core::traits::{Sink, Source, StreamFunction};
 
 /// Object-safe trait for cloneable, type-erased values.
 ///
-/// Implemented automatically for all `T: Clone + Any + Send`. This enables
+/// Implemented automatically for all `T: Clone + Any + Send + Debug`. This enables
 /// `AnyItem` to genuinely clone its contents, which is required for Timely's
 /// `Exchange` pact (used in distributed execution).
 pub(crate) trait CloneAnySend: Any + Send {
@@ -47,9 +47,11 @@ pub(crate) trait CloneAnySend: Any + Send {
     fn into_any(self: Box<Self>) -> Box<dyn Any + Send>;
     /// Borrow as `&dyn Any` for type checking and ref downcasting.
     fn as_any_ref(&self) -> &dyn Any;
+    /// Best-effort debug representation for DLQ diagnostics.
+    fn debug_repr(&self) -> String;
 }
 
-impl<T: Clone + Any + Send> CloneAnySend for T {
+impl<T: Clone + Any + Send + std::fmt::Debug> CloneAnySend for T {
     fn clone_box(&self) -> Box<dyn CloneAnySend> {
         Box::new(self.clone())
     }
@@ -60,6 +62,10 @@ impl<T: Clone + Any + Send> CloneAnySend for T {
 
     fn as_any_ref(&self) -> &dyn Any {
         self
+    }
+
+    fn debug_repr(&self) -> String {
+        format!("{self:?}")
     }
 }
 
@@ -78,7 +84,7 @@ impl Clone for AnyItem {
 
 impl AnyItem {
     /// Wrap a concrete typed value.
-    pub(crate) fn new<T: Clone + Send + 'static>(value: T) -> Self {
+    pub(crate) fn new<T: Clone + Send + std::fmt::Debug + 'static>(value: T) -> Self {
         AnyItem(Box::new(value))
     }
 
@@ -97,6 +103,11 @@ impl AnyItem {
             .as_any_ref()
             .downcast_ref::<T>()
             .unwrap_or_else(|| panic!("AnyItem: expected &{}", std::any::type_name::<T>()))
+    }
+
+    /// Best-effort debug representation for DLQ diagnostics.
+    pub(crate) fn debug_repr(&self) -> String {
+        self.0.debug_repr()
     }
 }
 
@@ -122,7 +133,7 @@ struct SourceWrapper<S: Source>(S);
 impl<S> ErasedSource for SourceWrapper<S>
 where
     S: Source + 'static,
-    S::Output: Clone + 'static,
+    S::Output: Clone + std::fmt::Debug + 'static,
 {
     async fn next_batch(&mut self) -> Option<Vec<AnyItem>> {
         let batch = self.0.next_batch().await?;
@@ -163,7 +174,11 @@ where
 /// Type-erased stateful operator. Must be cloneable for multi-worker.
 #[async_trait]
 pub(crate) trait ErasedOperator: Send {
-    async fn process(&mut self, input: AnyItem, ctx: &mut StateContext) -> Vec<AnyItem>;
+    async fn process(
+        &mut self,
+        input: AnyItem,
+        ctx: &mut StateContext,
+    ) -> anyhow::Result<Vec<AnyItem>>;
     fn clone_erased(&self) -> Box<dyn ErasedOperator>;
 }
 
@@ -177,10 +192,14 @@ where
     F::Input: 'static,
     F::Output: 'static,
 {
-    async fn process(&mut self, input: AnyItem, ctx: &mut StateContext) -> Vec<AnyItem> {
+    async fn process(
+        &mut self,
+        input: AnyItem,
+        ctx: &mut StateContext,
+    ) -> anyhow::Result<Vec<AnyItem>> {
         let typed: F::Input = input.downcast();
-        let results = self.0.process(typed, ctx).await;
-        results.into_iter().map(AnyItem::new).collect()
+        let results = self.0.process(typed, ctx).await?;
+        Ok(results.into_iter().map(AnyItem::new).collect())
     }
 
     fn clone_erased(&self) -> Box<dyn ErasedOperator> {
@@ -278,7 +297,7 @@ impl DataflowGraph {
     pub fn source<S>(&self, source: S) -> Stream<'_, S::Output>
     where
         S: Source + 'static,
-        S::Output: Clone + Send + 'static,
+        S::Output: Clone + Send + std::fmt::Debug + 'static,
     {
         let id = self.add_node(NodeKind::Source(Box::new(SourceWrapper(source))), vec![]);
         Stream::new(self, id)
@@ -335,7 +354,7 @@ impl<T> Clone for Stream<'_, T> {
 }
 impl<T> Copy for Stream<'_, T> {}
 
-impl<'a, T: Clone + Send + 'static> Stream<'a, T> {
+impl<'a, T: Clone + Send + std::fmt::Debug + 'static> Stream<'a, T> {
     pub(crate) fn new(graph: &'a DataflowGraph, node_id: NodeId) -> Self {
         Self {
             graph,
@@ -348,7 +367,7 @@ impl<'a, T: Clone + Send + 'static> Stream<'a, T> {
     pub fn map<F, O>(self, f: F) -> Stream<'a, O>
     where
         F: Fn(T) -> O + Send + Sync + 'static,
-        O: Clone + Send + 'static,
+        O: Clone + Send + std::fmt::Debug + 'static,
     {
         let transform: TransformFn = Arc::new(move |item: AnyItem, _ctx| {
             let typed: T = item.downcast();
@@ -364,7 +383,7 @@ impl<'a, T: Clone + Send + 'static> Stream<'a, T> {
     pub fn map_ctx<F, O>(self, f: F) -> Stream<'a, O>
     where
         F: Fn(T, &TransformContext) -> O + Send + Sync + 'static,
-        O: Clone + Send + 'static,
+        O: Clone + Send + std::fmt::Debug + 'static,
     {
         let transform: TransformFn = Arc::new(move |item: AnyItem, ctx| {
             let typed: T = item.downcast();
@@ -419,7 +438,7 @@ impl<'a, T: Clone + Send + 'static> Stream<'a, T> {
     pub fn flat_map<F, O>(self, f: F) -> Stream<'a, O>
     where
         F: Fn(T) -> Vec<O> + Send + Sync + 'static,
-        O: Clone + Send + 'static,
+        O: Clone + Send + std::fmt::Debug + 'static,
     {
         let transform: TransformFn = Arc::new(move |item: AnyItem, _ctx| {
             let typed: T = item.downcast();
@@ -435,7 +454,7 @@ impl<'a, T: Clone + Send + 'static> Stream<'a, T> {
     pub fn flat_map_ctx<F, O>(self, f: F) -> Stream<'a, O>
     where
         F: Fn(T, &TransformContext) -> Vec<O> + Send + Sync + 'static,
-        O: Clone + Send + 'static,
+        O: Clone + Send + std::fmt::Debug + 'static,
     {
         let transform: TransformFn = Arc::new(move |item: AnyItem, ctx| {
             let typed: T = item.downcast();
@@ -514,7 +533,7 @@ impl<T> Clone for KeyedStream<'_, T> {
 }
 impl<T> Copy for KeyedStream<'_, T> {}
 
-impl<'a, T: Clone + Send + 'static> KeyedStream<'a, T> {
+impl<'a, T: Clone + Send + std::fmt::Debug + 'static> KeyedStream<'a, T> {
     pub(crate) fn new(graph: &'a DataflowGraph, node_id: NodeId) -> Self {
         Self {
             graph,
@@ -527,7 +546,7 @@ impl<'a, T: Clone + Send + 'static> KeyedStream<'a, T> {
     pub fn map<F, O>(self, f: F) -> KeyedStream<'a, O>
     where
         F: Fn(T) -> O + Send + Sync + 'static,
-        O: Clone + Send + 'static,
+        O: Clone + Send + std::fmt::Debug + 'static,
     {
         let transform: TransformFn = Arc::new(move |item: AnyItem, _ctx| {
             let typed: T = item.downcast();
@@ -544,7 +563,7 @@ impl<'a, T: Clone + Send + 'static> KeyedStream<'a, T> {
     pub fn map_ctx<F, O>(self, f: F) -> KeyedStream<'a, O>
     where
         F: Fn(T, &TransformContext) -> O + Send + Sync + 'static,
-        O: Clone + Send + 'static,
+        O: Clone + Send + std::fmt::Debug + 'static,
     {
         let transform: TransformFn = Arc::new(move |item: AnyItem, ctx| {
             let typed: T = item.downcast();
@@ -599,7 +618,7 @@ impl<'a, T: Clone + Send + 'static> KeyedStream<'a, T> {
     pub fn flat_map<F, O>(self, f: F) -> KeyedStream<'a, O>
     where
         F: Fn(T) -> Vec<O> + Send + Sync + 'static,
-        O: Clone + Send + 'static,
+        O: Clone + Send + std::fmt::Debug + 'static,
     {
         let transform: TransformFn = Arc::new(move |item: AnyItem, _ctx| {
             let typed: T = item.downcast();
@@ -616,7 +635,7 @@ impl<'a, T: Clone + Send + 'static> KeyedStream<'a, T> {
     pub fn flat_map_ctx<F, O>(self, f: F) -> KeyedStream<'a, O>
     where
         F: Fn(T, &TransformContext) -> Vec<O> + Send + Sync + 'static,
-        O: Clone + Send + 'static,
+        O: Clone + Send + std::fmt::Debug + 'static,
     {
         let transform: TransformFn = Arc::new(move |item: AnyItem, ctx| {
             let typed: T = item.downcast();

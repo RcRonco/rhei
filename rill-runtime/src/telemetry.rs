@@ -1,6 +1,7 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
+use metrics_exporter_prometheus::PrometheusHandle;
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
@@ -11,7 +12,8 @@ use crate::tracing_capture::{CapturingLayer, LogEntry};
 /// Configuration for the observability stack.
 #[derive(Debug)]
 pub struct TelemetryConfig {
-    /// If set, start a Prometheus HTTP exporter on this address.
+    /// If set, start an HTTP server on this address with `/healthz`, `/readyz`,
+    /// and `/metrics` endpoints.
     pub metrics_addr: Option<SocketAddr>,
     /// `tracing` env-filter string (e.g. `"info"`, `"rill_core=debug"`).
     pub log_filter: String,
@@ -39,6 +41,8 @@ pub struct TelemetryHandles {
     pub metrics_rx: Option<tokio::sync::watch::Receiver<MetricsSnapshot>>,
     /// Receiver for captured log entries (only when `tui == true`).
     pub log_rx: Option<tokio::sync::mpsc::Receiver<LogEntry>>,
+    /// Prometheus exporter handle for the HTTP `/metrics` endpoint.
+    pub prometheus_handle: Option<PrometheusHandle>,
 }
 
 /// Initialize the tracing subscriber and (optionally) the Prometheus metrics exporter.
@@ -74,6 +78,7 @@ pub fn init(config: TelemetryConfig) -> anyhow::Result<TelemetryHandles> {
         Ok(TelemetryHandles {
             metrics_rx: Some(metrics_rx),
             log_rx: Some(log_rx),
+            prometheus_handle: None,
         })
     } else {
         // --- Standard mode: fmt subscriber + optional Prometheus ---
@@ -89,19 +94,21 @@ pub fn init(config: TelemetryConfig) -> anyhow::Result<TelemetryHandles> {
                 .init();
         }
 
-        // Set up Prometheus exporter if configured
-        if let Some(addr) = config.metrics_addr {
-            let builder = metrics_exporter_prometheus::PrometheusBuilder::new();
-            builder
-                .with_http_listener(addr)
-                .install()
-                .map_err(|e| anyhow::anyhow!("failed to install Prometheus exporter: {e}"))?;
-            tracing::info!(%addr, "Prometheus metrics exporter started");
-        }
+        // When metrics_addr is set, install the Prometheus recorder so the
+        // HTTP /metrics endpoint can call `handle.render()`.
+        let prometheus_handle = if config.metrics_addr.is_some() {
+            let handle = metrics_exporter_prometheus::PrometheusBuilder::new()
+                .install_recorder()
+                .map_err(|e| anyhow::anyhow!("failed to install Prometheus recorder: {e}"))?;
+            Some(handle)
+        } else {
+            None
+        };
 
         Ok(TelemetryHandles {
             metrics_rx: None,
             log_rx: None,
+            prometheus_handle,
         })
     }
 }

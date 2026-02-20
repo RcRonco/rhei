@@ -6,16 +6,20 @@ use crate::state::context::StateContext;
 ///
 /// Implementations receive an input element and a mutable reference to
 /// `StateContext` for reading/writing operator state. Returns zero or more
-/// output elements.
+/// output elements wrapped in a `Result`.
 #[async_trait]
 pub trait StreamFunction: Send + Sync {
     /// The element type consumed by this operator.
-    type Input: Clone + Send;
+    type Input: Clone + Send + std::fmt::Debug;
     /// The element type produced by this operator.
-    type Output: Clone + Send;
+    type Output: Clone + Send + std::fmt::Debug;
 
     /// Processes a single input element and returns zero or more output elements.
-    async fn process(&mut self, input: Self::Input, ctx: &mut StateContext) -> Vec<Self::Output>;
+    async fn process(
+        &mut self,
+        input: Self::Input,
+        ctx: &mut StateContext,
+    ) -> anyhow::Result<Vec<Self::Output>>;
 }
 
 /// A source that produces elements into a stream.

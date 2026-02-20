@@ -37,6 +37,10 @@ enum Commands {
         /// Number of parallel Timely worker threads
         #[arg(long, default_value = "1")]
         workers: usize,
+
+        /// Bind address for the HTTP health/metrics server (e.g. `0.0.0.0:9090`)
+        #[arg(long)]
+        metrics_addr: Option<std::net::SocketAddr>,
     },
 }
 
@@ -54,14 +58,17 @@ fn main() -> anyhow::Result<()> {
                 })?;
             cmd_new(&name)
         }
-        Commands::Run { tui: true, workers } => cmd_run_tui(cli.log_level, workers),
+        Commands::Run {
+            tui: true, workers, ..
+        } => cmd_run_tui(cli.log_level, workers),
         Commands::Run {
             tui: false,
             workers,
+            metrics_addr,
         } => {
             let _telemetry =
                 rill_runtime::telemetry::init(rill_runtime::telemetry::TelemetryConfig {
-                    metrics_addr: None,
+                    metrics_addr,
                     log_filter: cli.log_level.clone(),
                     json_logs: cli.json_logs,
                     tui: false,
@@ -111,9 +118,9 @@ impl StreamFunction for MyOperator {
     type Input = String;
     type Output = String;
 
-    async fn process(&mut self, input: String, ctx: &mut StateContext) -> Vec<String> {
+    async fn process(&mut self, input: String, ctx: &mut StateContext) -> anyhow::Result<Vec<String>> {
         // Your processing logic here
-        vec![input]
+        Ok(vec![input])
     }
 }
 
@@ -220,7 +227,7 @@ async fn run_demo_pipeline(workers: usize) -> anyhow::Result<()> {
     use rill_runtime::executor::Executor;
     use serde::{Deserialize, Serialize};
 
-    #[derive(Clone, Serialize, Deserialize)]
+    #[derive(Clone, Debug, Serialize, Deserialize)]
     struct SensorReading {
         sensor_id: String,
         value: f64,

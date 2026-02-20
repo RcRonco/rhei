@@ -14,6 +14,8 @@
 
 /// Built-in source and sink connectors.
 pub mod connectors;
+/// Dead-letter queue types.
+pub mod dlq;
 /// Event serialization and the [`Event`](event::Event) marker trait.
 pub mod event;
 /// Logical execution plan builder ([`StreamGraph`](graph::StreamGraph)).
@@ -41,9 +43,13 @@ mod compile_tests {
         type Input = String;
         type Output = String;
 
-        async fn process(&mut self, input: String, ctx: &mut StateContext) -> Vec<String> {
+        async fn process(
+            &mut self,
+            input: String,
+            ctx: &mut StateContext,
+        ) -> anyhow::Result<Vec<String>> {
             let _ = ctx.get(b"key").await;
-            vec![input]
+            Ok(vec![input])
         }
     }
 
@@ -57,7 +63,7 @@ mod compile_tests {
         let mut ctx = StateContext::new(Box::new(backend));
         let mut op = MyOp;
 
-        let result = op.process("hello".to_string(), &mut ctx).await;
+        let result = op.process("hello".to_string(), &mut ctx).await.unwrap();
         assert_eq!(result, vec!["hello".to_string()]);
 
         let _ = std::fs::remove_file(&path);

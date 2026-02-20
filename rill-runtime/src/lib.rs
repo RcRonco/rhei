@@ -38,6 +38,10 @@ pub(crate) mod compiler;
 pub mod dataflow;
 /// Pipeline executor with Timely-backed multi-worker support.
 pub mod executor;
+/// Pipeline health state for readiness and liveness probes.
+pub mod health;
+/// HTTP server for health checks and Prometheus metrics.
+pub mod http_server;
 /// Decoupled metrics snapshot data layer for dashboards and exporters.
 pub mod metrics_snapshot;
 /// Graceful shutdown coordination.

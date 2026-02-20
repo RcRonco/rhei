@@ -22,6 +22,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 metrics = "0.24"
 metrics-exporter-prometheus = "0.16"
 ratatui = "0.29"
+axum = "0.8"
 rdkafka = { version = "0.36", features = ["cmake-build"] }
 tempfile = "3"
 

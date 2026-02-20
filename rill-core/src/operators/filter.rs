@@ -37,16 +37,16 @@ where
 impl<F, T> StreamFunction for FilterOp<F, T>
 where
     F: Fn(&T) -> bool + Send + Sync,
-    T: Clone + Send + 'static,
+    T: Clone + Send + std::fmt::Debug + 'static,
 {
     type Input = T;
     type Output = T;
 
-    async fn process(&mut self, input: T, _ctx: &mut StateContext) -> Vec<T> {
+    async fn process(&mut self, input: T, _ctx: &mut StateContext) -> anyhow::Result<Vec<T>> {
         if (self.predicate)(&input) {
-            vec![input]
+            Ok(vec![input])
         } else {
-            vec![]
+            Ok(vec![])
         }
     }
 }

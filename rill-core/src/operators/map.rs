@@ -37,14 +37,14 @@ where
 impl<F, I, O> StreamFunction for MapOp<F, I, O>
 where
     F: Fn(I) -> O + Send + Sync,
-    I: Clone + Send + 'static,
-    O: Clone + Send + 'static,
+    I: Clone + Send + std::fmt::Debug + 'static,
+    O: Clone + Send + std::fmt::Debug + 'static,
 {
     type Input = I;
     type Output = O;
 
-    async fn process(&mut self, input: I, _ctx: &mut StateContext) -> Vec<O> {
-        vec![(self.f)(input)]
+    async fn process(&mut self, input: I, _ctx: &mut StateContext) -> anyhow::Result<Vec<O>> {
+        Ok(vec![(self.f)(input)])
     }
 }
 
@@ -77,13 +77,13 @@ where
 impl<F, I, O> StreamFunction for FlatMapOp<F, I, O>
 where
     F: Fn(I) -> Vec<O> + Send + Sync,
-    I: Clone + Send + 'static,
-    O: Clone + Send + 'static,
+    I: Clone + Send + std::fmt::Debug + 'static,
+    O: Clone + Send + std::fmt::Debug + 'static,
 {
     type Input = I;
     type Output = O;
 
-    async fn process(&mut self, input: I, _ctx: &mut StateContext) -> Vec<O> {
-        (self.f)(input)
+    async fn process(&mut self, input: I, _ctx: &mut StateContext) -> anyhow::Result<Vec<O>> {
+        Ok((self.f)(input))
     }
 }

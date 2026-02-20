@@ -20,6 +20,7 @@
 
 use std::sync::Arc;
 
+use rill_core::dlq::ErrorPolicy;
 use rill_core::state::context::StateContext;
 use rill_core::state::local_backend::LocalBackend;
 use rill_core::state::prefixed_backend::PrefixedBackend;
@@ -33,6 +34,7 @@ use crate::dataflow::{
     AnyItem, DataflowGraph, ErasedOperator, ErasedSink, ErasedSource, KeyFn, TransformContext,
     TransformFn,
 };
+use crate::health::{HealthState, PipelineStatus};
 use crate::shutdown::ShutdownHandle;
 use crate::timely_operator::TimelyErasedOperator;
 
@@ -65,6 +67,8 @@ pub struct Executor {
     checkpoint_dir: std::path::PathBuf,
     tiered: Option<TieredStorageConfig>,
     workers: usize,
+    error_policy: ErrorPolicy,
+    health: HealthState,
 }
 
 /// Builder for [`Executor`].
@@ -73,6 +77,8 @@ pub struct ExecutorBuilder {
     checkpoint_dir: std::path::PathBuf,
     workers: usize,
     tiered: Option<TieredStorageConfig>,
+    error_policy: ErrorPolicy,
+    health: HealthState,
 }
 
 impl ExecutorBuilder {
@@ -89,12 +95,26 @@ impl ExecutorBuilder {
         self
     }
 
+    /// Set the error handling policy for operator failures.
+    pub fn error_policy(mut self, policy: ErrorPolicy) -> Self {
+        self.error_policy = policy;
+        self
+    }
+
+    /// Set a custom [`HealthState`] to share with the HTTP server.
+    pub fn health(mut self, health: HealthState) -> Self {
+        self.health = health;
+        self
+    }
+
     /// Build the executor.
     pub fn build(self) -> Executor {
         Executor {
             checkpoint_dir: self.checkpoint_dir,
             tiered: self.tiered,
             workers: self.workers,
+            error_policy: self.error_policy,
+            health: self.health,
         }
     }
 }
@@ -106,6 +126,8 @@ impl Executor {
             checkpoint_dir: std::path::PathBuf::from("./checkpoints"),
             workers: 1,
             tiered: None,
+            error_policy: ErrorPolicy::default(),
+            health: HealthState::new(),
         }
     }
 
@@ -117,7 +139,14 @@ impl Executor {
             checkpoint_dir,
             tiered: None,
             workers: 1,
+            error_policy: ErrorPolicy::default(),
+            health: HealthState::new(),
         }
+    }
+
+    /// Returns a reference to the executor's [`HealthState`].
+    pub fn health(&self) -> &HealthState {
+        &self.health
     }
 
     /// Set the number of parallel workers for keyed pipelines.
@@ -208,6 +237,27 @@ impl Executor {
     }
 }
 
+/// Open a DLQ file sink if the error policy requires one.
+fn open_dlq_sink(
+    policy: &ErrorPolicy,
+) -> Option<Arc<std::sync::Mutex<rill_core::connectors::dlq_file_sink::DlqFileSink>>> {
+    match policy {
+        ErrorPolicy::Skip => None,
+        ErrorPolicy::DeadLetterFile { path } => {
+            match rill_core::connectors::dlq_file_sink::DlqFileSink::open(path) {
+                Ok(sink) => {
+                    tracing::info!(path = %path.display(), "DLQ file sink opened");
+                    Some(Arc::new(std::sync::Mutex::new(sink)))
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "failed to open DLQ file — falling back to skip");
+                    None
+                }
+            }
+        }
+    }
+}
+
 // ── Execution engine ────────────────────────────────────────────────
 
 /// Materialized step for execution (operators have their `StateContext`).
@@ -242,9 +292,13 @@ async fn apply_steps(
         for item in items {
             match step {
                 ExecStep::Transform(f) => next.extend(f(item, transform_ctx)),
-                ExecStep::Operator { op, ctx, .. } => {
-                    next.extend(op.process(item, ctx).await);
-                }
+                ExecStep::Operator { op, ctx, .. } => match op.process(item, ctx).await {
+                    Ok(results) => next.extend(results),
+                    Err(e) => {
+                        tracing::error!(error = %e, "operator error in pre-exchange step");
+                        metrics::counter!("dlq_items_total").increment(1);
+                    }
+                },
             }
         }
         items = next;
@@ -297,6 +351,7 @@ fn build_timely_dataflow<A: timely::communication::Allocate>(
     num_workers: usize,
     checkpoint_barrier: Option<Arc<std::sync::Barrier>>,
     checkpoint_notify: Option<std::sync::mpsc::Sender<()>>,
+    dlq_sink: Option<Arc<std::sync::Mutex<rill_core::connectors::dlq_file_sink::DlqFileSink>>>,
 ) -> timely::dataflow::operators::probe::Handle<u64> {
     use timely::container::CapacityContainerBuilder;
     use timely::dataflow::channels::pact::Pipeline;
@@ -408,6 +463,8 @@ fn build_timely_dataflow<A: timely::communication::Allocate>(
                 let wl_op = worker_label.clone();
                 let barrier = checkpoint_barrier.clone();
                 let notify = checkpoint_notify.clone();
+                let dlq = dlq_sink.clone();
+                let op_name = name.clone();
                 current = current
                     .unary_frontier::<CapacityContainerBuilder<Vec<AnyItem>>, _, _, _>(
                         Pipeline,
@@ -418,13 +475,40 @@ fn build_timely_dataflow<A: timely::communication::Allocate>(
                             let wl = wl_op;
                             let barrier = barrier;
                             let notify = notify;
+                            let dlq = dlq;
+                            let op_name = op_name;
                             move |(input, frontier), output| {
                                 input.for_each(|cap, data| {
                                     let mut batch_durations = Vec::new();
                                     for item in data.drain(..) {
+                                        let input_repr = item.debug_repr();
                                         let elem_start = std::time::Instant::now();
-                                        let results = timely_op.process(item, &rt);
+                                        let (results, errors) = timely_op.process(item, &rt);
                                         batch_durations.push(elem_start.elapsed().as_secs_f64());
+                                        for e in errors {
+                                            tracing::warn!(
+                                                error = %e,
+                                                operator = %op_name,
+                                                "operator error — routing to DLQ"
+                                            );
+                                            metrics::counter!("dlq_items_total").increment(1);
+                                            if let Some(ref dlq) = dlq {
+                                                let record = rill_core::dlq::DeadLetterRecord {
+                                                    input_repr: input_repr.clone(),
+                                                    operator_name: op_name.clone(),
+                                                    error: e.to_string(),
+                                                    timestamp: {
+                                                        let d = std::time::SystemTime::now()
+                                                            .duration_since(std::time::UNIX_EPOCH)
+                                                            .unwrap_or_default();
+                                                        format!("{}", d.as_secs())
+                                                    },
+                                                };
+                                                if let Ok(mut sink) = dlq.lock() {
+                                                    let _ = sink.write_record(&record);
+                                                }
+                                            }
+                                        }
                                         if !results.is_empty() {
                                             let mut session = output.session(&cap);
                                             for r in results {
@@ -583,6 +667,8 @@ async fn execute_single_worker(
     });
 
     // Package for the Timely closure (Fn, not FnOnce — use Mutex+Option+take).
+    let dlq_sink = open_dlq_sink(&executor.error_policy);
+
     let source_rx = std::sync::Mutex::new(Some(source_rx));
     let segments = std::sync::Mutex::new(Some(segments));
     let operator_contexts = std::sync::Mutex::new(Some(operator_contexts));
@@ -616,6 +702,7 @@ async fn execute_single_worker(
                     1,
                     None,
                     None,
+                    dlq_sink.clone(),
                 )
             });
 
@@ -661,6 +748,7 @@ async fn execute_multi_worker(
 ) -> anyhow::Result<()> {
     let rt = tokio::runtime::Handle::current();
     let channel_capacity = 256;
+    let dlq_sink = open_dlq_sink(&executor.error_policy);
 
     // Materialize pre-exchange steps on the main task (pure async).
     let mut pre_steps = materialize_steps(pre_segments, executor, 0).await?;
@@ -755,6 +843,7 @@ async fn execute_multi_worker(
                             n_workers,
                             Some(barrier),
                             Some(notify),
+                            dlq_sink.clone(),
                         )
                     });
 
@@ -873,15 +962,20 @@ async fn run_graph(
 ) -> anyhow::Result<()> {
     let pipelines = compile(graph.into_nodes())?;
 
-    if pipelines.len() == 1 {
+    executor.health.set_status(PipelineStatus::Running);
+
+    let result = if pipelines.len() == 1 {
         let pipeline = pipelines.into_iter().next().unwrap();
         execute_pipeline(pipeline, executor, shutdown.as_ref()).await
     } else {
-        anyhow::bail!(
+        Err(anyhow::anyhow!(
             "multiple independent pipelines are not yet supported; found {}",
             pipelines.len()
-        );
-    }
+        ))
+    };
+
+    executor.health.set_status(PipelineStatus::Stopped);
+    result
 }
 
 #[cfg(test)]
@@ -1014,7 +1108,11 @@ mod tests {
         type Input = String;
         type Output = String;
 
-        async fn process(&mut self, input: String, ctx: &mut StateContext) -> Vec<String> {
+        async fn process(
+            &mut self,
+            input: String,
+            ctx: &mut StateContext,
+        ) -> anyhow::Result<Vec<String>> {
             let mut outputs = Vec::new();
             for word in input.split_whitespace() {
                 let key = word.as_bytes();
@@ -1028,7 +1126,7 @@ mod tests {
                 ctx.put(key, &count.to_le_bytes());
                 outputs.push(format!("{word}: {count}"));
             }
-            outputs
+            Ok(outputs)
         }
     }
 
