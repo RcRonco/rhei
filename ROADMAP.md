@@ -9,7 +9,7 @@
   - [x] `SessionWindow<T, A>` — gap-based windows per key
   - [x] `KeyedState<K, V>` — typed state wrapper over `StateContext` with automatic serde
   - [x] `Filter`, `Map`, `FlatMap` — stateless combinators
-- [ ] Fluent pipeline builder API (`stream.join(...).window(...).aggregate(...)`)
+- [x] Fluent pipeline builder API (`DataflowGraph` with `Stream<T>` / `KeyedStream<T>`)
 - [x] Multi-operator chaining in `run_dataflow` (currently single-operator only)
 - [ ] Hot-reload operator logic without full pipeline restart
 - [ ] `rill-cli` improvements: deploy, inspect running pipelines, replay from checkpoint
@@ -40,13 +40,14 @@
 
 ## Observability
 
-- [ ] Structured tracing spans per-operator and per-epoch
+- [x] Structured tracing spans per-operator and per-worker
 - [ ] Prometheus metrics exporter endpoint
 - [x] Backpressure metrics (stash depth, pending future count, channel utilization)
-- [ ] Throughput and latency histograms per operator
-- [ ] State size metrics (memtable entries, L2/L3 hit rates, checkpoint size)
+- [x] Throughput and latency metrics (batch/element counters, p50/p99 element duration)
+- [x] State size metrics (L1/L2/L3 hit rates, checkpoint duration)
 - [ ] Dead-letter queue for failed/dropped elements with diagnostics
-- [ ] Pipeline topology visualization (DAG from `LogicalPlan`)
+- [x] Pipeline topology visualization (TUI graph view with exchange point rendering)
+- [x] TUI dashboard with worker count, per-worker log attribution
 - [ ] Health check endpoint for liveness/readiness probes
 
 ## Performance
@@ -58,6 +59,7 @@
 - [ ] Columnar in-memory representation for windowed aggregations
 - [ ] Benchmark suite with throughput/latency targets
 - [ ] Profile and optimize the Timely ↔ Tokio bridge (channel sizing, wake strategy)
+- [ ] Batch-level type erasure (erase `Vec<T>` once per batch instead of per element)
 - [ ] Investigate `abomonation` or `flatbuffers` for Timely serialization instead of `bincode`
 
 ## Stability
@@ -74,9 +76,11 @@
 
 ## Clustering
 
-- [ ] Multi-worker Timely execution (single-process, multiple threads)
+- [x] Multi-worker Timely execution (single-process, multiple threads)
+- [x] Key-based partitioning (hash-based exchange with per-worker Timely dataflows)
+- [x] Per-worker state contexts with frontier-based checkpointing
+- [x] `--workers <N>` CLI flag
 - [ ] Multi-process Timely cluster with TCP communication
-- [ ] Key-based partitioning (`Exchange` pact) for parallel stateful operators
 - [ ] Distributed state backend (shared SlateDB or S3-backed object store)
 - [ ] Coordinated checkpointing across workers (Chandy-Lamport style)
 - [ ] Dynamic scaling: add/remove workers with state redistribution

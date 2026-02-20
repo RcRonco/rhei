@@ -161,28 +161,23 @@ where
 #[async_trait]
 impl<T, A, KF, TF> StreamFunction for SessionWindow<T, A, KF, TF>
 where
-    T: Send + Sync,
+    T: Clone + Send + Sync,
     A: Aggregator<Input = T>,
-    A::Output: Send,
+    A::Output: Clone + Send,
     KF: Fn(&T) -> String + Send + Sync,
     TF: Fn(&T) -> u64 + Send + Sync,
 {
     type Input = T;
     type Output = WindowOutput<A::Output>;
 
-    async fn process(
-        &mut self,
-        input: T,
-        ctx: &mut StateContext,
-    ) -> Vec<WindowOutput<A::Output>> {
+    async fn process(&mut self, input: T, ctx: &mut StateContext) -> Vec<WindowOutput<A::Output>> {
         let key = (self.key_fn)(&input);
         let timestamp = (self.time_fn)(&input);
         let mut outputs = Vec::new();
 
         // Load existing session state for this key
         let session: Option<SessionState<A::Accumulator>> = {
-            let mut state =
-                KeyedState::<String, SessionState<A::Accumulator>>::new(ctx, "session");
+            let mut state = KeyedState::<String, SessionState<A::Accumulator>>::new(ctx, "session");
             state.get(&key).await.unwrap_or(None)
         };
 
@@ -224,8 +219,7 @@ where
 
         // Store updated session state
         {
-            let mut state =
-                KeyedState::<String, SessionState<A::Accumulator>>::new(ctx, "session");
+            let mut state = KeyedState::<String, SessionState<A::Accumulator>>::new(ctx, "session");
             state.put(&key, &new_session);
         }
 

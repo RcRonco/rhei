@@ -17,9 +17,14 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 metrics.workspace = true
 metrics-exporter-prometheus.workspace = true
+seahash = "4"
+# rdkafka is an optional dep activated by the `kafka` feature so that
+# `cargo test --workspace` (without --features kafka) doesn't require
+# libcurl-dev / cmake to build librdkafka.
+rdkafka = { workspace = true, optional = true }
 
 [features]
-kafka = ["rill-core/kafka"]
+kafka = ["rill-core/kafka", "dep:rdkafka"]
 
 [lints]
 workspace = true
@@ -30,3 +35,6 @@ required-features = ["kafka"]
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full"] }
+tempfile.workspace = true
+serde.workspace = true
+serde_json.workspace = true

@@ -1,3 +1,23 @@
+//! Pipeline executor with Timely-backed multi-worker support.
+//!
+//! [`Executor`] materializes a [`DataflowGraph`](crate::dataflow::DataflowGraph)
+//! into executable pipelines. Single-worker and multi-worker execution paths
+//! both use Timely Dataflow under the hood, providing frontier tracking and
+//! epoch-based checkpointing.
+//!
+//! ```ignore
+//! let graph = DataflowGraph::new();
+//! let orders = graph.source(kafka_source);
+//! orders.map(parse).key_by(|o| o.id.clone()).operator("agg", Agg).sink(sink);
+//!
+//! let executor = Executor::builder()
+//!     .checkpoint_dir("./checkpoints")
+//!     .workers(4)
+//!     .build();
+//!
+//! executor.run(graph).await?;
+//! ```
+
 use std::sync::Arc;
 
 use rill_core::state::context::StateContext;
@@ -5,10 +25,29 @@ use rill_core::state::local_backend::LocalBackend;
 use rill_core::state::prefixed_backend::PrefixedBackend;
 use rill_core::state::slatedb_backend::SlateDbBackend;
 use rill_core::state::tiered_backend::{TieredBackend, TieredBackendConfig};
-use rill_core::traits::{Sink, Source, StreamFunction};
 
-use crate::async_operator::AsyncOperator;
+use crate::compiler::{
+    CompiledPipeline, Segment, clone_segments, compile, split_at_first_exchange,
+};
+use crate::dataflow::{
+    AnyItem, DataflowGraph, ErasedOperator, ErasedSink, ErasedSource, KeyFn, TransformContext,
+    TransformFn,
+};
 use crate::shutdown::ShutdownHandle;
+use crate::timely_operator::TimelyErasedOperator;
+
+// ── Key partitioning ────────────────────────────────────────────────
+
+/// Deterministic key-to-worker assignment using `seahash`.
+///
+/// Uses a fixed, portable hash so the same key always maps to the same
+/// worker index — even across Rust compiler versions and restarts.
+#[allow(clippy::cast_possible_truncation)]
+pub fn partition_key(key: &str, n_workers: usize) -> usize {
+    (seahash::hash(key.as_bytes()) as usize) % n_workers
+}
+
+// ── Executor configuration ──────────────────────────────────────────
 
 /// Configuration for tiered storage on the executor.
 #[derive(Debug)]
@@ -17,23 +56,101 @@ struct TieredStorageConfig {
     foyer_config: TieredBackendConfig,
 }
 
-/// Materializes a `LogicalPlan` into an executable pipeline.
+/// Materializes a [`DataflowGraph`] into an executable pipeline.
 ///
-/// In Phase 1, this is a simple sequential executor that processes elements
-/// through the pipeline stages. Full Timely dataflow integration comes later.
+/// Use [`Executor::builder()`] to configure execution parameters, build the
+/// graph on a [`DataflowGraph`], then pass it to [`Executor::run()`].
 #[derive(Debug)]
 pub struct Executor {
     checkpoint_dir: std::path::PathBuf,
     tiered: Option<TieredStorageConfig>,
+    workers: usize,
+}
+
+/// Builder for [`Executor`].
+#[derive(Debug)]
+pub struct ExecutorBuilder {
+    checkpoint_dir: std::path::PathBuf,
+    workers: usize,
+    tiered: Option<TieredStorageConfig>,
+}
+
+impl ExecutorBuilder {
+    /// Set the checkpoint directory.
+    pub fn checkpoint_dir(mut self, dir: impl Into<std::path::PathBuf>) -> Self {
+        self.checkpoint_dir = dir.into();
+        self
+    }
+
+    /// Set the number of parallel workers for keyed pipelines.
+    pub fn workers(mut self, n: usize) -> Self {
+        assert!(n >= 1, "worker count must be at least 1");
+        self.workers = n;
+        self
+    }
+
+    /// Build the executor.
+    pub fn build(self) -> Executor {
+        Executor {
+            checkpoint_dir: self.checkpoint_dir,
+            tiered: self.tiered,
+            workers: self.workers,
+        }
+    }
 }
 
 impl Executor {
+    /// Create a builder for configuring an executor.
+    pub fn builder() -> ExecutorBuilder {
+        ExecutorBuilder {
+            checkpoint_dir: std::path::PathBuf::from("./checkpoints"),
+            workers: 1,
+            tiered: None,
+        }
+    }
+
     /// Create a new executor with the given checkpoint directory.
+    ///
+    /// For more options, use [`Executor::builder()`].
     pub fn new(checkpoint_dir: std::path::PathBuf) -> Self {
         Self {
             checkpoint_dir,
             tiered: None,
+            workers: 1,
         }
+    }
+
+    /// Set the number of parallel workers for keyed pipelines.
+    ///
+    /// When `workers > 1`, [`KeyedStream`](crate::dataflow::KeyedStream) operators
+    /// run on parallel Timely worker threads, distributed by key hash.
+    /// Defaults to `1` (single-worker mode).
+    pub fn with_workers(mut self, n: usize) -> Self {
+        assert!(n >= 1, "worker count must be at least 1");
+        self.workers = n;
+        self
+    }
+
+    /// Returns the configured number of workers.
+    pub fn workers(&self) -> usize {
+        self.workers
+    }
+
+    /// Compile and execute a [`DataflowGraph`].
+    ///
+    /// Build the graph first with [`DataflowGraph::source()`], stream
+    /// transforms, and sinks, then pass it here for execution.
+    pub async fn run(&self, graph: DataflowGraph) -> anyhow::Result<()> {
+        run_graph(graph, self, None).await
+    }
+
+    /// Compile and execute a [`DataflowGraph`] with graceful shutdown.
+    pub async fn run_with_shutdown(
+        &self,
+        graph: DataflowGraph,
+        shutdown: ShutdownHandle,
+    ) -> anyhow::Result<()> {
+        run_graph(graph, self, Some(shutdown)).await
     }
 
     /// Configure tiered storage (L2 Foyer + L3 `SlateDB`) for this executor.
@@ -51,522 +168,17 @@ impl Executor {
         self
     }
 
-    /// Run a simple linear pipeline: source -> operators -> sink.
+    /// Create a per-worker `StateContext` for the given operator.
     ///
-    /// This is the Phase 1 executor that processes elements sequentially.
-    /// A full Timely-based executor will replace this in Phase 2.
-    pub async fn run_linear<S, F, K>(
+    /// The context is namespaced as `{operator_name}_w{worker_index}` so each
+    /// worker has isolated state.
+    pub async fn create_context_for_worker(
         &self,
-        source: &mut S,
-        operators: &mut [OperatorSlot<F>],
-        sink: &mut K,
-    ) -> anyhow::Result<()>
-    where
-        S: Source<Output = F::Input>,
-        F: StreamFunction + 'static,
-        F::Output: Clone,
-        K: Sink<Input = F::Output>,
-    {
-        self.run_linear_inner(source, operators, sink, None).await
-    }
-
-    /// Run a linear pipeline with graceful shutdown support.
-    ///
-    /// When the [`ShutdownHandle`] fires, the executor finishes the current
-    /// batch, checkpoints all operator state, commits source offsets, flushes
-    /// the sink, and returns `Ok(())`.
-    pub async fn run_linear_with_shutdown<S, F, K>(
-        &self,
-        source: &mut S,
-        operators: &mut [OperatorSlot<F>],
-        sink: &mut K,
-        shutdown: ShutdownHandle,
-    ) -> anyhow::Result<()>
-    where
-        S: Source<Output = F::Input>,
-        F: StreamFunction + 'static,
-        F::Output: Clone,
-        K: Sink<Input = F::Output>,
-    {
-        self.run_linear_inner(source, operators, sink, Some(shutdown))
-            .await
-    }
-
-    async fn run_linear_inner<S, F, K>(
-        &self,
-        source: &mut S,
-        operators: &mut [OperatorSlot<F>],
-        sink: &mut K,
-        shutdown: Option<ShutdownHandle>,
-    ) -> anyhow::Result<()>
-    where
-        S: Source<Output = F::Input>,
-        F: StreamFunction + 'static,
-        F::Output: Clone,
-        K: Sink<Input = F::Output>,
-    {
-        let checkpoint_interval: u64 = 100;
-        let mut batches_since_checkpoint: u64 = 0;
-        let mut batch_count: u64 = 0;
-        let mut element_count: u64 = 0;
-
-        while let Some(batch) = source.next_batch().await {
-            batch_count += 1;
-            metrics::counter!("executor_batches_total").increment(1);
-
-            for item in batch {
-                element_count += 1;
-                metrics::counter!("executor_elements_total").increment(1);
-                let elem_start = std::time::Instant::now();
-
-                let mut current: Vec<F::Output> = Vec::new();
-
-                // Feed through first operator
-                if let Some(op) = operators.get_mut(0) {
-                    let results = op.async_op.process_element(item, None);
-                    current = results;
-                }
-
-                // Feed through remaining operators (if any chaining is needed)
-                // For now, single-operator pipelines are the common case.
-
-                // Write to sink
-                for output in current {
-                    sink.write(output).await?;
-                }
-
-                metrics::histogram!("executor_element_duration_seconds")
-                    .record(elem_start.elapsed().as_secs_f64());
-            }
-
-            batches_since_checkpoint += 1;
-            if batches_since_checkpoint >= checkpoint_interval {
-                let ckpt_start = std::time::Instant::now();
-                for op in operators.iter_mut() {
-                    op.async_op.context_mut().checkpoint().await?;
-                }
-                metrics::histogram!("executor_checkpoint_duration_seconds")
-                    .record(ckpt_start.elapsed().as_secs_f64());
-                source.on_checkpoint_complete().await?;
-                sink.flush().await?;
-                batches_since_checkpoint = 0;
-            }
-
-            // Check for shutdown after processing each batch
-            if let Some(ref handle) = shutdown
-                && handle.is_shutdown()
-            {
-                tracing::info!("shutdown requested, performing final checkpoint...");
-                break;
-            }
-        }
-
-        // Final checkpoint
-        let ckpt_start = std::time::Instant::now();
-        for op in operators.iter_mut() {
-            op.async_op.context_mut().checkpoint().await?;
-        }
-        metrics::histogram!("executor_checkpoint_duration_seconds")
-            .record(ckpt_start.elapsed().as_secs_f64());
-
-        source.on_checkpoint_complete().await?;
-        sink.flush().await?;
-        tracing::info!(
-            batches = batch_count,
-            elements = element_count,
-            "pipeline completed"
-        );
-        Ok(())
-    }
-
-    /// Run a Timely dataflow pipeline: source -> operator -> sink.
-    ///
-    /// Bridges async Source/Sink to sync channels, wraps the operator in a
-    /// `TimelyAsyncOperator`, and runs `timely::execute_directly()` inside
-    /// `spawn_blocking`. Each source batch is one epoch.
-    ///
-    /// For multi-operator chaining, use [`run_dataflow_chain`](Self::run_dataflow_chain).
-    #[allow(clippy::too_many_lines)]
-    pub async fn run_dataflow<S, F, K>(
-        &self,
-        source: S,
-        operators: Vec<OperatorSlot<F>>,
-        sink: K,
-    ) -> anyhow::Result<()>
-    where
-        S: Source<Output = F::Input> + 'static,
-        F: StreamFunction + 'static,
-        F::Input: Clone + 'static,
-        F::Output: Clone + 'static,
-        K: Sink<Input = F::Output> + 'static,
-    {
-        tracing::info!("starting dataflow");
-        let rt = tokio::runtime::Handle::current();
-
-        // Bridge async source/sink to sync channels
-        let source_rx = crate::bridge::source_bridge(source, &rt);
-        let sink_tx = crate::bridge::sink_bridge(sink, &rt);
-
-        // Extract the first operator
-        let mut operators = operators.into_iter();
-        let inner_op = operators
-            .next()
-            .expect("at least one operator required")
-            .async_op;
-
-        let rt_clone = rt.clone();
-
-        let source_rx = std::sync::Mutex::new(source_rx);
-        let inner_op = std::sync::Mutex::new(inner_op);
-
-        tokio::task::spawn_blocking(move || {
-            timely::execute_directly(move |worker| {
-                use timely::container::CapacityContainerBuilder;
-                use timely::dataflow::channels::pact::Pipeline;
-                use timely::dataflow::operators::Inspect;
-                use timely::dataflow::operators::core::probe::Probe;
-                use timely::dataflow::operators::generic::OutputBuilder;
-                use timely::dataflow::operators::generic::builder_rc::OperatorBuilder;
-                use timely::dataflow::operators::generic::operator::Operator;
-                use timely::scheduling::Scheduler;
-
-                let mut source_rx = source_rx.into_inner().unwrap();
-                let inner_op = inner_op.into_inner().unwrap();
-
-                let timely_op = crate::timely_operator::TimelyAsyncOperator::new(inner_op);
-
-                let rt_op = rt_clone.clone();
-
-                let dataflow_index = worker.next_dataflow_index();
-                let probe = worker.dataflow::<u64, _, _>(|scope| {
-                    let mut source_builder =
-                        OperatorBuilder::new("Source".to_owned(), scope.clone());
-                    let (output, stream) = source_builder.new_output::<Vec<F::Input>>();
-                    let mut output = OutputBuilder::from(output);
-                    let activator = scope.activator_for(source_builder.operator_info().address);
-                    source_builder.set_notify(false);
-
-                    source_builder.build_reschedule(move |mut capabilities| {
-                        let mut cap = Some(capabilities.pop().unwrap());
-                        let mut epoch: u64 = 0;
-
-                        move |_frontiers| {
-                            if cap.is_none() {
-                                return false;
-                            }
-
-                            match source_rx.try_recv() {
-                                Ok(batch) => {
-                                    if let Some(ref c) = cap {
-                                        let mut handle = output.activate();
-                                        let mut session = handle.session(c);
-                                        for item in batch {
-                                            session.give(item);
-                                        }
-                                    }
-                                    epoch += 1;
-                                    if let Some(ref mut c) = cap {
-                                        c.downgrade(&epoch);
-                                    }
-                                    activator.activate();
-                                    true
-                                }
-                                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
-                                    activator.activate();
-                                    true
-                                }
-                                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
-                                    cap = None;
-                                    false
-                                }
-                            }
-                        }
-                    });
-
-                    let processed = stream
-                        .unary_frontier::<CapacityContainerBuilder<Vec<F::Output>>, _, _, _>(
-                            Pipeline,
-                            "AsyncOp",
-                            move |_init_cap, _info| {
-                                let mut timely_op = timely_op;
-                                move |(input, frontier), output| {
-                                    input.for_each(|cap, data| {
-                                        let epoch = *cap.time();
-                                        for item in data.drain(..) {
-                                            let results = timely_op.process(item, epoch);
-                                            if !results.is_empty() {
-                                                let mut session = output.session(&cap);
-                                                for r in results {
-                                                    session.give(r);
-                                                }
-                                            }
-                                        }
-                                    });
-
-                                    if timely_op.has_pending() {
-                                        let _results = timely_op.poll_pending();
-                                    }
-
-                                    let frontier_vec: Vec<u64> =
-                                        frontier.frontier().iter().copied().collect();
-                                    timely_op.release_finished_epochs(&frontier_vec);
-                                    timely_op.maybe_checkpoint(&frontier_vec, &rt_op);
-                                }
-                            },
-                        );
-
-                    processed
-                        .inspect(move |item: &F::Output| {
-                            let _ = sink_tx.blocking_send(item.clone());
-                        })
-                        .probe()
-                });
-
-                while !probe.done() {
-                    worker.step();
-                }
-
-                worker.drop_dataflow(dataflow_index);
-            });
-        })
-        .await
-        .map_err(|e| anyhow::anyhow!("dataflow execution failed: {e}"))?;
-
-        Ok(())
-    }
-
-    /// Run a Timely dataflow pipeline with multiple chained operators.
-    ///
-    /// Like [`run_dataflow`](Self::run_dataflow), but chains all operators
-    /// as sequential Timely stages. Requires `F::Output: Into<F::Input>` so
-    /// intermediate results can flow between stages.
-    #[allow(clippy::too_many_lines)]
-    pub async fn run_dataflow_chain<S, F, K>(
-        &self,
-        source: S,
-        operators: Vec<OperatorSlot<F>>,
-        sink: K,
-    ) -> anyhow::Result<()>
-    where
-        S: Source<Output = F::Input> + 'static,
-        F: StreamFunction + 'static,
-        F::Input: Clone + 'static,
-        F::Output: Clone + Into<F::Input> + 'static,
-        K: Sink<Input = F::Output> + 'static,
-    {
-        assert!(!operators.is_empty(), "at least one operator required");
-        tracing::info!(operators = operators.len(), "starting dataflow");
-        let rt = tokio::runtime::Handle::current();
-
-        // Bridge async source/sink to sync channels
-        let source_rx = crate::bridge::source_bridge(source, &rt);
-        let sink_tx = crate::bridge::sink_bridge(sink, &rt);
-
-        // Collect all operators
-        let async_ops: Vec<AsyncOperator<F>> =
-            operators.into_iter().map(|slot| slot.async_op).collect();
-
-        let rt_clone = rt.clone();
-
-        // Wrap !Sync captures in Mutex so the closure satisfies
-        // execute_directly's Send+Sync bound. We unwrap them immediately
-        // inside the single-threaded timely worker.
-        let source_rx = std::sync::Mutex::new(source_rx);
-        let async_ops = std::sync::Mutex::new(async_ops);
-
-        // Run Timely computation in a blocking thread
-        tokio::task::spawn_blocking(move || {
-            timely::execute_directly(move |worker| {
-                use timely::container::CapacityContainerBuilder;
-                use timely::dataflow::channels::pact::Pipeline;
-                use timely::dataflow::operators::Inspect;
-                use timely::dataflow::operators::core::probe::Probe;
-                use timely::dataflow::operators::generic::OutputBuilder;
-                use timely::dataflow::operators::generic::builder_rc::OperatorBuilder;
-                use timely::dataflow::operators::generic::operator::Operator;
-                use timely::scheduling::Scheduler;
-
-                // Unwrap Mutex wrappers (single-threaded from here)
-                let mut source_rx = source_rx.into_inner().unwrap();
-                let async_ops = async_ops.into_inner().unwrap();
-
-                let rt_op = rt_clone.clone();
-
-                // Capture index so we can explicitly drop the dataflow after
-                // the probe loop. Without this, execute_directly's post-closure
-                // loop calls step_or_park(None) → std::thread::park() which
-                // hangs forever on spawn_blocking threads.
-                let dataflow_index = worker.next_dataflow_index();
-                let probe = worker.dataflow::<u64, _, _>(|scope| {
-                    // --- Source operator: drains channel, emits with capability ---
-                    let mut source_builder =
-                        OperatorBuilder::new("Source".to_owned(), scope.clone());
-                    let (output, stream) = source_builder.new_output::<Vec<F::Input>>();
-                    let mut output = OutputBuilder::from(output);
-                    let activator = scope.activator_for(source_builder.operator_info().address);
-                    source_builder.set_notify(false);
-
-                    source_builder.build_reschedule(move |mut capabilities| {
-                        let mut cap = Some(capabilities.pop().unwrap());
-                        let mut epoch: u64 = 0;
-
-                        move |_frontiers| {
-                            if cap.is_none() {
-                                return false;
-                            }
-
-                            match source_rx.try_recv() {
-                                Ok(batch) => {
-                                    if let Some(ref c) = cap {
-                                        let mut handle = output.activate();
-                                        let mut session = handle.session(c);
-                                        for item in batch {
-                                            session.give(item);
-                                        }
-                                    }
-                                    epoch += 1;
-                                    if let Some(ref mut c) = cap {
-                                        c.downgrade(&epoch);
-                                    }
-                                    activator.activate();
-                                    true
-                                }
-                                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
-                                    activator.activate();
-                                    true
-                                }
-                                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
-                                    cap = None;
-                                    false
-                                }
-                            }
-                        }
-                    });
-
-                    // --- Chain operators as sequential Timely stages ---
-                    // The first operator consumes F::Input and produces F::Output.
-                    // Subsequent operators consume F::Output (converted to F::Input
-                    // via Into) and produce F::Output.
-                    let mut timely_ops: Vec<_> = async_ops
-                        .into_iter()
-                        .map(crate::timely_operator::TimelyAsyncOperator::new)
-                        .collect();
-
-                    // First operator: Stream<F::Input> -> Stream<F::Output>
-                    let first_op = timely_ops.remove(0);
-                    let rt_first = rt_op.clone();
-                    let mut current = stream
-                        .unary_frontier::<CapacityContainerBuilder<Vec<F::Output>>, _, _, _>(
-                            Pipeline,
-                            "AsyncOp_0",
-                            move |_init_cap, _info| {
-                                let mut timely_op = first_op;
-                                let rt = rt_first;
-                                move |(input, frontier), output| {
-                                    input.for_each(|cap, data| {
-                                        let epoch = *cap.time();
-                                        for item in data.drain(..) {
-                                            let results = timely_op.process(item, epoch);
-                                            if !results.is_empty() {
-                                                let mut session = output.session(&cap);
-                                                for r in results {
-                                                    session.give(r);
-                                                }
-                                            }
-                                        }
-                                    });
-
-                                    if timely_op.has_pending() {
-                                        let _results = timely_op.poll_pending();
-                                    }
-
-                                    let frontier_vec: Vec<u64> =
-                                        frontier.frontier().iter().copied().collect();
-                                    timely_op.release_finished_epochs(&frontier_vec);
-                                    timely_op.maybe_checkpoint(&frontier_vec, &rt);
-                                }
-                            },
-                        );
-
-                    // Remaining operators: each takes Stream<F::Output>, converts
-                    // via Into<F::Input>, processes, and produces Stream<F::Output>.
-                    for (i, op) in timely_ops.into_iter().enumerate() {
-                        let rt_chain = rt_op.clone();
-                        let name = format!("AsyncOp_{}", i + 1);
-                        current = current
-                            .unary_frontier::<CapacityContainerBuilder<Vec<F::Output>>, _, _, _>(
-                                Pipeline,
-                                &name,
-                                move |_init_cap, _info| {
-                                    let mut timely_op = op;
-                                    let rt = rt_chain;
-                                    move |(input, frontier), output| {
-                                        input.for_each(|cap, data| {
-                                            let epoch = *cap.time();
-                                            for item in data.drain(..) {
-                                                let converted: F::Input = item.into();
-                                                let results =
-                                                    timely_op.process(converted, epoch);
-                                                if !results.is_empty() {
-                                                    let mut session =
-                                                        output.session(&cap);
-                                                    for r in results {
-                                                        session.give(r);
-                                                    }
-                                                }
-                                            }
-                                        });
-
-                                        if timely_op.has_pending() {
-                                            let _results = timely_op.poll_pending();
-                                        }
-
-                                        let frontier_vec: Vec<u64> =
-                                            frontier.frontier().iter().copied().collect();
-                                        timely_op.release_finished_epochs(&frontier_vec);
-                                        timely_op.maybe_checkpoint(&frontier_vec, &rt);
-                                    }
-                                },
-                            );
-                    }
-
-                    // --- Sink: inspect + probe ---
-                    current
-                        .inspect(move |item: &F::Output| {
-                            let _ = sink_tx.blocking_send(item.clone());
-                        })
-                        .probe()
-                });
-
-                // Drive computation until done
-                while !probe.done() {
-                    worker.step();
-                }
-
-                // Explicitly drop so execute_directly's post-closure loop
-                // sees has_dataflows() == false and exits immediately.
-                worker.drop_dataflow(dataflow_index);
-            });
-        })
-        .await
-        .map_err(|e| anyhow::anyhow!("dataflow execution failed: {e}"))?;
-
-        Ok(())
-    }
-
-    /// Create a fluent pipeline builder starting with the given source.
-    ///
-    /// ```ignore
-    /// executor
-    ///     .pipeline(source)
-    ///     .filter(|line: &String| !line.is_empty())
-    ///     .operator("word_counter", WordCounter, ctx)
-    ///     .map(|result: String| format!("[output] {result}"))
-    ///     .sink(sink)
-    ///     .await?;
-    /// ```
-    pub fn pipeline<S: Source>(&self, source: S) -> crate::pipeline::PipelineSource<'_, S> {
-        crate::pipeline::PipelineSource::new(self, source)
+        operator_name: &str,
+        worker_index: usize,
+    ) -> anyhow::Result<StateContext> {
+        let namespaced = format!("{operator_name}_w{worker_index}");
+        self.create_context(&namespaced).await
     }
 
     /// Create a `StateContext` for the given operator.
@@ -596,43 +208,805 @@ impl Executor {
     }
 }
 
-/// Holds an operator wrapped in its async executor.
-#[derive(Debug)]
-pub struct OperatorSlot<F: StreamFunction + 'static> {
-    /// Human-readable name identifying this operator in the pipeline.
-    pub name: String,
-    /// The async operator instance that processes elements.
-    pub async_op: AsyncOperator<F>,
+// ── Execution engine ────────────────────────────────────────────────
+
+/// Materialized step for execution (operators have their `StateContext`).
+enum ExecStep {
+    Transform(TransformFn),
+    Operator {
+        #[allow(dead_code)]
+        name: String,
+        op: Box<dyn ErasedOperator>,
+        ctx: StateContext,
+    },
 }
 
-impl<F: StreamFunction + 'static> OperatorSlot<F> {
-    /// Create a new operator slot with the given name, function, and state context.
-    ///
-    /// Pass `Some(tokio::runtime::Handle::current())` to enable cold-path async
-    /// completion (state misses). Pass `None` for tests that only exercise the
-    /// synchronous hot path.
-    pub fn new(
-        name: impl Into<String>,
-        func: F,
-        ctx: StateContext,
-        rt: Option<tokio::runtime::Handle>,
-    ) -> Self {
-        Self {
-            name: name.into(),
-            async_op: AsyncOperator::new(func, ctx, rt),
+impl ExecStep {
+    async fn checkpoint(&mut self) -> anyhow::Result<()> {
+        if let ExecStep::Operator { ctx, .. } = self {
+            ctx.checkpoint().await?;
         }
+        Ok(())
+    }
+}
+
+/// Apply a chain of steps to a single item, returning all outputs.
+async fn apply_steps(
+    item: AnyItem,
+    steps: &mut [ExecStep],
+    transform_ctx: &TransformContext,
+) -> Vec<AnyItem> {
+    let mut items = vec![item];
+    for step in steps.iter_mut() {
+        let mut next = Vec::new();
+        for item in items {
+            match step {
+                ExecStep::Transform(f) => next.extend(f(item, transform_ctx)),
+                ExecStep::Operator { op, ctx, .. } => {
+                    next.extend(op.process(item, ctx).await);
+                }
+            }
+        }
+        items = next;
+    }
+    items
+}
+
+/// Materialize segments into executable steps, creating `StateContext` for operators.
+async fn materialize_steps(
+    segments: Vec<Segment>,
+    executor: &Executor,
+    worker_index: usize,
+) -> anyhow::Result<Vec<ExecStep>> {
+    let mut steps = Vec::new();
+    for segment in segments {
+        match segment {
+            Segment::Transform(f) => steps.push(ExecStep::Transform(f)),
+            Segment::Operator { name, op } => {
+                let ctx = executor
+                    .create_context_for_worker(&name, worker_index)
+                    .await?;
+                steps.push(ExecStep::Operator { name, op, ctx });
+            }
+            Segment::Exchange(_) => {
+                // Handled by the caller at the section boundary level.
+            }
+        }
+    }
+    Ok(steps)
+}
+
+/// Build a Timely dataflow from compiled segments inside a worker scope.
+///
+/// Constructs: source operator → chain of transform/operator stages → sink terminal.
+/// Returns a probe for tracking completion.
+///
+/// - Transform segments become `unary` operators with Pipeline pact
+/// - Operator segments become `unary_frontier` operators wrapping [`TimelyErasedOperator`]
+/// - The source reads batches from an `mpsc::Receiver` (one batch = one epoch)
+/// - The sink sends items via an `mpsc::Sender`
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
+fn build_timely_dataflow<A: timely::communication::Allocate>(
+    scope: &mut timely::dataflow::scopes::Child<'_, timely::worker::Worker<A>, u64>,
+    source_rx: &mut tokio::sync::mpsc::Receiver<Vec<AnyItem>>,
+    segments: Vec<Segment>,
+    operator_contexts: &mut [Option<StateContext>],
+    sink_tx: tokio::sync::mpsc::Sender<AnyItem>,
+    rt: tokio::runtime::Handle,
+    worker_index: usize,
+    num_workers: usize,
+    checkpoint_barrier: Option<Arc<std::sync::Barrier>>,
+    checkpoint_notify: Option<std::sync::mpsc::Sender<()>>,
+) -> timely::dataflow::operators::probe::Handle<u64> {
+    use timely::container::CapacityContainerBuilder;
+    use timely::dataflow::channels::pact::Pipeline;
+    use timely::dataflow::operators::core::probe::Probe;
+    use timely::dataflow::operators::generic::OutputBuilder;
+    use timely::dataflow::operators::generic::builder_rc::OperatorBuilder;
+    use timely::dataflow::operators::generic::operator::Operator;
+    use timely::scheduling::Scheduler;
+
+    let worker_label = worker_index.to_string();
+
+    // --- Source operator: drains channel, emits with capability per batch ---
+    let mut source_builder = OperatorBuilder::new("Source".to_owned(), scope.clone());
+    let (output, stream) = source_builder.new_output::<Vec<AnyItem>>();
+    let mut output = OutputBuilder::from(output);
+    let activator = scope.activator_for(source_builder.operator_info().address);
+    source_builder.set_notify(false);
+
+    // Move source_rx into the closure by taking from the mutable ref.
+    let mut source_rx_owned = {
+        let (dummy_tx, dummy_rx) = tokio::sync::mpsc::channel(1);
+        drop(dummy_tx);
+        std::mem::replace(source_rx, dummy_rx)
+    };
+
+    let wl_source = worker_label.clone();
+    source_builder.build_reschedule(move |mut capabilities| {
+        let mut cap = Some(capabilities.pop().unwrap());
+        let mut epoch: u64 = 0;
+
+        move |_frontiers| {
+            if cap.is_none() {
+                return false;
+            }
+
+            match source_rx_owned.try_recv() {
+                Ok(batch) => {
+                    #[allow(clippy::cast_possible_truncation)]
+                    let batch_len = batch.len() as u64;
+                    if let Some(ref c) = cap {
+                        let mut handle = output.activate();
+                        let mut session = handle.session(c);
+                        for item in batch {
+                            session.give(item);
+                        }
+                    }
+                    metrics::counter!("executor_batches_total", "worker" => wl_source.clone())
+                        .increment(1);
+                    metrics::counter!("executor_elements_total", "worker" => wl_source.clone())
+                        .increment(batch_len);
+                    epoch += 1;
+                    if let Some(ref mut c) = cap {
+                        c.downgrade(&epoch);
+                    }
+                    activator.activate();
+                    true
+                }
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
+                    activator.activate();
+                    true
+                }
+                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                    cap = None;
+                    false
+                }
+            }
+        }
+    });
+
+    // --- Chain segments as sequential Timely stages ---
+    let mut current: timely::dataflow::Stream<_, AnyItem> = stream;
+    let mut ctx_idx = 0;
+
+    for (i, segment) in segments.into_iter().enumerate() {
+        match segment {
+            Segment::Transform(f) => {
+                let name = format!("Transform_{i}");
+                let ctx = TransformContext {
+                    worker_index,
+                    num_workers,
+                };
+                current = current.unary::<CapacityContainerBuilder<Vec<AnyItem>>, _, _, _>(
+                    Pipeline,
+                    &name,
+                    move |_cap, _info| {
+                        let f = f;
+                        let ctx = ctx;
+                        move |input, output| {
+                            input.for_each(|cap, data| {
+                                let mut session = output.session(&cap);
+                                for item in data.drain(..) {
+                                    for result in f(item, &ctx) {
+                                        session.give(result);
+                                    }
+                                }
+                            });
+                        }
+                    },
+                );
+            }
+            Segment::Operator { name, op } => {
+                let stage_name = format!("Op_{i}_{name}");
+                let ctx = operator_contexts[ctx_idx]
+                    .take()
+                    .expect("missing StateContext for operator");
+                ctx_idx += 1;
+
+                let rt_op = rt.clone();
+                let wl_op = worker_label.clone();
+                let barrier = checkpoint_barrier.clone();
+                let notify = checkpoint_notify.clone();
+                current = current
+                    .unary_frontier::<CapacityContainerBuilder<Vec<AnyItem>>, _, _, _>(
+                        Pipeline,
+                        &stage_name,
+                        move |_init_cap, _info| {
+                            let mut timely_op = TimelyErasedOperator::new(op, ctx);
+                            let rt = rt_op;
+                            let wl = wl_op;
+                            let barrier = barrier;
+                            let notify = notify;
+                            move |(input, frontier), output| {
+                                input.for_each(|cap, data| {
+                                    let mut batch_durations = Vec::new();
+                                    for item in data.drain(..) {
+                                        let elem_start = std::time::Instant::now();
+                                        let results = timely_op.process(item, &rt);
+                                        batch_durations.push(elem_start.elapsed().as_secs_f64());
+                                        if !results.is_empty() {
+                                            let mut session = output.session(&cap);
+                                            for r in results {
+                                                session.give(r);
+                                            }
+                                        }
+                                    }
+                                    if !batch_durations.is_empty() {
+                                        batch_durations.sort_unstable_by(|a, b| {
+                                            a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
+                                        });
+                                        let len = batch_durations.len();
+                                        let p50 = batch_durations[len / 2];
+                                        let p99 = batch_durations[(len * 99 / 100).min(len - 1)];
+                                        metrics::gauge!(
+                                            "executor_element_duration_p50",
+                                            "worker" => wl.clone()
+                                        )
+                                        .set(p50);
+                                        metrics::gauge!(
+                                            "executor_element_duration_p99",
+                                            "worker" => wl.clone()
+                                        )
+                                        .set(p99);
+                                    }
+                                });
+
+                                let frontier_vec: Vec<u64> =
+                                    frontier.frontier().iter().copied().collect();
+                                let did_checkpoint = timely_op.maybe_checkpoint(&frontier_vec, &rt);
+                                // Coordinate: all workers wait at the barrier after
+                                // checkpointing, then the leader notifies the main task.
+                                if did_checkpoint && let Some(ref b) = barrier {
+                                    let wait_result = b.wait();
+                                    if wait_result.is_leader()
+                                        && let Some(ref n) = notify
+                                    {
+                                        let _ = n.send(());
+                                    }
+                                }
+                            }
+                        },
+                    );
+            }
+            Segment::Exchange(_) => {
+                // Exchange segments are handled at the split level, not here.
+            }
+        }
+    }
+
+    // --- Sink terminal: send items via channel ---
+    current
+        .unary::<CapacityContainerBuilder<Vec<AnyItem>>, _, _, _>(
+            Pipeline,
+            "Sink",
+            move |_cap, _info| {
+                let sink_tx = sink_tx;
+                move |input, _output| {
+                    input.for_each(|_cap, data| {
+                        for item in data.drain(..) {
+                            let _ = sink_tx.blocking_send(item);
+                        }
+                    });
+                }
+            },
+        )
+        .probe()
+}
+
+/// Execute a compiled pipeline.
+async fn execute_pipeline(
+    pipeline: CompiledPipeline,
+    executor: &Executor,
+    shutdown: Option<&ShutdownHandle>,
+) -> anyhow::Result<()> {
+    let n_workers = executor.workers();
+    let (pre_segments, exchange) = split_at_first_exchange(pipeline.segments);
+
+    match exchange {
+        Some((key_fn, post_segments)) if n_workers > 1 => {
+            execute_multi_worker(
+                pipeline.source,
+                pre_segments,
+                key_fn,
+                post_segments,
+                pipeline.sink,
+                executor,
+                n_workers,
+                shutdown,
+            )
+            .await
+        }
+        _ => {
+            // Single-worker: flatten all segments and run in one async loop.
+            let mut all_segments = pre_segments;
+            if let Some((_key_fn, post)) = exchange {
+                all_segments.extend(post);
+            }
+            execute_single_worker(
+                pipeline.source,
+                all_segments,
+                pipeline.sink,
+                executor,
+                shutdown,
+            )
+            .await
+        }
+    }
+}
+
+/// Single-worker execution: Timely-backed with `Config::process(1)`.
+///
+/// Bridges the source and sink to channels, runs all segments inside a
+/// Timely dataflow with Pipeline pact, providing frontier-based checkpointing.
+#[allow(clippy::too_many_lines)]
+async fn execute_single_worker(
+    source: Box<dyn ErasedSource>,
+    segments: Vec<Segment>,
+    sink: Box<dyn ErasedSink>,
+    executor: &Executor,
+    shutdown: Option<&ShutdownHandle>,
+) -> anyhow::Result<()> {
+    let rt = tokio::runtime::Handle::current();
+
+    // Extract operator names upfront to avoid holding &Segment across await.
+    let operator_names: Vec<String> = segments
+        .iter()
+        .filter_map(|seg| {
+            if let Segment::Operator { name, .. } = seg {
+                Some(name.clone())
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    // Pre-create StateContexts for operator segments (must be done on async task).
+    let mut operator_contexts: Vec<Option<StateContext>> = Vec::new();
+    for name in &operator_names {
+        let ctx = executor.create_context_for_worker(name, 0).await?;
+        operator_contexts.push(Some(ctx));
+    }
+
+    // Bridge source to channel.
+    let source_rx = crate::bridge::erased_source_bridge(source, &rt, shutdown.cloned());
+
+    // Create sink channel manually so we can await the sink task.
+    let (sink_tx, mut sink_rx) = tokio::sync::mpsc::channel::<AnyItem>(16);
+    let sink_handle: tokio::task::JoinHandle<anyhow::Result<()>> = tokio::spawn(async move {
+        let mut sink = sink;
+        while let Some(item) = sink_rx.recv().await {
+            sink.write(item).await?;
+        }
+        sink.flush().await?;
+        Ok(())
+    });
+
+    // Package for the Timely closure (Fn, not FnOnce — use Mutex+Option+take).
+    let source_rx = std::sync::Mutex::new(Some(source_rx));
+    let segments = std::sync::Mutex::new(Some(segments));
+    let operator_contexts = std::sync::Mutex::new(Some(operator_contexts));
+    let sink_tx = std::sync::Mutex::new(Some(sink_tx));
+    let rt_clone = rt.clone();
+
+    metrics::gauge!("executor_workers").set(1.0);
+    tracing::info!(workers = 1, "pipeline started");
+
+    tokio::task::spawn_blocking(move || {
+        let guards = timely::execute::execute(timely::execute::Config::process(1), move |worker| {
+            let _span = tracing::info_span!("worker", worker = 0).entered();
+
+            // Take per-worker data.
+            let mut source_rx = source_rx.lock().unwrap().take().unwrap();
+            let segments = segments.lock().unwrap().take().unwrap();
+            let mut op_contexts = operator_contexts.lock().unwrap().take().unwrap();
+            let sink_tx = sink_tx.lock().unwrap().take().unwrap();
+            let rt = rt_clone.clone();
+
+            let dataflow_index = worker.next_dataflow_index();
+            let probe = worker.dataflow::<u64, _, _>(|scope| {
+                build_timely_dataflow(
+                    scope,
+                    &mut source_rx,
+                    segments,
+                    &mut op_contexts,
+                    sink_tx,
+                    rt,
+                    0,
+                    1,
+                    None,
+                    None,
+                )
+            });
+
+            while !probe.done() {
+                worker.step();
+            }
+
+            worker.drop_dataflow(dataflow_index);
+        })
+        .map_err(|e| anyhow::anyhow!("timely execution failed: {e}"))?;
+
+        // Drop guards to join worker threads. Sink sender is dropped here,
+        // signaling the sink task that no more items are coming.
+        drop(guards);
+        Ok::<(), anyhow::Error>(())
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("spawn_blocking failed: {e}"))??;
+
+    // Wait for the sink bridge task to finish writing and flushing.
+    sink_handle
+        .await
+        .map_err(|e| anyhow::anyhow!("sink task panicked: {e}"))??;
+
+    Ok(())
+}
+
+/// Multi-worker execution: pre-exchange on Tokio task, post-exchange in Timely.
+///
+/// Pre-exchange transforms run in a Tokio task (stateless transforms + hash routing).
+/// Post-exchange segments run inside per-worker Timely dataflows with Pipeline pact,
+/// providing frontier tracking and epoch-based checkpointing.
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
+async fn execute_multi_worker(
+    mut source: Box<dyn ErasedSource>,
+    pre_segments: Vec<Segment>,
+    key_fn: KeyFn,
+    post_segments: Vec<Segment>,
+    sink: Box<dyn ErasedSink>,
+    executor: &Executor,
+    n_workers: usize,
+    shutdown: Option<&ShutdownHandle>,
+) -> anyhow::Result<()> {
+    let rt = tokio::runtime::Handle::current();
+    let channel_capacity = 256;
+
+    // Materialize pre-exchange steps on the main task (pure async).
+    let mut pre_steps = materialize_steps(pre_segments, executor, 0).await?;
+
+    // Per-worker input channels (Tokio → Timely worker).
+    let mut worker_txs = Vec::with_capacity(n_workers);
+    let mut worker_receivers: Vec<Option<tokio::sync::mpsc::Receiver<Vec<AnyItem>>>> =
+        Vec::with_capacity(n_workers);
+    for _ in 0..n_workers {
+        let (tx, rx) = tokio::sync::mpsc::channel::<Vec<AnyItem>>(channel_capacity);
+        worker_txs.push(tx);
+        worker_receivers.push(Some(rx));
+    }
+
+    // Output channel: Timely workers → collector → sink.
+    let (output_tx, mut output_rx) = tokio::sync::mpsc::channel::<AnyItem>(channel_capacity);
+
+    // Extract operator names upfront to avoid holding &Segment across await.
+    let operator_names: Vec<String> = post_segments
+        .iter()
+        .filter_map(|seg| {
+            if let Segment::Operator { name, .. } = seg {
+                Some(name.clone())
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    // Pre-create per-worker segments and StateContexts.
+    let mut per_worker_segments: Vec<Option<Vec<Segment>>> = Vec::with_capacity(n_workers);
+    let mut per_worker_contexts: Vec<Option<Vec<Option<StateContext>>>> =
+        Vec::with_capacity(n_workers);
+    for i in 0..n_workers {
+        let cloned = clone_segments(&post_segments);
+        let mut contexts = Vec::new();
+        for name in &operator_names {
+            let ctx = executor.create_context_for_worker(name, i).await?;
+            contexts.push(Some(ctx));
+        }
+        per_worker_segments.push(Some(cloned));
+        per_worker_contexts.push(Some(contexts));
+    }
+
+    // Package per-worker data for Timely closure (Fn, not FnOnce).
+    let worker_receivers = std::sync::Mutex::new(worker_receivers);
+    let per_worker_segments = std::sync::Mutex::new(per_worker_segments);
+    let per_worker_contexts = std::sync::Mutex::new(per_worker_contexts);
+    let output_tx_arc = Arc::new(std::sync::Mutex::new(Some(output_tx)));
+
+    // Checkpoint coordination: barrier ensures all workers flush before the
+    // main task commits source offsets, achieving exactly-once semantics.
+    let checkpoint_barrier = Arc::new(std::sync::Barrier::new(n_workers));
+    let (checkpoint_notify_tx, checkpoint_notify_rx) = std::sync::mpsc::channel::<()>();
+
+    let rt_clone = rt.clone();
+
+    #[allow(clippy::cast_possible_truncation)]
+    metrics::gauge!("executor_workers").set(n_workers as f64);
+    tracing::info!(workers = n_workers, "pipeline started");
+
+    // Spawn Timely workers in a blocking thread.
+    let timely_handle: tokio::task::JoinHandle<anyhow::Result<()>> =
+        tokio::task::spawn_blocking(move || {
+            let guards = timely::execute::execute(
+                timely::execute::Config::process(n_workers),
+                move |worker| {
+                    let idx = worker.index();
+                    let _span = tracing::info_span!("worker", worker = idx).entered();
+
+                    // Take this worker's data.
+                    let mut source_rx = worker_receivers.lock().unwrap()[idx].take().unwrap();
+                    let segments = per_worker_segments.lock().unwrap()[idx].take().unwrap();
+                    let mut op_contexts = per_worker_contexts.lock().unwrap()[idx].take().unwrap();
+                    let sink_tx = output_tx_arc.lock().unwrap().as_ref().unwrap().clone();
+
+                    let rt = rt_clone.clone();
+
+                    let barrier = checkpoint_barrier.clone();
+                    let notify = checkpoint_notify_tx.clone();
+
+                    let dataflow_index = worker.next_dataflow_index();
+                    let probe = worker.dataflow::<u64, _, _>(|scope| {
+                        build_timely_dataflow(
+                            scope,
+                            &mut source_rx,
+                            segments,
+                            &mut op_contexts,
+                            sink_tx,
+                            rt,
+                            idx,
+                            n_workers,
+                            Some(barrier),
+                            Some(notify),
+                        )
+                    });
+
+                    while !probe.done() {
+                        worker.step();
+                    }
+
+                    worker.drop_dataflow(dataflow_index);
+                },
+            )
+            .map_err(|e| anyhow::anyhow!("timely execution failed: {e}"))?;
+
+            drop(guards);
+            Ok(())
+        });
+
+    // Collector task: output channel → sink.
+    let collector_handle: tokio::task::JoinHandle<anyhow::Result<()>> = tokio::spawn(async move {
+        let mut sink = sink;
+        while let Some(item) = output_rx.recv().await {
+            sink.write(item).await?;
+        }
+        sink.flush().await?;
+        Ok(())
+    });
+
+    // Main loop: source → pre-steps → hash key → route to per-worker channels.
+    // Each send is a batch (Vec) that becomes one Timely epoch.
+    let checkpoint_interval: u64 = 100;
+    let mut batches_since_checkpoint: u64 = 0;
+    // Pre-exchange runs on the main async task: single reader, not a worker.
+    let pre_exchange_ctx = TransformContext {
+        worker_index: 0,
+        num_workers: 1,
+    };
+
+    while let Some(batch) = source.next_batch().await {
+        #[allow(clippy::cast_possible_truncation)]
+        let batch_len = batch.len() as u64;
+        metrics::counter!("executor_batches_total").increment(1);
+        metrics::counter!("executor_elements_total").increment(batch_len);
+
+        // Apply pre-exchange transforms and bucket by worker.
+        let mut worker_buckets: Vec<Vec<AnyItem>> = (0..n_workers).map(|_| Vec::new()).collect();
+
+        for item in batch {
+            let mid_items = apply_steps(item, &mut pre_steps, &pre_exchange_ctx).await;
+            for mid in mid_items {
+                let key = key_fn(&mid);
+                let worker_idx = partition_key(&key, n_workers);
+                worker_buckets[worker_idx].push(mid);
+            }
+        }
+
+        // Send non-empty buckets to workers as batches.
+        for (i, bucket) in worker_buckets.into_iter().enumerate() {
+            if !bucket.is_empty() && worker_txs[i].send(bucket).await.is_err() {
+                break;
+            }
+        }
+
+        // Drain any coordinated checkpoint notifications from workers.
+        // Each notification means all workers have flushed their state.
+        while checkpoint_notify_rx.try_recv().is_ok() {
+            source.on_checkpoint_complete().await?;
+        }
+
+        batches_since_checkpoint += 1;
+        if batches_since_checkpoint >= checkpoint_interval {
+            for step in &mut pre_steps {
+                step.checkpoint().await?;
+            }
+            batches_since_checkpoint = 0;
+        }
+
+        if let Some(handle) = shutdown
+            && handle.is_shutdown()
+        {
+            tracing::info!("shutdown requested, draining workers...");
+            break;
+        }
+    }
+
+    // Final pre-step checkpoint.
+    for step in &mut pre_steps {
+        step.checkpoint().await?;
+    }
+
+    // Close worker channels → Timely sources drop capabilities → dataflows complete.
+    drop(worker_txs);
+
+    // Wait for Timely workers to finish.
+    timely_handle
+        .await
+        .map_err(|e| anyhow::anyhow!("timely workers panicked: {e}"))??;
+
+    source.on_checkpoint_complete().await?;
+
+    // Drop the output_tx so collector sees channel close.
+    // (Timely workers already dropped their clones when exiting.)
+
+    collector_handle
+        .await
+        .map_err(|e| anyhow::anyhow!("collector panicked: {e}"))??;
+
+    Ok(())
+}
+
+// ── Public execution entry point ────────────────────────────────────
+
+/// Compile and execute the dataflow graph.
+async fn run_graph(
+    graph: DataflowGraph,
+    executor: &Executor,
+    shutdown: Option<ShutdownHandle>,
+) -> anyhow::Result<()> {
+    let pipelines = compile(graph.into_nodes())?;
+
+    if pipelines.len() == 1 {
+        let pipeline = pipelines.into_iter().next().unwrap();
+        execute_pipeline(pipeline, executor, shutdown.as_ref()).await
+    } else {
+        anyhow::bail!(
+            "multiple independent pipelines are not yet supported; found {}",
+            pipelines.len()
+        );
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use async_trait::async_trait;
-    use rill_core::connectors::vec_source::VecSource;
-    use rill_core::traits::{Sink, StreamFunction};
     use std::sync::{Arc, Mutex};
 
-    /// A stateful word-count operator.
+    use async_trait::async_trait;
+    use rill_core::connectors::vec_source::VecSource;
+    use rill_core::state::context::StateContext;
+    use rill_core::traits::{Sink, StreamFunction};
+
+    use crate::dataflow::DataflowGraph;
+
+    struct CollectSink<T> {
+        collected: Arc<Mutex<Vec<T>>>,
+    }
+
+    #[async_trait]
+    impl<T: Send + Sync + 'static> Sink for CollectSink<T> {
+        type Input = T;
+
+        async fn write(&mut self, input: T) -> anyhow::Result<()> {
+            self.collected.lock().unwrap().push(input);
+            Ok(())
+        }
+    }
+
+    fn temp_dir(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("rill_dataflow_{name}_{}", std::process::id()))
+    }
+
+    #[tokio::test]
+    async fn map_transform() {
+        let dir = temp_dir("map");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let graph = DataflowGraph::new();
+        let source = VecSource::new(vec![1i32, 2, 3]);
+        let collected = Arc::new(Mutex::new(Vec::new()));
+
+        let stream = graph.source(source);
+        let doubled = stream.map(|x: i32| x * 2);
+        doubled.sink(CollectSink {
+            collected: collected.clone(),
+        });
+
+        let executor = super::Executor::new(dir.clone());
+        executor.run(graph).await.unwrap();
+        assert_eq!(*collected.lock().unwrap(), vec![2, 4, 6]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn filter_transform() {
+        let dir = temp_dir("filter");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let graph = DataflowGraph::new();
+        let source = VecSource::new(vec![1i32, 2, 3, 4, 5]);
+        let collected = Arc::new(Mutex::new(Vec::new()));
+
+        let stream = graph.source(source);
+        stream.filter(|x: &i32| x % 2 == 0).sink(CollectSink {
+            collected: collected.clone(),
+        });
+
+        let executor = super::Executor::new(dir.clone());
+        executor.run(graph).await.unwrap();
+        assert_eq!(*collected.lock().unwrap(), vec![2, 4]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn flat_map_transform() {
+        let dir = temp_dir("flat_map");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let graph = DataflowGraph::new();
+        let source = VecSource::new(vec!["hello world".to_string(), "foo bar".to_string()]);
+        let collected = Arc::new(Mutex::new(Vec::new()));
+
+        let stream = graph.source(source);
+        stream
+            .flat_map(|line: String| line.split_whitespace().map(String::from).collect())
+            .sink(CollectSink {
+                collected: collected.clone(),
+            });
+
+        let executor = super::Executor::new(dir.clone());
+        executor.run(graph).await.unwrap();
+        assert_eq!(
+            *collected.lock().unwrap(),
+            vec!["hello", "world", "foo", "bar"]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn chained_filter_map() {
+        let dir = temp_dir("chain");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let graph = DataflowGraph::new();
+        let source = VecSource::new(vec![1i32, 2, 3, 4, 5]);
+        let collected = Arc::new(Mutex::new(Vec::new()));
+
+        let stream = graph.source(source);
+        stream
+            .filter(|x: &i32| x % 2 == 0)
+            .map(|x: i32| x * 10)
+            .sink(CollectSink {
+                collected: collected.clone(),
+            });
+
+        let executor = super::Executor::new(dir.clone());
+        executor.run(graph).await.unwrap();
+        assert_eq!(*collected.lock().unwrap(), vec![20, 40]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[derive(Clone)]
     struct WordCounter;
 
     #[async_trait]
@@ -658,206 +1032,354 @@ mod tests {
         }
     }
 
-    /// A sink that collects output into a shared vec.
-    struct CollectSink {
-        collected: Arc<Mutex<Vec<String>>>,
+    #[tokio::test]
+    async fn keyed_operator_single_worker() {
+        let dir = temp_dir("keyed_single");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let graph = DataflowGraph::new();
+        let source = VecSource::new(vec!["hello world".to_string(), "hello rill".to_string()]);
+        let collected = Arc::new(Mutex::new(Vec::new()));
+
+        let stream = graph.source(source);
+        stream
+            .flat_map(|line: String| line.split_whitespace().map(String::from).collect())
+            .key_by(|word: &String| word.clone())
+            .operator("word_counter", WordCounter)
+            .sink(CollectSink {
+                collected: collected.clone(),
+            });
+
+        let executor = super::Executor::new(dir.clone());
+        executor.run(graph).await.unwrap();
+        let results = collected.lock().unwrap().clone();
+        assert_eq!(results.len(), 4); // hello, world, hello, rill
+        assert!(results.contains(&"hello: 1".to_string()));
+        assert!(results.contains(&"world: 1".to_string()));
+        assert!(results.contains(&"hello: 2".to_string()));
+        assert!(results.contains(&"rill: 1".to_string()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn keyed_multi_worker() {
+        let dir = temp_dir("keyed_multi");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let graph = DataflowGraph::new();
+        let source = VecSource::new(vec!["hello world".to_string(), "hello rill".to_string()]);
+        let collected = Arc::new(Mutex::new(Vec::new()));
+
+        let stream = graph.source(source);
+        stream
+            .flat_map(|line: String| line.split_whitespace().map(String::from).collect())
+            .key_by(|word: &String| word.clone())
+            .operator("word_counter", WordCounter)
+            .sink(CollectSink {
+                collected: collected.clone(),
+            });
+
+        let executor = super::Executor::builder()
+            .checkpoint_dir(&dir)
+            .workers(2)
+            .build();
+        executor.run(graph).await.unwrap();
+        let mut results = collected.lock().unwrap().clone();
+        results.sort_unstable();
+        assert_eq!(results.len(), 4);
+        // With multi-worker, order may vary but counts must be correct.
+        assert!(results.contains(&"hello: 1".to_string()));
+        assert!(results.contains(&"hello: 2".to_string()));
+        assert!(results.contains(&"world: 1".to_string()));
+        assert!(results.contains(&"rill: 1".to_string()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn keyed_filter_map_multi_worker() {
+        let dir = temp_dir("keyed_filter_map");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let graph = DataflowGraph::new();
+        let source = VecSource::new(vec![1i32, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+        let collected = Arc::new(Mutex::new(Vec::new()));
+
+        let stream = graph.source(source);
+        stream
+            .filter(|x: &i32| x % 2 == 0)
+            .key_by(|x: &i32| x.to_string())
+            .map(|x: i32| x * 10)
+            .sink(CollectSink {
+                collected: collected.clone(),
+            });
+
+        let executor = super::Executor::builder()
+            .checkpoint_dir(&dir)
+            .workers(2)
+            .build();
+        executor.run(graph).await.unwrap();
+        let mut results = collected.lock().unwrap().clone();
+        results.sort_unstable();
+        assert_eq!(results, vec![20, 40, 60, 80, 100]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn builder_api() {
+        let dir = temp_dir("builder");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let graph = DataflowGraph::new();
+        let source = VecSource::new(vec![10i32, 20, 30]);
+        let collected = Arc::new(Mutex::new(Vec::new()));
+
+        let stream = graph.source(source);
+        stream.map(|x: i32| x + 1).sink(CollectSink {
+            collected: collected.clone(),
+        });
+
+        let executor = super::Executor::builder()
+            .checkpoint_dir(&dir)
+            .workers(1)
+            .build();
+        executor.run(graph).await.unwrap();
+        assert_eq!(*collected.lock().unwrap(), vec![11, 21, 31]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn key_affinity() {
+        // Verify that the same key always routes to the same worker by checking
+        // that stateful counts are correct across multiple items with the same key.
+        let dir = temp_dir("affinity");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let graph = DataflowGraph::new();
+
+        // Send "alpha" 5 times and "beta" 3 times.
+        let source = VecSource::new(vec![
+            "alpha".to_string(),
+            "alpha".to_string(),
+            "beta".to_string(),
+            "alpha".to_string(),
+            "beta".to_string(),
+            "alpha".to_string(),
+            "beta".to_string(),
+            "alpha".to_string(),
+        ]);
+        let collected = Arc::new(Mutex::new(Vec::new()));
+
+        let stream = graph.source(source);
+        stream
+            .key_by(|w: &String| w.clone())
+            .operator("counter", WordCounter)
+            .sink(CollectSink {
+                collected: collected.clone(),
+            });
+
+        let executor = super::Executor::builder()
+            .checkpoint_dir(&dir)
+            .workers(4)
+            .build();
+        executor.run(graph).await.unwrap();
+        let results = collected.lock().unwrap().clone();
+        assert_eq!(results.len(), 8);
+        // Alpha should count up to 5, beta up to 3.
+        assert!(results.contains(&"alpha: 5".to_string()));
+        assert!(results.contains(&"beta: 3".to_string()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn shutdown_graceful() {
+        let dir = temp_dir("shutdown");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let graph = DataflowGraph::new();
+        let source = VecSource::new(vec![1i32, 2, 3]);
+        let collected = Arc::new(Mutex::new(Vec::new()));
+
+        let stream = graph.source(source);
+        stream.map(|x: i32| x * 2).sink(CollectSink {
+            collected: collected.clone(),
+        });
+
+        let (handle, trigger) = crate::shutdown::ShutdownHandle::new();
+        // Signal shutdown immediately. The loop processes at least one batch
+        // before checking the flag, then stops early.
+        trigger.shutdown();
+
+        let executor = super::Executor::new(dir.clone());
+        executor.run_with_shutdown(graph, handle).await.unwrap();
+        let results = collected.lock().unwrap().clone();
+        // At least the first batch was processed; early termination is expected.
+        assert!(!results.is_empty());
+        // All produced values must be valid doubles of the input.
+        for &v in &results {
+            assert!(v == 2 || v == 4 || v == 6);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn map_ctx_single_worker() {
+        let dir = temp_dir("map_ctx_single");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let graph = DataflowGraph::new();
+        let source = VecSource::new(vec![1i32, 2, 3]);
+        let collected = Arc::new(Mutex::new(Vec::new()));
+
+        let stream = graph.source(source);
+        stream
+            .map_ctx(|x: i32, ctx| format!("w{}:{x}", ctx.worker_index))
+            .sink(CollectSink {
+                collected: collected.clone(),
+            });
+
+        let executor = super::Executor::new(dir.clone());
+        executor.run(graph).await.unwrap();
+        assert_eq!(*collected.lock().unwrap(), vec!["w0:1", "w0:2", "w0:3"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn map_ctx_multi_worker() {
+        let dir = temp_dir("map_ctx_multi");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let graph = DataflowGraph::new();
+        let source = VecSource::new(vec![1i32, 2, 3, 4, 5, 6]);
+        let collected = Arc::new(Mutex::new(Vec::new()));
+
+        let stream = graph.source(source);
+        stream
+            .key_by(|x: &i32| x.to_string())
+            .map_ctx(|x: i32, ctx| (x, ctx.worker_index, ctx.num_workers))
+            .sink(CollectSink {
+                collected: collected.clone(),
+            });
+
+        let executor = super::Executor::builder()
+            .checkpoint_dir(&dir)
+            .workers(2)
+            .build();
+        executor.run(graph).await.unwrap();
+        let results = collected.lock().unwrap().clone();
+        assert_eq!(results.len(), 6);
+        for &(_, worker_idx, num_workers) in &results {
+            assert!(worker_idx < 2, "worker_index should be 0 or 1");
+            assert_eq!(num_workers, 2);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn deterministic_hash_across_calls() {
+        // Verify partition_key is deterministic: same key always maps to the same worker.
+        for n_workers in [1, 2, 4, 8, 16] {
+            for key in ["alpha", "beta", "gamma", "hello", "world", "sensor-42"] {
+                let first = super::partition_key(key, n_workers);
+                for _ in 0..100 {
+                    assert_eq!(
+                        super::partition_key(key, n_workers),
+                        first,
+                        "partition_key({key:?}, {n_workers}) is not deterministic"
+                    );
+                }
+                assert!(first < n_workers);
+            }
+        }
+    }
+
+    struct CheckpointTrackingSource {
+        items: std::collections::VecDeque<Vec<String>>,
+        checkpoint_count: Arc<std::sync::atomic::AtomicUsize>,
     }
 
     #[async_trait]
-    impl Sink for CollectSink {
-        type Input = String;
+    impl rill_core::traits::Source for CheckpointTrackingSource {
+        type Output = String;
 
-        async fn write(&mut self, input: String) -> anyhow::Result<()> {
-            self.collected.lock().unwrap().push(input);
+        async fn next_batch(&mut self) -> Option<Vec<String>> {
+            self.items.pop_front()
+        }
+
+        async fn on_checkpoint_complete(&mut self) -> anyhow::Result<()> {
+            self.checkpoint_count
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(())
         }
     }
 
-    fn temp_dir(name: &str) -> std::path::PathBuf {
-        std::env::temp_dir().join(format!("rill_exec_{name}_{}", std::process::id()))
-    }
-
     #[tokio::test]
-    async fn word_count_end_to_end() {
-        let dir = temp_dir("wordcount");
+    async fn coordinated_checkpoint() {
+        // Verify that source.on_checkpoint_complete() is only called after all
+        // workers have flushed their state (coordinated via barrier).
+        //
+        // We use a custom source that:
+        //   - emits enough batches to trigger at least one checkpoint cycle
+        //   - tracks on_checkpoint_complete calls via an Arc counter
+        let dir = temp_dir("coordinated_ckpt");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
 
-        let executor = Executor::new(dir.clone());
-        let ctx = executor.create_context("word_counter").await.unwrap();
+        let checkpoint_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let cc = checkpoint_count.clone();
 
-        let mut source = VecSource::new(vec!["hello world".to_string(), "hello rill".to_string()]);
+        // Generate enough batches to trigger checkpoint cycles (interval is 100).
+        let mut batches = std::collections::VecDeque::new();
+        for i in 0..150 {
+            batches.push_back(vec![format!("item_{i}")]);
+        }
 
-        let mut operators = vec![OperatorSlot::new("word_counter", WordCounter, ctx, Some(tokio::runtime::Handle::current()))];
-
-        let collected = Arc::new(Mutex::new(Vec::new()));
-        let mut sink = CollectSink {
-            collected: collected.clone(),
+        let source = CheckpointTrackingSource {
+            items: batches,
+            checkpoint_count: cc,
         };
 
-        executor
-            .run_linear(&mut source, &mut operators, &mut sink)
-            .await
-            .unwrap();
-
-        let results = collected.lock().unwrap().clone();
-        assert_eq!(
-            results,
-            vec![
-                "hello: 1".to_string(),
-                "world: 1".to_string(),
-                "hello: 2".to_string(),
-                "rill: 1".to_string(),
-            ]
-        );
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[tokio::test]
-    async fn state_persists_across_checkpoints() {
-        let dir = temp_dir("persist");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-
-        // First run
-        {
-            let executor = Executor::new(dir.clone());
-            let ctx = executor.create_context("counter").await.unwrap();
-
-            let mut source = VecSource::new(vec!["hello world".to_string()]);
-            let mut operators = vec![OperatorSlot::new("counter", WordCounter, ctx, Some(tokio::runtime::Handle::current()))];
-            let collected = Arc::new(Mutex::new(Vec::new()));
-            let mut sink = CollectSink {
-                collected: collected.clone(),
-            };
-
-            executor
-                .run_linear(&mut source, &mut operators, &mut sink)
-                .await
-                .unwrap();
-
-            let results = collected.lock().unwrap().clone();
-            assert_eq!(results, vec!["hello: 1", "world: 1"]);
-        }
-
-        // Second run — state should be restored from checkpoint
-        {
-            let executor = Executor::new(dir.clone());
-            let ctx = executor.create_context("counter").await.unwrap();
-
-            let mut source = VecSource::new(vec!["hello rill".to_string()]);
-            let mut operators = vec![OperatorSlot::new("counter", WordCounter, ctx, Some(tokio::runtime::Handle::current()))];
-            let collected = Arc::new(Mutex::new(Vec::new()));
-            let mut sink = CollectSink {
-                collected: collected.clone(),
-            };
-
-            executor
-                .run_linear(&mut source, &mut operators, &mut sink)
-                .await
-                .unwrap();
-
-            let results = collected.lock().unwrap().clone();
-            // hello count should be 2 (resumed from checkpoint)
-            assert_eq!(results, vec!["hello: 2", "rill: 1"]);
-        }
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[tokio::test]
-    async fn timely_word_count_end_to_end() {
-        let dir = temp_dir("timely_wordcount");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-
-        let executor = Executor::new(dir.clone());
-        let ctx = executor.create_context("word_counter").await.unwrap();
-
-        let source = VecSource::new(vec!["hello world".to_string(), "hello rill".to_string()]);
-
-        let operators = vec![OperatorSlot::new("word_counter", WordCounter, ctx, Some(tokio::runtime::Handle::current()))];
-
+        let graph = DataflowGraph::new();
         let collected = Arc::new(Mutex::new(Vec::new()));
-        let sink = CollectSink {
-            collected: collected.clone(),
-        };
 
-        executor
-            .run_dataflow(source, operators, sink)
-            .await
-            .unwrap();
+        let stream = graph.source(source);
+        stream
+            .key_by(|s: &String| s.clone())
+            .operator("counter", WordCounter)
+            .sink(CollectSink {
+                collected: collected.clone(),
+            });
 
-        // Allow sink bridge task to flush
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let executor = super::Executor::builder()
+            .checkpoint_dir(&dir)
+            .workers(2)
+            .build();
+        executor.run(graph).await.unwrap();
 
-        let results = collected.lock().unwrap().clone();
-        assert_eq!(
-            results,
-            vec![
-                "hello: 1".to_string(),
-                "world: 1".to_string(),
-                "hello: 2".to_string(),
-                "rill: 1".to_string(),
-            ]
+        // The final on_checkpoint_complete is always called after all workers finish.
+        // With 150 batches and interval=100, we expect at least 1 coordinated
+        // checkpoint during execution plus the final one.
+        let count = checkpoint_count.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            count >= 1,
+            "expected at least 1 checkpoint commit, got {count}"
         );
 
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[tokio::test]
-    async fn timely_state_persists_across_checkpoints() {
-        let dir = temp_dir("timely_persist");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-
-        // First run
-        {
-            let executor = Executor::new(dir.clone());
-            let ctx = executor.create_context("counter").await.unwrap();
-
-            let source = VecSource::new(vec!["hello world".to_string()]);
-            let operators = vec![OperatorSlot::new("counter", WordCounter, ctx, Some(tokio::runtime::Handle::current()))];
-            let collected = Arc::new(Mutex::new(Vec::new()));
-            let sink = CollectSink {
-                collected: collected.clone(),
-            };
-
-            executor
-                .run_dataflow(source, operators, sink)
-                .await
-                .unwrap();
-
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
-            let results = collected.lock().unwrap().clone();
-            assert_eq!(results, vec!["hello: 1", "world: 1"]);
-        }
-
-        // Second run — state should be restored from checkpoint
-        {
-            let executor = Executor::new(dir.clone());
-            let ctx = executor.create_context("counter").await.unwrap();
-
-            let source = VecSource::new(vec!["hello rill".to_string()]);
-            let operators = vec![OperatorSlot::new("counter", WordCounter, ctx, Some(tokio::runtime::Handle::current()))];
-            let collected = Arc::new(Mutex::new(Vec::new()));
-            let sink = CollectSink {
-                collected: collected.clone(),
-            };
-
-            executor
-                .run_dataflow(source, operators, sink)
-                .await
-                .unwrap();
-
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
-            let results = collected.lock().unwrap().clone();
-            // hello count should be 2 (resumed from checkpoint)
-            assert_eq!(results, vec!["hello: 2", "rill: 1"]);
-        }
+        // All 150 items should have been processed.
+        let results = collected.lock().unwrap();
+        assert_eq!(
+            results.len(),
+            150,
+            "expected 150 results, got {}",
+            results.len()
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

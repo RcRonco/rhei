@@ -9,6 +9,8 @@ use super::memtable::MemTable;
 pub struct StateContext {
     memtable: MemTable,
     backend: Box<dyn StateBackend>,
+    /// Optional worker label for per-worker metrics. `None` means no label.
+    worker_label: Option<String>,
 }
 
 impl std::fmt::Debug for StateContext {
@@ -25,25 +27,48 @@ impl StateContext {
         Self {
             memtable: MemTable::new(),
             backend,
+            worker_label: None,
         }
+    }
+
+    /// Creates a new `StateContext` with a worker label for per-worker metrics.
+    pub fn with_worker_label(mut self, label: String) -> Self {
+        self.worker_label = Some(label);
+        self
     }
 
     /// Get a value — checks memtable first, then falls back to backend.
     pub async fn get(&mut self, key: &[u8]) -> anyhow::Result<Option<Vec<u8>>> {
-        metrics::counter!("state_gets_total").increment(1);
+        if let Some(ref wl) = self.worker_label {
+            metrics::counter!("state_gets_total", "worker" => wl.clone()).increment(1);
+        } else {
+            metrics::counter!("state_gets_total").increment(1);
+        }
         let start = std::time::Instant::now();
 
         let result = match self.memtable.get(key) {
             Some(Some(v)) => {
-                metrics::counter!("state_l1_hits_total").increment(1);
+                if let Some(ref wl) = self.worker_label {
+                    metrics::counter!("state_l1_hits_total", "worker" => wl.clone()).increment(1);
+                } else {
+                    metrics::counter!("state_l1_hits_total").increment(1);
+                }
                 Ok(Some(v.clone()))
             }
             Some(None) => {
-                metrics::counter!("state_l1_hits_total").increment(1);
+                if let Some(ref wl) = self.worker_label {
+                    metrics::counter!("state_l1_hits_total", "worker" => wl.clone()).increment(1);
+                } else {
+                    metrics::counter!("state_l1_hits_total").increment(1);
+                }
                 Ok(None) // tombstone — key was deleted
             }
             None => {
-                metrics::counter!("state_l1_misses_total").increment(1);
+                if let Some(ref wl) = self.worker_label {
+                    metrics::counter!("state_l1_misses_total", "worker" => wl.clone()).increment(1);
+                } else {
+                    metrics::counter!("state_l1_misses_total").increment(1);
+                }
                 // Cache miss — fetch from backend
                 let result = self.backend.get(key).await?;
                 if let Some(ref v) = result {
@@ -59,13 +84,21 @@ impl StateContext {
 
     /// Put a value — writes to memtable only (synchronous).
     pub fn put(&mut self, key: &[u8], value: &[u8]) {
-        metrics::counter!("state_puts_total").increment(1);
+        if let Some(ref wl) = self.worker_label {
+            metrics::counter!("state_puts_total", "worker" => wl.clone()).increment(1);
+        } else {
+            metrics::counter!("state_puts_total").increment(1);
+        }
         self.memtable.put(key.to_vec(), value.to_vec());
     }
 
     /// Delete a key — marks as deleted in memtable.
     pub fn delete(&mut self, key: &[u8]) {
-        metrics::counter!("state_deletes_total").increment(1);
+        if let Some(ref wl) = self.worker_label {
+            metrics::counter!("state_deletes_total", "worker" => wl.clone()).increment(1);
+        } else {
+            metrics::counter!("state_deletes_total").increment(1);
+        }
         self.memtable.delete(key.to_vec());
     }
 

@@ -162,14 +162,11 @@ impl Source for KafkaSource {
         let mut tpl = TopicPartitionList::new();
         for ((topic, partition), offset) in &self.tracked_offsets {
             // Kafka convention: committed offset = next offset to read
-            tpl.add_partition_offset(
-                topic,
-                *partition,
-                rdkafka::Offset::Offset(offset + 1),
-            )?;
+            tpl.add_partition_offset(topic, *partition, rdkafka::Offset::Offset(offset + 1))?;
         }
 
-        self.consumer.commit(&tpl, rdkafka::consumer::CommitMode::Sync)?;
+        self.consumer
+            .commit(&tpl, rdkafka::consumer::CommitMode::Sync)?;
         metrics::counter!("kafka_consumer_offsets_committed_total").increment(1);
         tracing::debug!(partitions = self.tracked_offsets.len(), "committed offsets");
         self.tracked_offsets.clear();

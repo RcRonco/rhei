@@ -10,9 +10,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use metrics::{
-    Counter, Gauge, Histogram, Key, KeyName, Metadata, Recorder, SharedString, Unit,
-};
+use metrics::{Counter, Gauge, Histogram, Key, KeyName, Metadata, Recorder, SharedString, Unit};
 
 /// Point-in-time snapshot of all pipeline metrics.
 #[derive(Debug, Clone)]
@@ -49,6 +47,8 @@ pub struct MetricsSnapshot {
     pub stash_depth: f64,
     /// Current number of pending async futures.
     pub pending_futures: f64,
+    /// Number of parallel workers.
+    pub workers: u64,
     /// Time since pipeline started.
     pub uptime: Duration,
 }
@@ -72,6 +72,7 @@ impl Default for MetricsSnapshot {
             element_duration_p99: 0.0,
             stash_depth: 0.0,
             pending_futures: 0.0,
+            workers: 0,
             uptime: Duration::ZERO,
         }
     }
@@ -105,8 +106,7 @@ impl MetricsHandle {
         let gauges = self.inner.gauges.lock().unwrap();
 
         let get = |map: &HashMap<String, Arc<AtomicU64>>, key: &str| -> u64 {
-            map.get(key)
-                .map_or(0, |v| v.load(Ordering::Relaxed))
+            map.get(key).map_or(0, |v| v.load(Ordering::Relaxed))
         };
 
         let get_f64 = |map: &HashMap<String, Arc<AtomicU64>>, key: &str| -> f64 {
@@ -140,6 +140,9 @@ impl MetricsHandle {
         let element_duration_p99 = get_f64(&gauges, "executor_element_duration_p99");
         let stash_depth = get_f64(&gauges, "backpressure_stash_depth");
         let pending_futures = get_f64(&gauges, "backpressure_pending_futures");
+        let workers_f64 = get_f64(&gauges, "executor_workers");
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let workers = workers_f64 as u64;
 
         let uptime = self.inner.start_time.elapsed();
 
@@ -160,6 +163,7 @@ impl MetricsHandle {
             element_duration_p99,
             stash_depth,
             pending_futures,
+            workers,
             uptime,
         }
     }
@@ -297,7 +301,8 @@ mod tests {
     fn recorder_tracks_counters() {
         let (recorder, handle) = SnapshotRecorder::new();
         let key = Key::from_name("executor_elements_total");
-        let counter = recorder.register_counter(&key, &Metadata::new("", metrics::Level::INFO, None));
+        let counter =
+            recorder.register_counter(&key, &Metadata::new("", metrics::Level::INFO, None));
         counter.increment(42);
 
         let snap = handle.snapshot();

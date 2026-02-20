@@ -3,14 +3,19 @@
 //! [`CapturingLayer`] implements `tracing_subscriber::Layer`, forwarding
 //! structured log events to a bounded `mpsc` channel as [`LogEntry`] values.
 //! Consumers receive logs without coupling to any specific rendering framework.
+//!
+//! Worker context is automatically captured from tracing spans. Any span with
+//! a `worker` field (e.g. `tracing::info_span!("worker", worker = 0)`) will
+//! tag all events within it with the worker index.
 
 use std::time::SystemTime;
 
 use tracing::Level;
-use tracing_subscriber::layer::Context;
 use tracing_subscriber::Layer;
+use tracing_subscriber::layer::Context;
+use tracing_subscriber::registry::LookupSpan;
 
-/// A captured log event with timestamp, level, target, and message.
+/// A captured log event with timestamp, level, target, message, and optional worker.
 #[derive(Debug, Clone)]
 pub struct LogEntry {
     /// When the event was recorded.
@@ -21,6 +26,13 @@ pub struct LogEntry {
     pub target: String,
     /// The formatted message.
     pub message: String,
+    /// Worker index if the event was emitted within a worker span.
+    pub worker: Option<usize>,
+}
+
+/// Extension stored on spans to carry worker identity through the span tree.
+struct WorkerInfo {
+    worker: usize,
 }
 
 /// A `tracing_subscriber::Layer` that captures events into a bounded channel.
@@ -45,25 +57,67 @@ impl CapturingLayer {
 
 impl<S> Layer<S> for CapturingLayer
 where
-    S: tracing::Subscriber,
+    S: tracing::Subscriber + for<'a> LookupSpan<'a>,
 {
-    fn on_event(&self, event: &tracing::Event<'_>, _ctx: Context<'_, S>) {
+    fn on_new_span(
+        &self,
+        attrs: &tracing::span::Attributes<'_>,
+        id: &tracing::span::Id,
+        ctx: Context<'_, S>,
+    ) {
+        let mut visitor = WorkerVisitor(None);
+        attrs.record(&mut visitor);
+        if let Some(worker) = visitor.0
+            && let Some(span) = ctx.span(id)
+        {
+            span.extensions_mut().insert(WorkerInfo { worker });
+        }
+    }
+
+    fn on_event(&self, event: &tracing::Event<'_>, ctx: Context<'_, S>) {
         let metadata = event.metadata();
 
         // Extract message from the event's fields
         let mut visitor = MessageVisitor(String::new());
         event.record(&mut visitor);
 
+        // Walk the span tree to find worker context
+        let worker = ctx.event_span(event).and_then(|span| {
+            for s in span.scope() {
+                if let Some(info) = s.extensions().get::<WorkerInfo>() {
+                    return Some(info.worker);
+                }
+            }
+            None
+        });
+
         let entry = LogEntry {
             timestamp: SystemTime::now(),
             level: *metadata.level(),
             target: metadata.target().to_string(),
             message: visitor.0,
+            worker,
         };
 
         // Non-blocking send — drop if channel full
         let _ = self.tx.try_send(entry);
     }
+}
+
+/// Visitor that extracts a `worker` field (u64) from span attributes.
+struct WorkerVisitor(Option<usize>);
+
+impl tracing::field::Visit for WorkerVisitor {
+    fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+        if field.name() == "worker" {
+            #[allow(clippy::cast_possible_truncation)]
+            {
+                self.0 = Some(value as usize);
+            }
+        }
+    }
+
+    fn record_debug(&mut self, _field: &tracing::field::Field, _value: &dyn std::fmt::Debug) {}
 }
 
 /// Visitor that extracts the `message` field from a tracing event.

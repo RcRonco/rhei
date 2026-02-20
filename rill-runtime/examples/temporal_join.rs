@@ -1,19 +1,17 @@
-//! Temporal join example using the operators library.
+//! Temporal join example using the dataflow API.
 //!
 //! Interleaved order and shipment events are joined by `order_id` using
 //! [`TemporalJoin`]. When both sides of a join arrive, a matched result is
 //! emitted. Unmatched events are buffered in operator state until their
 //! counterpart appears.
 //!
-//! Uses `run_dataflow` to execute the pipeline as a Timely computation with
-//! epoch-based progress tracking and automatic checkpointing.
-//!
 //! Run with: `cargo run -p rill-runtime --example temporal_join`
 
 use rill_core::connectors::print_sink::PrintSink;
 use rill_core::connectors::vec_source::VecSource;
 use rill_core::operators::{JoinSide, TemporalJoin};
-use rill_runtime::executor::{Executor, OperatorSlot};
+use rill_runtime::dataflow::DataflowGraph;
+use rill_runtime::executor::Executor;
 use serde::{Deserialize, Serialize};
 
 /// An order event.
@@ -39,8 +37,7 @@ async fn main() -> anyhow::Result<()> {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir)?;
 
-    let executor = Executor::new(dir.clone());
-    let ctx = executor.create_context("temporal_join").await?;
+    let graph = DataflowGraph::new();
 
     let source = VecSource::new(vec![
         // ORD-001 arrives first, no shipment yet → buffered
@@ -100,15 +97,17 @@ async fn main() -> anyhow::Result<()> {
         })
         .build();
 
-    let operators = vec![OperatorSlot::new(
-        "temporal_join",
-        op,
-        ctx,
-        Some(tokio::runtime::Handle::current()),
-    )];
-    let sink: PrintSink<String> = PrintSink::new().with_prefix("output");
+    let events = graph.source(source);
+    events
+        .key_by(|side: &JoinSide<Order, Shipment>| match side {
+            JoinSide::Left(o) => o.order_id.clone(),
+            JoinSide::Right(s) => s.order_id.clone(),
+        })
+        .operator("temporal_join", op)
+        .sink(PrintSink::<String>::new().with_prefix("output"));
 
-    executor.run_dataflow(source, operators, sink).await?;
+    let executor = Executor::builder().checkpoint_dir(&dir).build();
+    executor.run(graph).await?;
 
     let _ = std::fs::remove_dir_all(&dir);
     Ok(())

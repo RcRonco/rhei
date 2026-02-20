@@ -4,6 +4,7 @@ use rill_core::state::context::StateContext;
 use rill_core::traits::StreamFunction;
 
 use crate::async_operator::AsyncOperator;
+use crate::dataflow::{AnyItem, ErasedOperator};
 
 /// Wraps `AsyncOperator<F>` with Timely capability management.
 ///
@@ -102,5 +103,68 @@ impl<F: StreamFunction + 'static> TimelyAsyncOperator<F> {
     /// Get mutable reference to the state context (for final checkpoint).
     pub fn context_mut(&mut self) -> &mut StateContext {
         self.inner.context_mut()
+    }
+}
+
+/// Wraps a type-erased `ErasedOperator` + `StateContext` with frontier-based
+/// checkpoint tracking for the dataflow graph execution path.
+///
+/// Analogous to [`TimelyAsyncOperator`] but for `Box<dyn ErasedOperator>`.
+pub(crate) struct TimelyErasedOperator {
+    op: Box<dyn ErasedOperator>,
+    ctx: StateContext,
+    last_checkpoint_epoch: Option<u64>,
+}
+
+impl TimelyErasedOperator {
+    /// Create a new erased operator wrapper.
+    pub fn new(op: Box<dyn ErasedOperator>, ctx: StateContext) -> Self {
+        Self {
+            op,
+            ctx,
+            last_checkpoint_epoch: None,
+        }
+    }
+
+    /// Process a type-erased input item. Blocks on the Tokio runtime since
+    /// we're running on a Timely worker thread (not a Tokio thread).
+    pub fn process(&mut self, input: AnyItem, rt: &tokio::runtime::Handle) -> Vec<AnyItem> {
+        rt.block_on(self.op.process(input, &mut self.ctx))
+    }
+
+    /// Checkpoint state when frontier advances past last checkpoint epoch.
+    ///
+    /// Returns `true` if a checkpoint was actually performed.
+    pub fn maybe_checkpoint(&mut self, frontier: &[u64], rt: &tokio::runtime::Handle) -> bool {
+        let min_frontier = frontier.iter().copied().min();
+
+        let should_checkpoint = match (min_frontier, self.last_checkpoint_epoch) {
+            (Some(current), Some(last)) => current > last,
+            (Some(_), None) | (None, _) => true,
+        };
+
+        if should_checkpoint {
+            let ckpt_start = std::time::Instant::now();
+            if let Err(e) = rt.block_on(self.ctx.checkpoint()) {
+                tracing::error!("checkpoint failed: {e}");
+            }
+            metrics::gauge!("executor_checkpoint_duration_seconds")
+                .set(ckpt_start.elapsed().as_secs_f64());
+            self.last_checkpoint_epoch = min_frontier;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Force a checkpoint (for final flush).
+    #[allow(dead_code)]
+    pub fn checkpoint(&mut self, rt: &tokio::runtime::Handle) {
+        let ckpt_start = std::time::Instant::now();
+        if let Err(e) = rt.block_on(self.ctx.checkpoint()) {
+            tracing::error!("final checkpoint failed: {e}");
+        }
+        metrics::gauge!("executor_checkpoint_duration_seconds")
+            .set(ckpt_start.elapsed().as_secs_f64());
     }
 }

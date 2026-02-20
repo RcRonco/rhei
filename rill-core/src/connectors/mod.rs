@@ -1,3 +1,5 @@
+/// A sink that writes JSON lines to a file.
+pub mod file_sink;
 /// Kafka message types (always compiled — no rdkafka dependency).
 pub mod kafka_types;
 /// A sink that prints each element to stdout.

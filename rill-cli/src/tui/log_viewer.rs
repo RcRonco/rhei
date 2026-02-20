@@ -22,9 +22,7 @@ fn level_color(level: Level) -> Color {
 }
 
 fn format_time(ts: std::time::SystemTime) -> String {
-    let since_epoch = ts
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default();
+    let since_epoch = ts.duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
     let total_secs = since_epoch.as_secs();
     let hours = (total_secs / 3600) % 24;
     let minutes = (total_secs / 60) % 60;
@@ -41,7 +39,12 @@ pub fn render_log_viewer(
 ) {
     let block = Block::default()
         .title(Line::from(vec![
-            Span::styled(" Logs ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                " Logs ",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::styled("[", Style::default().fg(Color::DarkGray)),
             Span::styled("\u{2191}\u{2193}", Style::default().fg(Color::White)),
             Span::styled("] ", Style::default().fg(Color::DarkGray)),
@@ -61,13 +64,27 @@ pub fn render_log_viewer(
             let level_str = format!("{:5}", entry.level);
             let color = level_color(entry.level);
 
-            ListItem::new(Line::from(vec![
+            let mut spans = vec![
                 Span::styled(time, Style::default().fg(Color::DarkGray)),
                 Span::raw(" "),
-                Span::styled(level_str, Style::default().fg(color).add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    level_str,
+                    Style::default().fg(color).add_modifier(Modifier::BOLD),
+                ),
                 Span::raw(" "),
-                Span::styled(&entry.message, Style::default().fg(Color::White)),
-            ]))
+            ];
+            if let Some(w) = entry.worker {
+                spans.push(Span::styled(
+                    format!("Worker={w} "),
+                    Style::default().fg(Color::Magenta),
+                ));
+            }
+            spans.push(Span::styled(
+                &entry.message,
+                Style::default().fg(Color::White),
+            ));
+
+            ListItem::new(Line::from(spans))
         })
         .collect::<Vec<_>>()
         .into_iter()

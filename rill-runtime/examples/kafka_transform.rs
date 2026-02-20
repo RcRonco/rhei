@@ -18,9 +18,11 @@ use rill_core::connectors::kafka_source::KafkaSource;
 use rill_core::connectors::kafka_types::{KafkaMessage, KafkaRecord};
 use rill_core::state::context::StateContext;
 use rill_core::traits::StreamFunction;
-use rill_runtime::executor::{Executor, OperatorSlot};
+use rill_runtime::dataflow::DataflowGraph;
+use rill_runtime::executor::Executor;
 
 /// Uppercases Kafka message payloads.
+#[derive(Clone)]
 struct Uppercase;
 
 #[async_trait]
@@ -39,34 +41,27 @@ impl StreamFunction for Uppercase {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter("info")
-        .init();
+    tracing_subscriber::fmt().with_env_filter("info").init();
 
     let dir = std::env::temp_dir().join("rill_kafka_transform_example");
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir)?;
 
-    let executor = Executor::new(dir.clone());
-    let ctx = executor.create_context("uppercase").await?;
+    let source =
+        KafkaSource::new("localhost:9092", "rill-example", &["input-topic"])?.with_batch_size(100);
+    let sink = KafkaSink::new("localhost:9092", "output-topic")?.with_buffer_capacity(100);
 
-    let mut source = KafkaSource::new("localhost:9092", "rill-example", &["input-topic"])?
-        .with_batch_size(100);
+    let graph = DataflowGraph::new();
+    graph
+        .source(source)
+        .key_by(|_msg: &KafkaMessage| "all".to_string())
+        .operator("uppercase", Uppercase)
+        .sink(sink);
 
-    let mut operators = vec![OperatorSlot::new(
-        "uppercase",
-        Uppercase,
-        ctx,
-        Some(tokio::runtime::Handle::current()),
-    )];
-
-    let mut sink = KafkaSink::new("localhost:9092", "output-topic")?
-        .with_buffer_capacity(100);
+    let executor = Executor::builder().checkpoint_dir(dir.clone()).build();
 
     tracing::info!("starting kafka transform pipeline");
-    executor
-        .run_linear(&mut source, &mut operators, &mut sink)
-        .await?;
+    executor.run(graph).await?;
 
     let _ = std::fs::remove_dir_all(&dir);
     Ok(())

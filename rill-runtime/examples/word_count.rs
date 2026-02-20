@@ -1,17 +1,7 @@
-//! Word-count example demonstrating the fluent pipeline builder.
+//! Word-count example using the dataflow API.
 //!
-//! Uses the pipeline builder API to compose a filter, a stateful operator,
-//! and a map step into a single type-safe pipeline:
-//!
-//! ```ignore
-//! executor
-//!     .pipeline(source)
-//!     .filter(|line: &String| !line.is_empty())
-//!     .operator("word_counter", WordCounter, ctx)
-//!     .map(|result: String| format!("[output] {result}"))
-//!     .sink(PrintSink::new())
-//!     .await?;
-//! ```
+//! Demonstrates `Stream`, `KeyedStream`, and stateful operators with
+//! automatic per-worker state context creation.
 //!
 //! Run with: `cargo run -p rill-runtime --example word_count`
 
@@ -21,12 +11,14 @@ use rill_core::connectors::vec_source::VecSource;
 use rill_core::operators::KeyedState;
 use rill_core::state::context::StateContext;
 use rill_core::traits::StreamFunction;
+use rill_runtime::dataflow::{DataflowGraph, TransformContext};
 use rill_runtime::executor::Executor;
 
 /// A stateful word-count operator using [`KeyedState`] for typed state access.
 ///
 /// Splits each input line into words and maintains a running count for each
 /// word. Emits `"word: count"` strings.
+#[derive(Clone)]
 struct WordCounter;
 
 #[async_trait]
@@ -56,22 +48,53 @@ async fn main() -> anyhow::Result<()> {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir)?;
 
-    let executor = Executor::new(dir.clone());
-    let ctx = executor.create_context("word_counter").await?;
-
-    let source = VecSource::new(vec![
+    let lines = vec![
         "hello world".to_string(),
         "hello rill".to_string(),
         "rill is a stream processor".to_string(),
         "hello world again".to_string(),
-    ]);
+    ];
 
-    executor
-        .pipeline(source)
-        .operator("word_counter", WordCounter, ctx)
-        .map(|result: String| format!("[output] {result}"))
-        .sink(PrintSink::new())
-        .await?;
+    // ── Single-worker ────────────────────────────────────────────────
+    println!("=== Single-worker ===");
+    {
+        let graph = DataflowGraph::new();
+        let stream = graph.source(VecSource::new(lines.clone()));
+        stream
+            .flat_map(|line: String| line.split_whitespace().map(String::from).collect())
+            .key_by(|word: &String| word.clone())
+            .operator("word_counter", WordCounter)
+            .map_ctx(|result: String, ctx: &TransformContext| {
+                format!("[W{}] {result}", ctx.worker_index)
+            })
+            .sink(PrintSink::new());
+
+        let executor = Executor::builder()
+            .checkpoint_dir(dir.join("single"))
+            .build();
+        executor.run(graph).await?;
+    }
+
+    // ── Multi-worker (2 workers) ─────────────────────────────────────
+    println!("\n=== Multi-worker (3 workers) ===");
+    {
+        let graph = DataflowGraph::new();
+        let stream = graph.source(VecSource::new(lines));
+        stream
+            .flat_map(|line: String| line.split_whitespace().map(String::from).collect())
+            .key_by(|word: &String| word.to_lowercase())
+            .operator("word_counter", WordCounter)
+            .map_ctx(|result: String, ctx: &TransformContext| {
+                format!("[W{}/{}] {result}", ctx.worker_index, ctx.num_workers)
+            })
+            .sink(PrintSink::new());
+
+        let executor = Executor::builder()
+            .checkpoint_dir(dir.join("multi"))
+            .workers(3)
+            .build();
+        executor.run(graph).await?;
+    }
 
     let _ = std::fs::remove_dir_all(&dir);
     Ok(())

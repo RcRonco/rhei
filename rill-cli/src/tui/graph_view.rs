@@ -34,25 +34,48 @@ pub fn render_graph(frame: &mut Frame<'_>, area: Rect, plan: &LogicalPlan) {
     let order = plan.topological_order();
 
     let mut spans: Vec<Span<'_>> = Vec::new();
+    let mut prev_is_exchange = false;
     for (i, &idx) in order.iter().enumerate() {
         let node = &plan.nodes[idx];
         let color = node_color(&node.kind);
         let name = node.kind.name().to_string();
+        let is_exchange = matches!(node.kind, NodeKind::KeyBy(_));
 
+        // Draw connector between nodes.
         if i > 0 {
+            let exchange_style = Style::default().fg(Color::Blue);
+            let normal_style = Style::default().fg(Color::DarkGray);
+            if is_exchange {
+                // Dashed line leading into exchange
+                spans.push(Span::styled(" \u{254C}\u{254C} ", exchange_style));
+            } else if prev_is_exchange {
+                // Dashed line leading out of exchange
+                spans.push(Span::styled(" \u{254C}\u{254C}\u{25B6} ", exchange_style));
+            } else {
+                spans.push(Span::styled(" \u{2500}\u{2500}\u{25B6} ", normal_style));
+            }
+        }
+
+        // Draw the node itself.
+        if is_exchange {
+            let style = Style::default().fg(color).add_modifier(Modifier::BOLD);
+            spans.push(Span::styled("\u{25C6} ", style));
+            spans.push(Span::styled(name, style));
+            spans.push(Span::styled(" \u{25C6}", style));
+        } else {
             spans.push(Span::styled(
-                " \u{2500}\u{2500}\u{25B6} ",
-                Style::default().fg(Color::DarkGray),
+                format!("[{name}]"),
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
             ));
         }
-        spans.push(Span::styled(
-            format!("[{name}]"),
-            Style::default().fg(color).add_modifier(Modifier::BOLD),
-        ));
+
+        prev_is_exchange = is_exchange;
     }
 
     let line = Line::from(spans);
-    let paragraph = Paragraph::new(line).alignment(Alignment::Center).block(block);
+    let paragraph = Paragraph::new(line)
+        .alignment(Alignment::Center)
+        .block(block);
     frame.render_widget(paragraph, area);
 }
 

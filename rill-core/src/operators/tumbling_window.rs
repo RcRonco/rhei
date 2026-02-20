@@ -55,6 +55,18 @@ pub struct TumblingWindow<T, A, KF, TF> {
     _phantom: PhantomData<T>,
 }
 
+impl<T, A: Clone, KF: Clone, TF: Clone> Clone for TumblingWindow<T, A, KF, TF> {
+    fn clone(&self) -> Self {
+        Self {
+            window_size: self.window_size,
+            key_fn: self.key_fn.clone(),
+            time_fn: self.time_fn.clone(),
+            aggregator: self.aggregator.clone(),
+            _phantom: PhantomData,
+        }
+    }
+}
+
 impl<T, A, KF, TF> fmt::Debug for TumblingWindow<T, A, KF, TF> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("TumblingWindow")
@@ -175,20 +187,16 @@ where
 #[async_trait]
 impl<T, A, KF, TF> StreamFunction for TumblingWindow<T, A, KF, TF>
 where
-    T: Send + Sync,
+    T: Clone + Send + Sync,
     A: Aggregator<Input = T>,
-    A::Output: Send,
+    A::Output: Clone + Send,
     KF: Fn(&T) -> String + Send + Sync,
     TF: Fn(&T) -> u64 + Send + Sync,
 {
     type Input = T;
     type Output = WindowOutput<A::Output>;
 
-    async fn process(
-        &mut self,
-        input: T,
-        ctx: &mut StateContext,
-    ) -> Vec<WindowOutput<A::Output>> {
+    async fn process(&mut self, input: T, ctx: &mut StateContext) -> Vec<WindowOutput<A::Output>> {
         let key = (self.key_fn)(&input);
         let timestamp = (self.time_fn)(&input);
         let window_start = timestamp - (timestamp % self.window_size);
@@ -206,8 +214,7 @@ where
         {
             let acc_key = format!("{key}:{old_start}");
             let old_acc: Option<A::Accumulator> = {
-                let mut state =
-                    KeyedState::<String, A::Accumulator>::new(ctx, "acc");
+                let mut state = KeyedState::<String, A::Accumulator>::new(ctx, "acc");
                 state.get(&acc_key).await.unwrap_or(None)
             };
             if let Some(acc) = old_acc {
@@ -220,8 +227,7 @@ where
             }
             // Delete old accumulator
             {
-                let mut state =
-                    KeyedState::<String, A::Accumulator>::new(ctx, "acc");
+                let mut state = KeyedState::<String, A::Accumulator>::new(ctx, "acc");
                 state.delete(&acc_key);
             }
         }

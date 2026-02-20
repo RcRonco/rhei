@@ -40,6 +40,16 @@ pub struct TemporalJoin<L, R, KF, JF> {
     _phantom: PhantomData<(L, R)>,
 }
 
+impl<L, R, KF: Clone, JF: Clone> Clone for TemporalJoin<L, R, KF, JF> {
+    fn clone(&self) -> Self {
+        Self {
+            key_fn: self.key_fn.clone(),
+            join_fn: self.join_fn.clone(),
+            _phantom: PhantomData,
+        }
+    }
+}
+
 impl<L, R, KF, JF> fmt::Debug for TemporalJoin<L, R, KF, JF> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("TemporalJoin").finish_non_exhaustive()
@@ -77,7 +87,8 @@ pub struct TemporalJoinBuilder<L, R, KF = (), JF = ()> {
 
 impl<L, R, KF, JF> fmt::Debug for TemporalJoinBuilder<L, R, KF, JF> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("TemporalJoinBuilder").finish_non_exhaustive()
+        f.debug_struct("TemporalJoinBuilder")
+            .finish_non_exhaustive()
     }
 }
 
@@ -122,9 +133,9 @@ where
 #[async_trait]
 impl<L, R, O, KF, JF> StreamFunction for TemporalJoin<L, R, KF, JF>
 where
-    L: Serialize + DeserializeOwned + Send + Sync,
-    R: Serialize + DeserializeOwned + Send + Sync,
-    O: Send,
+    L: Clone + Serialize + DeserializeOwned + Send + Sync,
+    R: Clone + Serialize + DeserializeOwned + Send + Sync,
+    O: Clone + Send,
     KF: Fn(&JoinSide<L, R>) -> String + Send + Sync,
     JF: Fn(L, R) -> O + Send + Sync,
 {
