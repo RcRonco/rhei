@@ -31,3 +31,8 @@ required-features = ["kafka"]
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full"] }
+tempfile.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+rill-core = { path = "../rill-core", features = ["kafka"] }
+rdkafka.workspace = true

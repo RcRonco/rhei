@@ -28,6 +28,12 @@ pub trait Aggregator: Send + Sync {
 /// Counts the number of elements in a window.
 pub struct Count<T>(PhantomData<T>);
 
+impl<T> Clone for Count<T> {
+    fn clone(&self) -> Self {
+        Count(PhantomData)
+    }
+}
+
 impl<T> fmt::Debug for Count<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Count").finish()
@@ -65,6 +71,15 @@ impl<T: Send + Sync> Aggregator for Count<T> {
 pub struct Sum<F, T> {
     extractor: F,
     _phantom: PhantomData<T>,
+}
+
+impl<F: Clone, T> Clone for Sum<F, T> {
+    fn clone(&self) -> Self {
+        Self {
+            extractor: self.extractor.clone(),
+            _phantom: PhantomData,
+        }
+    }
 }
 
 impl<F, T> fmt::Debug for Sum<F, T> {
