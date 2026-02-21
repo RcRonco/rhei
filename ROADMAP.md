@@ -58,13 +58,14 @@
 
 - [ ] Batch-level processing in operators (process `Vec<Input>` instead of element-at-a-time)
 - [ ] Zero-copy deserialization for state reads (avoid `Vec<u8>` cloning)
-- [ ] Memtable compaction and eviction policies (bounded memory)
+- [ ] Memtable compaction and eviction policies (bounded memory) (KI-7)
 - [ ] Async state prefetch — predict upcoming keys and warm L2/L3 cache
 - [ ] Columnar in-memory representation for windowed aggregations
 - [ ] Benchmark suite with throughput/latency targets
 - [ ] Profile and optimize the Timely ↔ Tokio bridge (channel sizing, wake strategy)
 - [ ] Batch-level type erasure (erase `Vec<T>` once per batch instead of per element)
 - [ ] Investigate `abomonation` or `flatbuffers` for Timely serialization instead of `bincode`
+- [ ] Sliding window eviction for closed active windows (KI-10)
 
 ## Stability
 
@@ -72,12 +73,29 @@
 - [ ] Checkpoint versioning and backward-compatible state migration
 - [x] Graceful shutdown: drain in-flight, checkpoint, then exit
 - [ ] Restart from checkpoint with offset tracking (Kafka consumer offsets)
-- [ ] Watermark propagation for out-of-order event handling
+  - [x] Checkpoint manifest with source offset persistence
+  - [ ] Reload source offsets from manifest on restart (KI-2)
+  - [ ] Kafka consumer seek to checkpointed offsets on restart (KI-16)
+- [ ] Watermark propagation for out-of-order event handling (KI-13)
 - [ ] Late-event policy (drop, redirect to side output, or update)
 - [x] Operator-level error handling (skip or dead-letter file via `ErrorPolicy`)
+- [ ] Propagate sink send errors instead of silently dropping (KI-1)
+- [ ] Propagate DLQ write errors instead of silently dropping (KI-3)
+- [ ] Propagate checkpoint failures in single-worker mode (KI-15)
+- [ ] Fix async stash ordering — pending elements can be overtaken by later L1 hits (KI-11)
+- [ ] Configurable checkpoint interval (currently hardcoded to 100 batches) (KI-8)
 - [ ] Fuzz testing for state serialization and checkpoint restore
 - [x] S3/MinIO E2E integration test for tiered storage backend
 - [ ] Integration tests with simulated failures (network partitions, slow backends)
+- [ ] Integration tests for backpressure, DLQ routing, late events, checkpoint recovery (KI-18)
+
+## Topology
+
+- [ ] Support multiple exchanges (key_by) in a single pipeline (KI-4)
+- [ ] Merge / fan-in — combine multiple streams into one (KI-9)
+- [ ] Fan-out — one source feeding multiple sinks (KI-17)
+- [ ] Temporal join timeout and state eviction for unmatched events (KI-5)
+- [ ] Single-worker source offset tracking in checkpoint manifest (KI-12)
 
 ## Clustering
 
