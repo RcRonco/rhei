@@ -154,6 +154,15 @@ impl Source for KafkaSource {
         self.watermark_pending
     }
 
+    fn current_offsets(&self) -> HashMap<String, String> {
+        self.tracked_offsets
+            .iter()
+            .map(|((topic, partition), offset)| {
+                (format!("{topic}/{partition}"), offset.to_string())
+            })
+            .collect()
+    }
+
     async fn on_checkpoint_complete(&mut self) -> anyhow::Result<()> {
         if self.tracked_offsets.is_empty() {
             return Ok(());

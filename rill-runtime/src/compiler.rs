@@ -118,6 +118,17 @@ pub(crate) fn compile(mut nodes: Vec<GraphNode>) -> anyhow::Result<Vec<CompiledP
 
 // ── Segment utilities ───────────────────────────────────────────────
 
+/// Extract operator names from a compiled segment list.
+pub(crate) fn operator_names(segments: &[Segment]) -> Vec<String> {
+    segments
+        .iter()
+        .filter_map(|seg| match seg {
+            Segment::Operator { name, .. } => Some(name.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
 /// Clone segments (Arc transforms are cheap, operators use `clone_erased`).
 pub(crate) fn clone_segments(segments: &[Segment]) -> Vec<Segment> {
     segments

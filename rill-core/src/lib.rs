@@ -12,6 +12,8 @@
 
 #![warn(missing_docs)]
 
+/// Checkpoint manifest for recording pipeline checkpoint metadata.
+pub mod checkpoint;
 /// Built-in source and sink connectors.
 pub mod connectors;
 /// Dead-letter queue types.

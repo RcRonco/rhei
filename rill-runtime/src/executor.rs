@@ -20,6 +20,7 @@
 
 use std::sync::Arc;
 
+use rill_core::checkpoint::CheckpointManifest;
 use rill_core::dlq::ErrorPolicy;
 use rill_core::state::context::StateContext;
 use rill_core::state::local_backend::LocalBackend;
@@ -28,7 +29,7 @@ use rill_core::state::slatedb_backend::SlateDbBackend;
 use rill_core::state::tiered_backend::{TieredBackend, TieredBackendConfig};
 
 use crate::compiler::{
-    CompiledPipeline, Segment, clone_segments, compile, split_at_first_exchange,
+    CompiledPipeline, Segment, clone_segments, compile, operator_names, split_at_first_exchange,
 };
 use crate::dataflow::{
     AnyItem, DataflowGraph, ErasedOperator, ErasedSink, ErasedSource, KeyFn, TransformContext,
@@ -37,6 +38,15 @@ use crate::dataflow::{
 use crate::health::{HealthState, PipelineStatus};
 use crate::shutdown::ShutdownHandle;
 use crate::timely_operator::TimelyErasedOperator;
+
+/// Current time as Unix milliseconds (saturating to `u64::MAX`).
+#[allow(clippy::cast_possible_truncation)]
+fn now_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
 
 // ── Key partitioning ────────────────────────────────────────────────
 
@@ -583,6 +593,8 @@ async fn execute_pipeline(
     pipeline: CompiledPipeline,
     executor: &Executor,
     shutdown: Option<&ShutdownHandle>,
+    initial_checkpoint_id: u64,
+    all_operator_names: Vec<String>,
 ) -> anyhow::Result<()> {
     let n_workers = executor.workers();
     let (pre_segments, exchange) = split_at_first_exchange(pipeline.segments);
@@ -598,6 +610,8 @@ async fn execute_pipeline(
                 executor,
                 n_workers,
                 shutdown,
+                initial_checkpoint_id,
+                all_operator_names,
             )
             .await
         }
@@ -613,6 +627,8 @@ async fn execute_pipeline(
                 pipeline.sink,
                 executor,
                 shutdown,
+                initial_checkpoint_id,
+                all_operator_names,
             )
             .await
         }
@@ -630,6 +646,8 @@ async fn execute_single_worker(
     sink: Box<dyn ErasedSink>,
     executor: &Executor,
     shutdown: Option<&ShutdownHandle>,
+    initial_checkpoint_id: u64,
+    all_operator_names: Vec<String>,
 ) -> anyhow::Result<()> {
     let rt = tokio::runtime::Handle::current();
 
@@ -727,6 +745,19 @@ async fn execute_single_worker(
         .await
         .map_err(|e| anyhow::anyhow!("sink task panicked: {e}"))??;
 
+    // Write final manifest. Source is consumed by the bridge so offsets are
+    // unavailable; record empty offsets (Kafka sources use multi-worker).
+    let checkpoint_id = initial_checkpoint_id + 1;
+    let manifest = CheckpointManifest {
+        version: 1,
+        checkpoint_id,
+        timestamp_ms: now_millis(),
+        operators: all_operator_names,
+        source_offsets: std::collections::HashMap::new(),
+    };
+    manifest.save(&executor.checkpoint_dir)?;
+    tracing::debug!(checkpoint_id, "checkpoint #{checkpoint_id} saved");
+
     Ok(())
 }
 
@@ -745,6 +776,8 @@ async fn execute_multi_worker(
     executor: &Executor,
     n_workers: usize,
     shutdown: Option<&ShutdownHandle>,
+    initial_checkpoint_id: u64,
+    all_operator_names: Vec<String>,
 ) -> anyhow::Result<()> {
     let rt = tokio::runtime::Handle::current();
     let channel_capacity = 256;
@@ -874,6 +907,7 @@ async fn execute_multi_worker(
     // Each send is a batch (Vec) that becomes one Timely epoch.
     let checkpoint_interval: u64 = 100;
     let mut batches_since_checkpoint: u64 = 0;
+    let mut checkpoint_id = initial_checkpoint_id;
     // Pre-exchange runs on the main async task: single reader, not a worker.
     let pre_exchange_ctx = TransformContext {
         worker_index: 0,
@@ -909,6 +943,16 @@ async fn execute_multi_worker(
         // Each notification means all workers have flushed their state.
         while checkpoint_notify_rx.try_recv().is_ok() {
             source.on_checkpoint_complete().await?;
+            checkpoint_id += 1;
+            let manifest = CheckpointManifest {
+                version: 1,
+                checkpoint_id,
+                timestamp_ms: now_millis(),
+                operators: all_operator_names.clone(),
+                source_offsets: source.current_offsets(),
+            };
+            manifest.save(&executor.checkpoint_dir)?;
+            tracing::debug!(checkpoint_id, "checkpoint #{checkpoint_id} saved");
         }
 
         batches_since_checkpoint += 1;
@@ -942,6 +986,18 @@ async fn execute_multi_worker(
 
     source.on_checkpoint_complete().await?;
 
+    // Write final checkpoint manifest.
+    checkpoint_id += 1;
+    let manifest = CheckpointManifest {
+        version: 1,
+        checkpoint_id,
+        timestamp_ms: now_millis(),
+        operators: all_operator_names,
+        source_offsets: source.current_offsets(),
+    };
+    manifest.save(&executor.checkpoint_dir)?;
+    tracing::debug!(checkpoint_id, "checkpoint #{checkpoint_id} saved");
+
     // Drop the output_tx so collector sees channel close.
     // (Timely workers already dropped their clones when exiting.)
 
@@ -962,11 +1018,56 @@ async fn run_graph(
 ) -> anyhow::Result<()> {
     let pipelines = compile(graph.into_nodes())?;
 
+    // Collect all operator names across pipelines for manifest validation.
+    let mut all_operator_names: Vec<String> = pipelines
+        .iter()
+        .flat_map(|p| operator_names(&p.segments))
+        .collect();
+    all_operator_names.sort();
+
+    // Load existing manifest and validate.
+    let initial_checkpoint_id =
+        if let Some(manifest) = CheckpointManifest::load(&executor.checkpoint_dir) {
+            tracing::info!(
+                checkpoint_id = manifest.checkpoint_id,
+                timestamp_ms = manifest.timestamp_ms,
+                operators = ?manifest.operators,
+                "resuming from checkpoint #{}", manifest.checkpoint_id
+            );
+
+            // Validate operator names.
+            let prev: std::collections::HashSet<&str> =
+                manifest.operators.iter().map(String::as_str).collect();
+            let curr: std::collections::HashSet<&str> =
+                all_operator_names.iter().map(String::as_str).collect();
+
+            let added: Vec<_> = curr.difference(&prev).collect();
+            let removed: Vec<_> = prev.difference(&curr).collect();
+            if !added.is_empty() || !removed.is_empty() {
+                tracing::warn!(
+                    ?added,
+                    ?removed,
+                    "operator topology changed since last checkpoint"
+                );
+            }
+
+            manifest.checkpoint_id
+        } else {
+            0
+        };
+
     executor.health.set_status(PipelineStatus::Running);
 
     let result = if pipelines.len() == 1 {
         let pipeline = pipelines.into_iter().next().unwrap();
-        execute_pipeline(pipeline, executor, shutdown.as_ref()).await
+        execute_pipeline(
+            pipeline,
+            executor,
+            shutdown.as_ref(),
+            initial_checkpoint_id,
+            all_operator_names,
+        )
+        .await
     } else {
         Err(anyhow::anyhow!(
             "multiple independent pipelines are not yet supported; found {}",

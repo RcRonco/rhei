@@ -41,6 +41,14 @@ pub trait Source: Send + Sync {
     async fn on_checkpoint_complete(&mut self) -> anyhow::Result<()> {
         Ok(())
     }
+
+    /// Returns a snapshot of current source offsets for checkpoint persistence.
+    ///
+    /// Key format is source-specific (e.g. `"topic/partition"` for Kafka).
+    /// The default implementation returns an empty map.
+    fn current_offsets(&self) -> std::collections::HashMap<String, String> {
+        std::collections::HashMap::new()
+    }
 }
 
 /// A sink that consumes elements from a stream.

@@ -124,6 +124,7 @@ pub(crate) struct NodeId(pub(crate) usize);
 pub(crate) trait ErasedSource: Send {
     async fn next_batch(&mut self) -> Option<Vec<AnyItem>>;
     async fn on_checkpoint_complete(&mut self) -> anyhow::Result<()>;
+    fn current_offsets(&self) -> std::collections::HashMap<String, String>;
 }
 
 /// Wraps a typed [`Source`] into an [`ErasedSource`].
@@ -142,6 +143,10 @@ where
 
     async fn on_checkpoint_complete(&mut self) -> anyhow::Result<()> {
         self.0.on_checkpoint_complete().await
+    }
+
+    fn current_offsets(&self) -> std::collections::HashMap<String, String> {
+        self.0.current_offsets()
     }
 }
 
