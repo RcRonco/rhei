@@ -95,3 +95,57 @@ pub trait Sink: Send + Sync {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Minimal source that uses all trait defaults.
+    struct MinimalSource;
+
+    #[async_trait]
+    impl Source for MinimalSource {
+        type Output = i32;
+        async fn next_batch(&mut self) -> Option<Vec<i32>> {
+            None
+        }
+    }
+
+    #[tokio::test]
+    async fn source_defaults_partition_count_is_none() {
+        let src = MinimalSource;
+        assert_eq!(src.partition_count(), None);
+    }
+
+    #[tokio::test]
+    async fn source_defaults_current_offsets_is_empty() {
+        let src = MinimalSource;
+        assert!(src.current_offsets().is_empty());
+    }
+
+    #[tokio::test]
+    async fn source_defaults_restore_offsets_is_noop() {
+        let mut src = MinimalSource;
+        let offsets = std::collections::HashMap::from([("key".to_string(), "42".to_string())]);
+        src.restore_offsets(&offsets).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn source_defaults_on_checkpoint_complete_is_noop() {
+        let mut src = MinimalSource;
+        src.on_checkpoint_complete().await.unwrap();
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "sources returning Some from partition_count()")]
+    async fn source_defaults_create_partition_source_panics() {
+        let src = MinimalSource;
+        let _ = src.create_partition_source(&[0]);
+    }
+
+    #[tokio::test]
+    async fn source_defaults_should_emit_watermark_is_false() {
+        let src = MinimalSource;
+        assert!(!src.should_emit_watermark());
+    }
+}

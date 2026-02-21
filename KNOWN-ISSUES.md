@@ -178,9 +178,11 @@ The unified Timely DAG executor supports fan-out implicitly via Timely's interna
 Tee. The same stream can feed multiple downstream operators and sinks. Stream
 handles are `Copy`, so `stream.sink(sink1); stream.sink(sink2);` works correctly.
 
-### KI-18: No integration tests for failure scenarios
+### KI-18: Limited integration tests for failure scenarios
 
-No tests exist for:
+Partitioned source and multi-worker checkpoint restart are now covered
+(`checkpoint_restart.rs`). Kafka multi-partition E2E is covered
+(`kafka_e2e.rs`). Still missing:
 - Backpressure behaviour when channels fill up
 - DLQ routing under sustained error rates
 - Late event handling across window boundaries

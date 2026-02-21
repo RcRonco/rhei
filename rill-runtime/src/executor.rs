@@ -1792,4 +1792,148 @@ mod tests {
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    // ── Partitioned source topology tests ────────────────────────
+
+    #[tokio::test]
+    async fn partitioned_source_single_partition_many_workers() {
+        // 1 partition, 4 workers — only worker 0 gets the partition reader.
+        // All data arrives through worker 0, exchange distributes.
+        let dir = temp_dir("part_single_part");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let graph = DataflowGraph::new();
+        let source = rill_core::connectors::partitioned_vec_source::PartitionedVecSource::new(
+            vec![1i32, 2, 3, 4, 5, 6],
+            1,
+        );
+        let collected = Arc::new(Mutex::new(Vec::new()));
+
+        graph
+            .source(source)
+            .key_by(|x: &i32| x.to_string())
+            .map(|x: i32| x * 10)
+            .sink(CollectSink {
+                collected: collected.clone(),
+            });
+
+        let executor = super::Executor::builder()
+            .checkpoint_dir(&dir)
+            .workers(4)
+            .build();
+        executor.run(graph).await.unwrap();
+        let mut results = collected.lock().unwrap().clone();
+        results.sort_unstable();
+        assert_eq!(results, vec![10, 20, 30, 40, 50, 60]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn partitioned_source_with_empty_partition() {
+        // 3 partitions over 4 items: partition 0 gets [0,3], partition 1 gets [1],
+        // partition 2 gets [2]. With 2 workers:
+        //   Worker 0: partitions [0, 2] — items [0, 3, 2]
+        //   Worker 1: partition [1] — items [1]
+        // All items should be processed exactly once.
+        let dir = temp_dir("part_empty");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let graph = DataflowGraph::new();
+        let source = rill_core::connectors::partitioned_vec_source::PartitionedVecSource::new(
+            vec![10i32, 20, 30, 40],
+            3,
+        );
+        let collected = Arc::new(Mutex::new(Vec::new()));
+
+        graph.source(source).sink(CollectSink {
+            collected: collected.clone(),
+        });
+
+        let executor = super::Executor::builder()
+            .checkpoint_dir(&dir)
+            .workers(2)
+            .build();
+        executor.run(graph).await.unwrap();
+        let mut results = collected.lock().unwrap().clone();
+        results.sort_unstable();
+        assert_eq!(results, vec![10, 20, 30, 40]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn mixed_partitioned_and_non_partitioned_merge() {
+        // Merge a PartitionedVecSource with a regular VecSource.
+        // Both source types should work in the same pipeline.
+        let dir = temp_dir("mixed_merge");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let graph = DataflowGraph::new();
+        let partitioned = rill_core::connectors::partitioned_vec_source::PartitionedVecSource::new(
+            vec![1i32, 2, 3, 4],
+            2,
+        );
+        let non_partitioned = VecSource::new(vec![10i32, 20, 30]);
+        let collected = Arc::new(Mutex::new(Vec::new()));
+
+        let stream1 = graph.source(partitioned);
+        let stream2 = graph.source(non_partitioned);
+        let merged = stream1.merge(stream2);
+        merged.map(|x: i32| x * 100).sink(CollectSink {
+            collected: collected.clone(),
+        });
+
+        let executor = super::Executor::builder()
+            .checkpoint_dir(&dir)
+            .workers(2)
+            .build();
+        executor.run(graph).await.unwrap();
+        let mut results = collected.lock().unwrap().clone();
+        results.sort_unstable();
+        assert_eq!(results, vec![100, 200, 300, 400, 1000, 2000, 3000]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn partitioned_source_fan_out() {
+        // One partitioned source feeding two sinks through different transforms.
+        let dir = temp_dir("part_fanout");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let graph = DataflowGraph::new();
+        let source = rill_core::connectors::partitioned_vec_source::PartitionedVecSource::new(
+            vec![1i32, 2, 3, 4, 5, 6],
+            3,
+        );
+        let collected_doubled = Arc::new(Mutex::new(Vec::new()));
+        let collected_tripled = Arc::new(Mutex::new(Vec::new()));
+
+        let stream = graph.source(source);
+        let doubled = stream.map(|x: i32| x * 2);
+        let tripled = stream.map(|x: i32| x * 3);
+        doubled.sink(CollectSink {
+            collected: collected_doubled.clone(),
+        });
+        tripled.sink(CollectSink {
+            collected: collected_tripled.clone(),
+        });
+
+        let executor = super::Executor::builder()
+            .checkpoint_dir(&dir)
+            .workers(2)
+            .build();
+        executor.run(graph).await.unwrap();
+
+        let mut doubled_results = collected_doubled.lock().unwrap().clone();
+        doubled_results.sort_unstable();
+        assert_eq!(doubled_results, vec![2, 4, 6, 8, 10, 12]);
+
+        let mut tripled_results = collected_tripled.lock().unwrap().clone();
+        tripled_results.sort_unstable();
+        assert_eq!(tripled_results, vec![3, 6, 9, 12, 15, 18]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

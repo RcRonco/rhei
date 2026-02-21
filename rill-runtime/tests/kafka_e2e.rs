@@ -368,3 +368,202 @@ async fn kafka_join_window_e2e() {
         windows.len()
     );
 }
+
+// ── Multi-partition Kafka E2E ────────────────────────────────────
+//
+// Same pipeline topology as above, but topics have 4 partitions each.
+// KafkaSource detects 8 total partitions and creates per-worker
+// partition readers. With 4 workers, each gets ~2 partitions.
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn kafka_multi_partition_e2e() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("info")
+        .with_test_writer()
+        .try_init();
+
+    // ── Setup multi-partition topics ─────────────────────────────
+    let orders_topic = unique_topic("mp_orders");
+    let payments_topic = unique_topic("mp_payments");
+
+    // 4 partitions per topic — Kafka distributes by key hash.
+    create_topic(&orders_topic, 4).await;
+    create_topic(&payments_topic, 4).await;
+
+    // ── Generate and produce data ────────────────────────────────
+    let orders = generate_orders(100);
+    let payments = generate_payments(&orders);
+
+    let producer: FutureProducer = ClientConfig::new()
+        .set("bootstrap.servers", brokers())
+        .create()
+        .expect("producer creation failed");
+
+    for order in &orders {
+        produce_json(&orders_topic, order.user_id.as_bytes(), order, &producer).await;
+    }
+    for payment in &payments {
+        produce_json(
+            &payments_topic,
+            payment.user_id.as_bytes(),
+            payment,
+            &producer,
+        )
+        .await;
+    }
+
+    // ── Build pipeline ───────────────────────────────────────────
+    let output_dir = tempfile::tempdir().unwrap();
+    let output_path = output_dir.path().join("output.jsonl");
+    let checkpoint_dir = tempfile::tempdir().unwrap();
+
+    let group_id = format!("rill_e2e_mp_group_{}", std::process::id());
+    let source = KafkaSource::new(&brokers(), &group_id, &[&orders_topic, &payments_topic])
+        .unwrap()
+        .with_batch_size(50)
+        .with_poll_timeout(Duration::from_millis(200));
+
+    let file_sink = FileSink::<WindowOutput<f64>>::new(&output_path).unwrap();
+
+    let ot = orders_topic.clone();
+
+    let join_op = TemporalJoin::<Order, Payment, _, _>::new(
+        |side: &JoinSide<Order, Payment>| match side {
+            JoinSide::Left(o) => o.id.clone(),
+            JoinSide::Right(p) => p.id.clone(),
+        },
+        |order: Order, payment: Payment| JoinedOrder {
+            id: order.id,
+            user_id: order.user_id,
+            amount: order.amount,
+            payment_method: payment.method,
+            timestamp: order.timestamp,
+        },
+    );
+
+    let window_size = 10_000u64;
+    let window_op = TumblingWindow::builder()
+        .window_size(window_size)
+        .key_fn(|j: &JoinedOrder| j.user_id.clone())
+        .time_fn(|j: &JoinedOrder| j.timestamp)
+        .aggregator(Sum::new(|j: &JoinedOrder| j.amount))
+        .build();
+
+    let graph = DataflowGraph::new();
+    graph
+        .source(source)
+        .map(move |msg: KafkaMessage| -> JoinSide<Order, Payment> {
+            let payload = msg.payload.expect("missing payload");
+            if msg.topic == ot {
+                JoinSide::Left(serde_json::from_slice(&payload).expect("bad order JSON"))
+            } else {
+                JoinSide::Right(serde_json::from_slice(&payload).expect("bad payment JSON"))
+            }
+        })
+        .filter(|side: &JoinSide<Order, Payment>| match side {
+            JoinSide::Left(o) => o.amount > 50.0,
+            JoinSide::Right(_) => true,
+        })
+        .key_by(|side: &JoinSide<Order, Payment>| match side {
+            JoinSide::Left(o) => o.user_id.clone(),
+            JoinSide::Right(p) => p.user_id.clone(),
+        })
+        .operator("temporal_join", join_op)
+        .operator("tumbling_window", window_op)
+        .sink(file_sink);
+
+    // ── Run with 4 workers ───────────────────────────────────────
+    // 8 partitions (4 per topic) distributed across 4 workers:
+    // each worker reads from ~2 partitions in parallel.
+    let (handle, trigger) = ShutdownHandle::new();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(15)).await;
+        trigger.shutdown();
+    });
+
+    let executor = Executor::builder()
+        .checkpoint_dir(checkpoint_dir.path())
+        .workers(4)
+        .build();
+
+    executor.run_with_shutdown(graph, handle).await.unwrap();
+
+    // ── Verify output ────────────────────────────────────────────
+    let content = std::fs::read_to_string(&output_path).unwrap();
+    let windows: Vec<WindowOutput<f64>> = content
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("invalid output JSON"))
+        .collect();
+
+    let expected = compute_expected_windows(&orders, window_size);
+
+    assert!(
+        !windows.is_empty(),
+        "multi-partition pipeline produced no output — expected {} window records",
+        expected.len()
+    );
+
+    // Verify structural properties.
+    let expected_users: std::collections::HashSet<&str> =
+        expected.keys().map(|(u, _)| u.as_str()).collect();
+
+    for w in &windows {
+        assert!(
+            expected_users.contains(w.key.as_str()),
+            "unexpected user in output: {}",
+            w.key
+        );
+        assert!(w.value > 0.0, "window value must be positive");
+        assert_eq!(
+            w.window_end,
+            w.window_start + window_size,
+            "window_end should be window_start + window_size"
+        );
+    }
+
+    // Aggregate actual output.
+    let mut actual_sums: HashMap<(String, u64), f64> = HashMap::new();
+    for w in &windows {
+        *actual_sums
+            .entry((w.key.clone(), w.window_start))
+            .or_default() += w.value;
+    }
+
+    // Verify window sums match expected.
+    for ((user, ws), actual_sum) in &actual_sums {
+        if let Some(&expected_sum) = expected.get(&(user.clone(), *ws)) {
+            let diff = (actual_sum - expected_sum).abs();
+            assert!(
+                diff < 0.01,
+                "sum mismatch for ({user}, window {ws}): actual={actual_sum}, expected={expected_sum}"
+            );
+        }
+    }
+
+    // Verify total amount.
+    let expected_total: f64 = expected.values().sum();
+    let actual_total: f64 = actual_sums.values().sum();
+    assert!(
+        actual_total >= expected_total * 0.9,
+        "actual total {actual_total} is less than 90% of expected {expected_total}"
+    );
+
+    // Verify checkpoint manifest has partition-level offsets.
+    let manifest = rill_core::checkpoint::CheckpointManifest::load(checkpoint_dir.path());
+    if let Some(m) = manifest {
+        assert!(
+            !m.source_offsets.is_empty(),
+            "manifest should have source offsets from partitioned readers"
+        );
+        eprintln!(
+            "manifest source_offsets: {} entries",
+            m.source_offsets.len()
+        );
+    }
+
+    eprintln!(
+        "Multi-partition E2E passed: {} window records, total {actual_total:.0} (expected {expected_total:.0})",
+        windows.len()
+    );
+}
