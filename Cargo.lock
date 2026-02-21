@@ -2668,6 +2668,7 @@ dependencies = [
  "futures",
  "metrics",
  "metrics-exporter-prometheus",
+ "object_store",
  "rdkafka",
  "rill-core",
  "seahash",
