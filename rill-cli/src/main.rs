@@ -1,6 +1,7 @@
 use std::fs;
 use std::path::Path;
 use std::process::Command;
+use std::time::{Duration, UNIX_EPOCH};
 
 use clap::{Parser, Subcommand};
 
@@ -37,6 +38,15 @@ enum Commands {
         /// Number of parallel Timely worker threads
         #[arg(long, default_value = "1")]
         workers: usize,
+
+        /// Bind address for the HTTP health/metrics server (e.g. `0.0.0.0:9090`)
+        #[arg(long)]
+        metrics_addr: Option<std::net::SocketAddr>,
+    },
+    /// Attach to a running pipeline's HTTP server and display the TUI dashboard
+    Attach {
+        /// Address of the running pipeline's HTTP server (e.g. `127.0.0.1:9090`)
+        addr: String,
     },
 }
 
@@ -54,20 +64,24 @@ fn main() -> anyhow::Result<()> {
                 })?;
             cmd_new(&name)
         }
-        Commands::Run { tui: true, workers } => cmd_run_tui(cli.log_level, workers),
+        Commands::Run {
+            tui: true, workers, ..
+        } => cmd_run_tui(cli.log_level, workers),
         Commands::Run {
             tui: false,
             workers,
+            metrics_addr,
         } => {
             let _telemetry =
                 rill_runtime::telemetry::init(rill_runtime::telemetry::TelemetryConfig {
-                    metrics_addr: None,
+                    metrics_addr,
                     log_filter: cli.log_level.clone(),
                     json_logs: cli.json_logs,
                     tui: false,
                 })?;
             cmd_run(workers)
         }
+        Commands::Attach { addr } => cmd_attach(addr),
     }
 }
 
@@ -111,9 +125,9 @@ impl StreamFunction for MyOperator {
     type Input = String;
     type Output = String;
 
-    async fn process(&mut self, input: String, ctx: &mut StateContext) -> Vec<String> {
+    async fn process(&mut self, input: String, ctx: &mut StateContext) -> anyhow::Result<Vec<String>> {
         // Your processing logic here
-        vec![input]
+        Ok(vec![input])
     }
 }
 
@@ -204,6 +218,117 @@ fn cmd_run_tui(log_level: String, workers: usize) -> anyhow::Result<()> {
     })
 }
 
+fn cmd_attach(addr: String) -> anyhow::Result<()> {
+    let rt = tokio::runtime::Runtime::new()?;
+
+    rt.block_on(async {
+        let base_url = if addr.starts_with("http") {
+            addr.clone()
+        } else {
+            format!("http://{addr}")
+        };
+
+        // Verify connectivity before launching TUI
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()?;
+
+        let health_url = format!("{base_url}/api/health");
+        match client.get(&health_url).send().await {
+            Ok(resp) if resp.status().is_success() => {}
+            Ok(resp) => {
+                anyhow::bail!(
+                    "Pipeline at {addr} returned HTTP {}: is the server running?",
+                    resp.status()
+                );
+            }
+            Err(e) => {
+                anyhow::bail!("Failed to connect to pipeline at {addr}: {e}");
+            }
+        }
+
+        let (metrics_tx, metrics_rx) =
+            tokio::sync::watch::channel(rill_runtime::metrics_snapshot::MetricsSnapshot::default());
+        let (log_tx, log_rx) =
+            tokio::sync::mpsc::channel::<rill_runtime::tracing_capture::LogEntry>(1000);
+
+        // Spawn metrics poller: every 500ms, GET /api/metrics
+        let metrics_client = client.clone();
+        let metrics_url = format!("{base_url}/api/metrics");
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_millis(500));
+            loop {
+                interval.tick().await;
+                let Ok(resp) = metrics_client.get(&metrics_url).send().await else {
+                    continue;
+                };
+                if let Ok(snapshot) = resp
+                    .json::<rill_runtime::metrics_snapshot::MetricsSnapshot>()
+                    .await
+                    && metrics_tx.send(snapshot).is_err()
+                {
+                    break;
+                }
+            }
+        });
+
+        // Spawn log poller: every 250ms, GET /api/logs?after=<last_seq>
+        let log_client = client;
+        let logs_url = format!("{base_url}/api/logs");
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_millis(250));
+            let mut last_seq: u64 = 0;
+            loop {
+                interval.tick().await;
+                let url = format!("{logs_url}?after={last_seq}");
+                let Ok(resp) = log_client.get(&url).send().await else {
+                    continue;
+                };
+                let Ok(entries) = resp
+                    .json::<Vec<rill_runtime::http_server::ApiLogEntry>>()
+                    .await
+                else {
+                    continue;
+                };
+                for entry in entries {
+                    if entry.seq > last_seq {
+                        last_seq = entry.seq;
+                    }
+                    let log_entry = api_log_to_log_entry(&entry);
+                    if log_tx.send(log_entry).await.is_err() {
+                        return;
+                    }
+                }
+            }
+        });
+
+        // Run TUI with no graph view (remote pipeline graph is unknown)
+        let app = tui::TuiApp::new(metrics_rx, log_rx, None);
+        app.run().await
+    })
+}
+
+/// Convert an [`ApiLogEntry`] to a [`LogEntry`] for the TUI.
+fn api_log_to_log_entry(
+    api: &rill_runtime::http_server::ApiLogEntry,
+) -> rill_runtime::tracing_capture::LogEntry {
+    let level = match api.level.as_str() {
+        "ERROR" => tracing::Level::ERROR,
+        "WARN" => tracing::Level::WARN,
+        "DEBUG" => tracing::Level::DEBUG,
+        "TRACE" => tracing::Level::TRACE,
+        _ => tracing::Level::INFO,
+    };
+    let timestamp = UNIX_EPOCH + Duration::from_millis(api.timestamp_ms);
+    rill_runtime::tracing_capture::LogEntry {
+        timestamp,
+        level,
+        target: api.target.clone(),
+        message: api.message.clone(),
+        worker: api.worker,
+    }
+}
+
 /// Built-in demo pipeline for TUI mode.
 ///
 /// Simulates a real-time sensor aggregation pipeline: 5 sensors emit readings
@@ -220,7 +345,7 @@ async fn run_demo_pipeline(workers: usize) -> anyhow::Result<()> {
     use rill_runtime::executor::Executor;
     use serde::{Deserialize, Serialize};
 
-    #[derive(Clone, Serialize, Deserialize)]
+    #[derive(Clone, Debug, Serialize, Deserialize)]
     struct SensorReading {
         sensor_id: String,
         value: f64,

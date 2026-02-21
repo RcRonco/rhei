@@ -33,7 +33,7 @@ pub struct AsyncOperator<F: StreamFunction> {
     ctx: StateContext,
     rt: Option<tokio::runtime::Handle>,
     #[allow(clippy::type_complexity)]
-    pending: VecDeque<(BoxFuture<Vec<F::Output>>, Option<u64>)>,
+    pending: VecDeque<(BoxFuture<anyhow::Result<Vec<F::Output>>>, Option<u64>)>,
     stash: Stash<F::Input>,
 }
 
@@ -62,31 +62,37 @@ impl<F: StreamFunction + 'static> AsyncOperator<F> {
         }
     }
 
-    /// Process an input element. Returns outputs that completed immediately.
-    /// Elements whose futures are pending are stashed for later.
-    pub fn process_element(&mut self, input: F::Input, capability: Option<u64>) -> Vec<F::Output> {
+    /// Process an input element. Returns outputs that completed immediately and
+    /// any errors from operator processing.
+    pub fn process_element(
+        &mut self,
+        input: F::Input,
+        capability: Option<u64>,
+    ) -> (Vec<F::Output>, Vec<anyhow::Error>) {
         let mut completed = Vec::new();
+        let mut errors = Vec::new();
 
         // First, drain any completed pending futures
-        self.drain_completed(&mut completed);
+        self.drain_completed(&mut completed, &mut errors);
 
         // Stash the new input for ordered processing
         self.stash.push(input, capability);
 
         // Try to process stashed items
-        self.process_stash(&mut completed);
+        self.process_stash(&mut completed, &mut errors);
 
         self.report_backpressure();
-        completed
+        (completed, errors)
     }
 
     /// Poll all pending futures and collect completed results.
-    pub fn poll_pending(&mut self) -> Vec<F::Output> {
+    pub fn poll_pending(&mut self) -> (Vec<F::Output>, Vec<anyhow::Error>) {
         let mut completed = Vec::new();
-        self.drain_completed(&mut completed);
-        self.process_stash(&mut completed);
+        let mut errors = Vec::new();
+        self.drain_completed(&mut completed, &mut errors);
+        self.process_stash(&mut completed, &mut errors);
         self.report_backpressure();
-        completed
+        (completed, errors)
     }
 
     /// Returns true if there are pending futures or stashed elements.
@@ -94,15 +100,19 @@ impl<F: StreamFunction + 'static> AsyncOperator<F> {
         !self.pending.is_empty() || !self.stash.is_empty()
     }
 
-    fn drain_completed(&mut self, output: &mut Vec<F::Output>) {
+    fn drain_completed(&mut self, output: &mut Vec<F::Output>, errors: &mut Vec<anyhow::Error>) {
         let waker = noop_waker();
         let mut cx = Context::from_waker(&waker);
         let mut still_pending = VecDeque::new();
 
         while let Some((mut fut, cap)) = self.pending.pop_front() {
             match fut.as_mut().poll(&mut cx) {
-                Poll::Ready(results) => {
+                Poll::Ready(Ok(results)) => {
                     output.extend(results);
+                    let _ = cap;
+                }
+                Poll::Ready(Err(e)) => {
+                    errors.push(e);
                     let _ = cap;
                 }
                 Poll::Pending => {
@@ -113,7 +123,7 @@ impl<F: StreamFunction + 'static> AsyncOperator<F> {
         self.pending = still_pending;
     }
 
-    fn process_stash(&mut self, output: &mut Vec<F::Output>) {
+    fn process_stash(&mut self, output: &mut Vec<F::Output>, errors: &mut Vec<anyhow::Error>) {
         while let Some((input, _cap)) = self.stash.pop() {
             let fut = self.func.process(input, &mut self.ctx);
             let mut fut = std::pin::pin!(fut);
@@ -122,15 +132,20 @@ impl<F: StreamFunction + 'static> AsyncOperator<F> {
             let waker = noop_waker();
             let mut cx = Context::from_waker(&waker);
             match fut.as_mut().poll(&mut cx) {
-                Poll::Ready(results) => {
+                Poll::Ready(Ok(results)) => {
                     output.extend(results);
+                }
+                Poll::Ready(Err(e)) => {
+                    errors.push(e);
                 }
                 Poll::Pending => {
                     // Cold path: the future needs async I/O (state miss).
                     // Drive it to completion via the Tokio runtime.
                     if let Some(ref rt) = self.rt {
-                        let results = tokio::task::block_in_place(|| rt.block_on(fut));
-                        output.extend(results);
+                        match tokio::task::block_in_place(|| rt.block_on(fut)) {
+                            Ok(results) => output.extend(results),
+                            Err(e) => errors.push(e),
+                        }
                     } else {
                         tracing::warn!("future pending but no runtime handle — dropping element");
                         break;
@@ -169,8 +184,12 @@ mod tests {
         type Input = String;
         type Output = String;
 
-        async fn process(&mut self, input: String, _ctx: &mut StateContext) -> Vec<String> {
-            vec![input]
+        async fn process(
+            &mut self,
+            input: String,
+            _ctx: &mut StateContext,
+        ) -> anyhow::Result<Vec<String>> {
+            Ok(vec![input])
         }
     }
 
@@ -187,8 +206,9 @@ mod tests {
         let ctx = StateContext::new(Box::new(backend));
         let mut op = AsyncOperator::new(PassThrough, ctx, None);
 
-        let results = op.process_element("hello".to_string(), Some(0));
+        let (results, errors) = op.process_element("hello".to_string(), Some(0));
         assert_eq!(results, vec!["hello".to_string()]);
+        assert!(errors.is_empty());
         assert!(!op.has_pending());
 
         let _ = std::fs::remove_file(&path);

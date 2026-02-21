@@ -13,7 +13,9 @@ futures.workspace = true
 ratatui.workspace = true
 rill-core = { path = "../rill-core" }
 rill-runtime = { path = "../rill-runtime" }
+reqwest.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 

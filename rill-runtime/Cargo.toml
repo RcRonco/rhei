@@ -7,6 +7,7 @@ license = "Apache-2.0"
 [dependencies]
 anyhow.workspace = true
 async-trait.workspace = true
+axum.workspace = true
 futures.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -22,9 +23,11 @@ seahash = "4"
 # `cargo test --workspace` (without --features kafka) doesn't require
 # libcurl-dev / cmake to build librdkafka.
 rdkafka = { workspace = true, optional = true }
+object_store = { workspace = true, features = ["aws"], optional = true }
 
 [features]
 kafka = ["rill-core/kafka", "dep:rdkafka"]
+s3 = ["dep:object_store"]
 
 [lints]
 workspace = true

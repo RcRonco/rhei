@@ -206,16 +206,20 @@ fn window_starts_for(timestamp: u64, window_size: u64, slide: u64) -> Vec<u64> {
 #[async_trait]
 impl<T, A, KF, TF> StreamFunction for SlidingWindow<T, A, KF, TF>
 where
-    T: Clone + Send + Sync,
+    T: Clone + Send + Sync + std::fmt::Debug,
     A: Aggregator<Input = T>,
-    A::Output: Clone + Send,
+    A::Output: Clone + Send + std::fmt::Debug,
     KF: Fn(&T) -> String + Send + Sync,
     TF: Fn(&T) -> u64 + Send + Sync,
 {
     type Input = T;
     type Output = WindowOutput<A::Output>;
 
-    async fn process(&mut self, input: T, ctx: &mut StateContext) -> Vec<WindowOutput<A::Output>> {
+    async fn process(
+        &mut self,
+        input: T,
+        ctx: &mut StateContext,
+    ) -> anyhow::Result<Vec<WindowOutput<A::Output>>> {
         let key = (self.key_fn)(&input);
         let timestamp = (self.time_fn)(&input);
         let mut outputs = Vec::new();
@@ -289,7 +293,7 @@ where
             state.put(&key, &active);
         }
 
-        outputs
+        Ok(outputs)
     }
 }
 

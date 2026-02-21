@@ -15,7 +15,7 @@ use rill_runtime::executor::Executor;
 use serde::{Deserialize, Serialize};
 
 /// A single sensor reading with a logical timestamp.
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 struct SensorReading {
     sensor_id: String,
     value: f64,

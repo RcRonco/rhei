@@ -1,3 +1,5 @@
+/// File-backed dead-letter queue sink.
+pub mod dlq_file_sink;
 /// A sink that writes JSON lines to a file.
 pub mod file_sink;
 /// Kafka message types (always compiled — no rdkafka dependency).

@@ -133,16 +133,20 @@ where
 #[async_trait]
 impl<L, R, O, KF, JF> StreamFunction for TemporalJoin<L, R, KF, JF>
 where
-    L: Clone + Serialize + DeserializeOwned + Send + Sync,
-    R: Clone + Serialize + DeserializeOwned + Send + Sync,
-    O: Clone + Send,
+    L: Clone + Serialize + DeserializeOwned + Send + Sync + std::fmt::Debug,
+    R: Clone + Serialize + DeserializeOwned + Send + Sync + std::fmt::Debug,
+    O: Clone + Send + std::fmt::Debug,
     KF: Fn(&JoinSide<L, R>) -> String + Send + Sync,
     JF: Fn(L, R) -> O + Send + Sync,
 {
     type Input = JoinSide<L, R>;
     type Output = O;
 
-    async fn process(&mut self, input: JoinSide<L, R>, ctx: &mut StateContext) -> Vec<O> {
+    async fn process(
+        &mut self,
+        input: JoinSide<L, R>,
+        ctx: &mut StateContext,
+    ) -> anyhow::Result<Vec<O>> {
         let key = (self.key_fn)(&input);
 
         match input {
@@ -158,12 +162,12 @@ where
                 };
 
                 if let Some(r) = right_value {
-                    vec![(self.join_fn)(l, r)]
+                    Ok(vec![(self.join_fn)(l, r)])
                 } else {
                     // Buffer the left-side event
                     let mut state = KeyedState::<String, L>::new(ctx, "left");
                     state.put(&key, &l);
-                    vec![]
+                    Ok(vec![])
                 }
             }
             JoinSide::Right(r) => {
@@ -178,12 +182,12 @@ where
                 };
 
                 if let Some(l) = left_value {
-                    vec![(self.join_fn)(l, r)]
+                    Ok(vec![(self.join_fn)(l, r)])
                 } else {
                     // Buffer the right-side event
                     let mut state = KeyedState::<String, R>::new(ctx, "right");
                     state.put(&key, &r);
-                    vec![]
+                    Ok(vec![])
                 }
             }
         }

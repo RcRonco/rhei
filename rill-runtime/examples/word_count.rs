@@ -26,7 +26,11 @@ impl StreamFunction for WordCounter {
     type Input = String;
     type Output = String;
 
-    async fn process(&mut self, input: String, ctx: &mut StateContext) -> Vec<String> {
+    async fn process(
+        &mut self,
+        input: String,
+        ctx: &mut StateContext,
+    ) -> anyhow::Result<Vec<String>> {
         let mut outputs = Vec::new();
         for word in input.split_whitespace() {
             let key = word.to_string();
@@ -38,7 +42,7 @@ impl StreamFunction for WordCounter {
             };
             outputs.push(format!("{word}: {count}"));
         }
-        outputs
+        Ok(outputs)
     }
 }
 

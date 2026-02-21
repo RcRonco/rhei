@@ -15,7 +15,7 @@ use rill_runtime::executor::Executor;
 use serde::{Deserialize, Serialize};
 
 /// An order event.
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[allow(clippy::struct_field_names)]
 struct Order {
     order_id: String,
@@ -24,7 +24,7 @@ struct Order {
 }
 
 /// A shipment event.
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 struct Shipment {
     order_id: String,
     carrier: String,
