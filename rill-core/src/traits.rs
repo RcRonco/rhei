@@ -60,6 +60,25 @@ pub trait Source: Send + Sync {
     ) -> anyhow::Result<()> {
         Ok(())
     }
+
+    /// Returns the number of partitions if this source supports parallel consumption.
+    ///
+    /// When `Some(n)`, the executor calls `create_partition_source()` to create
+    /// per-worker readers. Default: `None` (single-worker only).
+    fn partition_count(&self) -> Option<usize> {
+        None
+    }
+
+    /// Create a Source that reads only the given partition indices.
+    ///
+    /// Called by the executor when `partition_count()` returns `Some`.
+    /// Takes `&self` because multiple partition readers are created from one factory.
+    fn create_partition_source(&self, _assigned: &[usize]) -> Box<dyn Source<Output = Self::Output>>
+    where
+        Self: Sized,
+    {
+        unimplemented!("sources returning Some from partition_count() must implement this")
+    }
 }
 
 /// A sink that consumes elements from a stream.

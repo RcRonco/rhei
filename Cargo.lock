@@ -2665,6 +2665,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "axum",
+ "bincode",
  "futures",
  "metrics",
  "metrics-exporter-prometheus",

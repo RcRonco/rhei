@@ -44,15 +44,13 @@ Records that failed processing AND failed DLQ persistence are permanently lost.
 
 ## HIGH
 
-### KI-4: Multiple exchanges (key_by) not supported
+### ~~KI-4: Multiple exchanges (key_by) not supported~~ (RESOLVED)
 
-**Files:** `rill-runtime/src/compiler.rs:150` (`split_at_first_exchange`),
-`rill-runtime/src/executor.rs:335,566`
+**Fixed in:** `ADR/timely-exchange-dag.md`
 
-`split_at_first_exchange()` splits the segment list at the first `Exchange` only.
-Subsequent `Segment::Exchange` entries are silently ignored (no-op match arms in
-`build_pre_exchange_steps` and `build_timely_dataflow`). Pipelines with multiple
-`key_by()` calls lose key affinity after the first repartition in multi-worker mode.
+The unified Timely DAG executor uses the Exchange pact for each `key_by()` node.
+Multiple exchanges in a single pipeline work correctly — each triggers a full
+repartition via Timely's built-in worker routing.
 
 ### KI-5: Temporal join has no timeout or eviction
 
@@ -90,14 +88,13 @@ The checkpoint interval is now configurable via `Executor::builder().checkpoint_
 Defaults to 100 batches. Both `Executor` and `ExecutorBuilder` carry the field, and the
 multi-worker main loop reads it from the executor at runtime.
 
-### KI-9: No merge / fan-in support in executor
+### ~~KI-9: No merge / fan-in support in executor~~ (RESOLVED)
 
-**File:** `rill-runtime/src/compiler.rs:64-65,93-94`
+**Fixed in:** `ADR/timely-exchange-dag.md`
 
-Merge nodes are modelled in the graph (`NodeKind::Merge`, multi-input `GraphNode`)
-but explicitly rejected at compile time with
-`"merge nodes are not yet supported in the execution engine"`.
-Users needing fan-in must run independent pipelines.
+The unified Timely DAG executor supports merge nodes via `scope.concatenate()`,
+combining multiple input streams into one. The `stream.merge(other)` API works
+at execution time.
 
 ### KI-10: Sliding window unbounded active windows
 
@@ -173,14 +170,13 @@ implements it by parsing `"topic/partition"` keys from the manifest, building a
 `consumer.assign()` to seek to the correct positions. Note: this overrides consumer
 group rebalancing when restoring from checkpoint.
 
-### KI-17: No fan-out support
+### ~~KI-17: No fan-out support~~ (RESOLVED)
 
-**File:** `rill-runtime/src/compiler.rs`
+**Fixed in:** `ADR/timely-exchange-dag.md`
 
-The compiler walks backward from each sink to a source, validating linear topology.
-A single source feeding multiple sinks (fan-out) is modelled in the graph (stream
-handles are `Copy`) but not supported at execution time. Each sink-to-source path
-must be independent.
+The unified Timely DAG executor supports fan-out implicitly via Timely's internal
+Tee. The same stream can feed multiple downstream operators and sinks. Stream
+handles are `Copy`, so `stream.sink(sink1); stream.sink(sink2);` works correctly.
 
 ### KI-18: No integration tests for failure scenarios
 

@@ -1,163 +1,119 @@
 //! Graph compilation: converts a logical [`DataflowGraph`](crate::dataflow::DataflowGraph)
-//! into executable [`CompiledPipeline`] segments.
+//! into an executable [`CompiledGraph`] with topological ordering.
 //!
-//! For V1, supports linear topologies: source → [transforms] → sink.
-//! Fan-out and merge are detected and return an error.
+//! Supports arbitrary DAG topologies: fan-out (one stream feeding multiple
+//! downstream nodes), merge (multiple inputs), and multiple exchanges.
 
-use std::sync::Arc;
+use std::collections::VecDeque;
 
-use crate::dataflow::{
-    ErasedOperator, ErasedSink, ErasedSource, GraphNode, KeyFn, NodeKind, TransformFn,
-};
+use crate::dataflow::{GraphNode, NodeId, NodeKind};
 
-// ── Compiled pipeline types ─────────────────────────────────────────
+// ── Compiled graph ──────────────────────────────────────────────────
 
-/// A segment in the compiled pipeline.
-pub(crate) enum Segment {
-    /// A stateless transform (`map`/`filter`/`flat_map`).
-    Transform(TransformFn),
-    /// A key-based exchange point.
-    Exchange(KeyFn),
-    /// A stateful operator with its name and type-erased implementation.
-    Operator {
-        name: String,
-        op: Box<dyn ErasedOperator>,
-    },
+/// A compiled DAG ready for execution.
+pub(crate) struct CompiledGraph {
+    /// Original nodes, indexed by `NodeId`.
+    pub nodes: Vec<GraphNode>,
+    /// Node IDs in topological order (sources first, sinks last).
+    pub topo_order: Vec<NodeId>,
+    /// Source node IDs.
+    pub source_ids: Vec<NodeId>,
+    /// Sink node IDs.
+    pub sink_ids: Vec<NodeId>,
+    /// Sorted operator names for checkpoint manifest validation.
+    pub operator_names: Vec<String>,
 }
 
-/// A compiled linear pipeline from source to sink.
-pub(crate) struct CompiledPipeline {
-    pub(crate) source: Box<dyn ErasedSource>,
-    pub(crate) segments: Vec<Segment>,
-    pub(crate) sink: Box<dyn ErasedSink>,
-}
+// ── DAG compilation ─────────────────────────────────────────────────
 
-// ── Graph compilation ───────────────────────────────────────────────
-
-/// Compile the dataflow graph into executable pipelines.
+/// Compile a dataflow graph into an executable DAG with topological ordering.
 ///
-/// For V1, supports linear topologies: source → [transforms] → sink.
-/// Fan-out and merge are detected and return an error.
-pub(crate) fn compile(mut nodes: Vec<GraphNode>) -> anyhow::Result<Vec<CompiledPipeline>> {
-    let sink_ids: Vec<_> = nodes
+/// Validates the graph structure:
+/// - At least one source (node with no inputs)
+/// - At least one sink
+/// - No cycles (detected via Kahn's algorithm)
+pub(crate) fn compile_graph(nodes: Vec<GraphNode>) -> anyhow::Result<CompiledGraph> {
+    if nodes.is_empty() {
+        anyhow::bail!("dataflow graph is empty");
+    }
+
+    // Classify nodes.
+    let source_ids: Vec<NodeId> = nodes
+        .iter()
+        .filter(|n| matches!(n.kind, NodeKind::Source(_)))
+        .map(|n| n.id)
+        .collect();
+
+    let sink_ids: Vec<NodeId> = nodes
         .iter()
         .filter(|n| matches!(n.kind, NodeKind::Sink(_)))
         .map(|n| n.id)
         .collect();
 
+    if source_ids.is_empty() {
+        anyhow::bail!("dataflow graph has no sources");
+    }
     if sink_ids.is_empty() {
         anyhow::bail!("dataflow has no sinks — every stream must reach a sink");
     }
 
-    let mut pipelines = Vec::new();
+    // Compute successor (output) edges and in-degrees.
+    let n = nodes.len();
+    let mut successors: Vec<Vec<NodeId>> = vec![vec![]; n];
+    let mut in_degree: Vec<usize> = vec![0; n];
 
-    for sink_id in &sink_ids {
-        // Walk backwards from sink to source.
-        let mut path = Vec::new();
-        let mut current = *sink_id;
-        loop {
-            path.push(current);
-            let node = &nodes[current.0];
-            if node.inputs.is_empty() {
-                break;
-            }
-            if node.inputs.len() > 1 {
-                anyhow::bail!("merge nodes are not yet supported in the execution engine");
-            }
-            current = node.inputs[0];
+    for node in &nodes {
+        in_degree[node.id.0] = node.inputs.len();
+        for &input_id in &node.inputs {
+            successors[input_id.0].push(node.id);
         }
-        path.reverse();
-
-        if path.len() < 2 {
-            anyhow::bail!("degenerate pipeline: fewer than 2 nodes");
-        }
-        if !matches!(nodes[path[0].0].kind, NodeKind::Source(_)) {
-            anyhow::bail!(
-                "pipeline does not start with a source (found node {:?})",
-                path[0]
-            );
-        }
-
-        // Extract middle segments.
-        let mut segments = Vec::new();
-        for &node_id in &path[1..path.len() - 1] {
-            let kind = std::mem::replace(&mut nodes[node_id.0].kind, NodeKind::Merge);
-            match kind {
-                NodeKind::Transform(f) => segments.push(Segment::Transform(f)),
-                NodeKind::KeyBy(f) => segments.push(Segment::Exchange(f)),
-                NodeKind::Operator { name, op } => {
-                    segments.push(Segment::Operator { name, op });
-                }
-                NodeKind::Source(_) => anyhow::bail!("unexpected source in middle of pipeline"),
-                NodeKind::Sink(_) => anyhow::bail!("unexpected sink in middle of pipeline"),
-                NodeKind::Merge => {
-                    anyhow::bail!("merge nodes are not yet supported in the execution engine")
-                }
-            }
-        }
-
-        // Extract source and sink.
-        let source_kind = std::mem::replace(&mut nodes[path[0].0].kind, NodeKind::Merge);
-        let sink_kind = std::mem::replace(&mut nodes[path[path.len() - 1].0].kind, NodeKind::Merge);
-        let NodeKind::Source(source) = source_kind else {
-            anyhow::bail!("expected source node");
-        };
-        let NodeKind::Sink(sink) = sink_kind else {
-            anyhow::bail!("expected sink node");
-        };
-
-        pipelines.push(CompiledPipeline {
-            source,
-            segments,
-            sink,
-        });
     }
 
-    Ok(pipelines)
-}
-
-// ── Segment utilities ───────────────────────────────────────────────
-
-/// Extract operator names from a compiled segment list.
-pub(crate) fn operator_names(segments: &[Segment]) -> Vec<String> {
-    segments
-        .iter()
-        .filter_map(|seg| match seg {
-            Segment::Operator { name, .. } => Some(name.clone()),
-            _ => None,
-        })
-        .collect()
-}
-
-/// Clone segments (Arc transforms are cheap, operators use `clone_erased`).
-pub(crate) fn clone_segments(segments: &[Segment]) -> Vec<Segment> {
-    segments
-        .iter()
-        .map(|seg| match seg {
-            Segment::Transform(f) => Segment::Transform(Arc::clone(f)),
-            Segment::Exchange(f) => Segment::Exchange(Arc::clone(f)),
-            Segment::Operator { name, op } => Segment::Operator {
-                name: name.clone(),
-                op: op.clone_erased(),
-            },
-        })
-        .collect()
-}
-
-/// Split a flat segment list at the first Exchange boundary.
-///
-/// Returns `(pre_segments, Option<(key_fn, post_segments)>)`.
-pub(crate) fn split_at_first_exchange(
-    segments: Vec<Segment>,
-) -> (Vec<Segment>, Option<(KeyFn, Vec<Segment>)>) {
-    let mut pre = Vec::new();
-    let mut iter = segments.into_iter();
-    for seg in iter.by_ref() {
-        if let Segment::Exchange(key_fn) = seg {
-            let post: Vec<Segment> = iter.collect();
-            return (pre, Some((key_fn, post)));
+    // Kahn's algorithm for topological sort.
+    let mut queue: VecDeque<NodeId> = VecDeque::new();
+    for (i, &deg) in in_degree.iter().enumerate() {
+        if deg == 0 {
+            queue.push_back(NodeId(i));
         }
-        pre.push(seg);
     }
-    (pre, None)
+
+    let mut topo_order: Vec<NodeId> = Vec::with_capacity(n);
+    while let Some(node_id) = queue.pop_front() {
+        topo_order.push(node_id);
+        for &succ in &successors[node_id.0] {
+            in_degree[succ.0] -= 1;
+            if in_degree[succ.0] == 0 {
+                queue.push_back(succ);
+            }
+        }
+    }
+
+    if topo_order.len() != n {
+        anyhow::bail!(
+            "cycle detected in dataflow graph (sorted {} of {} nodes)",
+            topo_order.len(),
+            n
+        );
+    }
+
+    // Extract sorted operator names.
+    let mut operator_names: Vec<String> = nodes
+        .iter()
+        .filter_map(|node| {
+            if let NodeKind::Operator { name, .. } = &node.kind {
+                Some(name.clone())
+            } else {
+                None
+            }
+        })
+        .collect();
+    operator_names.sort();
+
+    Ok(CompiledGraph {
+        nodes,
+        topo_order,
+        source_ids,
+        sink_ids,
+        operator_names,
+    })
 }

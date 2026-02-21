@@ -27,7 +27,7 @@
 use std::any::Any;
 use std::cell::RefCell;
 use std::marker::PhantomData;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock, RwLock};
 
 use async_trait::async_trait;
 use rill_core::state::context::StateContext;
@@ -49,9 +49,13 @@ pub(crate) trait CloneAnySend: Any + Send {
     fn as_any_ref(&self) -> &dyn Any;
     /// Best-effort debug representation for DLQ diagnostics.
     fn debug_repr(&self) -> String;
+    /// Stable hash of the concrete type name, used as a serialization tag.
+    fn stable_type_id(&self) -> u64;
+    /// Serialize the value to bytes via bincode.
+    fn serialize_bytes(&self) -> Vec<u8>;
 }
 
-impl<T: Clone + Any + Send + std::fmt::Debug> CloneAnySend for T {
+impl<T: Clone + Any + Send + std::fmt::Debug + serde::Serialize> CloneAnySend for T {
     fn clone_box(&self) -> Box<dyn CloneAnySend> {
         Box::new(self.clone())
     }
@@ -66,6 +70,41 @@ impl<T: Clone + Any + Send + std::fmt::Debug> CloneAnySend for T {
 
     fn debug_repr(&self) -> String {
         format!("{self:?}")
+    }
+
+    fn stable_type_id(&self) -> u64 {
+        seahash::hash(std::any::type_name::<T>().as_bytes())
+    }
+
+    fn serialize_bytes(&self) -> Vec<u8> {
+        bincode::serialize(self).expect("AnyItem serialization failed")
+    }
+}
+
+// ── Global type registry for AnyItem deserialization ────────────────
+
+type DeserFn = Box<dyn Fn(&[u8]) -> AnyItem + Send + Sync>;
+
+static TYPE_REGISTRY: LazyLock<RwLock<std::collections::HashMap<u64, DeserFn>>> =
+    LazyLock::new(|| RwLock::new(std::collections::HashMap::new()));
+
+fn register_type<T>()
+where
+    T: Clone + Send + std::fmt::Debug + serde::Serialize + serde::de::DeserializeOwned + 'static,
+{
+    let type_hash = seahash::hash(std::any::type_name::<T>().as_bytes());
+    let needs_insert = {
+        let reg = TYPE_REGISTRY.read().unwrap();
+        !reg.contains_key(&type_hash)
+    };
+    if needs_insert {
+        let mut reg = TYPE_REGISTRY.write().unwrap();
+        reg.entry(type_hash).or_insert_with(|| {
+            Box::new(|bytes: &[u8]| {
+                let value: T = bincode::deserialize(bytes).expect("AnyItem deserialization failed");
+                AnyItem(Box::new(value))
+            })
+        });
     }
 }
 
@@ -84,7 +123,16 @@ impl Clone for AnyItem {
 
 impl AnyItem {
     /// Wrap a concrete typed value.
-    pub(crate) fn new<T: Clone + Send + std::fmt::Debug + 'static>(value: T) -> Self {
+    pub(crate) fn new<T>(value: T) -> Self
+    where
+        T: Clone
+            + Send
+            + std::fmt::Debug
+            + serde::Serialize
+            + serde::de::DeserializeOwned
+            + 'static,
+    {
+        register_type::<T>();
         AnyItem(Box::new(value))
     }
 
@@ -111,6 +159,27 @@ impl AnyItem {
     }
 }
 
+impl serde::Serialize for AnyItem {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeTuple;
+        let mut tup = serializer.serialize_tuple(2)?;
+        tup.serialize_element(&self.0.stable_type_id())?;
+        tup.serialize_element(&self.0.serialize_bytes())?;
+        tup.end()
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for AnyItem {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let (type_hash, bytes): (u64, Vec<u8>) = serde::Deserialize::deserialize(deserializer)?;
+        let reg = TYPE_REGISTRY.read().unwrap();
+        let deser_fn = reg.get(&type_hash).ok_or_else(|| {
+            serde::de::Error::custom(format!("unknown AnyItem type hash: {type_hash}"))
+        })?;
+        Ok(deser_fn(&bytes))
+    }
+}
+
 // ── Node identity ────────────────────────────────────────────────────
 
 /// Opaque identifier for a node in the dataflow graph.
@@ -121,6 +190,7 @@ pub(crate) struct NodeId(pub(crate) usize);
 
 /// Type-erased source: produces batches of [`AnyItem`].
 #[async_trait]
+#[allow(dead_code)]
 pub(crate) trait ErasedSource: Send {
     async fn next_batch(&mut self) -> Option<Vec<AnyItem>>;
     async fn on_checkpoint_complete(&mut self) -> anyhow::Result<()>;
@@ -129,6 +199,8 @@ pub(crate) trait ErasedSource: Send {
         &mut self,
         offsets: &std::collections::HashMap<String, String>,
     ) -> anyhow::Result<()>;
+    fn partition_count(&self) -> Option<usize>;
+    fn create_partition_source(&self, assigned: &[usize]) -> Option<Box<dyn ErasedSource>>;
 }
 
 /// Wraps a typed [`Source`] into an [`ErasedSource`].
@@ -138,7 +210,8 @@ struct SourceWrapper<S: Source>(S);
 impl<S> ErasedSource for SourceWrapper<S>
 where
     S: Source + 'static,
-    S::Output: Clone + std::fmt::Debug + 'static,
+    S::Output:
+        Clone + Sync + std::fmt::Debug + serde::Serialize + serde::de::DeserializeOwned + 'static,
 {
     async fn next_batch(&mut self) -> Option<Vec<AnyItem>> {
         let batch = self.0.next_batch().await?;
@@ -158,6 +231,63 @@ where
         offsets: &std::collections::HashMap<String, String>,
     ) -> anyhow::Result<()> {
         self.0.restore_offsets(offsets).await
+    }
+
+    fn partition_count(&self) -> Option<usize> {
+        self.0.partition_count()
+    }
+
+    fn create_partition_source(&self, assigned: &[usize]) -> Option<Box<dyn ErasedSource>> {
+        self.0.partition_count()?;
+        let partition_source = self.0.create_partition_source(assigned);
+        Some(Box::new(DynSourceWrapper(partition_source)))
+    }
+}
+
+/// Wraps a `Box<dyn Source<Output = T>>` into an [`ErasedSource`].
+///
+/// Used for partition sources returned by `create_partition_source()`,
+/// which are already type-erased at the `Source` level but not at the
+/// `ErasedSource` level.
+struct DynSourceWrapper<T>(Box<dyn Source<Output = T>>);
+
+#[async_trait]
+impl<T> ErasedSource for DynSourceWrapper<T>
+where
+    T: Clone
+        + Send
+        + Sync
+        + std::fmt::Debug
+        + serde::Serialize
+        + serde::de::DeserializeOwned
+        + 'static,
+{
+    async fn next_batch(&mut self) -> Option<Vec<AnyItem>> {
+        let batch = self.0.next_batch().await?;
+        Some(batch.into_iter().map(AnyItem::new).collect())
+    }
+
+    async fn on_checkpoint_complete(&mut self) -> anyhow::Result<()> {
+        self.0.on_checkpoint_complete().await
+    }
+
+    fn current_offsets(&self) -> std::collections::HashMap<String, String> {
+        self.0.current_offsets()
+    }
+
+    async fn restore_offsets(
+        &mut self,
+        offsets: &std::collections::HashMap<String, String>,
+    ) -> anyhow::Result<()> {
+        self.0.restore_offsets(offsets).await
+    }
+
+    fn partition_count(&self) -> Option<usize> {
+        None
+    }
+
+    fn create_partition_source(&self, _assigned: &[usize]) -> Option<Box<dyn ErasedSource>> {
+        None
     }
 }
 
@@ -205,8 +335,8 @@ struct OperatorWrapper<F: StreamFunction>(F);
 impl<F> ErasedOperator for OperatorWrapper<F>
 where
     F: StreamFunction + Clone + 'static,
-    F::Input: 'static,
-    F::Output: 'static,
+    F::Input: serde::Serialize + serde::de::DeserializeOwned + 'static,
+    F::Output: serde::Serialize + serde::de::DeserializeOwned + 'static,
 {
     async fn process(
         &mut self,
@@ -313,7 +443,13 @@ impl DataflowGraph {
     pub fn source<S>(&self, source: S) -> Stream<'_, S::Output>
     where
         S: Source + 'static,
-        S::Output: Clone + Send + std::fmt::Debug + 'static,
+        S::Output: Clone
+            + Send
+            + Sync
+            + std::fmt::Debug
+            + serde::Serialize
+            + serde::de::DeserializeOwned
+            + 'static,
     {
         let id = self.add_node(NodeKind::Source(Box::new(SourceWrapper(source))), vec![]);
         Stream::new(self, id)
@@ -370,7 +506,11 @@ impl<T> Clone for Stream<'_, T> {
 }
 impl<T> Copy for Stream<'_, T> {}
 
-impl<'a, T: Clone + Send + std::fmt::Debug + 'static> Stream<'a, T> {
+impl<
+    'a,
+    T: Clone + Send + std::fmt::Debug + serde::Serialize + serde::de::DeserializeOwned + 'static,
+> Stream<'a, T>
+{
     pub(crate) fn new(graph: &'a DataflowGraph, node_id: NodeId) -> Self {
         Self {
             graph,
@@ -383,7 +523,12 @@ impl<'a, T: Clone + Send + std::fmt::Debug + 'static> Stream<'a, T> {
     pub fn map<F, O>(self, f: F) -> Stream<'a, O>
     where
         F: Fn(T) -> O + Send + Sync + 'static,
-        O: Clone + Send + std::fmt::Debug + 'static,
+        O: Clone
+            + Send
+            + std::fmt::Debug
+            + serde::Serialize
+            + serde::de::DeserializeOwned
+            + 'static,
     {
         let transform: TransformFn = Arc::new(move |item: AnyItem, _ctx| {
             let typed: T = item.downcast();
@@ -399,7 +544,12 @@ impl<'a, T: Clone + Send + std::fmt::Debug + 'static> Stream<'a, T> {
     pub fn map_ctx<F, O>(self, f: F) -> Stream<'a, O>
     where
         F: Fn(T, &TransformContext) -> O + Send + Sync + 'static,
-        O: Clone + Send + std::fmt::Debug + 'static,
+        O: Clone
+            + Send
+            + std::fmt::Debug
+            + serde::Serialize
+            + serde::de::DeserializeOwned
+            + 'static,
     {
         let transform: TransformFn = Arc::new(move |item: AnyItem, ctx| {
             let typed: T = item.downcast();
@@ -454,7 +604,12 @@ impl<'a, T: Clone + Send + std::fmt::Debug + 'static> Stream<'a, T> {
     pub fn flat_map<F, O>(self, f: F) -> Stream<'a, O>
     where
         F: Fn(T) -> Vec<O> + Send + Sync + 'static,
-        O: Clone + Send + std::fmt::Debug + 'static,
+        O: Clone
+            + Send
+            + std::fmt::Debug
+            + serde::Serialize
+            + serde::de::DeserializeOwned
+            + 'static,
     {
         let transform: TransformFn = Arc::new(move |item: AnyItem, _ctx| {
             let typed: T = item.downcast();
@@ -470,7 +625,12 @@ impl<'a, T: Clone + Send + std::fmt::Debug + 'static> Stream<'a, T> {
     pub fn flat_map_ctx<F, O>(self, f: F) -> Stream<'a, O>
     where
         F: Fn(T, &TransformContext) -> Vec<O> + Send + Sync + 'static,
-        O: Clone + Send + std::fmt::Debug + 'static,
+        O: Clone
+            + Send
+            + std::fmt::Debug
+            + serde::Serialize
+            + serde::de::DeserializeOwned
+            + 'static,
     {
         let transform: TransformFn = Arc::new(move |item: AnyItem, ctx| {
             let typed: T = item.downcast();
@@ -549,7 +709,11 @@ impl<T> Clone for KeyedStream<'_, T> {
 }
 impl<T> Copy for KeyedStream<'_, T> {}
 
-impl<'a, T: Clone + Send + std::fmt::Debug + 'static> KeyedStream<'a, T> {
+impl<
+    'a,
+    T: Clone + Send + std::fmt::Debug + serde::Serialize + serde::de::DeserializeOwned + 'static,
+> KeyedStream<'a, T>
+{
     pub(crate) fn new(graph: &'a DataflowGraph, node_id: NodeId) -> Self {
         Self {
             graph,
@@ -562,7 +726,12 @@ impl<'a, T: Clone + Send + std::fmt::Debug + 'static> KeyedStream<'a, T> {
     pub fn map<F, O>(self, f: F) -> KeyedStream<'a, O>
     where
         F: Fn(T) -> O + Send + Sync + 'static,
-        O: Clone + Send + std::fmt::Debug + 'static,
+        O: Clone
+            + Send
+            + std::fmt::Debug
+            + serde::Serialize
+            + serde::de::DeserializeOwned
+            + 'static,
     {
         let transform: TransformFn = Arc::new(move |item: AnyItem, _ctx| {
             let typed: T = item.downcast();
@@ -579,7 +748,12 @@ impl<'a, T: Clone + Send + std::fmt::Debug + 'static> KeyedStream<'a, T> {
     pub fn map_ctx<F, O>(self, f: F) -> KeyedStream<'a, O>
     where
         F: Fn(T, &TransformContext) -> O + Send + Sync + 'static,
-        O: Clone + Send + std::fmt::Debug + 'static,
+        O: Clone
+            + Send
+            + std::fmt::Debug
+            + serde::Serialize
+            + serde::de::DeserializeOwned
+            + 'static,
     {
         let transform: TransformFn = Arc::new(move |item: AnyItem, ctx| {
             let typed: T = item.downcast();
@@ -634,7 +808,12 @@ impl<'a, T: Clone + Send + std::fmt::Debug + 'static> KeyedStream<'a, T> {
     pub fn flat_map<F, O>(self, f: F) -> KeyedStream<'a, O>
     where
         F: Fn(T) -> Vec<O> + Send + Sync + 'static,
-        O: Clone + Send + std::fmt::Debug + 'static,
+        O: Clone
+            + Send
+            + std::fmt::Debug
+            + serde::Serialize
+            + serde::de::DeserializeOwned
+            + 'static,
     {
         let transform: TransformFn = Arc::new(move |item: AnyItem, _ctx| {
             let typed: T = item.downcast();
@@ -651,7 +830,12 @@ impl<'a, T: Clone + Send + std::fmt::Debug + 'static> KeyedStream<'a, T> {
     pub fn flat_map_ctx<F, O>(self, f: F) -> KeyedStream<'a, O>
     where
         F: Fn(T, &TransformContext) -> Vec<O> + Send + Sync + 'static,
-        O: Clone + Send + std::fmt::Debug + 'static,
+        O: Clone
+            + Send
+            + std::fmt::Debug
+            + serde::Serialize
+            + serde::de::DeserializeOwned
+            + 'static,
     {
         let transform: TransformFn = Arc::new(move |item: AnyItem, ctx| {
             let typed: T = item.downcast();
@@ -670,7 +854,7 @@ impl<'a, T: Clone + Send + std::fmt::Debug + 'static> KeyedStream<'a, T> {
     pub fn operator<Func>(self, name: &str, func: Func) -> KeyedStream<'a, Func::Output>
     where
         Func: StreamFunction<Input = T> + Clone + 'static,
-        Func::Output: 'static,
+        Func::Output: serde::Serialize + serde::de::DeserializeOwned + 'static,
     {
         let node_id = self.graph.add_node(
             NodeKind::Operator {

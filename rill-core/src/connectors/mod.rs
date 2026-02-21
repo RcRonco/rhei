@@ -4,6 +4,8 @@ pub mod dlq_file_sink;
 pub mod file_sink;
 /// Kafka message types (always compiled — no rdkafka dependency).
 pub mod kafka_types;
+/// A partitioned source backed by an in-memory `Vec` (for testing parallel consumption).
+pub mod partitioned_vec_source;
 /// A sink that prints each element to stdout.
 pub mod print_sink;
 /// A source backed by an in-memory `Vec`.

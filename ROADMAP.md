@@ -19,6 +19,7 @@
 
 - [x] Kafka source/sink
   - [x] Consumer group source with partition-aware offset tracking
+  - [x] Partitioned source consumption (parallel per-worker partition readers)
   - [ ] Transactional producer sink (exactly-once via checkpoint coordination)
   - [ ] Schema Registry integration (Avro, Protobuf deserialization)
 - [ ] Redis Streams source/sink
@@ -91,9 +92,9 @@
 
 ## Topology
 
-- [ ] Support multiple exchanges (key_by) in a single pipeline (KI-4)
-- [ ] Merge / fan-in — combine multiple streams into one (KI-9)
-- [ ] Fan-out — one source feeding multiple sinks (KI-17)
+- [x] Support multiple exchanges (key_by) in a single pipeline (KI-4)
+- [x] Merge / fan-in — combine multiple streams into one (KI-9)
+- [x] Fan-out — one source feeding multiple sinks (KI-17)
 - [ ] Temporal join timeout and state eviction for unmatched events (KI-5)
 - [x] Single-worker source offset tracking in checkpoint manifest (KI-12)
 

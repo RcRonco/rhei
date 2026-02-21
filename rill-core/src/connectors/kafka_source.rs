@@ -22,6 +22,10 @@ pub struct KafkaSource {
     records_since_watermark: usize,
     watermark_interval: usize,
     watermark_pending: bool,
+    /// Factory config for creating partition-specific consumers.
+    brokers: String,
+    group_id: String,
+    topics: Vec<String>,
 }
 
 impl std::fmt::Debug for KafkaSource {
@@ -58,6 +62,9 @@ impl KafkaSource {
             records_since_watermark: 0,
             watermark_interval: 1000,
             watermark_pending: false,
+            brokers: brokers.to_owned(),
+            group_id: group_id.to_owned(),
+            topics: topics.iter().map(|t| (*t).to_owned()).collect(),
         })
     }
 
@@ -74,6 +81,9 @@ impl KafkaSource {
             records_since_watermark: 0,
             watermark_interval: 1000,
             watermark_pending: false,
+            brokers: String::new(),
+            group_id: String::new(),
+            topics: Vec::new(),
         }
     }
 
@@ -205,6 +215,198 @@ impl Source for KafkaSource {
             .commit(&tpl, rdkafka::consumer::CommitMode::Sync)?;
         metrics::counter!("kafka_consumer_offsets_committed_total").increment(1);
         tracing::debug!(partitions = self.tracked_offsets.len(), "committed offsets");
+        self.tracked_offsets.clear();
+
+        Ok(())
+    }
+
+    fn partition_count(&self) -> Option<usize> {
+        if self.topics.is_empty() {
+            return None; // from_consumer() path — no factory config
+        }
+        let metadata = self
+            .consumer
+            .fetch_metadata(None, Duration::from_secs(10))
+            .ok()?;
+        let count: usize = metadata
+            .topics()
+            .iter()
+            .filter(|t| self.topics.contains(&t.name().to_owned()))
+            .map(|t| t.partitions().len())
+            .sum();
+        Some(count)
+    }
+
+    fn create_partition_source(
+        &self,
+        assigned: &[usize],
+    ) -> Box<dyn Source<Output = KafkaMessage>> {
+        // Fetch metadata to map global partition indices to (topic, partition) pairs
+        let metadata = self
+            .consumer
+            .fetch_metadata(None, Duration::from_secs(10))
+            .expect("metadata fetch failed");
+
+        let mut all_partitions: Vec<(String, i32)> = Vec::new();
+        for t in metadata.topics() {
+            if self.topics.contains(&t.name().to_owned()) {
+                for p in t.partitions() {
+                    all_partitions.push((t.name().to_owned(), p.id()));
+                }
+            }
+        }
+
+        // Create a new consumer with manual assignment (no group rebalance)
+        let consumer: StreamConsumer = ClientConfig::new()
+            .set("bootstrap.servers", &self.brokers)
+            .set("group.id", &self.group_id)
+            .set("enable.auto.commit", "false")
+            .set("auto.offset.reset", "earliest")
+            .create()
+            .expect("failed to create partition consumer");
+
+        let mut tpl = TopicPartitionList::new();
+        let assigned_pairs: Vec<(String, i32)> = assigned
+            .iter()
+            .map(|&idx| all_partitions[idx].clone())
+            .collect();
+        for (topic, partition) in &assigned_pairs {
+            tpl.add_partition(topic, *partition);
+        }
+        consumer.assign(&tpl).expect("failed to assign partitions");
+
+        Box::new(KafkaPartitionSource {
+            consumer,
+            batch_size: self.batch_size,
+            poll_timeout: self.poll_timeout,
+            tracked_offsets: HashMap::new(),
+            records_since_watermark: 0,
+            watermark_interval: self.watermark_interval,
+            watermark_pending: false,
+            assigned_partitions: assigned_pairs,
+        })
+    }
+}
+
+/// A partition-specific Kafka consumer for parallel source consumption.
+///
+/// Created by [`KafkaSource::create_partition_source()`]. Each instance reads
+/// from a fixed set of (topic, partition) pairs using manual assignment.
+struct KafkaPartitionSource {
+    consumer: StreamConsumer,
+    batch_size: usize,
+    poll_timeout: Duration,
+    tracked_offsets: HashMap<(String, i32), i64>,
+    records_since_watermark: usize,
+    watermark_interval: usize,
+    watermark_pending: bool,
+    assigned_partitions: Vec<(String, i32)>,
+}
+
+#[async_trait]
+impl Source for KafkaPartitionSource {
+    type Output = KafkaMessage;
+
+    async fn next_batch(&mut self) -> Option<Vec<KafkaMessage>> {
+        let mut batch = Vec::with_capacity(self.batch_size);
+        let deadline = tokio::time::Instant::now() + self.poll_timeout;
+
+        while batch.len() < self.batch_size {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+
+            match tokio::time::timeout(remaining, self.consumer.recv()).await {
+                Ok(Ok(msg)) => {
+                    let topic = msg.topic().to_owned();
+                    let partition = msg.partition();
+                    let offset = msg.offset();
+
+                    let kafka_msg = KafkaMessage {
+                        topic: topic.clone(),
+                        partition,
+                        offset,
+                        key: msg.key().map(<[u8]>::to_vec),
+                        payload: msg.payload().map(<[u8]>::to_vec),
+                        timestamp: msg.timestamp().to_millis(),
+                    };
+
+                    self.tracked_offsets.insert((topic, partition), offset);
+                    metrics::counter!("kafka_messages_consumed_total").increment(1);
+                    batch.push(kafka_msg);
+                }
+                Ok(Err(e)) => {
+                    tracing::warn!(error = %e, "kafka partition consumer error");
+                    break;
+                }
+                Err(_) => break,
+            }
+        }
+
+        self.records_since_watermark += batch.len();
+        if self.records_since_watermark >= self.watermark_interval {
+            self.watermark_pending = true;
+            self.records_since_watermark = 0;
+        }
+
+        Some(batch)
+    }
+
+    fn should_emit_watermark(&self) -> bool {
+        self.watermark_pending
+    }
+
+    fn current_offsets(&self) -> HashMap<String, String> {
+        self.tracked_offsets
+            .iter()
+            .map(|((topic, partition), offset)| {
+                (format!("{topic}/{partition}"), offset.to_string())
+            })
+            .collect()
+    }
+
+    async fn restore_offsets(&mut self, offsets: &HashMap<String, String>) -> anyhow::Result<()> {
+        if offsets.is_empty() {
+            return Ok(());
+        }
+
+        let mut tpl = TopicPartitionList::new();
+        for (topic, partition) in &self.assigned_partitions {
+            let key = format!("{topic}/{partition}");
+            if let Some(offset_str) = offsets.get(&key) {
+                let offset: i64 = offset_str.parse()?;
+                tpl.add_partition_offset(topic, *partition, rdkafka::Offset::Offset(offset + 1))?;
+            }
+        }
+
+        if tpl.count() > 0 {
+            self.consumer.assign(&tpl)?;
+            tracing::info!(
+                partitions = tpl.count(),
+                "partition source restored offsets via assign()"
+            );
+        }
+        Ok(())
+    }
+
+    async fn on_checkpoint_complete(&mut self) -> anyhow::Result<()> {
+        if self.tracked_offsets.is_empty() {
+            return Ok(());
+        }
+
+        let mut tpl = TopicPartitionList::new();
+        for ((topic, partition), offset) in &self.tracked_offsets {
+            tpl.add_partition_offset(topic, *partition, rdkafka::Offset::Offset(offset + 1))?;
+        }
+
+        self.consumer
+            .commit(&tpl, rdkafka::consumer::CommitMode::Sync)?;
+        metrics::counter!("kafka_consumer_offsets_committed_total").increment(1);
+        tracing::debug!(
+            partitions = self.tracked_offsets.len(),
+            "partition source committed offsets"
+        );
         self.tracked_offsets.clear();
 
         Ok(())
