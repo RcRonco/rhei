@@ -12,6 +12,7 @@
 - [x] Fluent pipeline builder API (`DataflowGraph` with `Stream<T>` / `KeyedStream<T>`)
 - [x] Multi-operator chaining in `run_dataflow` (currently single-operator only)
 - [ ] Hot-reload operator logic without full pipeline restart
+- [x] `rill run --attach <url>` — connect to a running pipeline and stream health/metrics/logs to TUI
 - [ ] `rill-cli` improvements: deploy, inspect running pipelines, replay from checkpoint
 
 ## Integrations
@@ -41,14 +42,17 @@
 ## Observability
 
 - [x] Structured tracing spans per-operator and per-worker
-- [ ] Prometheus metrics exporter endpoint
+- [x] Prometheus metrics exporter endpoint (`/metrics`)
 - [x] Backpressure metrics (stash depth, pending future count, channel utilization)
 - [x] Throughput and latency metrics (batch/element counters, p50/p99 element duration)
 - [x] State size metrics (L1/L2/L3 hit rates, checkpoint duration)
-- [ ] Dead-letter queue for failed/dropped elements with diagnostics
+- [x] Dead-letter queue for failed/dropped elements (`ErrorPolicy::DeadLetterFile`)
 - [x] Pipeline topology visualization (TUI graph view with exchange point rendering)
 - [x] TUI dashboard with worker count, per-worker log attribution
-- [ ] Health check endpoint for liveness/readiness probes
+- [x] Health check endpoint for liveness/readiness probes (`/healthz`, `/readyz`)
+- [x] JSON metrics API (`/api/metrics`) via fanout recorder
+- [x] Log buffer API (`/api/logs`) with structured log capture
+- [x] S3 (MinIO) E2E test for tiered storage with CI job
 
 ## Performance
 
@@ -70,8 +74,9 @@
 - [ ] Restart from checkpoint with offset tracking (Kafka consumer offsets)
 - [ ] Watermark propagation for out-of-order event handling
 - [ ] Late-event policy (drop, redirect to side output, or update)
-- [ ] Operator-level error handling (retry, skip, dead-letter)
+- [x] Operator-level error handling (skip or dead-letter file via `ErrorPolicy`)
 - [ ] Fuzz testing for state serialization and checkpoint restore
+- [x] S3/MinIO E2E integration test for tiered storage backend
 - [ ] Integration tests with simulated failures (network partitions, slow backends)
 
 ## Clustering
