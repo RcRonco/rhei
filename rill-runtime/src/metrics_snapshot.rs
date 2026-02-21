@@ -11,9 +11,32 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use metrics::{Counter, Gauge, Histogram, Key, KeyName, Metadata, Recorder, SharedString, Unit};
+use serde::{Deserialize, Serialize};
+
+/// Serde helper to serialize `Duration` as `f64` seconds and back.
+mod duration_as_secs_f64 {
+    use std::time::Duration;
+
+    use serde::{self, Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S>(duration: &Duration, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_f64(duration.as_secs_f64())
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Duration, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let secs = f64::deserialize(deserializer)?;
+        Ok(Duration::from_secs_f64(secs))
+    }
+}
 
 /// Point-in-time snapshot of all pipeline metrics.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MetricsSnapshot {
     /// Total elements processed.
     pub elements_total: u64,
@@ -49,7 +72,8 @@ pub struct MetricsSnapshot {
     pub pending_futures: f64,
     /// Number of parallel workers.
     pub workers: u64,
-    /// Time since pipeline started.
+    /// Time since pipeline started (serialized as seconds f64).
+    #[serde(with = "duration_as_secs_f64")]
     pub uptime: Duration,
 }
 

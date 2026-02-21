@@ -24,6 +24,7 @@ metrics-exporter-prometheus = "0.16"
 ratatui = "0.29"
 axum = "0.8"
 rdkafka = { version = "0.36", features = ["cmake-build"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 tempfile = "3"
 
 [workspace.lints.rust]

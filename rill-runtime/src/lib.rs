@@ -38,6 +38,8 @@ pub(crate) mod compiler;
 pub mod dataflow;
 /// Pipeline executor with Timely-backed multi-worker support.
 pub mod executor;
+/// Fan-out recorder delegating to Prometheus and Snapshot recorders.
+pub mod fanout_recorder;
 /// Pipeline health state for readiness and liveness probes.
 pub mod health;
 /// HTTP server for health checks and Prometheus metrics.
