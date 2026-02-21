@@ -163,6 +163,33 @@ impl Source for KafkaSource {
             .collect()
     }
 
+    async fn restore_offsets(&mut self, offsets: &HashMap<String, String>) -> anyhow::Result<()> {
+        if offsets.is_empty() {
+            return Ok(());
+        }
+
+        let mut tpl = TopicPartitionList::new();
+        for (key, value) in offsets {
+            // Key format: "topic/partition"
+            let (topic, partition_str) = key
+                .rsplit_once('/')
+                .ok_or_else(|| anyhow::anyhow!("invalid offset key format: {key}"))?;
+            let partition: i32 = partition_str.parse()?;
+            let offset: i64 = value.parse()?;
+            // Seek to offset+1 (next unread message).
+            tpl.add_partition_offset(topic, partition, rdkafka::Offset::Offset(offset + 1))?;
+        }
+
+        // Switch to manual partition assignment at the restored offsets.
+        // This overrides consumer group subscription/rebalancing.
+        self.consumer.assign(&tpl)?;
+        tracing::info!(
+            partitions = offsets.len(),
+            "restored source offsets via assign()"
+        );
+        Ok(())
+    }
+
     async fn on_checkpoint_complete(&mut self) -> anyhow::Result<()> {
         if self.tracked_offsets.is_empty() {
             return Ok(());

@@ -49,6 +49,17 @@ pub trait Source: Send + Sync {
     fn current_offsets(&self) -> std::collections::HashMap<String, String> {
         std::collections::HashMap::new()
     }
+
+    /// Restore source offsets from a checkpoint manifest.
+    ///
+    /// Called before any `next_batch()` on restart so the source can seek
+    /// to the correct position. The default implementation is a no-op.
+    async fn restore_offsets(
+        &mut self,
+        _offsets: &std::collections::HashMap<String, String>,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
 }
 
 /// A sink that consumes elements from a stream.

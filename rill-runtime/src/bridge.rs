@@ -1,3 +1,6 @@
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+
 use rill_core::traits::{Sink, Source};
 
 use crate::dataflow::{AnyItem, ErasedSource};
@@ -54,19 +57,38 @@ where
     tx
 }
 
-/// Bridges a type-erased [`ErasedSource`] into a `tokio::sync::mpsc::Receiver`.
+/// Bridges a type-erased [`ErasedSource`] into a `tokio::sync::mpsc::Receiver`,
+/// also sharing current source offsets via an `Arc<Mutex<HashMap>>`.
 ///
-/// Same pattern as [`source_bridge`] but for the type-erased dataflow path.
+/// Spawns a Tokio task that calls `source.next_batch().await` in a loop,
+/// sending each batch via a bounded async channel. After each batch the
+/// source's `current_offsets()` are copied into the shared map. The Timely
+/// side reads with `try_recv()` (non-blocking). Channel close signals
+/// source exhaustion.
+///
 /// When a `ShutdownHandle` is provided, the bridge stops reading from the
 /// source once shutdown is signalled.
-pub(crate) fn erased_source_bridge(
+#[allow(clippy::type_complexity)]
+pub(crate) fn erased_source_bridge_with_offsets(
     mut source: Box<dyn ErasedSource>,
     rt: &tokio::runtime::Handle,
     shutdown: Option<ShutdownHandle>,
-) -> tokio::sync::mpsc::Receiver<Vec<AnyItem>> {
+) -> (
+    tokio::sync::mpsc::Receiver<Vec<AnyItem>>,
+    Arc<Mutex<HashMap<String, String>>>,
+) {
     let (tx, rx) = tokio::sync::mpsc::channel(16);
+    let shared_offsets: Arc<Mutex<HashMap<String, String>>> = Arc::new(Mutex::new(HashMap::new()));
+    let offsets_writer = shared_offsets.clone();
+
     rt.spawn(async move {
         while let Some(batch) = source.next_batch().await {
+            // Snapshot offsets after reading each batch.
+            let offsets = source.current_offsets();
+            if !offsets.is_empty() {
+                *offsets_writer.lock().unwrap() = offsets;
+            }
+
             if tx.send(batch).await.is_err() {
                 break; // receiver dropped
             }
@@ -79,5 +101,5 @@ pub(crate) fn erased_source_bridge(
         }
         // tx drops here, closing the channel
     });
-    rx
+    (rx, shared_offsets)
 }

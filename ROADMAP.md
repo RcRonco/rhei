@@ -72,18 +72,18 @@
 - [ ] Exactly-once semantics with two-phase commit on source/sink
 - [ ] Checkpoint versioning and backward-compatible state migration
 - [x] Graceful shutdown: drain in-flight, checkpoint, then exit
-- [ ] Restart from checkpoint with offset tracking (Kafka consumer offsets)
+- [x] Restart from checkpoint with offset tracking (Kafka consumer offsets)
   - [x] Checkpoint manifest with source offset persistence
-  - [ ] Reload source offsets from manifest on restart (KI-2)
-  - [ ] Kafka consumer seek to checkpointed offsets on restart (KI-16)
+  - [x] Reload source offsets from manifest on restart (KI-2)
+  - [x] Kafka consumer seek to checkpointed offsets on restart (KI-16)
 - [ ] Watermark propagation for out-of-order event handling (KI-13)
 - [ ] Late-event policy (drop, redirect to side output, or update)
 - [x] Operator-level error handling (skip or dead-letter file via `ErrorPolicy`)
 - [ ] Propagate sink send errors instead of silently dropping (KI-1)
 - [ ] Propagate DLQ write errors instead of silently dropping (KI-3)
-- [ ] Propagate checkpoint failures in single-worker mode (KI-15)
+- [x] Propagate checkpoint failures in single-worker mode (KI-15)
 - [ ] Fix async stash ordering — pending elements can be overtaken by later L1 hits (KI-11)
-- [ ] Configurable checkpoint interval (currently hardcoded to 100 batches) (KI-8)
+- [x] Configurable checkpoint interval via `Executor::builder().checkpoint_interval(n)` (KI-8)
 - [ ] Fuzz testing for state serialization and checkpoint restore
 - [x] S3/MinIO E2E integration test for tiered storage backend
 - [ ] Integration tests with simulated failures (network partitions, slow backends)
@@ -95,7 +95,7 @@
 - [ ] Merge / fan-in — combine multiple streams into one (KI-9)
 - [ ] Fan-out — one source feeding multiple sinks (KI-17)
 - [ ] Temporal join timeout and state eviction for unmatched events (KI-5)
-- [ ] Single-worker source offset tracking in checkpoint manifest (KI-12)
+- [x] Single-worker source offset tracking in checkpoint manifest (KI-12)
 
 ## Clustering
 

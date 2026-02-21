@@ -20,15 +20,14 @@ If `blocking_send()` fails (receiver dropped, channel full after close), the err
 is discarded with `let _ =`. Elements are permanently lost with no error propagation
 or logging. This affects the single-worker execution path.
 
-### KI-2: Checkpoint source offsets never reloaded on restart
+### ~~KI-2: Checkpoint source offsets never reloaded on restart~~ (RESOLVED)
 
-**Files:** `rill-runtime/src/executor.rs:1028-1055`, `rill-core/src/checkpoint.rs`
+**Fixed in:** `ADR/checkpoint-restore.md`
 
-The checkpoint manifest persists `source_offsets` and loads them at startup, but
-there is no code to feed those offsets back into the source. `KafkaSource` starts
-fresh from `auto.offset.reset=earliest` on every restart instead of seeking to the
-last committed offset. This causes full re-consumption of all data, violating
-at-least-once semantics.
+On restart, `run_graph` now extracts `source_offsets` from the loaded manifest and
+calls `source.restore_offsets()` before any batches are read. `KafkaSource`
+implements `restore_offsets()` by calling `consumer.assign()` with the checkpointed
+offsets, restoring at-least-once semantics.
 
 ### KI-3: DLQ write errors silently dropped
 
@@ -83,17 +82,13 @@ already emitted and cannot be updated. No metrics, logging, or configurable poli
 eviction policy, or backpressure mechanism. Between checkpoints, L1 can grow
 without bound. Under high cardinality workloads this can exhaust available RAM.
 
-### KI-8: Checkpoint interval is hardcoded
+### ~~KI-8: Checkpoint interval is hardcoded~~ (RESOLVED)
 
-**File:** `rill-runtime/src/executor.rs:908`
+**Fixed in:** `ADR/checkpoint-restore.md`
 
-```rust
-let checkpoint_interval: u64 = 100;
-```
-
-The multi-worker checkpoint interval is a compile-time constant (100 batches).
-Too frequent = overhead; too infrequent = large replay window on failure and
-unbounded L1 growth. This should be configurable.
+The checkpoint interval is now configurable via `Executor::builder().checkpoint_interval(n)`.
+Defaults to 100 batches. Both `Executor` and `ExecutorBuilder` carry the field, and the
+multi-worker main loop reads it from the executor at runtime.
 
 ### KI-9: No merge / fan-in support in executor
 
@@ -129,14 +124,14 @@ Capability tokens are explicitly dropped with `let _ = cap` (lines 112, 116) rat
 than being retained for frontier tracking, which may allow the frontier to advance
 prematurely for elements with pending futures.
 
-### KI-12: Single-worker checkpoint has no source offsets
+### ~~KI-12: Single-worker checkpoint has no source offsets~~ (RESOLVED)
 
-**File:** `rill-runtime/src/executor.rs:748-757`
+**Fixed in:** `ADR/checkpoint-restore.md`
 
-In single-worker mode the source is consumed by `erased_source_bridge()`, making
-`current_offsets()` inaccessible. The manifest records empty offsets. This means
-single-worker restarts for Kafka pipelines have no persisted offset information
-in the manifest (though Kafka's `__consumer_offsets` may still have committed offsets).
+`erased_source_bridge_with_offsets()` shares an `Arc<Mutex<HashMap>>` between
+the bridge task and the executor. After each `next_batch()`, the bridge copies
+`current_offsets()` into the shared map. The single-worker manifest now records
+actual source offsets.
 
 ### KI-13: Watermarks tracked but never propagated
 
@@ -159,24 +154,24 @@ The tracing capture layer uses non-blocking `try_send`. When the channel is full
 log entries are silently dropped. This is documented and intentional (backpressure),
 but under high log volume it means observability gaps.
 
-### KI-15: No checkpoint failure propagation in single-worker
+### ~~KI-15: No checkpoint failure propagation in single-worker~~ (RESOLVED)
 
-**File:** `rill-runtime/src/executor.rs:721-722`
+**Fixed in:** `ADR/checkpoint-restore.md`
 
-Single-worker mode passes `None` for both `checkpoint_barrier` and
-`checkpoint_notify`. Checkpoint errors in the Timely operator (e.g. L3 write
-failure) are not propagated to the main task. The pipeline continues without
-acknowledging the failure.
+Single-worker now creates a `Barrier::new(1)` and `mpsc::channel`, passes them
+into `build_timely_dataflow`. After Timely completes, the executor drains
+checkpoint notifications and writes intermediate manifests with source offsets,
+matching multi-worker behavior.
 
-### KI-16: Kafka consumer group does not seek on restart
+### ~~KI-16: Kafka consumer group does not seek on restart~~ (RESOLVED)
 
-**File:** `rill-core/src/connectors/kafka_source.rs:41-48`
+**Fixed in:** `ADR/checkpoint-restore.md`
 
-`KafkaSource::new()` sets `enable.auto.commit=false` and `auto.offset.reset=earliest`.
-There is no `restore_offsets()` or seek API. Even if checkpoint manifest offsets are
-eventually loaded (fixing KI-2), there is no mechanism to pass them to the Kafka
-consumer. The consumer relies entirely on Kafka's `__consumer_offsets` topic, which
-is only updated by `on_checkpoint_complete()`.
+The `Source` trait now has a default no-op `restore_offsets()` method. `KafkaSource`
+implements it by parsing `"topic/partition"` keys from the manifest, building a
+`TopicPartitionList` with `Offset::Offset(offset + 1)`, and calling
+`consumer.assign()` to seek to the correct positions. Note: this overrides consumer
+group rebalancing when restoring from checkpoint.
 
 ### KI-17: No fan-out support
 

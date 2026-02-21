@@ -77,6 +77,7 @@ pub struct Executor {
     checkpoint_dir: std::path::PathBuf,
     tiered: Option<TieredStorageConfig>,
     workers: usize,
+    checkpoint_interval: u64,
     error_policy: ErrorPolicy,
     health: HealthState,
 }
@@ -86,6 +87,7 @@ pub struct Executor {
 pub struct ExecutorBuilder {
     checkpoint_dir: std::path::PathBuf,
     workers: usize,
+    checkpoint_interval: u64,
     tiered: Option<TieredStorageConfig>,
     error_policy: ErrorPolicy,
     health: HealthState,
@@ -102,6 +104,16 @@ impl ExecutorBuilder {
     pub fn workers(mut self, n: usize) -> Self {
         assert!(n >= 1, "worker count must be at least 1");
         self.workers = n;
+        self
+    }
+
+    /// Set the checkpoint interval in batches (default: 100).
+    ///
+    /// Controls how often pre-exchange steps are checkpointed in the
+    /// multi-worker main loop. Must be at least 1.
+    pub fn checkpoint_interval(mut self, interval: u64) -> Self {
+        assert!(interval >= 1, "checkpoint interval must be at least 1");
+        self.checkpoint_interval = interval;
         self
     }
 
@@ -123,6 +135,7 @@ impl ExecutorBuilder {
             checkpoint_dir: self.checkpoint_dir,
             tiered: self.tiered,
             workers: self.workers,
+            checkpoint_interval: self.checkpoint_interval,
             error_policy: self.error_policy,
             health: self.health,
         }
@@ -135,6 +148,7 @@ impl Executor {
         ExecutorBuilder {
             checkpoint_dir: std::path::PathBuf::from("./checkpoints"),
             workers: 1,
+            checkpoint_interval: 100,
             tiered: None,
             error_policy: ErrorPolicy::default(),
             health: HealthState::new(),
@@ -149,6 +163,7 @@ impl Executor {
             checkpoint_dir,
             tiered: None,
             workers: 1,
+            checkpoint_interval: 100,
             error_policy: ErrorPolicy::default(),
             health: HealthState::new(),
         }
@@ -173,6 +188,11 @@ impl Executor {
     /// Returns the configured number of workers.
     pub fn workers(&self) -> usize {
         self.workers
+    }
+
+    /// Returns the configured checkpoint interval in batches.
+    pub fn checkpoint_interval(&self) -> u64 {
+        self.checkpoint_interval
     }
 
     /// Compile and execute a [`DataflowGraph`].
@@ -590,12 +610,22 @@ fn build_timely_dataflow<A: timely::communication::Allocate>(
 
 /// Execute a compiled pipeline.
 async fn execute_pipeline(
-    pipeline: CompiledPipeline,
+    mut pipeline: CompiledPipeline,
     executor: &Executor,
     shutdown: Option<&ShutdownHandle>,
     initial_checkpoint_id: u64,
     all_operator_names: Vec<String>,
+    restored_offsets: std::collections::HashMap<String, String>,
 ) -> anyhow::Result<()> {
+    // Restore source offsets from a prior checkpoint before any batches are read.
+    if !restored_offsets.is_empty() {
+        pipeline.source.restore_offsets(&restored_offsets).await?;
+        tracing::info!(
+            offsets = restored_offsets.len(),
+            "source offsets restored from checkpoint"
+        );
+    }
+
     let n_workers = executor.workers();
     let (pre_segments, exchange) = split_at_first_exchange(pipeline.segments);
 
@@ -670,8 +700,9 @@ async fn execute_single_worker(
         operator_contexts.push(Some(ctx));
     }
 
-    // Bridge source to channel.
-    let source_rx = crate::bridge::erased_source_bridge(source, &rt, shutdown.cloned());
+    // Bridge source to channel, sharing offsets for manifest writing.
+    let (source_rx, source_offsets) =
+        crate::bridge::erased_source_bridge_with_offsets(source, &rt, shutdown.cloned());
 
     // Create sink channel manually so we can await the sink task.
     let (sink_tx, mut sink_rx) = tokio::sync::mpsc::channel::<AnyItem>(16);
@@ -686,6 +717,12 @@ async fn execute_single_worker(
 
     // Package for the Timely closure (Fn, not FnOnce — use Mutex+Option+take).
     let dlq_sink = open_dlq_sink(&executor.error_policy);
+
+    // Checkpoint coordination: Barrier(1) is a no-op for a single worker
+    // (immediately becomes leader), but the notify channel allows Timely
+    // checkpoint events to propagate back to the main task.
+    let checkpoint_barrier = Arc::new(std::sync::Barrier::new(1));
+    let (checkpoint_notify_tx, checkpoint_notify_rx) = std::sync::mpsc::channel::<()>();
 
     let source_rx = std::sync::Mutex::new(Some(source_rx));
     let segments = std::sync::Mutex::new(Some(segments));
@@ -707,6 +744,9 @@ async fn execute_single_worker(
             let sink_tx = sink_tx.lock().unwrap().take().unwrap();
             let rt = rt_clone.clone();
 
+            let barrier = checkpoint_barrier.clone();
+            let notify = checkpoint_notify_tx.clone();
+
             let dataflow_index = worker.next_dataflow_index();
             let probe = worker.dataflow::<u64, _, _>(|scope| {
                 build_timely_dataflow(
@@ -718,8 +758,8 @@ async fn execute_single_worker(
                     rt,
                     0,
                     1,
-                    None,
-                    None,
+                    Some(barrier),
+                    Some(notify),
                     dlq_sink.clone(),
                 )
             });
@@ -745,15 +785,29 @@ async fn execute_single_worker(
         .await
         .map_err(|e| anyhow::anyhow!("sink task panicked: {e}"))??;
 
-    // Write final manifest. Source is consumed by the bridge so offsets are
-    // unavailable; record empty offsets (Kafka sources use multi-worker).
-    let checkpoint_id = initial_checkpoint_id + 1;
+    // Drain any checkpoint notifications that arrived during Timely execution.
+    let mut checkpoint_id = initial_checkpoint_id;
+    while checkpoint_notify_rx.try_recv().is_ok() {
+        checkpoint_id += 1;
+        let manifest = CheckpointManifest {
+            version: 1,
+            checkpoint_id,
+            timestamp_ms: now_millis(),
+            operators: all_operator_names.clone(),
+            source_offsets: source_offsets.lock().unwrap().clone(),
+        };
+        manifest.save(&executor.checkpoint_dir)?;
+        tracing::debug!(checkpoint_id, "checkpoint #{checkpoint_id} saved");
+    }
+
+    // Write final manifest with source offsets from the shared bridge state.
+    checkpoint_id += 1;
     let manifest = CheckpointManifest {
         version: 1,
         checkpoint_id,
         timestamp_ms: now_millis(),
         operators: all_operator_names,
-        source_offsets: std::collections::HashMap::new(),
+        source_offsets: source_offsets.lock().unwrap().clone(),
     };
     manifest.save(&executor.checkpoint_dir)?;
     tracing::debug!(checkpoint_id, "checkpoint #{checkpoint_id} saved");
@@ -905,7 +959,7 @@ async fn execute_multi_worker(
 
     // Main loop: source → pre-steps → hash key → route to per-worker channels.
     // Each send is a batch (Vec) that becomes one Timely epoch.
-    let checkpoint_interval: u64 = 100;
+    let checkpoint_interval: u64 = executor.checkpoint_interval();
     let mut batches_since_checkpoint: u64 = 0;
     let mut checkpoint_id = initial_checkpoint_id;
     // Pre-exchange runs on the main async task: single reader, not a worker.
@@ -1026,12 +1080,13 @@ async fn run_graph(
     all_operator_names.sort();
 
     // Load existing manifest and validate.
-    let initial_checkpoint_id =
+    let (initial_checkpoint_id, restored_offsets) =
         if let Some(manifest) = CheckpointManifest::load(&executor.checkpoint_dir) {
             tracing::info!(
                 checkpoint_id = manifest.checkpoint_id,
                 timestamp_ms = manifest.timestamp_ms,
                 operators = ?manifest.operators,
+                source_offsets = ?manifest.source_offsets,
                 "resuming from checkpoint #{}", manifest.checkpoint_id
             );
 
@@ -1051,9 +1106,9 @@ async fn run_graph(
                 );
             }
 
-            manifest.checkpoint_id
+            (manifest.checkpoint_id, manifest.source_offsets)
         } else {
-            0
+            (0, std::collections::HashMap::new())
         };
 
     executor.health.set_status(PipelineStatus::Running);
@@ -1066,6 +1121,7 @@ async fn run_graph(
             shutdown.as_ref(),
             initial_checkpoint_id,
             all_operator_names,
+            restored_offsets,
         )
         .await
     } else {
