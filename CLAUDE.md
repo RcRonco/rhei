@@ -45,6 +45,10 @@ Three crates:
 - State access goes through `StateContext` (or the typed `KeyedState<K, V>` wrapper).
 - Kafka integration is behind the `kafka` feature flag on `rill-core`.
 
+## ADR (Architecture Decision Records)
+
+Every big feature must include an ADR under `ADR/<feature-name>.md`. An ADR should cover: context, decision (what and why), a **Diagram** section with Mermaid diagrams illustrating data/control flow and component relationships, alternatives considered with rationale, and consequences (positive and negative). See `ADR/checkpoint-manifest.md` for the reference format.
+
 ## Design Documents
 
 - `ARCHITECTURE.md` — Full system topology, component breakdown, data flow paths.
