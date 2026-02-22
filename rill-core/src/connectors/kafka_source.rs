@@ -22,6 +22,10 @@ pub struct KafkaSource {
     records_since_watermark: usize,
     watermark_interval: usize,
     watermark_pending: bool,
+    /// Maximum message timestamp seen so far (millis since epoch).
+    max_timestamp: Option<i64>,
+    /// How far behind the max timestamp the watermark sits (millis).
+    allowed_lateness_ms: u64,
     /// Factory config for creating partition-specific consumers.
     brokers: String,
     group_id: String,
@@ -62,6 +66,8 @@ impl KafkaSource {
             records_since_watermark: 0,
             watermark_interval: 1000,
             watermark_pending: false,
+            max_timestamp: None,
+            allowed_lateness_ms: 0,
             brokers: brokers.to_owned(),
             group_id: group_id.to_owned(),
             topics: topics.iter().map(|t| (*t).to_owned()).collect(),
@@ -81,6 +87,8 @@ impl KafkaSource {
             records_since_watermark: 0,
             watermark_interval: 1000,
             watermark_pending: false,
+            max_timestamp: None,
+            allowed_lateness_ms: 0,
             brokers: String::new(),
             group_id: String::new(),
             topics: Vec::new(),
@@ -102,6 +110,15 @@ impl KafkaSource {
     /// Set the watermark interval in records (default: 1000).
     pub fn with_watermark_interval(mut self, interval: usize) -> Self {
         self.watermark_interval = interval;
+        self
+    }
+
+    /// Set the allowed lateness for watermark computation in milliseconds (default: 0).
+    ///
+    /// The watermark is computed as `max_timestamp - allowed_lateness_ms`. This
+    /// gives late events a grace period before they are considered past the watermark.
+    pub fn with_allowed_lateness(mut self, ms: u64) -> Self {
+        self.allowed_lateness_ms = ms;
         self
     }
 }
@@ -135,6 +152,12 @@ impl Source for KafkaSource {
                         timestamp: msg.timestamp().to_millis(),
                     };
 
+                    // Track max message timestamp for watermark computation.
+                    if let Some(ts) = kafka_msg.timestamp {
+                        self.max_timestamp =
+                            Some(self.max_timestamp.map_or(ts, |prev| prev.max(ts)));
+                    }
+
                     self.tracked_offsets.insert((topic, partition), offset);
                     metrics::counter!("kafka_messages_consumed_total").increment(1);
                     batch.push(kafka_msg);
@@ -162,6 +185,11 @@ impl Source for KafkaSource {
 
     fn should_emit_watermark(&self) -> bool {
         self.watermark_pending
+    }
+
+    fn current_watermark(&self) -> Option<u64> {
+        self.max_timestamp
+            .map(|ts| (ts.max(0) as u64).saturating_sub(self.allowed_lateness_ms))
     }
 
     fn current_offsets(&self) -> HashMap<String, String> {
@@ -283,6 +311,8 @@ impl Source for KafkaSource {
             records_since_watermark: 0,
             watermark_interval: self.watermark_interval,
             watermark_pending: false,
+            max_timestamp: None,
+            allowed_lateness_ms: self.allowed_lateness_ms,
             assigned_partitions: assigned_pairs,
         })
     }
@@ -300,6 +330,8 @@ struct KafkaPartitionSource {
     records_since_watermark: usize,
     watermark_interval: usize,
     watermark_pending: bool,
+    max_timestamp: Option<i64>,
+    allowed_lateness_ms: u64,
     assigned_partitions: Vec<(String, i32)>,
 }
 
@@ -332,6 +364,12 @@ impl Source for KafkaPartitionSource {
                         timestamp: msg.timestamp().to_millis(),
                     };
 
+                    // Track max message timestamp for watermark computation.
+                    if let Some(ts) = kafka_msg.timestamp {
+                        self.max_timestamp =
+                            Some(self.max_timestamp.map_or(ts, |prev| prev.max(ts)));
+                    }
+
                     self.tracked_offsets.insert((topic, partition), offset);
                     metrics::counter!("kafka_messages_consumed_total").increment(1);
                     batch.push(kafka_msg);
@@ -355,6 +393,11 @@ impl Source for KafkaPartitionSource {
 
     fn should_emit_watermark(&self) -> bool {
         self.watermark_pending
+    }
+
+    fn current_watermark(&self) -> Option<u64> {
+        self.max_timestamp
+            .map(|ts| (ts.max(0) as u64).saturating_sub(self.allowed_lateness_ms))
     }
 
     fn current_offsets(&self) -> HashMap<String, String> {

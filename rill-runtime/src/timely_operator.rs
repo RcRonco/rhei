@@ -166,6 +166,22 @@ impl TimelyErasedOperator {
         }
     }
 
+    /// Process a watermark advancement. Delegates to the operator's `on_watermark`.
+    /// Returns any outputs produced (e.g. closed windows).
+    pub fn process_watermark(
+        &mut self,
+        watermark: u64,
+        rt: &tokio::runtime::Handle,
+    ) -> Vec<AnyItem> {
+        match rt.block_on(self.op.on_watermark(watermark, &mut self.ctx)) {
+            Ok(results) => results,
+            Err(e) => {
+                tracing::error!("watermark processing failed: {e}");
+                vec![]
+            }
+        }
+    }
+
     /// Force a checkpoint (for final flush).
     #[allow(dead_code)]
     pub fn checkpoint(&mut self, rt: &tokio::runtime::Handle) {

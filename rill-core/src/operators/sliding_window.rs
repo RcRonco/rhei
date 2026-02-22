@@ -5,6 +5,7 @@
 //! its timestamp. When an element arrives whose timestamp is past a window's
 //! end, that window is closed and its aggregate is emitted.
 
+use std::collections::HashSet;
 use std::fmt;
 use std::marker::PhantomData;
 
@@ -38,7 +39,29 @@ pub struct SlidingWindow<T, A, KF, TF> {
     key_fn: KF,
     time_fn: TF,
     aggregator: A,
+    /// In-memory set of keys with open windows (for watermark-driven closure).
+    active_keys: HashSet<String>,
+    /// Configurable allowed lateness for late event detection (default: 0).
+    allowed_lateness: u64,
+    /// Last seen watermark for late event detection.
+    last_watermark: u64,
     _phantom: PhantomData<T>,
+}
+
+impl<T, A: Clone, KF: Clone, TF: Clone> Clone for SlidingWindow<T, A, KF, TF> {
+    fn clone(&self) -> Self {
+        Self {
+            window_size: self.window_size,
+            slide: self.slide,
+            key_fn: self.key_fn.clone(),
+            time_fn: self.time_fn.clone(),
+            aggregator: self.aggregator.clone(),
+            active_keys: HashSet::new(),
+            allowed_lateness: self.allowed_lateness,
+            last_watermark: 0,
+            _phantom: PhantomData,
+        }
+    }
 }
 
 impl<T, A, KF, TF> fmt::Debug for SlidingWindow<T, A, KF, TF> {
@@ -59,6 +82,9 @@ impl<T, A, KF, TF> SlidingWindow<T, A, KF, TF> {
             key_fn,
             time_fn,
             aggregator,
+            active_keys: HashSet::new(),
+            allowed_lateness: 0,
+            last_watermark: 0,
             _phantom: PhantomData,
         }
     }
@@ -73,6 +99,7 @@ impl<T> SlidingWindow<T, (), (), ()> {
             key_fn: (),
             time_fn: (),
             aggregator: (),
+            allowed_lateness: 0,
             _phantom: PhantomData,
         }
     }
@@ -85,6 +112,7 @@ pub struct SlidingWindowBuilder<T, A = (), KF = (), TF = ()> {
     key_fn: KF,
     time_fn: TF,
     aggregator: A,
+    allowed_lateness: u64,
     _phantom: PhantomData<T>,
 }
 
@@ -110,6 +138,12 @@ impl<T, A, KF, TF> SlidingWindowBuilder<T, A, KF, TF> {
         self
     }
 
+    /// Sets the allowed lateness in timestamp units (default: 0).
+    pub fn allowed_lateness(mut self, lateness: u64) -> Self {
+        self.allowed_lateness = lateness;
+        self
+    }
+
     /// Sets the key extraction function.
     pub fn key_fn<KF2>(self, kf: KF2) -> SlidingWindowBuilder<T, A, KF2, TF> {
         SlidingWindowBuilder {
@@ -118,6 +152,7 @@ impl<T, A, KF, TF> SlidingWindowBuilder<T, A, KF, TF> {
             key_fn: kf,
             time_fn: self.time_fn,
             aggregator: self.aggregator,
+            allowed_lateness: self.allowed_lateness,
             _phantom: PhantomData,
         }
     }
@@ -130,6 +165,7 @@ impl<T, A, KF, TF> SlidingWindowBuilder<T, A, KF, TF> {
             key_fn: self.key_fn,
             time_fn: tf,
             aggregator: self.aggregator,
+            allowed_lateness: self.allowed_lateness,
             _phantom: PhantomData,
         }
     }
@@ -142,6 +178,7 @@ impl<T, A, KF, TF> SlidingWindowBuilder<T, A, KF, TF> {
             key_fn: self.key_fn,
             time_fn: self.time_fn,
             aggregator: agg,
+            allowed_lateness: self.allowed_lateness,
             _phantom: PhantomData,
         }
     }
@@ -173,6 +210,9 @@ where
             key_fn: self.key_fn,
             time_fn: self.time_fn,
             aggregator: self.aggregator,
+            active_keys: HashSet::new(),
+            allowed_lateness: self.allowed_lateness,
+            last_watermark: 0,
             _phantom: PhantomData,
         }
     }
@@ -223,6 +263,21 @@ where
         let key = (self.key_fn)(&input);
         let timestamp = (self.time_fn)(&input);
         let mut outputs = Vec::new();
+
+        // Late event detection: check if ALL windows this element would belong to
+        // are past the watermark + allowed_lateness.
+        let candidate_starts = window_starts_for(timestamp, self.window_size, self.slide);
+        let all_late = !candidate_starts.is_empty()
+            && candidate_starts
+                .iter()
+                .all(|&ws| ws + self.window_size + self.allowed_lateness <= self.last_watermark);
+        if all_late {
+            metrics::counter!("late_events_dropped_total").increment(1);
+            return Ok(vec![]);
+        }
+
+        // Track this key as active for watermark-driven closure.
+        self.active_keys.insert(key.clone());
 
         // Load current active windows for this key
         let mut active: ActiveWindows = {
@@ -295,11 +350,79 @@ where
 
         Ok(outputs)
     }
+
+    async fn on_watermark(
+        &mut self,
+        watermark: u64,
+        ctx: &mut StateContext,
+    ) -> anyhow::Result<Vec<WindowOutput<A::Output>>> {
+        self.last_watermark = watermark;
+        let mut outputs = Vec::new();
+        let mut keys_to_remove = Vec::new();
+
+        for key in &self.active_keys {
+            let mut active: ActiveWindows = {
+                let mut state = KeyedState::<String, ActiveWindows>::new(ctx, "sw_active");
+                state.get(key).await.unwrap_or(None).unwrap_or_default()
+            };
+
+            let mut still_active = Vec::new();
+            for &win_start in &active.starts {
+                if win_start + self.window_size + self.allowed_lateness <= watermark {
+                    // Close this window.
+                    let acc_key = format!("{key}:{win_start}");
+                    let acc: Option<A::Accumulator> = {
+                        let mut state = KeyedState::<String, A::Accumulator>::new(ctx, "sw_acc");
+                        state.get(&acc_key).await.unwrap_or(None)
+                    };
+                    if let Some(acc) = acc {
+                        outputs.push(WindowOutput {
+                            key: key.clone(),
+                            window_start: win_start,
+                            window_end: win_start + self.window_size,
+                            value: self.aggregator.finish(&acc),
+                        });
+                    }
+                    let mut state = KeyedState::<String, A::Accumulator>::new(ctx, "sw_acc");
+                    state.delete(&acc_key);
+                } else {
+                    still_active.push(win_start);
+                }
+            }
+
+            active.starts = still_active;
+            if active.starts.is_empty() {
+                let mut state = KeyedState::<String, ActiveWindows>::new(ctx, "sw_active");
+                state.delete(key);
+                keys_to_remove.push(key.clone());
+            } else {
+                active.starts.sort_unstable();
+                let mut state = KeyedState::<String, ActiveWindows>::new(ctx, "sw_active");
+                state.put(key, &active);
+            }
+        }
+
+        for key in &keys_to_remove {
+            self.active_keys.remove(key);
+        }
+
+        Ok(outputs)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::operators::aggregator::Count;
+    use crate::state::context::StateContext;
+    use crate::state::local_backend::LocalBackend;
+
+    fn test_ctx(name: &str) -> StateContext {
+        let path = std::env::temp_dir().join(format!("rill_sw_test_{name}_{}", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let backend = LocalBackend::new(path, None).unwrap();
+        StateContext::new(Box::new(backend))
+    }
 
     #[test]
     fn window_starts_basic() {
@@ -329,5 +452,69 @@ mod tests {
         // Only window [0,10) contains it
         let starts = window_starts_for(2, 10, 5);
         assert_eq!(starts, vec![0]);
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn make_sliding() -> SlidingWindow<
+        (String, u64),
+        Count<(String, u64)>,
+        fn(&(String, u64)) -> String,
+        fn(&(String, u64)) -> u64,
+    > {
+        SlidingWindow::new(
+            10,
+            5,
+            (|e: &(String, u64)| e.0.clone()) as fn(&(String, u64)) -> String,
+            (|e: &(String, u64)| e.1) as fn(&(String, u64)) -> u64,
+            Count::new(),
+        )
+    }
+
+    #[tokio::test]
+    async fn sliding_watermark_closes_windows() {
+        let mut ctx = test_ctx("wm_close");
+        let mut win = make_sliding();
+
+        // Element at ts=3 belongs to window [0,10)
+        let r = win.process(("a".into(), 3), &mut ctx).await.unwrap();
+        assert!(r.is_empty());
+
+        // Watermark at 10 closes window [0,10) but not [0+5=5, 15)
+        // Actually window [0,10): 0+10+0 <= 10 → closed
+        let r = win.on_watermark(10, &mut ctx).await.unwrap();
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].window_start, 0);
+        assert_eq!(r[0].window_end, 10);
+        assert_eq!(r[0].value, 1);
+    }
+
+    #[tokio::test]
+    async fn sliding_watermark_no_close_before_end() {
+        let mut ctx = test_ctx("wm_no_close");
+        let mut win = make_sliding();
+
+        // Element at ts=3 belongs to window [0,10)
+        win.process(("a".into(), 3), &mut ctx).await.unwrap();
+
+        // Watermark at 5 — window [0,10) not complete yet (0+10 > 5)
+        let r = win.on_watermark(5, &mut ctx).await.unwrap();
+        assert!(r.is_empty());
+    }
+
+    #[tokio::test]
+    async fn sliding_late_event_dropped() {
+        let mut ctx = test_ctx("late_drop");
+        let mut win = make_sliding();
+
+        // Process element to establish windows
+        win.process(("a".into(), 3), &mut ctx).await.unwrap();
+
+        // Advance watermark well past all windows containing ts=2
+        // ts=2 belongs to [0, 10). 0+10+0 <= 15 → all late
+        win.on_watermark(15, &mut ctx).await.unwrap();
+
+        // Late element
+        let r = win.process(("a".into(), 2), &mut ctx).await.unwrap();
+        assert!(r.is_empty());
     }
 }

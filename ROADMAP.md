@@ -77,8 +77,9 @@
   - [x] Checkpoint manifest with source offset persistence
   - [x] Reload source offsets from manifest on restart (KI-2)
   - [x] Kafka consumer seek to checkpointed offsets on restart (KI-16)
-- [ ] Watermark propagation for out-of-order event handling (KI-13)
-- [ ] Late-event policy (drop, redirect to side output, or update)
+- [x] Watermark propagation for out-of-order event handling (KI-13)
+- [x] Late-event policy: drop with metric and configurable `allowed_lateness` (KI-6 partial)
+- [ ] Late-event side-output routing (redirect late events to a separate stream)
 - [x] Operator-level error handling (skip or dead-letter file via `ErrorPolicy`)
 - [ ] Propagate sink send errors instead of silently dropping (KI-1)
 - [ ] Propagate DLQ write errors instead of silently dropping (KI-3)

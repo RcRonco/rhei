@@ -60,17 +60,15 @@ Unmatched events are buffered in operator state indefinitely. There is no timeou
 TTL, or eviction mechanism. If one side never produces a matching event, state grows
 without bound. Risk of OOM in long-running pipelines with skewed join keys.
 
-### KI-6: Window operators silently drop late events
+### ~~KI-6: Window operators silently drop late events~~ (PARTIALLY RESOLVED)
 
-**Files:** `rill-core/src/operators/tumbling_window.rs:215-235`,
-`rill-core/src/operators/sliding_window.rs`,
-`rill-core/src/operators/session_window.rs`
+**Fixed in:** `ADR/watermark-propagation.md`
 
-When a tumbling window receives an element whose timestamp maps to a different window
-than the currently active one, the old window is closed and emitted. If a late element
-arrives for the closed window, it opens a new window — but the old aggregation is
-already emitted and cannot be updated. No metrics, logging, or configurable policy
-(drop/redirect/update) exists for late arrivals.
+Window operators now detect late events using watermark-based tracking. Events arriving
+after `window_end + allowed_lateness <= last_watermark` are dropped with a
+`late_events_dropped_total` metric increment. The `allowed_lateness` parameter is
+configurable per window operator via the builder API. Side-output routing of late
+events to a separate stream is not yet implemented.
 
 ### KI-7: L1 memtable has no size limit or eviction
 
@@ -130,14 +128,15 @@ the bridge task and the executor. After each `next_batch()`, the bridge copies
 `current_offsets()` into the shared map. The single-worker manifest now records
 actual source offsets.
 
-### KI-13: Watermarks tracked but never propagated
+### ~~KI-13: Watermarks tracked but never propagated~~ (RESOLVED)
 
-**Files:** `rill-core/src/traits.rs:34-37`, `rill-core/src/connectors/kafka_source.rs:22-24,143-155`
+**Fixed in:** `ADR/watermark-propagation.md`
 
-`KafkaSource` tracks `records_since_watermark` and implements `should_emit_watermark()`.
-The `Source` trait defines the watermark hook. However, no downstream consumer reads
-the watermark signal. Watermarks are generated but never propagated through the
-dataflow, making them a no-op.
+Sources now implement `current_watermark()` which is read by the bridge and propagated
+to operators via a shared `Arc<AtomicU64>`. A global watermark task computes the
+minimum of all non-zero source watermarks every 100ms. Operators read this watermark
+in their `unary_frontier` callback and call `on_watermark()` on the wrapped
+`StreamFunction`. Window operators use this to close eligible windows on idle sources.
 
 ### KI-14: Tracing log channel drops entries under backpressure
 

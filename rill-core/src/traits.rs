@@ -20,6 +20,16 @@ pub trait StreamFunction: Send + Sync {
         input: Self::Input,
         ctx: &mut StateContext,
     ) -> anyhow::Result<Vec<Self::Output>>;
+
+    /// Called when the global watermark advances. Window operators use this
+    /// to close eligible windows. Default: no output.
+    async fn on_watermark(
+        &mut self,
+        _watermark: u64,
+        _ctx: &mut StateContext,
+    ) -> anyhow::Result<Vec<Self::Output>> {
+        Ok(vec![])
+    }
 }
 
 /// A source that produces elements into a stream.
@@ -34,6 +44,12 @@ pub trait Source: Send + Sync {
     /// Returns true when a watermark should be emitted (e.g. every N records).
     fn should_emit_watermark(&self) -> bool {
         false
+    }
+
+    /// Returns the current event-time watermark (millis). Downstream window
+    /// operators use this to close windows. Default: None.
+    fn current_watermark(&self) -> Option<u64> {
+        None
     }
 
     /// Called after a successful checkpoint. Sources that track offsets

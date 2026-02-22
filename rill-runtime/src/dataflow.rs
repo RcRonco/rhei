@@ -201,6 +201,8 @@ pub(crate) trait ErasedSource: Send {
     ) -> anyhow::Result<()>;
     fn partition_count(&self) -> Option<usize>;
     fn create_partition_source(&self, assigned: &[usize]) -> Option<Box<dyn ErasedSource>>;
+    /// Returns the current event-time watermark (millis), if available.
+    fn current_watermark(&self) -> Option<u64>;
 }
 
 /// Wraps a typed [`Source`] into an [`ErasedSource`].
@@ -241,6 +243,10 @@ where
         self.0.partition_count()?;
         let partition_source = self.0.create_partition_source(assigned);
         Some(Box::new(DynSourceWrapper(partition_source)))
+    }
+
+    fn current_watermark(&self) -> Option<u64> {
+        self.0.current_watermark()
     }
 }
 
@@ -289,6 +295,10 @@ where
     fn create_partition_source(&self, _assigned: &[usize]) -> Option<Box<dyn ErasedSource>> {
         None
     }
+
+    fn current_watermark(&self) -> Option<u64> {
+        self.0.current_watermark()
+    }
 }
 
 /// Type-erased sink: consumes [`AnyItem`].
@@ -325,6 +335,12 @@ pub(crate) trait ErasedOperator: Send {
         input: AnyItem,
         ctx: &mut StateContext,
     ) -> anyhow::Result<Vec<AnyItem>>;
+    /// Called when the global watermark advances.
+    async fn on_watermark(
+        &mut self,
+        watermark: u64,
+        ctx: &mut StateContext,
+    ) -> anyhow::Result<Vec<AnyItem>>;
     fn clone_erased(&self) -> Box<dyn ErasedOperator>;
 }
 
@@ -345,6 +361,15 @@ where
     ) -> anyhow::Result<Vec<AnyItem>> {
         let typed: F::Input = input.downcast();
         let results = self.0.process(typed, ctx).await?;
+        Ok(results.into_iter().map(AnyItem::new).collect())
+    }
+
+    async fn on_watermark(
+        &mut self,
+        watermark: u64,
+        ctx: &mut StateContext,
+    ) -> anyhow::Result<Vec<AnyItem>> {
+        let results = self.0.on_watermark(watermark, ctx).await?;
         Ok(results.into_iter().map(AnyItem::new).collect())
     }
 

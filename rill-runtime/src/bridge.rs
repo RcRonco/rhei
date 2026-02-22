@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use rill_core::traits::{Sink, Source};
@@ -76,10 +77,13 @@ pub(crate) fn erased_source_bridge_with_offsets(
 ) -> (
     tokio::sync::mpsc::Receiver<Vec<AnyItem>>,
     Arc<Mutex<HashMap<String, String>>>,
+    Arc<AtomicU64>,
 ) {
     let (tx, rx) = tokio::sync::mpsc::channel(16);
     let shared_offsets: Arc<Mutex<HashMap<String, String>>> = Arc::new(Mutex::new(HashMap::new()));
     let offsets_writer = shared_offsets.clone();
+    let source_watermark: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
+    let wm_writer = source_watermark.clone();
 
     rt.spawn(async move {
         while let Some(batch) = source.next_batch().await {
@@ -87,6 +91,11 @@ pub(crate) fn erased_source_bridge_with_offsets(
             let offsets = source.current_offsets();
             if !offsets.is_empty() {
                 *offsets_writer.lock().unwrap() = offsets;
+            }
+
+            // Update source watermark monotonically.
+            if let Some(wm) = source.current_watermark() {
+                wm_writer.fetch_max(wm, Ordering::Release);
             }
 
             if tx.send(batch).await.is_err() {
@@ -101,5 +110,5 @@ pub(crate) fn erased_source_bridge_with_offsets(
         }
         // tx drops here, closing the channel
     });
-    (rx, shared_offsets)
+    (rx, shared_offsets, source_watermark)
 }

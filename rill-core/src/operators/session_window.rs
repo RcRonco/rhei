@@ -4,6 +4,7 @@
 //! element arrives with a timestamp more than `gap` units after the last event
 //! in the current session, the session is closed and its aggregate is emitted.
 
+use std::collections::HashSet;
 use std::fmt;
 use std::marker::PhantomData;
 
@@ -38,7 +39,28 @@ pub struct SessionWindow<T, A, KF, TF> {
     key_fn: KF,
     time_fn: TF,
     aggregator: A,
+    /// In-memory set of keys with open sessions (for watermark-driven closure).
+    active_keys: HashSet<String>,
+    /// Configurable allowed lateness for late event detection (default: 0).
+    allowed_lateness: u64,
+    /// Last seen watermark for late event detection.
+    last_watermark: u64,
     _phantom: PhantomData<T>,
+}
+
+impl<T, A: Clone, KF: Clone, TF: Clone> Clone for SessionWindow<T, A, KF, TF> {
+    fn clone(&self) -> Self {
+        Self {
+            gap: self.gap,
+            key_fn: self.key_fn.clone(),
+            time_fn: self.time_fn.clone(),
+            aggregator: self.aggregator.clone(),
+            active_keys: HashSet::new(),
+            allowed_lateness: self.allowed_lateness,
+            last_watermark: 0,
+            _phantom: PhantomData,
+        }
+    }
 }
 
 impl<T, A, KF, TF> fmt::Debug for SessionWindow<T, A, KF, TF> {
@@ -57,6 +79,9 @@ impl<T, A, KF, TF> SessionWindow<T, A, KF, TF> {
             key_fn,
             time_fn,
             aggregator,
+            active_keys: HashSet::new(),
+            allowed_lateness: 0,
+            last_watermark: 0,
             _phantom: PhantomData,
         }
     }
@@ -70,6 +95,7 @@ impl<T> SessionWindow<T, (), (), ()> {
             key_fn: (),
             time_fn: (),
             aggregator: (),
+            allowed_lateness: 0,
             _phantom: PhantomData,
         }
     }
@@ -81,6 +107,7 @@ pub struct SessionWindowBuilder<T, A = (), KF = (), TF = ()> {
     key_fn: KF,
     time_fn: TF,
     aggregator: A,
+    allowed_lateness: u64,
     _phantom: PhantomData<T>,
 }
 
@@ -99,6 +126,12 @@ impl<T, A, KF, TF> SessionWindowBuilder<T, A, KF, TF> {
         self
     }
 
+    /// Sets the allowed lateness in timestamp units (default: 0).
+    pub fn allowed_lateness(mut self, lateness: u64) -> Self {
+        self.allowed_lateness = lateness;
+        self
+    }
+
     /// Sets the key extraction function.
     pub fn key_fn<KF2>(self, kf: KF2) -> SessionWindowBuilder<T, A, KF2, TF> {
         SessionWindowBuilder {
@@ -106,6 +139,7 @@ impl<T, A, KF, TF> SessionWindowBuilder<T, A, KF, TF> {
             key_fn: kf,
             time_fn: self.time_fn,
             aggregator: self.aggregator,
+            allowed_lateness: self.allowed_lateness,
             _phantom: PhantomData,
         }
     }
@@ -117,6 +151,7 @@ impl<T, A, KF, TF> SessionWindowBuilder<T, A, KF, TF> {
             key_fn: self.key_fn,
             time_fn: tf,
             aggregator: self.aggregator,
+            allowed_lateness: self.allowed_lateness,
             _phantom: PhantomData,
         }
     }
@@ -128,6 +163,7 @@ impl<T, A, KF, TF> SessionWindowBuilder<T, A, KF, TF> {
             key_fn: self.key_fn,
             time_fn: self.time_fn,
             aggregator: agg,
+            allowed_lateness: self.allowed_lateness,
             _phantom: PhantomData,
         }
     }
@@ -153,6 +189,9 @@ where
             key_fn: self.key_fn,
             time_fn: self.time_fn,
             aggregator: self.aggregator,
+            active_keys: HashSet::new(),
+            allowed_lateness: self.allowed_lateness,
+            last_watermark: 0,
             _phantom: PhantomData,
         }
     }
@@ -178,6 +217,9 @@ where
         let key = (self.key_fn)(&input);
         let timestamp = (self.time_fn)(&input);
         let mut outputs = Vec::new();
+
+        // Track this key as active for watermark-driven closure.
+        self.active_keys.insert(key.clone());
 
         // Load existing session state for this key
         let session: Option<SessionState<A::Accumulator>> = {
@@ -228,5 +270,124 @@ where
         }
 
         Ok(outputs)
+    }
+
+    async fn on_watermark(
+        &mut self,
+        watermark: u64,
+        ctx: &mut StateContext,
+    ) -> anyhow::Result<Vec<WindowOutput<A::Output>>> {
+        self.last_watermark = watermark;
+        let mut outputs = Vec::new();
+        let mut closed_keys = Vec::new();
+
+        for key in &self.active_keys {
+            let session: Option<SessionState<A::Accumulator>> = {
+                let mut state =
+                    KeyedState::<String, SessionState<A::Accumulator>>::new(ctx, "session");
+                state.get(key).await.unwrap_or(None)
+            };
+
+            if let Some(s) = session
+                && s.last_event_time + self.gap + self.allowed_lateness <= watermark
+            {
+                // Session timed out — close it.
+                outputs.push(WindowOutput {
+                    key: key.clone(),
+                    window_start: s.session_start,
+                    window_end: s.last_event_time,
+                    value: self.aggregator.finish(&s.accumulator),
+                });
+                let mut state =
+                    KeyedState::<String, SessionState<A::Accumulator>>::new(ctx, "session");
+                state.delete(key);
+                closed_keys.push(key.clone());
+            }
+        }
+
+        for key in &closed_keys {
+            self.active_keys.remove(key);
+        }
+
+        Ok(outputs)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::operators::aggregator::Count;
+    use crate::state::context::StateContext;
+    use crate::state::local_backend::LocalBackend;
+
+    fn test_ctx(name: &str) -> StateContext {
+        let path =
+            std::env::temp_dir().join(format!("rill_sess_test_{name}_{}", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let backend = LocalBackend::new(path, None).unwrap();
+        StateContext::new(Box::new(backend))
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn make_session() -> SessionWindow<
+        (String, u64),
+        Count<(String, u64)>,
+        fn(&(String, u64)) -> String,
+        fn(&(String, u64)) -> u64,
+    > {
+        SessionWindow::new(
+            10,
+            (|e: &(String, u64)| e.0.clone()) as fn(&(String, u64)) -> String,
+            (|e: &(String, u64)| e.1) as fn(&(String, u64)) -> u64,
+            Count::new(),
+        )
+    }
+
+    #[tokio::test]
+    async fn session_watermark_closes_session() {
+        let mut ctx = test_ctx("wm_close");
+        let mut win = make_session();
+
+        // Two events for key "a", last at ts=5
+        win.process(("a".into(), 1), &mut ctx).await.unwrap();
+        win.process(("a".into(), 5), &mut ctx).await.unwrap();
+
+        // Watermark at 16: last_event_time(5) + gap(10) + allowed_lateness(0) = 15 <= 16
+        let r = win.on_watermark(16, &mut ctx).await.unwrap();
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].key, "a");
+        assert_eq!(r[0].window_start, 1);
+        assert_eq!(r[0].window_end, 5);
+        assert_eq!(r[0].value, 2);
+    }
+
+    #[tokio::test]
+    async fn session_watermark_no_close_before_gap() {
+        let mut ctx = test_ctx("wm_no_close");
+        let mut win = make_session();
+
+        // Event at ts=5
+        win.process(("a".into(), 5), &mut ctx).await.unwrap();
+
+        // Watermark at 10: 5 + 10 + 0 = 15 > 10, no close
+        let r = win.on_watermark(10, &mut ctx).await.unwrap();
+        assert!(r.is_empty());
+    }
+
+    #[tokio::test]
+    async fn session_multiple_keys_watermark() {
+        let mut ctx = test_ctx("multi_key");
+        let mut win = make_session();
+
+        // Key "a" events
+        win.process(("a".into(), 1), &mut ctx).await.unwrap();
+        // Key "b" events at later time
+        win.process(("b".into(), 10), &mut ctx).await.unwrap();
+
+        // Watermark at 12: "a" session: 1+10+0 = 11 <= 12 → close
+        // "b" session: 10+10+0 = 20 > 12 → stay open
+        let r = win.on_watermark(12, &mut ctx).await.unwrap();
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].key, "a");
     }
 }

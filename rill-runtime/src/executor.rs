@@ -19,6 +19,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use rill_core::checkpoint::CheckpointManifest;
 use rill_core::dlq::ErrorPolicy;
@@ -356,9 +357,11 @@ fn build_timely_dag<A: timely::communication::Allocate>(
     checkpoint_notify: Option<std::sync::mpsc::Sender<()>>,
     dlq_sink: Option<Arc<std::sync::Mutex<rill_core::connectors::dlq_file_sink::DlqFileSink>>>,
     last_operator_id: Option<NodeId>,
+    global_watermark: Arc<AtomicU64>,
 ) -> timely::dataflow::operators::probe::Handle<u64> {
     use timely::container::CapacityContainerBuilder;
     use timely::dataflow::channels::pact::{Exchange as ExchangePact, Pipeline};
+    use timely::dataflow::operators::Capability;
     use timely::dataflow::operators::core::probe::Probe;
     use timely::dataflow::operators::generic::OutputBuilder;
     use timely::dataflow::operators::generic::builder_rc::OperatorBuilder;
@@ -508,6 +511,7 @@ fn build_timely_dag<A: timely::communication::Allocate>(
                 let is_last_op = last_operator_id == Some(node_id);
                 let notify = checkpoint_notify.clone();
                 let dlq = dlq_sink.clone();
+                let gw = global_watermark.clone();
                 let result = input_stream
                     .unary_frontier::<CapacityContainerBuilder<Vec<AnyItem>>, _, _, _>(
                         Pipeline,
@@ -519,8 +523,13 @@ fn build_timely_dag<A: timely::communication::Allocate>(
                             let notify = notify;
                             let dlq = dlq;
                             let op_name = op_name;
+                            let gw = gw;
+                            let mut last_watermark: u64 = 0;
+                            let mut retained_cap: Option<Capability<u64>> = None;
                             move |(input, frontier), output| {
                                 input.for_each(|cap, data| {
+                                    // Retain latest capability for watermark-triggered output.
+                                    let owned_cap = cap.retain();
                                     let mut batch_durations = Vec::new();
                                     for item in data.drain(..) {
                                         let input_repr = item.debug_repr();
@@ -552,12 +561,13 @@ fn build_timely_dag<A: timely::communication::Allocate>(
                                             }
                                         }
                                         if !results.is_empty() {
-                                            let mut session = output.session(&cap);
+                                            let mut session = output.session(&owned_cap);
                                             for r in results {
                                                 session.give(r);
                                             }
                                         }
                                     }
+                                    retained_cap = Some(owned_cap);
                                     if !batch_durations.is_empty() {
                                         batch_durations.sort_unstable_by(|a, b| {
                                             a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
@@ -577,6 +587,29 @@ fn build_timely_dag<A: timely::communication::Allocate>(
                                         .set(p99);
                                     }
                                 });
+
+                                // Check for watermark advancement and emit
+                                // any outputs (e.g. closed windows).
+                                let current_wm = gw.load(Ordering::Acquire);
+                                if current_wm > last_watermark {
+                                    last_watermark = current_wm;
+                                    let wm_results = timely_op.process_watermark(current_wm, &rt);
+                                    if !wm_results.is_empty()
+                                        && let Some(ref cap) = retained_cap
+                                    {
+                                        let mut session = output.session(cap);
+                                        for r in wm_results {
+                                            session.give(r);
+                                        }
+                                    }
+                                }
+
+                                // Drop retained cap if frontier has advanced past it.
+                                if let Some(ref cap) = retained_cap
+                                    && !frontier.less_equal(cap.time())
+                                {
+                                    retained_cap = None;
+                                }
 
                                 let frontier_vec: Vec<u64> =
                                     frontier.frontier().iter().copied().collect();
@@ -706,6 +739,7 @@ async fn execute_graph(
     let mut per_worker_source_rx: Vec<HashMap<NodeId, tokio::sync::mpsc::Receiver<Vec<AnyItem>>>> =
         (0..n_workers).map(|_| HashMap::new()).collect();
     let mut all_source_offsets: Vec<Arc<std::sync::Mutex<HashMap<String, String>>>> = Vec::new();
+    let mut all_source_watermarks: Vec<Arc<AtomicU64>> = Vec::new();
 
     for &source_id in &graph.source_ids {
         let source = extract_source(&mut graph.nodes[source_id.0]);
@@ -732,10 +766,11 @@ async fn execute_graph(
                 if !restored_offsets.is_empty() {
                     psrc.restore_offsets(&restored_offsets).await?;
                 }
-                let (rx, offsets) =
+                let (rx, offsets, wm) =
                     crate::bridge::erased_source_bridge_with_offsets(psrc, &rt, shutdown.cloned());
                 per_worker_source_rx[worker_idx].insert(source_id, rx);
                 all_source_offsets.push(offsets);
+                all_source_watermarks.push(wm);
             }
         } else {
             // Non-partitioned: only worker 0 reads.
@@ -743,10 +778,11 @@ async fn execute_graph(
             if !restored_offsets.is_empty() {
                 source.restore_offsets(&restored_offsets).await?;
             }
-            let (rx, offsets) =
+            let (rx, offsets, wm) =
                 crate::bridge::erased_source_bridge_with_offsets(source, &rt, shutdown.cloned());
             per_worker_source_rx[0].insert(source_id, rx);
             all_source_offsets.push(offsets);
+            all_source_watermarks.push(wm);
         }
     }
 
@@ -875,6 +911,36 @@ async fn execute_graph(
 
     let (checkpoint_notify_tx, checkpoint_notify_rx) = std::sync::mpsc::channel::<()>();
 
+    // ── Global watermark computation ──────────────────────────────
+    let global_watermark: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
+    if !all_source_watermarks.is_empty() {
+        let gw = global_watermark.clone();
+        let source_wms = all_source_watermarks.clone();
+        let shutdown_for_wm = shutdown.cloned();
+        rt.spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_millis(100));
+            loop {
+                interval.tick().await;
+                if let Some(ref h) = shutdown_for_wm
+                    && h.is_shutdown()
+                {
+                    break;
+                }
+                // Global watermark = min of all non-zero source watermarks.
+                let mut min_wm: Option<u64> = None;
+                for sw in &source_wms {
+                    let wm = sw.load(Ordering::Acquire);
+                    if wm > 0 {
+                        min_wm = Some(min_wm.map_or(wm, |m: u64| m.min(wm)));
+                    }
+                }
+                if let Some(wm) = min_wm {
+                    gw.fetch_max(wm, Ordering::Release);
+                }
+            }
+        });
+    }
+
     let rt_clone = rt.clone();
     let topo_order = Arc::new(topo_order);
     let node_inputs = Arc::new(node_inputs);
@@ -899,6 +965,7 @@ async fn execute_graph(
                 let notify = checkpoint_notify_tx.clone();
 
                 let dataflow_index = worker.next_dataflow_index();
+                let gw = global_watermark.clone();
                 let probe = worker.dataflow::<u64, _, _>(|scope| {
                     build_timely_dag(
                         scope,
@@ -917,6 +984,7 @@ async fn execute_graph(
                         Some(notify),
                         dlq_sink.clone(),
                         last_operator_id,
+                        gw,
                     )
                 });
 
