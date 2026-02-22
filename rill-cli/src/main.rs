@@ -1,4 +1,3 @@
-use std::fs;
 use std::path::Path;
 use std::process::Command;
 use std::time::{Duration, UNIX_EPOCH};
@@ -24,11 +23,6 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Generate a new Rill project
-    New {
-        /// Project name
-        name: String,
-    },
     /// Run the current Rill project
     Run {
         /// Launch the TUI dashboard instead of shelling out to cargo
@@ -54,16 +48,6 @@ fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::New { name } => {
-            let _telemetry =
-                rill_runtime::telemetry::init(rill_runtime::telemetry::TelemetryConfig {
-                    metrics_addr: None,
-                    log_filter: cli.log_level.clone(),
-                    json_logs: cli.json_logs,
-                    tui: false,
-                })?;
-            cmd_new(&name)
-        }
         Commands::Run {
             tui: true, workers, ..
         } => cmd_run_tui(cli.log_level, workers),
@@ -83,81 +67,6 @@ fn main() -> anyhow::Result<()> {
         }
         Commands::Attach { addr } => cmd_attach(addr),
     }
-}
-
-fn cmd_new(name: &str) -> anyhow::Result<()> {
-    let project_dir = Path::new(name);
-    if project_dir.exists() {
-        anyhow::bail!("Directory '{name}' already exists");
-    }
-
-    fs::create_dir_all(project_dir.join("src"))?;
-
-    let cargo_toml = format!(
-        r#"[package]
-name = "{name}"
-version = "0.1.0"
-edition = "2024"
-
-[dependencies]
-anyhow = "1.0"
-async-trait = "0.1"
-rill-core = {{ git = "https://github.com/your-org/rill", package = "rill-core" }}
-rill-runtime = {{ git = "https://github.com/your-org/rill", package = "rill-runtime" }}
-tokio = {{ version = "1", features = ["full"] }}
-serde = {{ version = "1", features = ["derive"] }}
-"#
-    );
-
-    let main_rs = r#"use async_trait::async_trait;
-use rill_core::traits::StreamFunction;
-use rill_core::state::context::StateContext;
-use rill_core::connectors::vec_source::VecSource;
-use rill_core::connectors::print_sink::PrintSink;
-use rill_runtime::dataflow::DataflowGraph;
-use rill_runtime::executor::Executor;
-
-#[derive(Clone)]
-struct MyOperator;
-
-#[async_trait]
-impl StreamFunction for MyOperator {
-    type Input = String;
-    type Output = String;
-
-    async fn process(&mut self, input: String, ctx: &mut StateContext) -> anyhow::Result<Vec<String>> {
-        // Your processing logic here
-        Ok(vec![input])
-    }
-}
-
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    let graph = DataflowGraph::new();
-    let source = VecSource::new(vec![
-        "hello world".to_string(),
-        "hello rill".to_string(),
-    ]);
-
-    graph.source(source)
-        .key_by(|s: &String| s.clone())
-        .operator("my_operator", MyOperator)
-        .sink(PrintSink::new());
-
-    let executor = Executor::new("./checkpoints".into());
-    executor.run(graph).await?;
-    Ok(())
-}
-"#;
-
-    fs::write(project_dir.join("Cargo.toml"), cargo_toml)?;
-    fs::write(project_dir.join("src/main.rs"), main_rs)?;
-
-    println!("Created new Rill project: {name}");
-    println!("  cd {name}");
-    println!("  cargo run");
-
-    Ok(())
 }
 
 fn cmd_run(workers: usize) -> anyhow::Result<()> {
