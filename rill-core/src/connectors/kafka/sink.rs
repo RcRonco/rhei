@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use rdkafka::ClientConfig;
 use rdkafka::producer::{FutureProducer, FutureRecord};
 
-use super::kafka_types::KafkaRecord;
+use super::kafka::types::KafkaRecord;
 use crate::traits::Sink;
 
 /// A Kafka producer that implements the [`Sink`] trait.

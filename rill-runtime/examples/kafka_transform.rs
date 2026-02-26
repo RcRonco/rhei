@@ -13,9 +13,9 @@
 //! ```
 
 use async_trait::async_trait;
-use rill_core::connectors::kafka_sink::KafkaSink;
-use rill_core::connectors::kafka_source::KafkaSource;
-use rill_core::connectors::kafka_types::{KafkaMessage, KafkaRecord};
+use rill_core::connectors::kafka::sink::KafkaSink;
+use rill_core::connectors::kafka::source::KafkaSource;
+use rill_core::connectors::kafka::types::{KafkaMessage, KafkaRecord};
 use rill_core::state::context::StateContext;
 use rill_core::traits::StreamFunction;
 use rill_runtime::dataflow::DataflowGraph;

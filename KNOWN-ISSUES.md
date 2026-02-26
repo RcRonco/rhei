@@ -27,11 +27,15 @@ offsets, restoring at-least-once semantics.
 
 ### ~~KI-3: DLQ write errors silently dropped~~ (RESOLVED)
 
-**Fixed in:** `ADR/temporal-join-timeout.md` (same batch of fixes)
+**Fixed in:** `ADR/temporal-join-timeout.md` (same batch of fixes),
+updated in `ADR/dead-letter-queue.md` (per-worker channel refactor)
 
-DLQ `write_record` failures and mutex poisoning are now logged at `error` level
-with a `dlq_write_errors_total` metrics counter. Records that fail both processing
-and DLQ persistence are still lost, but the failure is now observable.
+DLQ writes now use per-worker `tokio::sync::mpsc` channels bridged to async sink
+tasks — the same pattern as regular sinks. Channel send failures are logged at
+`error` level with a `dlq_write_errors_total` metrics counter. The shared
+`Arc<Mutex<DlqFileSink>>` has been replaced, eliminating mutex poisoning as a
+failure mode. Any `Sink` implementation (file, Kafka, custom) can serve as a DLQ
+destination via the `DlqSinkFactory` trait.
 
 ---
 

@@ -6,7 +6,7 @@ use rdkafka::consumer::{Consumer, StreamConsumer};
 use rdkafka::message::Message;
 use rdkafka::{ClientConfig, TopicPartitionList};
 
-use super::kafka_types::KafkaMessage;
+use super::kafka::types::KafkaMessage;
 use crate::traits::Source;
 
 /// A Kafka consumer that implements the [`Source`] trait.

@@ -1,6 +1,6 @@
 # ADR: Dead Letter Queue (DLQ)
 
-**Status:** Accepted
+**Status:** Accepted (updated 2026-02-26)
 **Date:** 2026-02-21
 
 ## Context
@@ -11,18 +11,31 @@ The system needs a configurable policy that balances between availability (keep 
 
 ## Decision
 
-Introduce a **Dead Letter Queue** backed by an append-only JSON Lines file. Operator errors are captured with full context and persisted for post-mortem analysis, while the pipeline continues processing.
+Introduce a **Dead Letter Queue** backed by the `Sink` trait. Operator errors are captured with full context and routed to any `Sink` implementation for post-mortem analysis, while the pipeline continues processing.
 
 ### Error policy
 
 ```rust
 pub enum ErrorPolicy {
-    Skip,                              // log warning, drop element
-    DeadLetterFile { path: PathBuf },  // persist to file, drop element
+    Skip,                                  // log warning, drop element
+    DeadLetter(Box<dyn DlqSinkFactory>),   // persist via Sink trait, drop element
 }
 ```
 
-`Skip` is the default. `DeadLetterFile` adds persistence. Both increment the `dlq_items_total` metrics counter.
+`Skip` is the default. `DeadLetter` creates per-worker sink instances via a factory. Both increment the `dlq_items_total` metrics counter. A convenience constructor `ErrorPolicy::dead_letter_file(path)` creates a file-backed DLQ.
+
+### DlqSinkFactory trait
+
+```rust
+pub trait DlqSinkFactory: Send + Sync + Debug {
+    fn create(&self, worker_index: usize) -> Result<Box<dyn Sink<Input = DeadLetterRecord>>>;
+}
+```
+
+The factory creates one sink per Timely worker, eliminating shared-state contention. Built-in implementations:
+
+- `DlqFileSinkFactory` — file-backed, appends `-{worker_index}` to the base path
+- `KafkaDlqFactory` — Kafka-backed (behind `kafka` feature flag)
 
 ### Dead letter record
 
@@ -39,24 +52,31 @@ Each record is serialized as a single JSON line, enabling simple `cat | jq` insp
 
 ### DLQ file sink
 
-`DlqFileSink` opens the file in append mode with `BufWriter` for efficient I/O. Records are written as JSON Lines (one JSON object per line, newline-delimited).
+`DlqFileSink` opens the file in append mode with `BufWriter` for efficient I/O. Records are written as JSON Lines (one JSON object per line, newline-delimited). It implements the `Sink` trait with `Input = DeadLetterRecord`.
+
+### Kafka DLQ sink
+
+`KafkaDlqSink` wraps `KafkaSink`, serializing `DeadLetterRecord` as a JSON payload with the `operator_name` as the Kafka message key. Available behind the `kafka` feature flag.
 
 ### Error routing in the executor
 
-Errors surface from two locations:
+Per-worker DLQ sinks are bridged via `tokio::sync::mpsc` channels — the same pattern used for regular sinks. Each worker sends `DeadLetterRecord`s via `blocking_send()` to its own channel, where an async task drives the sink.
 
-1. **Pre-exchange operators** (`apply_steps`) — errors logged with `tracing::error`, `dlq_items_total` incremented, element dropped.
-2. **Timely dataflow operators** (`build_timely_dataflow`) — full DLQ path: capture `debug_repr` of the input before processing, on error create a `DeadLetterRecord`, write to the `DlqFileSink` (if configured), increment metrics, continue.
-
-The DLQ sink is wrapped in `Arc<Mutex<DlqFileSink>>` for thread-safe sharing across Timely worker threads. Lock contention is negligible because DLQ writes are rare (error path only).
+Errors surface from Timely dataflow operators: capture `debug_repr` of the input before processing, on error create a `DeadLetterRecord`, send to the DLQ channel (if configured), increment metrics, continue.
 
 ### Configuration
 
 ```rust
+// File-backed DLQ (convenience constructor)
 let executor = Executor::builder()
-    .error_policy(ErrorPolicy::DeadLetterFile {
-        path: PathBuf::from("./dlq.jsonl"),
-    })
+    .error_policy(ErrorPolicy::dead_letter_file("./dlq.jsonl"))
+    .build();
+
+// Kafka-backed DLQ
+let executor = Executor::builder()
+    .error_policy(ErrorPolicy::DeadLetter(Box::new(
+        KafkaDlqFactory::new("localhost:9092", "dlq-topic"),
+    )))
     .build();
 ```
 
@@ -71,14 +91,14 @@ flowchart TD
     B -- No --> D[Capture error + input debug repr]
     D --> E{ErrorPolicy?}
     E -- Skip --> F[Log warning]
-    E -- DeadLetterFile --> G[Build DeadLetterRecord]
-    G --> H[Write JSON line to DLQ file]
+    E -- DeadLetter --> G[Build DeadLetterRecord]
+    G --> H[blocking_send to DLQ channel]
     H --> F
     F --> I[Increment dlq_items_total]
     I --> J[Continue processing next element]
 ```
 
-### Thread safety model
+### Per-worker channel model
 
 ```mermaid
 graph LR
@@ -88,15 +108,24 @@ graph LR
         W2[Worker N]
     end
 
-    subgraph "Shared DLQ Sink"
-        M["Arc&lt;Mutex&lt;DlqFileSink&gt;&gt;"]
-        F[dlq.jsonl]
+    subgraph "Per-Worker DLQ Channels"
+        C0["mpsc channel 0"]
+        C1["mpsc channel 1"]
+        C2["mpsc channel N"]
     end
 
-    W0 -->|lock + write| M
-    W1 -->|lock + write| M
-    W2 -->|lock + write| M
-    M -->|BufWriter append| F
+    subgraph "Async DLQ Sink Tasks"
+        S0["Sink task 0<br/>(any Sink impl)"]
+        S1["Sink task 1<br/>(any Sink impl)"]
+        S2["Sink task N<br/>(any Sink impl)"]
+    end
+
+    W0 -->|blocking_send| C0
+    W1 -->|blocking_send| C1
+    W2 -->|blocking_send| C2
+    C0 --> S0
+    C1 --> S1
+    C2 --> S2
 ```
 
 ### Component ownership
@@ -104,20 +133,21 @@ graph LR
 ```mermaid
 graph LR
     subgraph rill-core
-        DLQ[dlq.rs<br/>DeadLetterRecord<br/>ErrorPolicy]
-        SINK[DlqFileSink<br/>JSON Lines writer]
+        DLQ[dlq.rs<br/>DeadLetterRecord<br/>ErrorPolicy<br/>DlqSinkFactory]
+        FSINK[DlqFileSink<br/>Sink impl]
+        KSINK[KafkaDlqSink<br/>Sink impl]
     end
 
     subgraph rill-runtime
         EB[ExecutorBuilder<br/>error_policy config]
-        EX[Executor<br/>open_dlq_sink]
-        TD[build_timely_dataflow<br/>error routing loop]
+        EX[Executor<br/>setup_dlq_sinks]
+        TD[build_timely_dag<br/>error routing via channel]
     end
 
     EB -->|stores| DLQ
-    EX -->|opens| SINK
-    TD -->|writes| SINK
-    TD -->|creates| DLQ
+    EX -->|creates per-worker sinks| FSINK
+    EX -->|creates per-worker sinks| KSINK
+    TD -->|sends via channel| DLQ
 ```
 
 ## Alternatives considered
@@ -130,9 +160,9 @@ Rejected for the initial implementation. Retries add latency and complexity (bac
 
 Rejected because it risks losing error records on crash. Append-mode file I/O with `BufWriter` is already fast, and DLQ writes are infrequent (error path only). The current design trades minimal write latency for crash safety.
 
-### 3. Route DLQ records to a Kafka topic
+### 3. Shared Mutex for DLQ sink (previous design)
 
-Rejected as over-engineering for the initial implementation. A file-based DLQ has zero external dependencies and works in any environment. Kafka-based DLQ can be added as a future `ErrorPolicy` variant (e.g., `DeadLetterKafka { topic, brokers }`).
+The original implementation used `Arc<Mutex<DlqFileSink>>` shared across all Timely workers. This was replaced with per-worker channels and sinks because: (a) mutex contention becomes a bottleneck under high error rates, (b) the bespoke `DlqFileSink` bypassed the standard `Sink` trait, limiting DLQ destinations to files.
 
 ### 4. Fail-fast: crash the pipeline on first error
 
@@ -143,19 +173,21 @@ Rejected as the default because it makes pipelines fragile. A single malformed r
 **Positive:**
 - Pipelines survive operator errors without data loss visibility — every failure is recorded.
 - JSON Lines format is universally supported by log aggregators, `jq`, and monitoring tools.
-- Zero external dependencies — file-based DLQ works in any deployment.
+- Per-worker channels eliminate mutex contention — lock-free DLQ writes at any error rate.
+- Any `Sink` implementation can serve as a DLQ destination (file, Kafka, custom).
+- `DlqSinkFactory` trait enables per-worker isolation with zero shared state.
 - Metrics integration (`dlq_items_total`) enables alerting on error rate spikes.
-- `ErrorPolicy` enum is extensible for future strategies (retry, Kafka DLQ, fail-fast).
 
 **Negative:**
 - DLQ file grows unboundedly. No built-in rotation or retention policy — operators must manage file lifecycle externally (logrotate, cron cleanup).
-- `Arc<Mutex>` introduces a theoretical contention point, though in practice DLQ writes are rare and fast.
+- Per-worker file sinks produce multiple output files (one per worker) that must be aggregated for analysis.
 - `input_repr` uses `Debug` formatting, which may not capture full element fidelity for complex types.
 
 ## Files
 
 | File | Role |
 |------|------|
-| `rill-core/src/dlq.rs` | `DeadLetterRecord`, `ErrorPolicy` types |
-| `rill-core/src/connectors/dlq_file_sink.rs` | `DlqFileSink` — append-only JSON Lines writer |
-| `rill-runtime/src/executor.rs` | `open_dlq_sink()`, error routing in `build_timely_dataflow` |
+| `rill-core/src/dlq.rs` | `DeadLetterRecord`, `ErrorPolicy`, `DlqSinkFactory`, `DlqFileSinkFactory` |
+| `rill-core/src/connectors/dlq_file_sink.rs` | `DlqFileSink` — append-only JSON Lines writer, implements `Sink` |
+| `rill-core/src/connectors/kafka_dlq.rs` | `KafkaDlqSink`, `KafkaDlqFactory` — Kafka DLQ adapter (behind `kafka` feature) |
+| `rill-runtime/src/executor.rs` | `setup_dlq_sinks()`, per-worker channel bridge, error routing in `build_timely_dag` |

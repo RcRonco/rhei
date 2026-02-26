@@ -266,23 +266,57 @@ impl Executor {
     }
 }
 
-/// Open a DLQ file sink if the error policy requires one.
-fn open_dlq_sink(
+/// DLQ channel sender type for per-worker DLQ writes.
+type DlqSender = tokio::sync::mpsc::Sender<rill_core::dlq::DeadLetterRecord>;
+
+/// Create per-worker DLQ sinks and bridge them via channels.
+///
+/// Returns a vector of per-worker senders and the async task handles that drive
+/// the sinks. Follows the same channel bridge pattern as regular sinks.
+fn setup_dlq_sinks(
     policy: &ErrorPolicy,
-) -> Option<Arc<std::sync::Mutex<rill_core::connectors::dlq_file_sink::DlqFileSink>>> {
+    n_workers: usize,
+) -> (
+    Vec<Option<DlqSender>>,
+    Vec<tokio::task::JoinHandle<anyhow::Result<()>>>,
+) {
     match policy {
-        ErrorPolicy::Skip => None,
-        ErrorPolicy::DeadLetterFile { path } => {
-            match rill_core::connectors::dlq_file_sink::DlqFileSink::open(path) {
-                Ok(sink) => {
-                    tracing::info!(path = %path.display(), "DLQ file sink opened");
-                    Some(Arc::new(std::sync::Mutex::new(sink)))
-                }
-                Err(e) => {
-                    tracing::error!(error = %e, "failed to open DLQ file — falling back to skip");
-                    None
+        ErrorPolicy::Skip => {
+            let senders = vec![None; n_workers];
+            (senders, Vec::new())
+        }
+        ErrorPolicy::DeadLetter(factory) => {
+            let mut senders = Vec::with_capacity(n_workers);
+            let mut handles = Vec::with_capacity(n_workers);
+
+            for i in 0..n_workers {
+                match factory.create(i) {
+                    Ok(sink) => {
+                        let (tx, mut rx) =
+                            tokio::sync::mpsc::channel::<rill_core::dlq::DeadLetterRecord>(64);
+                        senders.push(Some(tx));
+                        handles.push(tokio::spawn(async move {
+                            let mut sink = sink;
+                            while let Some(record) = rx.recv().await {
+                                sink.write(record).await?;
+                            }
+                            sink.flush().await?;
+                            Ok(())
+                        }));
+                        tracing::info!(worker = i, "DLQ sink opened for worker");
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            error = %e,
+                            worker = i,
+                            "failed to open DLQ sink — falling back to skip for worker"
+                        );
+                        senders.push(None);
+                    }
                 }
             }
+
+            (senders, handles)
         }
     }
 }
@@ -355,7 +389,7 @@ fn build_timely_dag<A: timely::communication::Allocate>(
     worker_index: usize,
     num_workers: usize,
     checkpoint_notify: Option<std::sync::mpsc::Sender<()>>,
-    dlq_sink: Option<Arc<std::sync::Mutex<rill_core::connectors::dlq_file_sink::DlqFileSink>>>,
+    dlq_tx: Option<DlqSender>,
     last_operator_id: Option<NodeId>,
     global_watermark: Arc<AtomicU64>,
 ) -> timely::dataflow::operators::probe::Handle<u64> {
@@ -510,7 +544,7 @@ fn build_timely_dag<A: timely::communication::Allocate>(
                 let wl_op = worker_label.clone();
                 let is_last_op = last_operator_id == Some(node_id);
                 let notify = checkpoint_notify.clone();
-                let dlq = dlq_sink.clone();
+                let dlq = dlq_tx.clone();
                 let gw = global_watermark.clone();
                 let result = input_stream
                     .unary_frontier::<CapacityContainerBuilder<Vec<AnyItem>>, _, _, _>(
@@ -555,28 +589,14 @@ fn build_timely_dag<A: timely::communication::Allocate>(
                                                         format!("{}", d.as_secs())
                                                     },
                                                 };
-                                                match dlq.lock() {
-                                                    Ok(mut sink) => {
-                                                        if let Err(e) = sink.write_record(&record) {
-                                                            tracing::error!(
-                                                                error = %e,
-                                                                operator = %op_name,
-                                                                "DLQ write failed — record lost"
-                                                            );
-                                                            metrics::counter!(
-                                                                "dlq_write_errors_total"
-                                                            )
-                                                            .increment(1);
-                                                        }
-                                                    }
-                                                    Err(e) => {
-                                                        tracing::error!(
-                                                            error = %e,
-                                                            "DLQ mutex poisoned"
-                                                        );
-                                                        metrics::counter!("dlq_write_errors_total")
-                                                            .increment(1);
-                                                    }
+                                                if let Err(e) = dlq.blocking_send(record) {
+                                                    tracing::error!(
+                                                        error = %e,
+                                                        operator = %op_name,
+                                                        "DLQ send failed — record lost"
+                                                    );
+                                                    metrics::counter!("dlq_write_errors_total")
+                                                        .increment(1);
                                                 }
                                             }
                                         }
@@ -736,7 +756,7 @@ async fn execute_graph(
 ) -> anyhow::Result<()> {
     let rt = tokio::runtime::Handle::current();
     let n_workers = executor.workers();
-    let dlq_sink = open_dlq_sink(&executor.error_policy);
+    let (dlq_senders, dlq_handles) = setup_dlq_sinks(&executor.error_policy, n_workers);
 
     // Tag each node kind before extracting data.
     let node_kinds: HashMap<NodeId, NodeKindTag> = graph
@@ -924,12 +944,16 @@ async fn execute_graph(
     let per_worker_source_rx: Vec<
         Option<HashMap<NodeId, tokio::sync::mpsc::Receiver<Vec<AnyItem>>>>,
     > = per_worker_source_rx.into_iter().map(Some).collect();
+    // Per-worker DLQ senders (each worker gets its own channel).
+    let per_worker_dlq_tx: Vec<Option<Option<DlqSender>>> =
+        dlq_senders.into_iter().map(Some).collect();
 
     let per_worker_transforms = std::sync::Mutex::new(per_worker_transforms);
     let per_worker_key_fns = std::sync::Mutex::new(per_worker_key_fns);
     let per_worker_operators = std::sync::Mutex::new(per_worker_operators);
     let per_worker_contexts = std::sync::Mutex::new(per_worker_contexts);
     let per_worker_source_rx = std::sync::Mutex::new(per_worker_source_rx);
+    let per_worker_dlq_tx = std::sync::Mutex::new(per_worker_dlq_tx);
     let sink_senders = Arc::new(sink_senders);
 
     let (checkpoint_notify_tx, checkpoint_notify_rx) = std::sync::mpsc::channel::<()>();
@@ -984,6 +1008,7 @@ async fn execute_graph(
                 let mut w_key_fns = per_worker_key_fns.lock().unwrap()[idx].take().unwrap();
                 let mut w_operators = per_worker_operators.lock().unwrap()[idx].take().unwrap();
                 let mut w_contexts = per_worker_contexts.lock().unwrap()[idx].take().unwrap();
+                let w_dlq_tx = per_worker_dlq_tx.lock().unwrap()[idx].take().unwrap();
                 let rt = rt_clone.clone();
                 let notify = checkpoint_notify_tx.clone();
 
@@ -1005,7 +1030,7 @@ async fn execute_graph(
                         idx,
                         n_workers,
                         Some(notify),
-                        dlq_sink.clone(),
+                        w_dlq_tx,
                         last_operator_id,
                         gw,
                     )
@@ -1030,6 +1055,13 @@ async fn execute_graph(
         handle
             .await
             .map_err(|e| anyhow::anyhow!("sink task panicked: {e}"))??;
+    }
+
+    // Wait for all DLQ sink tasks to complete.
+    for handle in dlq_handles {
+        handle
+            .await
+            .map_err(|e| anyhow::anyhow!("DLQ sink task panicked: {e}"))??;
     }
 
     // Drain checkpoint notifications and save manifests.

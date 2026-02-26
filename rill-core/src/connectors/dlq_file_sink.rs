@@ -6,7 +6,10 @@ use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 
+use async_trait::async_trait;
+
 use crate::dlq::DeadLetterRecord;
+use crate::traits::Sink;
 
 /// Appends [`DeadLetterRecord`]s as JSON lines to a file.
 #[derive(Debug)]
@@ -45,10 +48,32 @@ impl DlqFileSink {
     }
 }
 
+#[async_trait]
+impl Sink for DlqFileSink {
+    type Input = DeadLetterRecord;
+
+    async fn write(&mut self, input: DeadLetterRecord) -> anyhow::Result<()> {
+        self.write_record(&input).map_err(Into::into)
+    }
+
+    async fn flush(&mut self) -> anyhow::Result<()> {
+        std::io::Write::flush(&mut self.writer).map_err(Into::into)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::dlq::DeadLetterRecord;
+
+    fn sample_record() -> DeadLetterRecord {
+        DeadLetterRecord {
+            input_repr: r#"ClickEvent { user: "alice" }"#.to_string(),
+            operator_name: "click_counter".to_string(),
+            error: "state backend unavailable".to_string(),
+            timestamp: "2026-01-01T00:00:00Z".to_string(),
+        }
+    }
 
     #[test]
     fn writes_and_reads_records() {
@@ -57,18 +82,38 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("dlq.jsonl");
 
-        let record = DeadLetterRecord {
-            input_repr: r#"ClickEvent { user: "alice" }"#.to_string(),
-            operator_name: "click_counter".to_string(),
-            error: "state backend unavailable".to_string(),
-            timestamp: "2026-01-01T00:00:00Z".to_string(),
-        };
+        let record = sample_record();
 
         {
             let mut sink = DlqFileSink::open(&path).unwrap();
             sink.write_record(&record).unwrap();
             sink.write_record(&record).unwrap();
             sink.flush().unwrap();
+        }
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = content.lines().collect();
+        assert_eq!(lines.len(), 2);
+        let parsed: DeadLetterRecord = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(parsed.operator_name, "click_counter");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn sink_trait_write_and_flush() {
+        let dir = std::env::temp_dir().join(format!("rill_dlq_sink_trait_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("dlq_sink.jsonl");
+
+        let record = sample_record();
+
+        {
+            let mut sink = DlqFileSink::open(&path).unwrap();
+            Sink::write(&mut sink, record.clone()).await.unwrap();
+            Sink::write(&mut sink, record).await.unwrap();
+            Sink::flush(&mut sink).await.unwrap();
         }
 
         let content = std::fs::read_to_string(&path).unwrap();
