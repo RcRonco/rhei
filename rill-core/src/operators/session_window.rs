@@ -7,9 +7,12 @@
 use std::collections::HashSet;
 use std::fmt;
 use std::marker::PhantomData;
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+
+use crate::time::{TimeProvider, WallClockProvider};
 
 use crate::state::context::StateContext;
 use crate::traits::StreamFunction;
@@ -169,6 +172,30 @@ impl<T, A, KF, TF> SessionWindowBuilder<T, A, KF, TF> {
     }
 }
 
+impl<T, A, KF> SessionWindowBuilder<T, A, KF, ()> {
+    /// Uses wall-clock (processing) time instead of event time.
+    ///
+    /// The timestamp extraction function is replaced by a closure that calls
+    /// [`WallClockProvider::current_time()`].
+    pub fn proc_time_fn(
+        self,
+    ) -> SessionWindowBuilder<T, A, KF, impl Fn(&T) -> u64 + Send + Sync + Clone> {
+        let provider = WallClockProvider;
+        self.time_fn(move |_: &T| provider.current_time())
+    }
+
+    /// Uses a custom [`TimeProvider`] for processing-time semantics.
+    ///
+    /// Pass a [`FixedClockProvider`](crate::time::FixedClockProvider) for
+    /// deterministic testing or replay.
+    pub fn proc_time_fn_with(
+        self,
+        provider: Arc<dyn TimeProvider>,
+    ) -> SessionWindowBuilder<T, A, KF, impl Fn(&T) -> u64 + Send + Sync + Clone> {
+        self.time_fn(move |_: &T| provider.current_time())
+    }
+}
+
 impl<T, A, KF, TF> SessionWindowBuilder<T, A, KF, TF>
 where
     T: Send + Sync,
@@ -315,10 +342,13 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
     use crate::operators::aggregator::Count;
     use crate::state::context::StateContext;
     use crate::state::local_backend::LocalBackend;
+    use crate::time::FixedClockProvider;
 
     fn test_ctx(name: &str) -> StateContext {
         let path =
@@ -389,5 +419,49 @@ mod tests {
         let r = win.on_watermark(12, &mut ctx).await.unwrap();
         assert_eq!(r.len(), 1);
         assert_eq!(r[0].key, "a");
+    }
+
+    #[tokio::test]
+    async fn session_proc_time_with_fixed_clock() {
+        let mut ctx = test_ctx("proc_fixed");
+        let clock = FixedClockProvider::new(100);
+
+        let mut win = SessionWindow::<String, _, _, _>::builder()
+            .gap(10)
+            .key_fn(|e: &String| e.clone())
+            .proc_time_fn_with(Arc::new(clock.clone()))
+            .aggregator(Count::new())
+            .build();
+
+        // First event at clock=100
+        let r = win.process("a".into(), &mut ctx).await.unwrap();
+        assert!(r.is_empty());
+
+        // Second event within gap (clock=105)
+        clock.set(105);
+        let r = win.process("a".into(), &mut ctx).await.unwrap();
+        assert!(r.is_empty());
+
+        // Third event past gap (clock=120, gap=10, last_event=105 → 120 - 105 > 10)
+        clock.set(120);
+        let r = win.process("a".into(), &mut ctx).await.unwrap();
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].window_start, 100);
+        assert_eq!(r[0].window_end, 105);
+        assert_eq!(r[0].value, 2);
+    }
+
+    #[tokio::test]
+    async fn session_proc_time_fn_smoke() {
+        let mut ctx = test_ctx("proc_wall");
+        let mut win = SessionWindow::<String, _, _, _>::builder()
+            .gap(60_000)
+            .key_fn(|e: &String| e.clone())
+            .proc_time_fn()
+            .aggregator(Count::new())
+            .build();
+
+        let r = win.process("x".into(), &mut ctx).await.unwrap();
+        assert!(r.is_empty());
     }
 }

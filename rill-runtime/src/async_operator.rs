@@ -32,6 +32,11 @@ pub struct AsyncOperator<F: StreamFunction> {
     func: F,
     ctx: StateContext,
     rt: Option<tokio::runtime::Handle>,
+    /// Scaffolding for a future async cold path. Currently unused because
+    /// `process_stash` drives pending futures to completion via `block_in_place`.
+    /// A true async cold path would require an API redesign (e.g., `'static`
+    /// futures or split prepare/complete) since `StreamFunction::process` borrows
+    /// `&mut self` + `&mut StateContext`.
     #[allow(clippy::type_complexity)]
     pending: VecDeque<(BoxFuture<anyhow::Result<Vec<F::Output>>>, Option<u64>)>,
     stash: Stash<F::Input>,
@@ -86,6 +91,10 @@ impl<F: StreamFunction + 'static> AsyncOperator<F> {
     }
 
     /// Poll all pending futures and collect completed results.
+    ///
+    /// Note: Currently the `pending` queue is always empty because `process_stash`
+    /// uses `block_in_place` to drive futures synchronously. This method is
+    /// scaffolding for a future async cold path (see KI-11).
     pub fn poll_pending(&mut self) -> (Vec<F::Output>, Vec<anyhow::Error>) {
         let mut completed = Vec::new();
         let mut errors = Vec::new();
@@ -100,6 +109,11 @@ impl<F: StreamFunction + 'static> AsyncOperator<F> {
         !self.pending.is_empty() || !self.stash.is_empty()
     }
 
+    /// Drains completed futures from the `pending` queue.
+    ///
+    /// Note: Currently the `pending` queue is always empty because `process_stash`
+    /// uses `block_in_place` to drive futures synchronously. This method is
+    /// scaffolding for a future async cold path (see KI-11).
     fn drain_completed(&mut self, output: &mut Vec<F::Output>, errors: &mut Vec<anyhow::Error>) {
         let waker = noop_waker();
         let mut cx = Context::from_waker(&waker);
@@ -109,6 +123,9 @@ impl<F: StreamFunction + 'static> AsyncOperator<F> {
             match fut.as_mut().poll(&mut cx) {
                 Poll::Ready(Ok(results)) => {
                     output.extend(results);
+                    // Capability is intentionally unused — not retained for frontier
+                    // tracking. Retaining caps for a future async cold path requires
+                    // an API redesign (see KI-11).
                     let _ = cap;
                 }
                 Poll::Ready(Err(e)) => {
@@ -147,7 +164,11 @@ impl<F: StreamFunction + 'static> AsyncOperator<F> {
                             Err(e) => errors.push(e),
                         }
                     } else {
-                        tracing::warn!("future pending but no runtime handle — dropping element");
+                        tracing::error!(
+                            "future pending but no runtime handle — element dropped. \
+                             Async state backends (L2/L3) require a runtime handle."
+                        );
+                        metrics::counter!("async_operator_dropped_elements_total").increment(1);
                         break;
                     }
                 }

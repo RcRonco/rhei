@@ -8,9 +8,12 @@
 use std::collections::HashSet;
 use std::fmt;
 use std::marker::PhantomData;
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+
+use crate::time::{TimeProvider, WallClockProvider};
 
 use crate::state::context::StateContext;
 use crate::traits::StreamFunction;
@@ -181,6 +184,30 @@ impl<T, A, KF, TF> SlidingWindowBuilder<T, A, KF, TF> {
             allowed_lateness: self.allowed_lateness,
             _phantom: PhantomData,
         }
+    }
+}
+
+impl<T, A, KF> SlidingWindowBuilder<T, A, KF, ()> {
+    /// Uses wall-clock (processing) time instead of event time.
+    ///
+    /// The timestamp extraction function is replaced by a closure that calls
+    /// [`WallClockProvider::current_time()`].
+    pub fn proc_time_fn(
+        self,
+    ) -> SlidingWindowBuilder<T, A, KF, impl Fn(&T) -> u64 + Send + Sync + Clone> {
+        let provider = WallClockProvider;
+        self.time_fn(move |_: &T| provider.current_time())
+    }
+
+    /// Uses a custom [`TimeProvider`] for processing-time semantics.
+    ///
+    /// Pass a [`FixedClockProvider`](crate::time::FixedClockProvider) for
+    /// deterministic testing or replay.
+    pub fn proc_time_fn_with(
+        self,
+        provider: Arc<dyn TimeProvider>,
+    ) -> SlidingWindowBuilder<T, A, KF, impl Fn(&T) -> u64 + Send + Sync + Clone> {
+        self.time_fn(move |_: &T| provider.current_time())
     }
 }
 
@@ -412,10 +439,13 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
     use crate::operators::aggregator::Count;
     use crate::state::context::StateContext;
     use crate::state::local_backend::LocalBackend;
+    use crate::time::FixedClockProvider;
 
     fn test_ctx(name: &str) -> StateContext {
         let path = std::env::temp_dir().join(format!("rill_sw_test_{name}_{}", std::process::id()));
@@ -515,6 +545,47 @@ mod tests {
 
         // Late element
         let r = win.process(("a".into(), 2), &mut ctx).await.unwrap();
+        assert!(r.is_empty());
+    }
+
+    #[tokio::test]
+    async fn sliding_proc_time_with_fixed_clock() {
+        let mut ctx = test_ctx("proc_fixed");
+        let clock = FixedClockProvider::new(3);
+
+        let mut win = SlidingWindow::<String, _, _, _>::builder()
+            .window_size(10)
+            .slide(5)
+            .key_fn(|e: &String| e.clone())
+            .proc_time_fn_with(Arc::new(clock.clone()))
+            .aggregator(Count::new())
+            .build();
+
+        // Clock at 3 → belongs to window [0,10)
+        let r = win.process("a".into(), &mut ctx).await.unwrap();
+        assert!(r.is_empty());
+
+        // Advance clock to 12 → belongs to [10,20) and [5,15); closes [0,10)
+        clock.set(12);
+        let r = win.process("a".into(), &mut ctx).await.unwrap();
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].window_start, 0);
+        assert_eq!(r[0].window_end, 10);
+        assert_eq!(r[0].value, 1);
+    }
+
+    #[tokio::test]
+    async fn sliding_proc_time_fn_smoke() {
+        let mut ctx = test_ctx("proc_wall");
+        let mut win = SlidingWindow::<String, _, _, _>::builder()
+            .window_size(60_000)
+            .slide(10_000)
+            .key_fn(|e: &String| e.clone())
+            .proc_time_fn()
+            .aggregator(Count::new())
+            .build();
+
+        let r = win.process("x".into(), &mut ctx).await.unwrap();
         assert!(r.is_empty());
     }
 }

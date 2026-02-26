@@ -555,8 +555,28 @@ fn build_timely_dag<A: timely::communication::Allocate>(
                                                         format!("{}", d.as_secs())
                                                     },
                                                 };
-                                                if let Ok(mut sink) = dlq.lock() {
-                                                    let _ = sink.write_record(&record);
+                                                match dlq.lock() {
+                                                    Ok(mut sink) => {
+                                                        if let Err(e) = sink.write_record(&record) {
+                                                            tracing::error!(
+                                                                error = %e,
+                                                                operator = %op_name,
+                                                                "DLQ write failed — record lost"
+                                                            );
+                                                            metrics::counter!(
+                                                                "dlq_write_errors_total"
+                                                            )
+                                                            .increment(1);
+                                                        }
+                                                    }
+                                                    Err(e) => {
+                                                        tracing::error!(
+                                                            error = %e,
+                                                            "DLQ mutex poisoned"
+                                                        );
+                                                        metrics::counter!("dlq_write_errors_total")
+                                                            .increment(1);
+                                                    }
                                                 }
                                             }
                                         }
@@ -653,7 +673,10 @@ fn build_timely_dag<A: timely::communication::Allocate>(
                             move |input, _output| {
                                 input.for_each(|_cap, data| {
                                     for item in data.drain(..) {
-                                        let _ = sink_tx.blocking_send(item);
+                                        if let Err(e) = sink_tx.blocking_send(item) {
+                                            tracing::error!(error = %e, "sink channel send failed — item dropped");
+                                            metrics::counter!("sink_send_errors_total").increment(1);
+                                        }
                                     }
                                 });
                             }

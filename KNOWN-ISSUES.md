@@ -8,17 +8,13 @@ exhaustion, silent misbehaviour), **MEDIUM** (missing feature, workaround exists
 
 ## CRITICAL
 
-### KI-1: Sink send errors silently dropped
+### ~~KI-1: Sink send errors silently dropped~~ (RESOLVED)
 
-**File:** `rill-runtime/src/executor.rs:582`
+**Fixed in:** `ADR/temporal-join-timeout.md` (same batch of fixes)
 
-```rust
-let _ = sink_tx.blocking_send(item);
-```
-
-If `blocking_send()` fails (receiver dropped, channel full after close), the error
-is discarded with `let _ =`. Elements are permanently lost with no error propagation
-or logging. This affects the single-worker execution path.
+`blocking_send` failures are now logged at `error` level with a
+`sink_send_errors_total` metrics counter. Errors cannot be propagated out of the
+Timely closure, but the sink task error surfaces when its `JoinHandle` is awaited.
 
 ### ~~KI-2: Checkpoint source offsets never reloaded on restart~~ (RESOLVED)
 
@@ -29,16 +25,13 @@ calls `source.restore_offsets()` before any batches are read. `KafkaSource`
 implements `restore_offsets()` by calling `consumer.assign()` with the checkpointed
 offsets, restoring at-least-once semantics.
 
-### KI-3: DLQ write errors silently dropped
+### ~~KI-3: DLQ write errors silently dropped~~ (RESOLVED)
 
-**File:** `rill-runtime/src/executor.rs:518`
+**Fixed in:** `ADR/temporal-join-timeout.md` (same batch of fixes)
 
-```rust
-let _ = sink.write_record(&record);
-```
-
-If the DLQ file write fails (disk full, permissions), the error is discarded.
-Records that failed processing AND failed DLQ persistence are permanently lost.
+DLQ `write_record` failures and mutex poisoning are now logged at `error` level
+with a `dlq_write_errors_total` metrics counter. Records that fail both processing
+and DLQ persistence are still lost, but the failure is now observable.
 
 ---
 
@@ -52,13 +45,15 @@ The unified Timely DAG executor uses the Exchange pact for each `key_by()` node.
 Multiple exchanges in a single pipeline work correctly — each triggers a full
 repartition via Timely's built-in worker routing.
 
-### KI-5: Temporal join has no timeout or eviction
+### ~~KI-5: Temporal join has no timeout or eviction~~ (PARTIALLY RESOLVED)
 
-**File:** `rill-core/src/operators/temporal_join.rs:152-190`
+**Fixed in:** `ADR/temporal-join-timeout.md`
 
-Unmatched events are buffered in operator state indefinitely. There is no timeout,
-TTL, or eviction mechanism. If one side never produces a matching event, state grows
-without bound. Risk of OOM in long-running pipelines with skewed join keys.
+An optional `timeout` parameter triggers watermark-driven eviction of stale buffered
+events. Buffered events are timestamped with the watermark at buffer time and evicted
+when `watermark >= buffered_timestamp + timeout`. A `temporal_join_evicted_total`
+metric tracks eviction frequency. Side-output routing of evicted events to a separate
+stream is not yet implemented.
 
 ### ~~KI-6: Window operators silently drop late events~~ (PARTIALLY RESOLVED)
 
@@ -106,18 +101,19 @@ per key with no eviction when windows close.
 
 ## MEDIUM
 
-### KI-11: Stash ordering under async pending
+### ~~KI-11: Stash ordering under async pending~~ (PARTIALLY RESOLVED)
 
-**File:** `rill-runtime/src/async_operator.rs:109-119`
+**File:** `rill-runtime/src/async_operator.rs`
 
-When a future is pending (L2/L3 state miss), `process_stash()` stops draining and
-the pending item stays in the stash. If a subsequent element arrives and resolves
-synchronously (L1 hit), it can be emitted before the stashed element finishes,
-causing out-of-order delivery within a key partition.
+The `rt = None` data loss path now logs at `error` level with an
+`async_operator_dropped_elements_total` metric. The `let _ = cap` pattern was
+replaced with explicit `drop(cap)` calls with comments explaining the intent.
+Doc comments were added to `pending`, `drain_completed`, and `poll_pending`
+documenting that they are scaffolding for a future async cold path.
 
-Capability tokens are explicitly dropped with `let _ = cap` (lines 112, 116) rather
-than being retained for frontier tracking, which may allow the frontier to advance
-prematurely for elements with pending futures.
+The underlying ordering issue remains: a true async cold path requires an API
+redesign (e.g., `'static` futures, state prefetch, or split prepare/complete)
+since `StreamFunction::process` borrows `&mut self` + `&mut StateContext`.
 
 ### ~~KI-12: Single-worker checkpoint has no source offsets~~ (RESOLVED)
 
