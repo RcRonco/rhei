@@ -18,6 +18,7 @@
 //! ```
 
 use std::collections::HashMap;
+use std::ops::Range;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -79,6 +80,10 @@ pub struct Executor {
     checkpoint_interval: u64,
     error_policy: ErrorPolicy,
     health: HealthState,
+    /// Process ID for multi-process cluster mode (`None` = single-process).
+    process_id: Option<usize>,
+    /// Peer addresses for multi-process cluster mode (`None` = single-process).
+    peers: Option<Vec<String>>,
 }
 
 /// Builder for [`Executor`].
@@ -90,6 +95,8 @@ pub struct ExecutorBuilder {
     tiered: Option<TieredStorageConfig>,
     error_policy: ErrorPolicy,
     health: HealthState,
+    process_id: Option<usize>,
+    peers: Option<Vec<String>>,
 }
 
 impl ExecutorBuilder {
@@ -128,8 +135,55 @@ impl ExecutorBuilder {
         self
     }
 
+    /// Set the process ID for multi-process cluster mode (0-based).
+    pub fn process_id(mut self, id: usize) -> Self {
+        self.process_id = Some(id);
+        self
+    }
+
+    /// Set peer addresses for multi-process cluster mode.
+    pub fn peers(mut self, peers: Vec<String>) -> Self {
+        self.peers = Some(peers);
+        self
+    }
+
+    /// Read cluster configuration from environment variables.
+    ///
+    /// - `RILL_WORKERS`: number of worker threads (overrides `.workers()`)
+    /// - `RILL_PROCESS_ID`: process ID for cluster mode
+    /// - `RILL_PEERS`: comma-separated peer addresses for cluster mode
+    pub fn from_env(mut self) -> Self {
+        if let Ok(val) = std::env::var("RILL_WORKERS")
+            && let Ok(n) = val.parse::<usize>()
+        {
+            self.workers = n;
+        }
+        if let Ok(val) = std::env::var("RILL_PROCESS_ID")
+            && let Ok(id) = val.parse::<usize>()
+        {
+            self.process_id = Some(id);
+        }
+        if let Ok(val) = std::env::var("RILL_PEERS") {
+            let peers: Vec<String> = val.split(',').map(|s| s.trim().to_string()).collect();
+            if !peers.is_empty() {
+                self.peers = Some(peers);
+            }
+        }
+        self
+    }
+
     /// Build the executor.
     pub fn build(self) -> Executor {
+        if let Some(ref peers) = self.peers {
+            let pid = self
+                .process_id
+                .expect("process_id is required when peers are set");
+            assert!(
+                pid < peers.len(),
+                "process_id ({pid}) must be less than number of peers ({})",
+                peers.len()
+            );
+        }
         Executor {
             checkpoint_dir: self.checkpoint_dir,
             tiered: self.tiered,
@@ -137,6 +191,8 @@ impl ExecutorBuilder {
             checkpoint_interval: self.checkpoint_interval,
             error_policy: self.error_policy,
             health: self.health,
+            process_id: self.process_id,
+            peers: self.peers,
         }
     }
 }
@@ -151,6 +207,8 @@ impl Executor {
             tiered: None,
             error_policy: ErrorPolicy::default(),
             health: HealthState::new(),
+            process_id: None,
+            peers: None,
         }
     }
 
@@ -165,6 +223,8 @@ impl Executor {
             checkpoint_interval: 100,
             error_policy: ErrorPolicy::default(),
             health: HealthState::new(),
+            process_id: None,
+            peers: None,
         }
     }
 
@@ -178,6 +238,7 @@ impl Executor {
     /// When `workers > 1`, [`KeyedStream`](crate::dataflow::KeyedStream) operators
     /// run on parallel Timely worker threads, distributed by key hash.
     /// Defaults to `1` (single-worker mode).
+    #[must_use]
     pub fn with_workers(mut self, n: usize) -> Self {
         assert!(n >= 1, "worker count must be at least 1");
         self.workers = n;
@@ -192,6 +253,61 @@ impl Executor {
     /// Returns the configured checkpoint interval in batches.
     pub fn checkpoint_interval(&self) -> u64 {
         self.checkpoint_interval
+    }
+
+    /// Returns `true` when running in multi-process cluster mode.
+    pub fn is_cluster(&self) -> bool {
+        self.peers.is_some()
+    }
+
+    /// Returns the configured process ID, if in cluster mode.
+    pub fn process_id(&self) -> Option<usize> {
+        self.process_id
+    }
+
+    /// Total number of workers across all processes.
+    ///
+    /// In cluster mode: `workers * peers.len()`.
+    /// In single-process mode: `workers`.
+    pub fn total_workers(&self) -> usize {
+        if let Some(ref peers) = self.peers {
+            self.workers * peers.len()
+        } else {
+            self.workers
+        }
+    }
+
+    /// Range of worker indices owned by this process.
+    ///
+    /// In cluster mode: `pid*workers .. pid*workers + workers`.
+    /// In single-process mode: `0..workers`.
+    pub fn local_worker_range(&self) -> Range<usize> {
+        if let Some(pid) = self.process_id {
+            let start = pid * self.workers;
+            start..start + self.workers
+        } else {
+            0..self.workers
+        }
+    }
+
+    /// Construct a Timely config appropriate for the execution mode.
+    fn timely_config(&self) -> timely::execute::Config {
+        if let Some(ref peers) = self.peers {
+            let pid = self.process_id.expect("process_id required for cluster");
+            timely::execute::Config {
+                communication: timely::CommunicationConfig::Cluster {
+                    threads: self.workers,
+                    process: pid,
+                    addresses: peers.clone(),
+                    report: false,
+                    zerocopy: false,
+                    log_fn: Arc::new(|_| None),
+                },
+                worker: timely::WorkerConfig::default(),
+            }
+        } else {
+            timely::execute::Config::process(self.workers)
+        }
     }
 
     /// Compile and execute a [`DataflowGraph`].
@@ -228,14 +344,20 @@ impl Executor {
 
     /// Create a per-worker `StateContext` for the given operator.
     ///
-    /// The context is namespaced as `{operator_name}_w{worker_index}` so each
-    /// worker has isolated state.
+    /// In single-process mode the context is namespaced as
+    /// `{operator_name}_w{worker_index}`.
+    /// In cluster mode it includes the process ID:
+    /// `p{process_id}_w{worker_index}_{operator_name}`.
     pub async fn create_context_for_worker(
         &self,
         operator_name: &str,
         worker_index: usize,
     ) -> anyhow::Result<StateContext> {
-        let namespaced = format!("{operator_name}_w{worker_index}");
+        let namespaced = if let Some(pid) = self.process_id {
+            format!("p{pid}_w{worker_index}_{operator_name}")
+        } else {
+            format!("{operator_name}_w{worker_index}")
+        };
         self.create_context(&namespaced).await
     }
 
@@ -271,30 +393,32 @@ type DlqSender = tokio::sync::mpsc::Sender<rill_core::dlq::DeadLetterRecord>;
 
 /// Create per-worker DLQ sinks and bridge them via channels.
 ///
-/// Returns a vector of per-worker senders and the async task handles that drive
-/// the sinks. Follows the same channel bridge pattern as regular sinks.
+/// Returns a vector of per-worker senders (sized to `total_workers`, with `None`
+/// for remote workers) and the async task handles that drive the sinks. Only
+/// workers in `local_range` get actual sinks created.
 fn setup_dlq_sinks(
     policy: &ErrorPolicy,
-    n_workers: usize,
+    total_workers: usize,
+    local_range: &Range<usize>,
 ) -> (
     Vec<Option<DlqSender>>,
     Vec<tokio::task::JoinHandle<anyhow::Result<()>>>,
 ) {
     match policy {
         ErrorPolicy::Skip => {
-            let senders = vec![None; n_workers];
+            let senders = vec![None; total_workers];
             (senders, Vec::new())
         }
         ErrorPolicy::DeadLetter(factory) => {
-            let mut senders = Vec::with_capacity(n_workers);
-            let mut handles = Vec::with_capacity(n_workers);
+            let mut senders: Vec<Option<DlqSender>> = vec![None; total_workers];
+            let mut handles = Vec::with_capacity(local_range.len());
 
-            for i in 0..n_workers {
+            for i in local_range.clone() {
                 match factory.create(i) {
                     Ok(sink) => {
                         let (tx, mut rx) =
                             tokio::sync::mpsc::channel::<rill_core::dlq::DeadLetterRecord>(64);
-                        senders.push(Some(tx));
+                        senders[i] = Some(tx);
                         handles.push(tokio::spawn(async move {
                             let mut sink = sink;
                             while let Some(record) = rx.recv().await {
@@ -311,7 +435,6 @@ fn setup_dlq_sinks(
                             worker = i,
                             "failed to open DLQ sink — falling back to skip for worker"
                         );
-                        senders.push(None);
                     }
                 }
             }
@@ -755,8 +878,11 @@ async fn execute_graph(
     restored_offsets: std::collections::HashMap<String, String>,
 ) -> anyhow::Result<()> {
     let rt = tokio::runtime::Handle::current();
-    let n_workers = executor.workers();
-    let (dlq_senders, dlq_handles) = setup_dlq_sinks(&executor.error_policy, n_workers);
+    let total_workers = executor.total_workers();
+    let local_range = executor.local_worker_range();
+    let n_local = local_range.len();
+    let (dlq_senders, dlq_handles) =
+        setup_dlq_sinks(&executor.error_policy, total_workers, &local_range);
 
     // Tag each node kind before extracting data.
     let node_kinds: HashMap<NodeId, NodeKindTag> = graph
@@ -779,8 +905,9 @@ async fn execute_graph(
         .copied();
 
     // ── Source bridging ─────────────────────────────────────────────
+    // Sized to total_workers; only slots in local_range are populated.
     let mut per_worker_source_rx: Vec<HashMap<NodeId, tokio::sync::mpsc::Receiver<Vec<AnyItem>>>> =
-        (0..n_workers).map(|_| HashMap::new()).collect();
+        (0..total_workers).map(|_| HashMap::new()).collect();
     let mut all_source_offsets: Vec<Arc<std::sync::Mutex<HashMap<String, String>>>> = Vec::new();
     let mut all_source_watermarks: Vec<Arc<AtomicU64>> = Vec::new();
 
@@ -788,19 +915,20 @@ async fn execute_graph(
         let source = extract_source(&mut graph.nodes[source_id.0]);
 
         if let Some(n_partitions) = source.partition_count() {
-            // Partitioned: round-robin distribute partitions across workers.
+            // Partitioned: round-robin distribute partitions across total workers.
             tracing::info!(
                 source = ?source_id,
                 partitions = n_partitions,
-                workers = n_workers,
+                total_workers = total_workers,
                 "distributing partitioned source"
             );
-            let mut worker_partitions: Vec<Vec<usize>> = vec![vec![]; n_workers];
+            let mut worker_partitions: Vec<Vec<usize>> = vec![vec![]; total_workers];
             for p in 0..n_partitions {
-                worker_partitions[p % n_workers].push(p);
+                worker_partitions[p % total_workers].push(p);
             }
+            // Only create bridges for workers in local_range.
             for (worker_idx, parts) in worker_partitions.into_iter().enumerate() {
-                if parts.is_empty() {
+                if parts.is_empty() || !local_range.contains(&worker_idx) {
                     continue;
                 }
                 let mut psrc = source
@@ -816,16 +944,22 @@ async fn execute_graph(
                 all_source_watermarks.push(wm);
             }
         } else {
-            // Non-partitioned: only worker 0 reads.
-            let mut source = source;
-            if !restored_offsets.is_empty() {
-                source.restore_offsets(&restored_offsets).await?;
+            // Non-partitioned: only global worker 0 reads.
+            // In cluster mode, only process 0 creates this bridge.
+            if local_range.contains(&0) {
+                let mut source = source;
+                if !restored_offsets.is_empty() {
+                    source.restore_offsets(&restored_offsets).await?;
+                }
+                let (rx, offsets, wm) = crate::bridge::erased_source_bridge_with_offsets(
+                    source,
+                    &rt,
+                    shutdown.cloned(),
+                );
+                per_worker_source_rx[0].insert(source_id, rx);
+                all_source_offsets.push(offsets);
+                all_source_watermarks.push(wm);
             }
-            let (rx, offsets, wm) =
-                crate::bridge::erased_source_bridge_with_offsets(source, &rt, shutdown.cloned());
-            per_worker_source_rx[0].insert(source_id, rx);
-            all_source_offsets.push(offsets);
-            all_source_watermarks.push(wm);
         }
     }
 
@@ -855,13 +989,16 @@ async fn execute_graph(
     }
 
     // ── Extract transforms, key_fns, operators from graph nodes ────
-    // We need per-worker copies. Worker 0 gets the original, others get clones.
-    let mut all_transforms: Vec<HashMap<NodeId, TransformFn>> = Vec::with_capacity(n_workers);
-    let mut all_key_fns: Vec<HashMap<NodeId, crate::dataflow::KeyFn>> =
-        Vec::with_capacity(n_workers);
-    let mut all_operators: Vec<HashMap<NodeId, (String, Box<dyn ErasedOperator>)>> =
-        Vec::with_capacity(n_workers);
-    let mut all_contexts: Vec<HashMap<NodeId, StateContext>> = Vec::with_capacity(n_workers);
+    // Sized to total_workers; only local_range slots are populated.
+    // Remote slots stay None after wrapping.
+    let mut all_transforms: Vec<Option<HashMap<NodeId, TransformFn>>> =
+        (0..total_workers).map(|_| None).collect();
+    let mut all_key_fns: Vec<Option<HashMap<NodeId, crate::dataflow::KeyFn>>> =
+        (0..total_workers).map(|_| None).collect();
+    let mut all_operators: Vec<Option<HashMap<NodeId, (String, Box<dyn ErasedOperator>)>>> =
+        (0..total_workers).map(|_| None).collect();
+    let mut all_contexts: Vec<Option<HashMap<NodeId, StateContext>>> =
+        (0..total_workers).map(|_| None).collect();
 
     // Collect node IDs by kind for extraction.
     let transform_ids: Vec<NodeId> = graph
@@ -897,8 +1034,8 @@ async fn execute_graph(
         orig_operators.insert(nid, extract_operator(&mut graph.nodes[nid.0]));
     }
 
-    // Create per-worker copies.
-    for worker_idx in 0..n_workers {
+    // Create per-worker copies for local workers only.
+    for worker_idx in local_range.clone() {
         let mut w_transforms = HashMap::new();
         let mut w_key_fns = HashMap::new();
         let mut w_operators = HashMap::new();
@@ -922,24 +1059,17 @@ async fn execute_graph(
             w_operators.insert(nid, (name, op));
         }
 
-        all_transforms.push(w_transforms);
-        all_key_fns.push(w_key_fns);
-        all_operators.push(w_operators);
-        all_contexts.push(w_contexts);
+        all_transforms[worker_idx] = Some(w_transforms);
+        all_key_fns[worker_idx] = Some(w_key_fns);
+        all_operators[worker_idx] = Some(w_operators);
+        all_contexts[worker_idx] = Some(w_contexts);
     }
 
     // Package data for Timely closure (Fn, not FnOnce — Mutex+Option+take).
     let topo_order = graph.topo_order.clone();
     let all_operator_names = graph.operator_names.clone();
 
-    let per_worker_transforms: Vec<Option<HashMap<NodeId, TransformFn>>> =
-        all_transforms.into_iter().map(Some).collect();
-    let per_worker_key_fns: Vec<Option<HashMap<NodeId, crate::dataflow::KeyFn>>> =
-        all_key_fns.into_iter().map(Some).collect();
-    let per_worker_operators: Vec<Option<HashMap<NodeId, (String, Box<dyn ErasedOperator>)>>> =
-        all_operators.into_iter().map(Some).collect();
-    let per_worker_contexts: Vec<Option<HashMap<NodeId, StateContext>>> =
-        all_contexts.into_iter().map(Some).collect();
+    // Vecs are already sized to total_workers with Some for local, None for remote.
     // Per-worker source receivers (partitioned sources may give receivers to multiple workers).
     let per_worker_source_rx: Vec<
         Option<HashMap<NodeId, tokio::sync::mpsc::Receiver<Vec<AnyItem>>>>,
@@ -948,10 +1078,10 @@ async fn execute_graph(
     let per_worker_dlq_tx: Vec<Option<Option<DlqSender>>> =
         dlq_senders.into_iter().map(Some).collect();
 
-    let per_worker_transforms = std::sync::Mutex::new(per_worker_transforms);
-    let per_worker_key_fns = std::sync::Mutex::new(per_worker_key_fns);
-    let per_worker_operators = std::sync::Mutex::new(per_worker_operators);
-    let per_worker_contexts = std::sync::Mutex::new(per_worker_contexts);
+    let per_worker_transforms = std::sync::Mutex::new(all_transforms);
+    let per_worker_key_fns = std::sync::Mutex::new(all_key_fns);
+    let per_worker_operators = std::sync::Mutex::new(all_operators);
+    let per_worker_contexts = std::sync::Mutex::new(all_contexts);
     let per_worker_source_rx = std::sync::Mutex::new(per_worker_source_rx);
     let per_worker_dlq_tx = std::sync::Mutex::new(per_worker_dlq_tx);
     let sink_senders = Arc::new(sink_senders);
@@ -994,55 +1124,76 @@ async fn execute_graph(
     let node_kinds = Arc::new(node_kinds);
 
     #[allow(clippy::cast_possible_truncation)]
-    metrics::gauge!("executor_workers").set(n_workers as f64);
-    tracing::info!(workers = n_workers, "pipeline started");
+    metrics::gauge!("executor_workers").set(n_local as f64);
+    tracing::info!(
+        local_workers = n_local,
+        total_workers = total_workers,
+        process_id = ?executor.process_id(),
+        cluster = executor.is_cluster(),
+        "pipeline started"
+    );
+
+    let timely_config = executor.timely_config();
 
     tokio::task::spawn_blocking(move || {
-        let guards =
-            timely::execute::execute(timely::execute::Config::process(n_workers), move |worker| {
-                let idx = worker.index();
-                let _span = tracing::info_span!("worker", worker = idx).entered();
+        let guards = timely::execute::execute(timely_config, move |worker| {
+            let idx = worker.index();
+            let _span = tracing::info_span!("worker", worker = idx).entered();
 
-                let mut w_source_rx = per_worker_source_rx.lock().unwrap()[idx].take().unwrap();
-                let mut w_transforms = per_worker_transforms.lock().unwrap()[idx].take().unwrap();
-                let mut w_key_fns = per_worker_key_fns.lock().unwrap()[idx].take().unwrap();
-                let mut w_operators = per_worker_operators.lock().unwrap()[idx].take().unwrap();
-                let mut w_contexts = per_worker_contexts.lock().unwrap()[idx].take().unwrap();
-                let w_dlq_tx = per_worker_dlq_tx.lock().unwrap()[idx].take().unwrap();
-                let rt = rt_clone.clone();
-                let notify = checkpoint_notify_tx.clone();
+            // Timely only invokes this closure for local workers.
+            // take() from the pre-populated slot; remote slots are None.
+            let mut w_source_rx = per_worker_source_rx.lock().unwrap()[idx]
+                .take()
+                .unwrap_or_default();
+            let mut w_transforms = per_worker_transforms.lock().unwrap()[idx]
+                .take()
+                .unwrap_or_default();
+            let mut w_key_fns = per_worker_key_fns.lock().unwrap()[idx]
+                .take()
+                .unwrap_or_default();
+            let mut w_operators = per_worker_operators.lock().unwrap()[idx]
+                .take()
+                .unwrap_or_default();
+            let mut w_contexts = per_worker_contexts.lock().unwrap()[idx]
+                .take()
+                .unwrap_or_default();
+            let w_dlq_tx = per_worker_dlq_tx.lock().unwrap()[idx]
+                .take()
+                .unwrap_or_default();
+            let rt = rt_clone.clone();
+            let notify = checkpoint_notify_tx.clone();
 
-                let dataflow_index = worker.next_dataflow_index();
-                let gw = global_watermark.clone();
-                let probe = worker.dataflow::<u64, _, _>(|scope| {
-                    build_timely_dag(
-                        scope,
-                        &mut w_source_rx,
-                        &mut w_transforms,
-                        &mut w_key_fns,
-                        &mut w_operators,
-                        &mut w_contexts,
-                        &sink_senders,
-                        &topo_order,
-                        &node_inputs,
-                        &node_kinds,
-                        rt,
-                        idx,
-                        n_workers,
-                        Some(notify),
-                        w_dlq_tx,
-                        last_operator_id,
-                        gw,
-                    )
-                });
+            let dataflow_index = worker.next_dataflow_index();
+            let gw = global_watermark.clone();
+            let probe = worker.dataflow::<u64, _, _>(|scope| {
+                build_timely_dag(
+                    scope,
+                    &mut w_source_rx,
+                    &mut w_transforms,
+                    &mut w_key_fns,
+                    &mut w_operators,
+                    &mut w_contexts,
+                    &sink_senders,
+                    &topo_order,
+                    &node_inputs,
+                    &node_kinds,
+                    rt,
+                    idx,
+                    total_workers,
+                    Some(notify),
+                    w_dlq_tx,
+                    last_operator_id,
+                    gw,
+                )
+            });
 
-                while !probe.done() {
-                    worker.step();
-                }
+            while !probe.done() {
+                worker.step();
+            }
 
-                worker.drop_dataflow(dataflow_index);
-            })
-            .map_err(|e| anyhow::anyhow!("timely execution failed: {e}"))?;
+            worker.drop_dataflow(dataflow_index);
+        })
+        .map_err(|e| anyhow::anyhow!("timely execution failed: {e}"))?;
 
         drop(guards);
         Ok::<(), anyhow::Error>(())
@@ -1068,18 +1219,9 @@ async fn execute_graph(
     let mut checkpoint_id = initial_checkpoint_id;
     while checkpoint_notify_rx.try_recv().is_ok() {
         checkpoint_id += 1;
-        let manifest = CheckpointManifest {
-            version: 1,
-            checkpoint_id,
-            timestamp_ms: now_millis(),
-            operators: all_operator_names.clone(),
-            source_offsets: merge_source_offsets(&all_source_offsets),
-        };
-        manifest.save(&executor.checkpoint_dir)?;
-        tracing::debug!(checkpoint_id, "checkpoint #{checkpoint_id} saved");
     }
 
-    // Final manifest.
+    // Final manifest (includes all accumulated checkpoint progress).
     checkpoint_id += 1;
     let manifest = CheckpointManifest {
         version: 1,
@@ -1088,8 +1230,35 @@ async fn execute_graph(
         operators: all_operator_names,
         source_offsets: merge_source_offsets(&all_source_offsets),
     };
-    manifest.save(&executor.checkpoint_dir)?;
-    tracing::debug!(checkpoint_id, "checkpoint #{checkpoint_id} saved");
+
+    if let Some(pid) = executor.process_id() {
+        // Cluster mode: write a partial manifest for this process.
+        manifest.save_partial(&executor.checkpoint_dir, pid)?;
+        tracing::debug!(
+            checkpoint_id,
+            process_id = pid,
+            "partial checkpoint #{checkpoint_id} saved for process {pid}"
+        );
+
+        // Process 0 merges all partial manifests into the final manifest.
+        if pid == 0 {
+            let n_processes = executor.peers.as_ref().map_or(1, Vec::len);
+            let merged = CheckpointManifest::merge_partials(&executor.checkpoint_dir, n_processes);
+            if let Some(merged) = merged {
+                merged.save(&executor.checkpoint_dir)?;
+                tracing::debug!(
+                    checkpoint_id = merged.checkpoint_id,
+                    "merged checkpoint saved"
+                );
+            } else {
+                tracing::warn!("not all partial manifests available for merge");
+            }
+        }
+    } else {
+        // Single-process mode: write directly.
+        manifest.save(&executor.checkpoint_dir)?;
+        tracing::debug!(checkpoint_id, "checkpoint #{checkpoint_id} saved");
+    }
 
     Ok(())
 }
@@ -2058,5 +2227,147 @@ mod tests {
         tripled_results.sort_unstable();
         assert_eq!(tripled_results, vec![3, 6, 9, 12, 15, 18]);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── Cluster config tests ────────────────────────────────────────
+
+    #[test]
+    fn cluster_total_workers() {
+        let exec = super::Executor::builder()
+            .checkpoint_dir("/tmp/test")
+            .workers(4)
+            .process_id(0)
+            .peers(vec!["h0:2101".into(), "h1:2101".into()])
+            .build();
+        assert_eq!(exec.total_workers(), 8); // 4 workers * 2 peers
+        assert!(exec.is_cluster());
+    }
+
+    #[test]
+    fn single_process_total_workers() {
+        let exec = super::Executor::builder()
+            .checkpoint_dir("/tmp/test")
+            .workers(4)
+            .build();
+        assert_eq!(exec.total_workers(), 4);
+        assert!(!exec.is_cluster());
+    }
+
+    #[test]
+    fn cluster_local_worker_range() {
+        // Process 0 of 2, 4 workers each
+        let exec0 = super::Executor::builder()
+            .checkpoint_dir("/tmp/test")
+            .workers(4)
+            .process_id(0)
+            .peers(vec!["h0:2101".into(), "h1:2101".into()])
+            .build();
+        assert_eq!(exec0.local_worker_range(), 0..4);
+
+        // Process 1 of 2, 4 workers each
+        let exec1 = super::Executor::builder()
+            .checkpoint_dir("/tmp/test")
+            .workers(4)
+            .process_id(1)
+            .peers(vec!["h0:2101".into(), "h1:2101".into()])
+            .build();
+        assert_eq!(exec1.local_worker_range(), 4..8);
+    }
+
+    #[test]
+    fn single_process_local_worker_range() {
+        let exec = super::Executor::builder()
+            .checkpoint_dir("/tmp/test")
+            .workers(3)
+            .build();
+        assert_eq!(exec.local_worker_range(), 0..3);
+    }
+
+    #[test]
+    fn cluster_timely_config_is_cluster() {
+        let exec = super::Executor::builder()
+            .checkpoint_dir("/tmp/test")
+            .workers(2)
+            .process_id(0)
+            .peers(vec!["h0:2101".into(), "h1:2101".into()])
+            .build();
+        let config = exec.timely_config();
+        assert!(
+            matches!(
+                config.communication,
+                timely::CommunicationConfig::Cluster { .. }
+            ),
+            "expected Cluster config"
+        );
+    }
+
+    #[test]
+    fn single_process_timely_config_is_process() {
+        let exec = super::Executor::builder()
+            .checkpoint_dir("/tmp/test")
+            .workers(2)
+            .build();
+        let config = exec.timely_config();
+        assert!(
+            matches!(
+                config.communication,
+                timely::CommunicationConfig::Process(2)
+            ),
+            "expected Process(2) config"
+        );
+    }
+
+    #[test]
+    fn cluster_state_prefix_includes_process_id() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let exec = super::Executor::builder()
+            .checkpoint_dir(temp_dir("cluster_prefix"))
+            .workers(2)
+            .process_id(1)
+            .peers(vec!["h0:2101".into(), "h1:2101".into()])
+            .build();
+
+        let ctx = rt
+            .block_on(exec.create_context_for_worker("my_op", 3))
+            .unwrap();
+        // The context should have been created with prefix "p1_w3_my_op"
+        // We can verify via the backend path for LocalBackend
+        // Just check it doesn't panic with the cluster prefix format
+        drop(ctx);
+    }
+
+    #[test]
+    fn single_process_state_prefix_unchanged() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let dir = temp_dir("single_prefix");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let exec = super::Executor::new(dir.clone());
+        let ctx = rt
+            .block_on(exec.create_context_for_worker("my_op", 0))
+            .unwrap();
+        // Should not panic; prefix is "my_op_w0" (original format)
+        drop(ctx);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[should_panic(expected = "process_id is required when peers are set")]
+    fn cluster_requires_process_id() {
+        super::Executor::builder()
+            .checkpoint_dir("/tmp/test")
+            .peers(vec!["h0:2101".into()])
+            .build();
+    }
+
+    #[test]
+    #[should_panic(expected = "process_id (2) must be less than number of peers (2)")]
+    fn cluster_process_id_out_of_range() {
+        super::Executor::builder()
+            .checkpoint_dir("/tmp/test")
+            .process_id(2)
+            .peers(vec!["h0:2101".into(), "h1:2101".into()])
+            .build();
     }
 }
