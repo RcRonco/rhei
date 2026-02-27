@@ -7,6 +7,7 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
 
 jobs:
   check:
@@ -19,6 +20,9 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
       - name: Cache dependencies
         uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: stable
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Run cargo check
         run: cargo check --workspace --all-targets
 
@@ -38,6 +42,9 @@ jobs:
           toolchain: ${{ matrix.toolchain }}
       - name: Cache dependencies
         uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ${{ matrix.toolchain }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Run tests
         run: cargo test --workspace
 
@@ -66,6 +73,9 @@ jobs:
           components: clippy
       - name: Cache dependencies
         uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: stable
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Run clippy
         run: cargo clippy --workspace --all-targets --no-deps -- -D warnings
 

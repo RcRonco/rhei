@@ -7,6 +7,7 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
 
 jobs:
   kafka-e2e:
@@ -41,6 +42,9 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
       - name: Cache dependencies
         uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: stable-kafka
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Run Kafka E2E tests
         run: cargo test -p rill-runtime --features kafka --test kafka_e2e -- --nocapture
       - name: Run Kafka Cluster E2E tests
@@ -56,6 +60,9 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
       - name: Cache dependencies
         uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: stable
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Run Checkpoint Coordination E2E tests
         run: cargo test -p rill-runtime --test checkpoint_coord_e2e -- --nocapture
 
@@ -90,6 +97,9 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
       - name: Cache dependencies
         uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: stable-remote-state
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Run S3 E2E tests
         run: cargo test -p rill-runtime --features remote-state --test s3_e2e -- --nocapture
         env:
