@@ -58,7 +58,12 @@ pub(crate) async fn execute_dag(
     let node_kinds = worker_set.node_kinds.clone();
     let last_operator_id = worker_set.last_operator_id;
     let global_watermark = worker_set.global_watermark.clone();
-    let checkpoint_notify_tx = worker_set.checkpoint_notify_tx.clone();
+    let checkpoint_notify_tx = worker_set
+        .checkpoint_notify_tx
+        .lock()
+        .unwrap()
+        .as_ref()
+        .cloned();
 
     // Clone Arc fields for per-worker take_worker_data inside the closure.
     let source_rx = worker_set.source_rx.clone();
@@ -92,7 +97,7 @@ pub(crate) async fn execute_dag(
                 rt: rt.clone(),
                 worker_index: idx,
                 num_workers: total_workers,
-                checkpoint_notify: Some(checkpoint_notify_tx.clone()),
+                checkpoint_notify: checkpoint_notify_tx.clone(),
                 dlq_tx: w_data.dlq_tx.take(),
                 last_operator_id,
                 global_watermark: global_watermark.clone(),

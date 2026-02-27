@@ -561,11 +561,11 @@ async fn execute_compiled(
     let timely_config = controller.timely_config();
     crate::executor::execute_dag(timely_config, &worker_set, rt.clone(), total_workers).await?;
 
-    // Cancel the checkpoint task (DAG is done, no more epochs will arrive).
-    checkpoint_task.abort();
+    // Close the checkpoint channel so the task drains remaining notifications
+    // and exits cleanly (recv() returns None when all senders are dropped).
+    worker_set.close_checkpoint_channel();
     let last_checkpoint_id = match checkpoint_task.await {
         Ok(id) => id,
-        Err(e) if e.is_cancelled() => initial_checkpoint_id,
         Err(e) => return Err(anyhow::anyhow!("checkpoint task panicked: {e}")),
     };
 
