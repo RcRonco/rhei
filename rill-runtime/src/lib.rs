@@ -2,8 +2,8 @@
 //!
 //! This crate provides the machinery to run logical plans built with `rill-core`:
 //!
-//! - [`executor::Executor`] — materializes [`DataflowGraph`](dataflow::DataflowGraph)
-//!   pipelines into Timely-backed multi-worker execution
+//! - [`controller::PipelineController`] — configuration, lifecycle orchestration, and checkpointing
+//! - [`executor`] — pure Timely DAG construction and execution
 //! - [`dataflow::DataflowGraph`] — type-erased graph builder with
 //!   [`Stream<T>`](dataflow::Stream) and [`KeyedStream<T>`](dataflow::KeyedStream)
 //! - [`bridge`] — async-to-sync channel bridges for Timely integration
@@ -33,10 +33,12 @@ pub mod async_operator;
 pub mod bridge;
 /// Graph compilation: logical [`DataflowGraph`](dataflow::DataflowGraph) to executable segments.
 pub(crate) mod compiler;
+/// Pipeline configuration, lifecycle orchestration, and checkpointing.
+pub mod controller;
 /// Dataflow graph API: [`DataflowGraph`](dataflow::DataflowGraph),
 /// [`Stream<T>`](dataflow::Stream), [`KeyedStream<T>`](dataflow::KeyedStream).
 pub mod dataflow;
-/// Pipeline executor with Timely-backed multi-worker support.
+/// Pure Timely DAG construction and execution.
 pub mod executor;
 /// Fan-out recorder delegating to Prometheus and Snapshot recorders.
 pub mod fanout_recorder;
@@ -56,3 +58,11 @@ pub mod telemetry;
 pub mod timely_operator;
 /// Log capture layer for dashboards and log aggregation.
 pub mod tracing_capture;
+/// I/O bridging and per-worker data preparation for Timely execution.
+pub(crate) mod worker;
+
+// Backward-compatible re-exports.
+#[doc(hidden)]
+pub use controller::PipelineController as Executor;
+#[doc(hidden)]
+pub use controller::PipelineControllerBuilder as ExecutorBuilder;

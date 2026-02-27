@@ -101,13 +101,28 @@
 
 ## Clustering
 
+### Phase 1: Multi-thread (done)
 - [x] Multi-worker Timely execution (single-process, multiple threads)
 - [x] Key-based partitioning (hash-based exchange with per-worker Timely dataflows)
 - [x] Per-worker state contexts with frontier-based checkpointing
 - [x] `--workers <N>` CLI flag
+
+### Phase 2: Multi-process (in progress)
+- [x] Controller / Worker / Executor split (`PipelineController` → `WorkerSet` → `execute_dag`)
+- [x] `TimelyCompiler` struct for per-worker DAG construction
 - [ ] Multi-process Timely cluster with TCP communication
 - [ ] Distributed state backend (shared SlateDB or S3-backed object store)
 - [ ] Coordinated checkpointing across workers (Chandy-Lamport style)
-- [ ] Dynamic scaling: add/remove workers with state redistribution
+
+### Phase 3: Dynamic control plane (chitchat + OpenRaft)
+- [ ] `PipelineController::reconfigure()` — update topology at runtime (new peers, worker count)
+- [ ] Checkpoint manifest topology metadata (track process count, workers per process)
+- [ ] Manifest merge with non-sequential process IDs (tolerate node replacement)
+- [ ] State repartitioning strategy after topology changes
+  - [ ] Decide approach: lazy migration (read-through old prefix) vs eager compaction
+  - [ ] Decouple state prefix from `(process_id, worker_index)` pair
+- [ ] WorkerSet rebuild path: checkpoint → build fresh WorkerSet → restart Timely
+- [ ] Source partition rebalance on scale events (re-trigger Kafka consumer group)
+- [ ] Job Manager integration: chitchat gossip for failure detection, OpenRaft for coordination
 - [ ] Leader election and failure detection
-- [ ] Cluster membership via etcd or similar coordination service
+- [ ] Dynamic scaling: add/remove workers with state redistribution

@@ -29,13 +29,25 @@ enum Commands {
         #[arg(long)]
         tui: bool,
 
-        /// Number of parallel Timely worker threads
+        /// Number of parallel Timely worker threads per process
         #[arg(long, default_value = "1")]
         workers: usize,
 
         /// Bind address for the HTTP health/metrics server (e.g. `0.0.0.0:9090`)
         #[arg(long)]
         metrics_addr: Option<std::net::SocketAddr>,
+
+        /// Process ID for multi-process cluster mode (0-based)
+        #[arg(long)]
+        process_id: Option<usize>,
+
+        /// Comma-separated peer addresses (host:port) for cluster mode
+        #[arg(long, value_delimiter = ',')]
+        peers: Option<Vec<String>>,
+
+        /// Path to hostfile (one host:port per line), alternative to --peers
+        #[arg(long, conflicts_with = "peers")]
+        hostfile: Option<std::path::PathBuf>,
     },
     /// Attach to a running pipeline's HTTP server and display the TUI dashboard
     Attach {
@@ -55,6 +67,9 @@ fn main() -> anyhow::Result<()> {
             tui: false,
             workers,
             metrics_addr,
+            process_id,
+            peers,
+            hostfile,
         } => {
             let _telemetry =
                 rill_runtime::telemetry::init(rill_runtime::telemetry::TelemetryConfig {
@@ -63,21 +78,53 @@ fn main() -> anyhow::Result<()> {
                     json_logs: cli.json_logs,
                     tui: false,
                 })?;
-            cmd_run(workers)
+
+            // Resolve peers from --peers or --hostfile.
+            let resolved_peers = if let Some(peers) = peers {
+                Some(peers)
+            } else if let Some(ref path) = hostfile {
+                let contents = std::fs::read_to_string(path)?;
+                let peers: Vec<String> = contents
+                    .lines()
+                    .map(str::trim)
+                    .filter(|l| !l.is_empty() && !l.starts_with('#'))
+                    .map(String::from)
+                    .collect();
+                if peers.is_empty() {
+                    anyhow::bail!("hostfile is empty: {}", path.display());
+                }
+                Some(peers)
+            } else {
+                None
+            };
+
+            cmd_run(workers, process_id, resolved_peers)
         }
         Commands::Attach { addr } => cmd_attach(addr),
     }
 }
 
-fn cmd_run(workers: usize) -> anyhow::Result<()> {
+fn cmd_run(
+    workers: usize,
+    process_id: Option<usize>,
+    peers: Option<Vec<String>>,
+) -> anyhow::Result<()> {
     if !Path::new("Cargo.toml").exists() {
         anyhow::bail!("No Cargo.toml found. Are you in a Rill project directory?");
     }
 
-    let status = Command::new("cargo")
-        .arg("run")
-        .env("RILL_WORKERS", workers.to_string())
-        .status()?;
+    let mut cmd = Command::new("cargo");
+    cmd.arg("run");
+    cmd.env("RILL_WORKERS", workers.to_string());
+
+    if let Some(pid) = process_id {
+        cmd.env("RILL_PROCESS_ID", pid.to_string());
+    }
+    if let Some(ref peers) = peers {
+        cmd.env("RILL_PEERS", peers.join(","));
+    }
+
+    let status = cmd.status()?;
 
     if !status.success() {
         anyhow::bail!("cargo run failed with status: {status}");
@@ -345,6 +392,7 @@ async fn run_demo_pipeline(workers: usize) -> anyhow::Result<()> {
     let executor = Executor::builder()
         .checkpoint_dir(dir.clone())
         .workers(workers)
+        .from_env()
         .build();
 
     // Let the TUI render before data starts flowing

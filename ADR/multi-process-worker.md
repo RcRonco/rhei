@@ -1,7 +1,8 @@
 # ADR: Multi-Process Worker Execution (Phase 2)
 
-**Status:** Proposed
+**Status:** Accepted
 **Date:** 2026-02-21
+**Implemented:** 2026-02-26
 
 ## Context
 
