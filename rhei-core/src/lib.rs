@@ -1,4 +1,4 @@
-//! Core abstractions for the Rill stream processing engine.
+//! Core abstractions for the Rhei stream processing engine.
 //!
 //! This crate provides the foundational types and traits for building
 //! stateful stream processing pipelines:

@@ -1,4 +1,4 @@
-//! Runtime execution engine for Rill stream processing pipelines.
+//! Runtime execution engine for Rhei stream processing pipelines.
 //!
 //! This crate provides the machinery to run logical plans built with `rill-core`:
 //!

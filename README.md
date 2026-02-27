@@ -1,8 +1,8 @@
-# Rill
+# Rhei
 
 Stream processing you can actually debug. A stateful streaming engine built on Rust, Timely Dataflow, and SlateDB.
 
-## Why Rill?
+## Why Rhei?
 
 **Debuggable.** Replay production state locally. Step through streaming operators in your debugger like any other Rust program. No black-box cluster to SSH into.
 
@@ -48,7 +48,7 @@ Source (async) ──▶ Transforms ╌╌ ◆ Exchange ◆ ╌╌▶ Stateful O
                       hash(key) % N workers
 ```
 
-Rill separates the dataflow graph definition from execution:
+Rhei separates the dataflow graph definition from execution:
 
 - **`DataflowGraph`** — Type-safe builder API. `Stream<T>` and `KeyedStream<T>` enforce correct types at compile time. Stateful operators require keyed streams.
 - **Compiler** — Converts the logical graph into executable pipeline segments, splitting at exchange boundaries for multi-worker routing.

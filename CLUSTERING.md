@@ -1,6 +1,6 @@
 # Clustering Design
 
-This document describes the incremental path from Rill's current single-threaded executor to a fully distributed, dynamically scaled stream processing cluster. It is organized into three phases, each building on the previous.
+This document describes the incremental path from Rhei's current single-threaded executor to a fully distributed, dynamically scaled stream processing cluster. It is organized into three phases, each building on the previous.
 
 For the full system topology vision, see [ARCHITECTURE.md](ARCHITECTURE.md). For the checklist of clustering work items, see the **Clustering** section of [ROADMAP.md](ROADMAP.md).
 

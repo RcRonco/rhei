@@ -13,7 +13,7 @@ use crate::traits::Source;
 ///
 /// Polls messages from one or more Kafka topics and emits [`KafkaMessage`] batches.
 /// Offset commits are deferred until [`Source::on_checkpoint_complete`] is called,
-/// ensuring at-least-once delivery when combined with Rill's checkpoint mechanism.
+/// ensuring at-least-once delivery when combined with Rhei's checkpoint mechanism.
 pub struct KafkaSource {
     consumer: StreamConsumer,
     batch_size: usize,

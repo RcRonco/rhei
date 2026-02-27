@@ -7,7 +7,7 @@ use clap::{Parser, Subcommand};
 mod tui;
 
 #[derive(Parser)]
-#[command(name = "rill", about = "Rill stream processing CLI")]
+#[command(name = "rill", about = "Rhei stream processing CLI")]
 struct Cli {
     /// Emit logs as JSON
     #[arg(long, global = true)]
@@ -23,7 +23,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Run the current Rill project
+    /// Run the current Rhei project
     Run {
         /// Launch the TUI dashboard instead of shelling out to cargo
         #[arg(long)]
@@ -110,7 +110,7 @@ fn cmd_run(
     peers: Option<Vec<String>>,
 ) -> anyhow::Result<()> {
     if !Path::new("Cargo.toml").exists() {
-        anyhow::bail!("No Cargo.toml found. Are you in a Rill project directory?");
+        anyhow::bail!("No Cargo.toml found. Are you in a Rhei project directory?");
     }
 
     let mut cmd = Command::new("cargo");

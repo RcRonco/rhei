@@ -1,8 +1,8 @@
-# Rill API Design
+# Rhei API Design
 
 ## Philosophy
 
-Rill exposes **one** API for building stream processing pipelines. There is no "simple mode" vs "advanced mode" — the same constructs handle single-threaded development, multi-worker production, and eventually distributed execution.
+Rhei exposes **one** API for building stream processing pipelines. There is no "simple mode" vs "advanced mode" — the same constructs handle single-threaded development, multi-worker production, and eventually distributed execution.
 
 The API is built on **dataflow variables**. Each operation returns a typed stream handle that can be reused, branched, and merged. The executor compiles the dataflow graph and determines execution strategy (exchange pacts, worker assignment, checkpointing) automatically.
 

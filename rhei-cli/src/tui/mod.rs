@@ -1,4 +1,4 @@
-//! TUI dashboard for monitoring Rill pipeline execution.
+//! TUI dashboard for monitoring Rhei pipeline execution.
 //!
 //! Uses ratatui + crossterm for terminal rendering. Consumes metrics and logs
 //! from the decoupled data layer in `rill-runtime` (no UI deps there).

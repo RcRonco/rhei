@@ -5,7 +5,7 @@
 
 ## Context
 
-Rill is an async-first Rust framework — sources, sinks, and operators are `async_trait` implementations running on Tokio. However, the execution engine needs frontier tracking (knowing when all data for an epoch has been processed), epoch-based checkpointing, and multi-worker coordination. These are exactly the problems Timely Dataflow solves.
+Rhei is an async-first Rust framework — sources, sinks, and operators are `async_trait` implementations running on Tokio. However, the execution engine needs frontier tracking (knowing when all data for an epoch has been processed), epoch-based checkpointing, and multi-worker coordination. These are exactly the problems Timely Dataflow solves.
 
 The challenge is bridging two fundamentally different execution models:
 

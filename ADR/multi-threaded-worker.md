@@ -5,7 +5,7 @@
 
 ## Context
 
-Rill's initial executor used `timely::execute_directly()`, running a single worker on one thread. All stateful operators, stateless transforms, source reads, and sink writes shared a single thread — limiting throughput to one CPU core.
+Rhei's initial executor used `timely::execute_directly()`, running a single worker on one thread. All stateful operators, stateless transforms, source reads, and sink writes shared a single thread — limiting throughput to one CPU core.
 
 For keyed stateful operators (windows, aggregations, joins), elements with different keys are independent and can be processed in parallel. The system needs a multi-threaded execution path that preserves key affinity (same key always goes to the same worker) while enabling parallel stateful processing.
 

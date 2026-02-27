@@ -36,7 +36,7 @@ pub fn render_dashboard(frame: &mut Frame<'_>, area: Rect, snap: &MetricsSnapsho
     let block = Block::default()
         .title(Line::from(vec![
             Span::styled(
-                " Rill Pipeline ",
+                " Rhei Pipeline ",
                 Style::default()
                     .fg(Color::Cyan)
                     .add_modifier(Modifier::BOLD),

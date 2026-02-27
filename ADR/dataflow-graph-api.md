@@ -5,7 +5,7 @@
 
 ## Context
 
-Rill needs a user-facing API for constructing stream processing pipelines. The API must:
+Rhei needs a user-facing API for constructing stream processing pipelines. The API must:
 
 - Be type-safe — a `Stream<String>` should not accept an operator expecting `i32`.
 - Support both stateless transforms (map, filter) and stateful operators (windows, aggregations).

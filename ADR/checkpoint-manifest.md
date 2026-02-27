@@ -5,7 +5,7 @@
 
 ## Context
 
-Rill's checkpoint infrastructure already persists operator state on each checkpoint cycle: `LocalBackend` writes JSON files that auto-load on construction, and `SlateDbBackend` is durable on S3. Kafka offsets are committed to Kafka's `__consumer_offsets` topic via `on_checkpoint_complete()`. A pipeline restart "happens to work" if you reuse the same checkpoint directory and Kafka consumer group, but there is no formal mechanism to:
+Rhei's checkpoint infrastructure already persists operator state on each checkpoint cycle: `LocalBackend` writes JSON files that auto-load on construction, and `SlateDbBackend` is durable on S3. Kafka offsets are committed to Kafka's `__consumer_offsets` topic via `on_checkpoint_complete()`. A pipeline restart "happens to work" if you reuse the same checkpoint directory and Kafka consumer group, but there is no formal mechanism to:
 
 - **Record** what was checkpointed (operators, source offsets, timestamp).
 - **Verify** consistency at startup (e.g. detect topology changes).

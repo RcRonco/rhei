@@ -1,6 +1,6 @@
 # Known Issues
 
-Tracked gaps, limitations, and potential correctness issues in the Rill codebase.
+Tracked gaps, limitations, and potential correctness issues in the Rhei codebase.
 Severity labels: **CRITICAL** (data loss or incorrect results), **HIGH** (resource
 exhaustion, silent misbehaviour), **MEDIUM** (missing feature, workaround exists).
 
