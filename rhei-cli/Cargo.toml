@@ -1,5 +1,5 @@
 [package]
-name = "rill-cli"
+name = "rhei-cli"
 version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"
@@ -11,8 +11,8 @@ clap.workspace = true
 crossterm.workspace = true
 futures.workspace = true
 ratatui.workspace = true
-rill-core = { path = "../rill-core" }
-rill-runtime = { path = "../rill-runtime" }
+rhei-core = { path = "../rhei-core" }
+rhei-runtime = { path = "../rhei-runtime" }
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true

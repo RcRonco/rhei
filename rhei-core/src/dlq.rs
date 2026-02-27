@@ -92,7 +92,7 @@ mod tests {
     #[test]
     fn dlq_file_sink_factory_creates_sinks() {
         let dir =
-            std::env::temp_dir().join(format!("rill_dlq_factory_test_{}", std::process::id()));
+            std::env::temp_dir().join(format!("rhei_dlq_factory_test_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
 

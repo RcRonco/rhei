@@ -8,8 +8,8 @@ use std::ops::Range;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use rill_core::dlq::ErrorPolicy;
-use rill_core::state::context::StateContext;
+use rhei_core::dlq::ErrorPolicy;
+use rhei_core::state::context::StateContext;
 use tokio::task::JoinHandle;
 
 use crate::compiler::CompiledGraph;
@@ -19,7 +19,7 @@ use crate::executor::NodeKindTag;
 use crate::shutdown::ShutdownHandle;
 
 /// DLQ channel sender type for per-worker DLQ writes.
-pub(crate) type DlqSender = tokio::sync::mpsc::Sender<rill_core::dlq::DeadLetterRecord>;
+pub(crate) type DlqSender = tokio::sync::mpsc::Sender<rhei_core::dlq::DeadLetterRecord>;
 
 /// All per-worker data packaged for Timely execution.
 ///
@@ -515,7 +515,7 @@ fn setup_dlq_sinks(
                 match factory.create(i) {
                     Ok(sink) => {
                         let (tx, mut rx) =
-                            tokio::sync::mpsc::channel::<rill_core::dlq::DeadLetterRecord>(64);
+                            tokio::sync::mpsc::channel::<rhei_core::dlq::DeadLetterRecord>(64);
                         senders[i] = Some(tx);
                         handles.push(tokio::spawn(async move {
                             let mut sink = sink;

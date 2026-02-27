@@ -3,12 +3,12 @@
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use rill_core::connectors::vec_source::VecSource;
-use rill_core::operators::aggregator::Count;
-use rill_core::operators::tumbling_window::{TumblingWindow, WindowOutput};
-use rill_core::traits::{Sink, Source};
-use rill_runtime::dataflow::DataflowGraph;
-use rill_runtime::executor::Executor;
+use rhei_core::connectors::vec_source::VecSource;
+use rhei_core::operators::aggregator::Count;
+use rhei_core::operators::tumbling_window::{TumblingWindow, WindowOutput};
+use rhei_core::traits::{Sink, Source};
+use rhei_runtime::dataflow::DataflowGraph;
+use rhei_runtime::executor::Executor;
 use serde::{Deserialize, Serialize};
 
 // ── Helpers ────────────────────────────────────────────────────────
@@ -80,7 +80,7 @@ impl std::fmt::Display for Event {
 
 #[tokio::test]
 async fn test_watermark_propagation_closes_window() {
-    let dir = std::env::temp_dir().join(format!("rill_wm_propagation_{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("rhei_wm_propagation_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
 

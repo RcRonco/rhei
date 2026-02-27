@@ -5,13 +5,13 @@
 //! emitted. Unmatched events are buffered in operator state until their
 //! counterpart appears.
 //!
-//! Run with: `cargo run -p rill-runtime --example temporal_join`
+//! Run with: `cargo run -p rhei-runtime --example temporal_join`
 
-use rill_core::connectors::print_sink::PrintSink;
-use rill_core::connectors::vec_source::VecSource;
-use rill_core::operators::{JoinSide, TemporalJoin};
-use rill_runtime::dataflow::DataflowGraph;
-use rill_runtime::executor::Executor;
+use rhei_core::connectors::print_sink::PrintSink;
+use rhei_core::connectors::vec_source::VecSource;
+use rhei_core::operators::{JoinSide, TemporalJoin};
+use rhei_runtime::dataflow::DataflowGraph;
+use rhei_runtime::executor::Executor;
 use serde::{Deserialize, Serialize};
 
 /// An order event.
@@ -33,7 +33,7 @@ struct Shipment {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let dir = std::env::temp_dir().join("rill_temporal_join_example");
+    let dir = std::env::temp_dir().join("rhei_temporal_join_example");
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir)?;
 

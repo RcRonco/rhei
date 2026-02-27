@@ -18,14 +18,14 @@ use async_trait::async_trait;
 use futures::TryStreamExt;
 use object_store::ObjectStore;
 use object_store::aws::AmazonS3Builder;
-use rill_core::connectors::vec_source::VecSource;
-use rill_core::state::backend::StateBackend;
-use rill_core::state::context::StateContext;
-use rill_core::state::slatedb_backend::SlateDbBackend;
-use rill_core::state::tiered_backend::TieredBackendConfig;
-use rill_core::traits::{Sink, StreamFunction};
-use rill_runtime::dataflow::DataflowGraph;
-use rill_runtime::executor::Executor;
+use rhei_core::connectors::vec_source::VecSource;
+use rhei_core::state::backend::StateBackend;
+use rhei_core::state::context::StateContext;
+use rhei_core::state::slatedb_backend::SlateDbBackend;
+use rhei_core::state::tiered_backend::TieredBackendConfig;
+use rhei_core::traits::{Sink, StreamFunction};
+use rhei_runtime::dataflow::DataflowGraph;
+use rhei_runtime::executor::Executor;
 
 // ── Helpers ────────────────────────────────────────────────────────
 
@@ -47,7 +47,7 @@ fn unique_path(prefix: &str) -> String {
 fn build_s3_store() -> Arc<dyn ObjectStore> {
     let s3 = AmazonS3Builder::new()
         .with_endpoint(env_or("S3_ENDPOINT", "http://localhost:9000"))
-        .with_bucket_name(env_or("S3_BUCKET", "rill-test"))
+        .with_bucket_name(env_or("S3_BUCKET", "rhei-test"))
         .with_access_key_id(env_or("S3_ACCESS_KEY", "minioadmin"))
         .with_secret_access_key(env_or("S3_SECRET_KEY", "minioadmin"))
         .with_region(env_or("S3_REGION", "us-east-1"))

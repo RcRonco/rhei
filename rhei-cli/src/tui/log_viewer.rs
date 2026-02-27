@@ -9,7 +9,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem};
 use tracing::Level;
 
-use rill_runtime::tracing_capture::LogEntry;
+use rhei_runtime::tracing_capture::LogEntry;
 
 fn level_color(level: Level) -> Color {
     match level {

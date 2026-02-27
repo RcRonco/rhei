@@ -15,7 +15,7 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
-use rill_core::checkpoint::CheckpointManifest;
+use rhei_core::checkpoint::CheckpointManifest;
 
 // ── Port allocation ─────────────────────────────────────────────────
 
@@ -217,14 +217,14 @@ fn wait_with_timeout(
 struct CharCounter;
 
 #[async_trait::async_trait]
-impl rill_core::traits::StreamFunction for CharCounter {
+impl rhei_core::traits::StreamFunction for CharCounter {
     type Input = String;
     type Output = String;
 
     async fn process(
         &mut self,
         input: String,
-        ctx: &mut rill_core::state::context::StateContext,
+        ctx: &mut rhei_core::state::context::StateContext,
     ) -> anyhow::Result<Vec<String>> {
         let key = input.as_bytes();
         let count = match ctx.get(key).await? {
@@ -240,10 +240,10 @@ impl rill_core::traits::StreamFunction for CharCounter {
 }
 
 async fn worker_main() {
-    use rill_core::connectors::file_sink::FileSink;
-    use rill_core::connectors::partitioned_vec_source::PartitionedVecSource;
-    use rill_runtime::dataflow::DataflowGraph;
-    use rill_runtime::executor::Executor;
+    use rhei_core::connectors::file_sink::FileSink;
+    use rhei_core::connectors::partitioned_vec_source::PartitionedVecSource;
+    use rhei_runtime::dataflow::DataflowGraph;
+    use rhei_runtime::executor::Executor;
 
     let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
 

@@ -4,13 +4,13 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use rill_core::checkpoint::CheckpointManifest;
-use rill_core::connectors::partitioned_vec_source::PartitionedVecSource;
-use rill_core::connectors::vec_source::VecSource;
-use rill_core::state::context::StateContext;
-use rill_core::traits::{Sink, Source, StreamFunction};
-use rill_runtime::dataflow::DataflowGraph;
-use rill_runtime::executor::Executor;
+use rhei_core::checkpoint::CheckpointManifest;
+use rhei_core::connectors::partitioned_vec_source::PartitionedVecSource;
+use rhei_core::connectors::vec_source::VecSource;
+use rhei_core::state::context::StateContext;
+use rhei_core::traits::{Sink, Source, StreamFunction};
+use rhei_runtime::dataflow::DataflowGraph;
+use rhei_runtime::executor::Executor;
 
 // ── Helpers ────────────────────────────────────────────────────────
 
@@ -73,7 +73,7 @@ fn parse_final_counts(results: &[String]) -> HashMap<String, u64> {
 
 #[tokio::test]
 async fn checkpoint_restart_preserves_state() {
-    let dir = std::env::temp_dir().join(format!("rill_ckpt_restart_{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("rhei_ckpt_restart_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
 
@@ -164,7 +164,7 @@ async fn checkpoint_restart_preserves_state() {
 
 #[tokio::test]
 async fn checkpoint_manifest_detects_operator_mismatch() {
-    let dir = std::env::temp_dir().join(format!("rill_ckpt_mismatch_{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("rhei_ckpt_mismatch_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
 
@@ -311,7 +311,7 @@ impl Source for OffsetPartitionReader {
 
 #[tokio::test]
 async fn multi_worker_checkpoint_restart() {
-    let dir = std::env::temp_dir().join(format!("rill_ckpt_multi_{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("rhei_ckpt_multi_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
 
@@ -397,7 +397,7 @@ async fn multi_worker_checkpoint_restart() {
 
 #[tokio::test]
 async fn partitioned_source_checkpoint_restart() {
-    let dir = std::env::temp_dir().join(format!("rill_ckpt_partsrc_{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("rhei_ckpt_partsrc_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
 
@@ -487,7 +487,7 @@ async fn partitioned_source_checkpoint_restart() {
 
 #[tokio::test]
 async fn partitioned_source_offset_merge() {
-    let dir = std::env::temp_dir().join(format!("rill_ckpt_offmerge_{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("rhei_ckpt_offmerge_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
 
@@ -548,7 +548,7 @@ async fn partitioned_source_offset_merge() {
 #[tokio::test]
 #[allow(clippy::too_many_lines)]
 async fn partitioned_source_offset_restore() {
-    let dir = std::env::temp_dir().join(format!("rill_ckpt_offrestore_{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("rhei_ckpt_offrestore_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
 
@@ -684,7 +684,7 @@ async fn partitioned_source_changed_worker_count() {
     // Per-partition offsets (src/0, src/1, src/2, src/3) are keyed by
     // partition ID, so restore works regardless of worker distribution.
     let dir =
-        std::env::temp_dir().join(format!("rill_ckpt_changed_workers_{}", std::process::id()));
+        std::env::temp_dir().join(format!("rhei_ckpt_changed_workers_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
 

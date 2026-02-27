@@ -64,7 +64,7 @@ mod tests {
     use crate::state::local_backend::LocalBackend;
 
     fn temp_path(name: &str) -> std::path::PathBuf {
-        std::env::temp_dir().join(format!("rill_prefix_test_{name}_{}", std::process::id()))
+        std::env::temp_dir().join(format!("rhei_prefix_test_{name}_{}", std::process::id()))
     }
 
     #[tokio::test]

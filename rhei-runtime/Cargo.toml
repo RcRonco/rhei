@@ -1,5 +1,5 @@
 [package]
-name = "rill-runtime"
+name = "rhei-runtime"
 version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"
@@ -14,7 +14,7 @@ serde.workspace = true
 serde_json.workspace = true
 timely.workspace = true
 tokio.workspace = true
-rill-core = { path = "../rill-core" }
+rhei-core = { path = "../rhei-core" }
 tracing.workspace = true
 tracing-subscriber.workspace = true
 metrics.workspace = true
@@ -27,7 +27,7 @@ rdkafka = { workspace = true, optional = true }
 object_store = { workspace = true, features = ["aws"], optional = true }
 
 [features]
-kafka = ["rill-core/kafka", "dep:rdkafka"]
+kafka = ["rhei-core/kafka", "dep:rdkafka"]
 remote-state = ["dep:object_store"]
 
 [lints]

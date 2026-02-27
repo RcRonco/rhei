@@ -1,7 +1,7 @@
 //! TUI dashboard for monitoring Rhei pipeline execution.
 //!
 //! Uses ratatui + crossterm for terminal rendering. Consumes metrics and logs
-//! from the decoupled data layer in `rill-runtime` (no UI deps there).
+//! from the decoupled data layer in `rhei-runtime` (no UI deps there).
 
 mod dashboard;
 mod graph_view;
@@ -21,9 +21,9 @@ use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout};
 
-use rill_core::graph::LogicalPlan;
-use rill_runtime::metrics_snapshot::MetricsSnapshot;
-use rill_runtime::tracing_capture::LogEntry;
+use rhei_core::graph::LogicalPlan;
+use rhei_runtime::metrics_snapshot::MetricsSnapshot;
+use rhei_runtime::tracing_capture::LogEntry;
 
 use self::dashboard::render_dashboard;
 use self::graph_view::render_graph;

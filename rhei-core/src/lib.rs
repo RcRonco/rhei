@@ -60,7 +60,7 @@ mod compile_tests {
     #[tokio::test]
     async fn my_op_compiles_and_runs() {
         use crate::state::local_backend::LocalBackend;
-        let path = std::env::temp_dir().join(format!("rill_compile_test_{}", std::process::id()));
+        let path = std::env::temp_dir().join(format!("rhei_compile_test_{}", std::process::id()));
         let _ = std::fs::remove_file(&path);
 
         let backend = LocalBackend::new(path.clone(), None).unwrap();

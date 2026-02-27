@@ -1,6 +1,6 @@
 //! Runtime execution engine for Rhei stream processing pipelines.
 //!
-//! This crate provides the machinery to run logical plans built with `rill-core`:
+//! This crate provides the machinery to run logical plans built with `rhei-core`:
 //!
 //! - [`controller::PipelineController`] — configuration, lifecycle orchestration, and checkpointing
 //! - [`executor`] — pure Timely DAG construction and execution
@@ -27,7 +27,7 @@
 
 #![warn(missing_docs)]
 
-/// Non-blocking async wrapper for [`StreamFunction`](rill_core::traits::StreamFunction).
+/// Non-blocking async wrapper for [`StreamFunction`](rhei_core::traits::StreamFunction).
 pub mod async_operator;
 /// Async-to-sync channel bridges for Timely dataflow integration.
 pub mod bridge;

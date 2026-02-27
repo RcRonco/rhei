@@ -7,13 +7,13 @@ use clap::{Parser, Subcommand};
 mod tui;
 
 #[derive(Parser)]
-#[command(name = "rill", about = "Rhei stream processing CLI")]
+#[command(name = "rhei", about = "Rhei stream processing CLI")]
 struct Cli {
     /// Emit logs as JSON
     #[arg(long, global = true)]
     json_logs: bool,
 
-    /// Log level filter (e.g. `"info"`, `"debug"`, `"rill_core=trace"`)
+    /// Log level filter (e.g. `"info"`, `"debug"`, `"rhei_core=trace"`)
     #[arg(long, global = true, default_value = "info")]
     log_level: String,
 
@@ -72,7 +72,7 @@ fn main() -> anyhow::Result<()> {
             hostfile,
         } => {
             let _telemetry =
-                rill_runtime::telemetry::init(rill_runtime::telemetry::TelemetryConfig {
+                rhei_runtime::telemetry::init(rhei_runtime::telemetry::TelemetryConfig {
                     metrics_addr,
                     log_filter: cli.log_level.clone(),
                     json_logs: cli.json_logs,
@@ -138,7 +138,7 @@ fn cmd_run_tui(log_level: String, workers: usize) -> anyhow::Result<()> {
 
     rt.block_on(async {
         // Initialize telemetry inside the runtime so tokio::spawn works
-        let handles = rill_runtime::telemetry::init(rill_runtime::telemetry::TelemetryConfig {
+        let handles = rhei_runtime::telemetry::init(rhei_runtime::telemetry::TelemetryConfig {
             metrics_addr: None,
             log_filter: log_level,
             json_logs: false,
@@ -151,7 +151,7 @@ fn cmd_run_tui(log_level: String, workers: usize) -> anyhow::Result<()> {
         let log_rx = handles.log_rx.expect("TUI mode should provide log_rx");
 
         // Build the logical plan for the demo pipeline
-        let plan = rill_core::graph::StreamGraph::new()
+        let plan = rhei_core::graph::StreamGraph::new()
             .source("SensorSource")
             .filter("RangeFilter")
             .key_by("BySensorId")
@@ -204,9 +204,9 @@ fn cmd_attach(addr: String) -> anyhow::Result<()> {
         }
 
         let (metrics_tx, metrics_rx) =
-            tokio::sync::watch::channel(rill_runtime::metrics_snapshot::MetricsSnapshot::default());
+            tokio::sync::watch::channel(rhei_runtime::metrics_snapshot::MetricsSnapshot::default());
         let (log_tx, log_rx) =
-            tokio::sync::mpsc::channel::<rill_runtime::tracing_capture::LogEntry>(1000);
+            tokio::sync::mpsc::channel::<rhei_runtime::tracing_capture::LogEntry>(1000);
 
         // Spawn metrics poller: every 500ms, GET /api/metrics
         let metrics_client = client.clone();
@@ -219,7 +219,7 @@ fn cmd_attach(addr: String) -> anyhow::Result<()> {
                     continue;
                 };
                 if let Ok(snapshot) = resp
-                    .json::<rill_runtime::metrics_snapshot::MetricsSnapshot>()
+                    .json::<rhei_runtime::metrics_snapshot::MetricsSnapshot>()
                     .await
                     && metrics_tx.send(snapshot).is_err()
                 {
@@ -241,7 +241,7 @@ fn cmd_attach(addr: String) -> anyhow::Result<()> {
                     continue;
                 };
                 let Ok(entries) = resp
-                    .json::<Vec<rill_runtime::http_server::ApiLogEntry>>()
+                    .json::<Vec<rhei_runtime::http_server::ApiLogEntry>>()
                     .await
                 else {
                     continue;
@@ -266,8 +266,8 @@ fn cmd_attach(addr: String) -> anyhow::Result<()> {
 
 /// Convert an [`ApiLogEntry`] to a [`LogEntry`] for the TUI.
 fn api_log_to_log_entry(
-    api: &rill_runtime::http_server::ApiLogEntry,
-) -> rill_runtime::tracing_capture::LogEntry {
+    api: &rhei_runtime::http_server::ApiLogEntry,
+) -> rhei_runtime::tracing_capture::LogEntry {
     let level = match api.level.as_str() {
         "ERROR" => tracing::Level::ERROR,
         "WARN" => tracing::Level::WARN,
@@ -276,7 +276,7 @@ fn api_log_to_log_entry(
         _ => tracing::Level::INFO,
     };
     let timestamp = UNIX_EPOCH + Duration::from_millis(api.timestamp_ms);
-    rill_runtime::tracing_capture::LogEntry {
+    rhei_runtime::tracing_capture::LogEntry {
         timestamp,
         level,
         target: api.target.clone(),
@@ -295,10 +295,10 @@ async fn run_demo_pipeline(workers: usize) -> anyhow::Result<()> {
     use std::marker::PhantomData;
 
     use async_trait::async_trait;
-    use rill_core::operators::{Avg, TumblingWindow, WindowOutput};
-    use rill_core::traits::{Sink, Source};
-    use rill_runtime::dataflow::DataflowGraph;
-    use rill_runtime::executor::Executor;
+    use rhei_core::operators::{Avg, TumblingWindow, WindowOutput};
+    use rhei_core::traits::{Sink, Source};
+    use rhei_runtime::dataflow::DataflowGraph;
+    use rhei_runtime::executor::Executor;
     use serde::{Deserialize, Serialize};
 
     #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -364,7 +364,7 @@ async fn run_demo_pipeline(workers: usize) -> anyhow::Result<()> {
         }
     }
 
-    let dir = std::env::temp_dir().join("rill_tui_demo");
+    let dir = std::env::temp_dir().join("rhei_tui_demo");
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir)?;
 

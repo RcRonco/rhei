@@ -84,11 +84,11 @@ sequenceDiagram
 
 ```mermaid
 graph LR
-    subgraph rill-core
+    subgraph rhei-core
         CM[CheckpointManifest<br/>save/load/remote]
     end
 
-    subgraph rill-runtime
+    subgraph rhei-runtime
         CC[checkpoint_coord.rs<br/>Coordinator + Participant]
         CT[controller.rs<br/>CheckpointTaskConfig<br/>run_checkpoint_task]
         WS[worker.rs<br/>WorkerSet<br/>checkpoint_notify channel]
@@ -138,12 +138,12 @@ Process 0 polls for partial manifests from all processes in a loop. Rejected: re
 
 | File | Change |
 |------|--------|
-| `rill-runtime/src/checkpoint_coord.rs` | New: coordinator + participant protocol |
-| `rill-runtime/src/controller.rs` | Prefix fix, remote state config, mid-execution checkpoint task, coordinator integration |
-| `rill-runtime/src/worker.rs` | Channel `()` -> `u64`, `std::sync::mpsc` -> `tokio::sync::mpsc` |
-| `rill-runtime/src/executor.rs` | Forward epoch from `try_checkpoint` |
-| `rill-runtime/src/timely_operator.rs` | `maybe_checkpoint` returns `Option<u64>` |
-| `rill-runtime/src/lib.rs` | Register `checkpoint_coord` module |
-| `rill-core/src/checkpoint.rs` | `save_to_object_store` / `load_from_object_store` |
-| `rill-runtime/tests/checkpoint_coord_e2e.rs` | New: cross-process coordination E2E |
+| `rhei-runtime/src/checkpoint_coord.rs` | New: coordinator + participant protocol |
+| `rhei-runtime/src/controller.rs` | Prefix fix, remote state config, mid-execution checkpoint task, coordinator integration |
+| `rhei-runtime/src/worker.rs` | Channel `()` -> `u64`, `std::sync::mpsc` -> `tokio::sync::mpsc` |
+| `rhei-runtime/src/executor.rs` | Forward epoch from `try_checkpoint` |
+| `rhei-runtime/src/timely_operator.rs` | `maybe_checkpoint` returns `Option<u64>` |
+| `rhei-runtime/src/lib.rs` | Register `checkpoint_coord` module |
+| `rhei-core/src/checkpoint.rs` | `save_to_object_store` / `load_from_object_store` |
+| `rhei-runtime/tests/checkpoint_coord_e2e.rs` | New: cross-process coordination E2E |
 | `ROADMAP.md` | Mark Phase 2 items complete |

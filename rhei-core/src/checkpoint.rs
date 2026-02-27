@@ -142,7 +142,7 @@ mod tests {
 
     #[test]
     fn round_trip() {
-        let dir = std::env::temp_dir().join(format!("rill_manifest_rt_{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("rhei_manifest_rt_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
 
         let manifest = CheckpointManifest {
@@ -167,14 +167,14 @@ mod tests {
 
     #[test]
     fn load_missing_returns_none() {
-        let dir = std::env::temp_dir().join("rill_manifest_missing");
+        let dir = std::env::temp_dir().join("rhei_manifest_missing");
         assert!(CheckpointManifest::load(&dir).is_none());
     }
 
     #[test]
     fn partial_save_load_round_trip() {
         let dir =
-            std::env::temp_dir().join(format!("rill_manifest_partial_{}", std::process::id()));
+            std::env::temp_dir().join(format!("rhei_manifest_partial_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
 
         let manifest = CheckpointManifest {
@@ -198,7 +198,7 @@ mod tests {
 
     #[test]
     fn merge_partials_combines_offsets() {
-        let dir = std::env::temp_dir().join(format!("rill_manifest_merge_{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("rhei_manifest_merge_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
 
         let p0 = CheckpointManifest {
@@ -239,7 +239,7 @@ mod tests {
     #[test]
     fn merge_partials_returns_none_when_incomplete() {
         let dir =
-            std::env::temp_dir().join(format!("rill_manifest_merge_inc_{}", std::process::id()));
+            std::env::temp_dir().join(format!("rhei_manifest_merge_inc_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
 
         let p0 = CheckpointManifest {

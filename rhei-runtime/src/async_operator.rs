@@ -3,8 +3,8 @@ use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll, Wake, Waker};
 
-use rill_core::state::context::StateContext;
-use rill_core::traits::StreamFunction;
+use rhei_core::state::context::StateContext;
+use rhei_core::traits::StreamFunction;
 
 use crate::stash::Stash;
 
@@ -194,7 +194,7 @@ impl<F: StreamFunction + 'static> AsyncOperator<F> {
 mod tests {
     use super::*;
     use async_trait::async_trait;
-    use rill_core::state::local_backend::LocalBackend;
+    use rhei_core::state::local_backend::LocalBackend;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -215,7 +215,7 @@ mod tests {
     }
 
     fn temp_path(name: &str) -> std::path::PathBuf {
-        std::env::temp_dir().join(format!("rill_async_op_{name}_{}", std::process::id()))
+        std::env::temp_dir().join(format!("rhei_async_op_{name}_{}", std::process::id()))
     }
 
     #[test]

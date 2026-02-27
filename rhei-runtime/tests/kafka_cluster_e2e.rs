@@ -30,15 +30,15 @@ use std::time::Duration;
 use rdkafka::ClientConfig;
 use rdkafka::admin::{AdminClient, AdminOptions, NewTopic, TopicReplication};
 use rdkafka::producer::{FutureProducer, FutureRecord};
-use rill_core::connectors::file_sink::FileSink;
-use rill_core::connectors::kafka::source::KafkaSource;
-use rill_core::connectors::kafka::types::KafkaMessage;
-use rill_core::operators::Sum;
-use rill_core::operators::temporal_join::{JoinSide, TemporalJoin};
-use rill_core::operators::tumbling_window::{TumblingWindow, WindowOutput};
-use rill_runtime::dataflow::DataflowGraph;
-use rill_runtime::executor::Executor;
-use rill_runtime::shutdown::ShutdownHandle;
+use rhei_core::connectors::file_sink::FileSink;
+use rhei_core::connectors::kafka::source::KafkaSource;
+use rhei_core::connectors::kafka::types::KafkaMessage;
+use rhei_core::operators::Sum;
+use rhei_core::operators::temporal_join::{JoinSide, TemporalJoin};
+use rhei_core::operators::tumbling_window::{TumblingWindow, WindowOutput};
+use rhei_runtime::dataflow::DataflowGraph;
+use rhei_runtime::executor::Executor;
+use rhei_runtime::shutdown::ShutdownHandle;
 use serde::{Deserialize, Serialize};
 
 // ── Domain types (same as kafka_e2e.rs) ─────────────────────────────
@@ -125,7 +125,7 @@ fn compute_expected_windows(orders: &[Order], window_size: u64) -> HashMap<(Stri
 
 fn unique_topic(prefix: &str) -> String {
     format!(
-        "rill_e2e_{prefix}_{}_{}",
+        "rhei_e2e_{prefix}_{}_{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -236,7 +236,7 @@ async fn orchestrator_main() {
     let output_p0 = output_dir.path().join("output_p0.jsonl");
     let output_p1 = output_dir.path().join("output_p1.jsonl");
     let checkpoint_dir = tempfile::tempdir().unwrap();
-    let group_id = format!("rill_cluster_e2e_group_{}", std::process::id());
+    let group_id = format!("rhei_cluster_e2e_group_{}", std::process::id());
 
     // ── Spawn 2 child processes ─────────────────────────────────────
     let test_exe = std::env::current_exe().expect("failed to get current exe");
@@ -374,7 +374,7 @@ async fn orchestrator_main() {
     );
 
     // 7. Checkpoint manifests exist
-    let manifest = rill_core::checkpoint::CheckpointManifest::load(checkpoint_dir.path());
+    let manifest = rhei_core::checkpoint::CheckpointManifest::load(checkpoint_dir.path());
     if let Some(m) = manifest {
         eprintln!(
             "checkpoint manifest: id={}, offsets={}",

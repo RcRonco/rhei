@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
-use rill_core::state::context::StateContext;
-use rill_core::traits::StreamFunction;
+use rhei_core::state::context::StateContext;
+use rhei_core::traits::StreamFunction;
 
 use crate::async_operator::AsyncOperator;
 use crate::dataflow::{AnyItem, ErasedOperator};

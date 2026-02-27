@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use rill_core::traits::{Sink, Source};
+use rhei_core::traits::{Sink, Source};
 
 use crate::dataflow::{AnyItem, ErasedSource};
 use crate::shutdown::ShutdownHandle;

@@ -5,13 +5,13 @@
 //! When a reading's timestamp crosses into a new window, the previous
 //! window's average is emitted.
 //!
-//! Run with: `cargo run -p rill-runtime --example window_agg`
+//! Run with: `cargo run -p rhei-runtime --example window_agg`
 
-use rill_core::connectors::print_sink::PrintSink;
-use rill_core::connectors::vec_source::VecSource;
-use rill_core::operators::{Avg, TumblingWindow, WindowOutput};
-use rill_runtime::dataflow::DataflowGraph;
-use rill_runtime::executor::Executor;
+use rhei_core::connectors::print_sink::PrintSink;
+use rhei_core::connectors::vec_source::VecSource;
+use rhei_core::operators::{Avg, TumblingWindow, WindowOutput};
+use rhei_runtime::dataflow::DataflowGraph;
+use rhei_runtime::executor::Executor;
 use serde::{Deserialize, Serialize};
 
 /// A single sensor reading with a logical timestamp.
@@ -24,7 +24,7 @@ struct SensorReading {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let dir = std::env::temp_dir().join("rill_window_agg_example");
+    let dir = std::env::temp_dir().join("rhei_window_agg_example");
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir)?;
 

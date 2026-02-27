@@ -25,15 +25,15 @@ use std::time::Duration;
 use rdkafka::ClientConfig;
 use rdkafka::admin::{AdminClient, AdminOptions, NewTopic, TopicReplication};
 use rdkafka::producer::{FutureProducer, FutureRecord};
-use rill_core::connectors::file_sink::FileSink;
-use rill_core::connectors::kafka::source::KafkaSource;
-use rill_core::connectors::kafka::types::KafkaMessage;
-use rill_core::operators::Sum;
-use rill_core::operators::temporal_join::{JoinSide, TemporalJoin};
-use rill_core::operators::tumbling_window::{TumblingWindow, WindowOutput};
-use rill_runtime::dataflow::DataflowGraph;
-use rill_runtime::executor::Executor;
-use rill_runtime::shutdown::ShutdownHandle;
+use rhei_core::connectors::file_sink::FileSink;
+use rhei_core::connectors::kafka::source::KafkaSource;
+use rhei_core::connectors::kafka::types::KafkaMessage;
+use rhei_core::operators::Sum;
+use rhei_core::operators::temporal_join::{JoinSide, TemporalJoin};
+use rhei_core::operators::tumbling_window::{TumblingWindow, WindowOutput};
+use rhei_runtime::dataflow::DataflowGraph;
+use rhei_runtime::executor::Executor;
+use rhei_runtime::shutdown::ShutdownHandle;
 use serde::{Deserialize, Serialize};
 
 // ── Domain types ────────────────────────────────────────────────────
@@ -141,7 +141,7 @@ fn compute_expected_windows(orders: &[Order], window_size: u64) -> HashMap<(Stri
 
 fn unique_topic(prefix: &str) -> String {
     format!(
-        "rill_e2e_{prefix}_{}_{}",
+        "rhei_e2e_{prefix}_{}_{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -226,7 +226,7 @@ async fn kafka_join_window_e2e() {
     let output_path = output_dir.path().join("output.jsonl");
     let checkpoint_dir = tempfile::tempdir().unwrap();
 
-    let group_id = format!("rill_e2e_group_{}", std::process::id());
+    let group_id = format!("rhei_e2e_group_{}", std::process::id());
     let source = KafkaSource::new(&brokers(), &group_id, &[&orders_topic, &payments_topic])
         .unwrap()
         .with_batch_size(50)
@@ -418,7 +418,7 @@ async fn kafka_multi_partition_e2e() {
     let output_path = output_dir.path().join("output.jsonl");
     let checkpoint_dir = tempfile::tempdir().unwrap();
 
-    let group_id = format!("rill_e2e_mp_group_{}", std::process::id());
+    let group_id = format!("rhei_e2e_mp_group_{}", std::process::id());
     let source = KafkaSource::new(&brokers(), &group_id, &[&orders_topic, &payments_topic])
         .unwrap()
         .with_batch_size(50)
@@ -550,7 +550,7 @@ async fn kafka_multi_partition_e2e() {
     );
 
     // Verify checkpoint manifest has partition-level offsets.
-    let manifest = rill_core::checkpoint::CheckpointManifest::load(checkpoint_dir.path());
+    let manifest = rhei_core::checkpoint::CheckpointManifest::load(checkpoint_dir.path());
     if let Some(m) = manifest {
         assert!(
             !m.source_offsets.is_empty(),

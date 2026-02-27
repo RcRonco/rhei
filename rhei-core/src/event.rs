@@ -79,7 +79,7 @@ mod tests {
     #[test]
     fn bincode_roundtrip() {
         let wc = WordCount {
-            word: "rill".into(),
+            word: "rhei".into(),
             count: 7,
         };
         let bytes = to_bincode(&wc).unwrap();

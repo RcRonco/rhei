@@ -8,18 +8,18 @@
 //! kafka-topics.sh --create --topic input-topic --bootstrap-server localhost:9092
 //! kafka-topics.sh --create --topic output-topic --bootstrap-server localhost:9092
 //! echo "hello world" | kafka-console-producer.sh --topic input-topic --bootstrap-server localhost:9092
-//! cargo run -p rill-runtime --example kafka_transform --features kafka
+//! cargo run -p rhei-runtime --example kafka_transform --features kafka
 //! kafka-console-consumer.sh --topic output-topic --from-beginning --bootstrap-server localhost:9092
 //! ```
 
 use async_trait::async_trait;
-use rill_core::connectors::kafka::sink::KafkaSink;
-use rill_core::connectors::kafka::source::KafkaSource;
-use rill_core::connectors::kafka::types::{KafkaMessage, KafkaRecord};
-use rill_core::state::context::StateContext;
-use rill_core::traits::StreamFunction;
-use rill_runtime::dataflow::DataflowGraph;
-use rill_runtime::executor::Executor;
+use rhei_core::connectors::kafka::sink::KafkaSink;
+use rhei_core::connectors::kafka::source::KafkaSource;
+use rhei_core::connectors::kafka::types::{KafkaMessage, KafkaRecord};
+use rhei_core::state::context::StateContext;
+use rhei_core::traits::StreamFunction;
+use rhei_runtime::dataflow::DataflowGraph;
+use rhei_runtime::executor::Executor;
 
 /// Uppercases Kafka message payloads.
 #[derive(Clone)]
@@ -47,12 +47,12 @@ impl StreamFunction for Uppercase {
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt().with_env_filter("info").init();
 
-    let dir = std::env::temp_dir().join("rill_kafka_transform_example");
+    let dir = std::env::temp_dir().join("rhei_kafka_transform_example");
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir)?;
 
     let source =
-        KafkaSource::new("localhost:9092", "rill-example", &["input-topic"])?.with_batch_size(100);
+        KafkaSource::new("localhost:9092", "rhei-example", &["input-topic"])?.with_batch_size(100);
     let sink = KafkaSink::new("localhost:9092", "output-topic")?.with_buffer_capacity(100);
 
     let graph = DataflowGraph::new();

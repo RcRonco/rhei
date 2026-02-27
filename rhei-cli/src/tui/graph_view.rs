@@ -6,7 +6,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 
-use rill_core::graph::{LogicalPlan, NodeKind};
+use rhei_core::graph::{LogicalPlan, NodeKind};
 
 /// Returns the display color for a given node kind.
 fn node_color(kind: &NodeKind) -> Color {

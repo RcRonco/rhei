@@ -3,16 +3,16 @@
 //! Demonstrates `Stream`, `KeyedStream`, and stateful operators with
 //! automatic per-worker state context creation.
 //!
-//! Run with: `cargo run -p rill-runtime --example word_count`
+//! Run with: `cargo run -p rhei-runtime --example word_count`
 
 use async_trait::async_trait;
-use rill_core::connectors::print_sink::PrintSink;
-use rill_core::connectors::vec_source::VecSource;
-use rill_core::operators::KeyedState;
-use rill_core::state::context::StateContext;
-use rill_core::traits::StreamFunction;
-use rill_runtime::dataflow::{DataflowGraph, TransformContext};
-use rill_runtime::executor::Executor;
+use rhei_core::connectors::print_sink::PrintSink;
+use rhei_core::connectors::vec_source::VecSource;
+use rhei_core::operators::KeyedState;
+use rhei_core::state::context::StateContext;
+use rhei_core::traits::StreamFunction;
+use rhei_runtime::dataflow::{DataflowGraph, TransformContext};
+use rhei_runtime::executor::Executor;
 
 /// A stateful word-count operator using [`KeyedState`] for typed state access.
 ///
@@ -48,14 +48,14 @@ impl StreamFunction for WordCounter {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let dir = std::env::temp_dir().join("rill_word_count_example");
+    let dir = std::env::temp_dir().join("rhei_word_count_example");
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir)?;
 
     let lines = vec![
         "hello world".to_string(),
-        "hello rill".to_string(),
-        "rill is a stream processor".to_string(),
+        "hello rhei".to_string(),
+        "rhei is a stream processor".to_string(),
         "hello world again".to_string(),
     ];
 

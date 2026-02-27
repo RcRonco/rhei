@@ -6,7 +6,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 
-use rill_runtime::metrics_snapshot::MetricsSnapshot;
+use rhei_runtime::metrics_snapshot::MetricsSnapshot;
 
 /// Format a `Duration` as `HH:MM:SS`.
 fn format_uptime(d: std::time::Duration) -> String {

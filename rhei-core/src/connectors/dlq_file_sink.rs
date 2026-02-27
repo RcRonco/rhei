@@ -77,7 +77,7 @@ mod tests {
 
     #[test]
     fn writes_and_reads_records() {
-        let dir = std::env::temp_dir().join(format!("rill_dlq_test_{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("rhei_dlq_test_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("dlq.jsonl");
@@ -102,7 +102,7 @@ mod tests {
 
     #[tokio::test]
     async fn sink_trait_write_and_flush() {
-        let dir = std::env::temp_dir().join(format!("rill_dlq_sink_trait_{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("rhei_dlq_sink_trait_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("dlq_sink.jsonl");

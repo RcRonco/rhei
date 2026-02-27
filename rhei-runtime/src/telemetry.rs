@@ -18,7 +18,7 @@ pub struct TelemetryConfig {
     /// If set, start an HTTP server on this address with `/healthz`, `/readyz`,
     /// and `/metrics` endpoints.
     pub metrics_addr: Option<SocketAddr>,
-    /// `tracing` env-filter string (e.g. `"info"`, `"rill_core=debug"`).
+    /// `tracing` env-filter string (e.g. `"info"`, `"rhei_core=debug"`).
     pub log_filter: String,
     /// Emit logs as JSON instead of human-readable format.
     pub json_logs: bool,

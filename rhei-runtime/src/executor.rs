@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use rill_core::state::context::StateContext;
+use rhei_core::state::context::StateContext;
 use timely::communication::Allocate;
 use timely::dataflow::operators::probe;
 use timely::dataflow::scopes::Child;
@@ -557,7 +557,7 @@ fn route_errors_to_dlq(
         );
         metrics::counter!("dlq_items_total").increment(1);
         if let Some(dlq) = dlq {
-            let record = rill_core::dlq::DeadLetterRecord {
+            let record = rhei_core::dlq::DeadLetterRecord {
                 input_repr: input_repr.to_owned(),
                 operator_name: op_name.to_owned(),
                 error: e.to_string(),

@@ -21,7 +21,7 @@ pub struct TieredBackendConfig {
 impl Default for TieredBackendConfig {
     fn default() -> Self {
         Self {
-            foyer_dir: PathBuf::from("/tmp/rill-foyer"),
+            foyer_dir: PathBuf::from("/tmp/rhei-foyer"),
             foyer_memory_capacity: 64 * 1024 * 1024,
             foyer_disk_capacity: 256 * 1024 * 1024,
         }

@@ -6,13 +6,13 @@
 
 use std::sync::Arc;
 
-use rill_core::checkpoint::CheckpointManifest;
-use rill_core::dlq::ErrorPolicy;
-use rill_core::state::context::StateContext;
-use rill_core::state::local_backend::LocalBackend;
-use rill_core::state::prefixed_backend::PrefixedBackend;
-use rill_core::state::slatedb_backend::SlateDbBackend;
-use rill_core::state::tiered_backend::{TieredBackend, TieredBackendConfig};
+use rhei_core::checkpoint::CheckpointManifest;
+use rhei_core::dlq::ErrorPolicy;
+use rhei_core::state::context::StateContext;
+use rhei_core::state::local_backend::LocalBackend;
+use rhei_core::state::prefixed_backend::PrefixedBackend;
+use rhei_core::state::slatedb_backend::SlateDbBackend;
+use rhei_core::state::tiered_backend::{TieredBackend, TieredBackendConfig};
 
 use crate::compiler::compile_graph;
 use crate::dataflow::DataflowGraph;
@@ -46,7 +46,7 @@ pub(crate) struct TieredStorageConfig {
 pub struct RemoteStateConfig {
     /// Bucket (S3/GCS) or container (Azure Blob) name.
     pub bucket: String,
-    /// Key prefix inside the bucket/container (e.g. `"rill/state/"`).
+    /// Key prefix inside the bucket/container (e.g. `"rhei/state/"`).
     pub prefix: String,
     /// Custom endpoint URL (for MinIO, Azurite, fake-gcs-server, etc.).
     pub endpoint: Option<String>,
@@ -741,9 +741,9 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use async_trait::async_trait;
-    use rill_core::connectors::vec_source::VecSource;
-    use rill_core::state::context::StateContext;
-    use rill_core::traits::{Sink, StreamFunction};
+    use rhei_core::connectors::vec_source::VecSource;
+    use rhei_core::state::context::StateContext;
+    use rhei_core::traits::{Sink, StreamFunction};
 
     use crate::dataflow::DataflowGraph;
 
@@ -762,7 +762,7 @@ mod tests {
     }
 
     fn temp_dir(name: &str) -> std::path::PathBuf {
-        std::env::temp_dir().join(format!("rill_dataflow_{name}_{}", std::process::id()))
+        std::env::temp_dir().join(format!("rhei_dataflow_{name}_{}", std::process::id()))
     }
 
     #[tokio::test]
@@ -895,7 +895,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
 
         let graph = DataflowGraph::new();
-        let source = VecSource::new(vec!["hello world".to_string(), "hello rill".to_string()]);
+        let source = VecSource::new(vec!["hello world".to_string(), "hello rhei".to_string()]);
         let collected = Arc::new(Mutex::new(Vec::new()));
 
         let stream = graph.source(source);
@@ -910,11 +910,11 @@ mod tests {
         let controller = super::PipelineController::new(dir.clone());
         controller.run(graph).await.unwrap();
         let results = collected.lock().unwrap().clone();
-        assert_eq!(results.len(), 4); // hello, world, hello, rill
+        assert_eq!(results.len(), 4); // hello, world, hello, rhei
         assert!(results.contains(&"hello: 1".to_string()));
         assert!(results.contains(&"world: 1".to_string()));
         assert!(results.contains(&"hello: 2".to_string()));
-        assert!(results.contains(&"rill: 1".to_string()));
+        assert!(results.contains(&"rhei: 1".to_string()));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -925,7 +925,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
 
         let graph = DataflowGraph::new();
-        let source = VecSource::new(vec!["hello world".to_string(), "hello rill".to_string()]);
+        let source = VecSource::new(vec!["hello world".to_string(), "hello rhei".to_string()]);
         let collected = Arc::new(Mutex::new(Vec::new()));
 
         let stream = graph.source(source);
@@ -949,7 +949,7 @@ mod tests {
         assert!(results.contains(&"hello: 1".to_string()));
         assert!(results.contains(&"hello: 2".to_string()));
         assert!(results.contains(&"world: 1".to_string()));
-        assert!(results.contains(&"rill: 1".to_string()));
+        assert!(results.contains(&"rhei: 1".to_string()));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1118,7 +1118,7 @@ mod tests {
         let graph = DataflowGraph::new();
         let items: Vec<i32> = (0..20).collect();
         let source =
-            rill_core::connectors::partitioned_vec_source::PartitionedVecSource::new(items, 4);
+            rhei_core::connectors::partitioned_vec_source::PartitionedVecSource::new(items, 4);
         let collected = Arc::new(Mutex::new(Vec::new()));
 
         let stream = graph.source(source);
@@ -1146,12 +1146,12 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
 
         let graph = DataflowGraph::new();
-        let source = rill_core::connectors::partitioned_vec_source::PartitionedVecSource::new(
+        let source = rhei_core::connectors::partitioned_vec_source::PartitionedVecSource::new(
             vec![
                 "hello".to_string(),
                 "world".to_string(),
                 "hello".to_string(),
-                "rill".to_string(),
+                "rhei".to_string(),
                 "hello".to_string(),
                 "world".to_string(),
             ],
@@ -1179,7 +1179,7 @@ mod tests {
         assert!(results.contains(&"hello: 3".to_string()));
         assert!(results.contains(&"world: 1".to_string()));
         assert!(results.contains(&"world: 2".to_string()));
-        assert!(results.contains(&"rill: 1".to_string()));
+        assert!(results.contains(&"rhei: 1".to_string()));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1193,7 +1193,7 @@ mod tests {
         let graph = DataflowGraph::new();
         let items: Vec<i32> = (0..12).collect();
         let source =
-            rill_core::connectors::partitioned_vec_source::PartitionedVecSource::new(items, 4);
+            rhei_core::connectors::partitioned_vec_source::PartitionedVecSource::new(items, 4);
         let collected = Arc::new(Mutex::new(Vec::new()));
 
         let stream = graph.source(source);
@@ -1222,7 +1222,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
 
         let graph = DataflowGraph::new();
-        let source = rill_core::connectors::partitioned_vec_source::PartitionedVecSource::new(
+        let source = rhei_core::connectors::partitioned_vec_source::PartitionedVecSource::new(
             vec![1i32, 2, 3, 4, 5, 6, 7, 8],
             2,
         );
@@ -1285,7 +1285,7 @@ mod tests {
     }
 
     #[async_trait]
-    impl rill_core::traits::Source for CheckpointTrackingSource {
+    impl rhei_core::traits::Source for CheckpointTrackingSource {
         type Output = String;
 
         async fn next_batch(&mut self) -> Option<Vec<String>> {
@@ -1443,7 +1443,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
 
         let graph = DataflowGraph::new();
-        let source = VecSource::new(vec!["hello world".to_string(), "hello rill".to_string()]);
+        let source = VecSource::new(vec!["hello world".to_string(), "hello rhei".to_string()]);
         let collected = Arc::new(Mutex::new(Vec::new()));
 
         let stream = graph.source(source);
@@ -1483,7 +1483,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
 
         let graph = DataflowGraph::new();
-        let source = rill_core::connectors::partitioned_vec_source::PartitionedVecSource::new(
+        let source = rhei_core::connectors::partitioned_vec_source::PartitionedVecSource::new(
             vec![1i32, 2, 3, 4, 5, 6],
             1,
         );
@@ -1520,7 +1520,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
 
         let graph = DataflowGraph::new();
-        let source = rill_core::connectors::partitioned_vec_source::PartitionedVecSource::new(
+        let source = rhei_core::connectors::partitioned_vec_source::PartitionedVecSource::new(
             vec![10i32, 20, 30, 40],
             3,
         );
@@ -1550,7 +1550,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
 
         let graph = DataflowGraph::new();
-        let partitioned = rill_core::connectors::partitioned_vec_source::PartitionedVecSource::new(
+        let partitioned = rhei_core::connectors::partitioned_vec_source::PartitionedVecSource::new(
             vec![1i32, 2, 3, 4],
             2,
         );
@@ -1583,7 +1583,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
 
         let graph = DataflowGraph::new();
-        let source = rill_core::connectors::partitioned_vec_source::PartitionedVecSource::new(
+        let source = rhei_core::connectors::partitioned_vec_source::PartitionedVecSource::new(
             vec![1i32, 2, 3, 4, 5, 6],
             3,
         );

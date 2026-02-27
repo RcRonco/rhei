@@ -30,8 +30,8 @@ use std::marker::PhantomData;
 use std::sync::{Arc, LazyLock, RwLock};
 
 use async_trait::async_trait;
-use rill_core::state::context::StateContext;
-use rill_core::traits::{Sink, Source, StreamFunction};
+use rhei_core::state::context::StateContext;
+use rhei_core::traits::{Sink, Source, StreamFunction};
 
 // ── Cloneable type-erased wrapper ────────────────────────────────────
 

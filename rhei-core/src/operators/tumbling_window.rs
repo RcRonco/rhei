@@ -394,7 +394,7 @@ mod tests {
     use crate::time::FixedClockProvider;
 
     fn test_ctx(name: &str) -> StateContext {
-        let path = std::env::temp_dir().join(format!("rill_tw_test_{name}_{}", std::process::id()));
+        let path = std::env::temp_dir().join(format!("rhei_tw_test_{name}_{}", std::process::id()));
         let _ = std::fs::remove_file(&path);
         let backend = LocalBackend::new(path, None).unwrap();
         StateContext::new(Box::new(backend))
