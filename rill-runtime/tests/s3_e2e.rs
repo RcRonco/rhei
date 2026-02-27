@@ -1,4 +1,4 @@
-#![cfg(feature = "s3")]
+#![cfg(feature = "remote-state")]
 
 //! End-to-end S3 tiered storage test.
 //!

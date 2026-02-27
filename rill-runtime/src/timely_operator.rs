@@ -143,8 +143,12 @@ impl TimelyErasedOperator {
 
     /// Checkpoint state when frontier advances past last checkpoint epoch.
     ///
-    /// Returns `true` if a checkpoint was actually performed.
-    pub fn maybe_checkpoint(&mut self, frontier: &[u64], rt: &tokio::runtime::Handle) -> bool {
+    /// Returns `Some(epoch)` if a checkpoint was performed, `None` otherwise.
+    pub fn maybe_checkpoint(
+        &mut self,
+        frontier: &[u64],
+        rt: &tokio::runtime::Handle,
+    ) -> Option<u64> {
         let min_frontier = frontier.iter().copied().min();
 
         let should_checkpoint = match (min_frontier, self.last_checkpoint_epoch) {
@@ -160,9 +164,9 @@ impl TimelyErasedOperator {
             metrics::gauge!("executor_checkpoint_duration_seconds")
                 .set(ckpt_start.elapsed().as_secs_f64());
             self.last_checkpoint_epoch = min_frontier;
-            true
+            Some(min_frontier.unwrap_or(0))
         } else {
-            false
+            None
         }
     }
 

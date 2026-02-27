@@ -28,7 +28,7 @@ object_store = { workspace = true, features = ["aws"], optional = true }
 
 [features]
 kafka = ["rill-core/kafka", "dep:rdkafka"]
-s3 = ["dep:object_store"]
+remote-state = ["dep:object_store"]
 
 [lints]
 workspace = true
