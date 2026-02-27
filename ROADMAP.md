@@ -107,12 +107,16 @@
 - [x] Per-worker state contexts with frontier-based checkpointing
 - [x] `--workers <N>` CLI flag
 
-### Phase 2: Multi-process (in progress)
+### Phase 2: Multi-process (done)
 - [x] Controller / Worker / Executor split (`PipelineController` → `WorkerSet` → `execute_dag`)
 - [x] `TimelyCompiler` struct for per-worker DAG construction
-- [ ] Multi-process Timely cluster with TCP communication
-- [ ] Distributed state backend (shared SlateDB or S3-backed object store)
-- [ ] Coordinated checkpointing across workers (Chandy-Lamport style)
+- [x] Multi-process Timely cluster with TCP communication
+- [x] Remote state configuration (`RemoteStateConfig` + env vars for distributed SlateDB)
+- [x] Remote checkpoint manifest storage (`save_to_object_store` / `load_from_object_store`)
+- [x] Coordinated checkpointing across processes (out-of-band TCP protocol)
+- [x] Mid-execution checkpoint task (write manifests during DAG execution, not just at end)
+- [x] State key prefix fix (`p{pid}/w{idx}/{op}` matching CLUSTERING.md spec)
+- [x] Epoch-carrying checkpoint channel (`u64` epoch instead of `()`)
 
 ### Phase 3: Dynamic control plane (chitchat + OpenRaft)
 - [ ] `PipelineController::reconfigure()` — update topology at runtime (new peers, worker count)

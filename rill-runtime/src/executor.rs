@@ -196,7 +196,7 @@ pub(crate) struct TimelyCompiler {
     rt: tokio::runtime::Handle,
     worker_index: usize,
     num_workers: usize,
-    checkpoint_notify: Option<std::sync::mpsc::Sender<()>>,
+    checkpoint_notify: Option<tokio::sync::mpsc::Sender<u64>>,
     dlq_tx: Option<DlqSender>,
     last_operator_id: Option<NodeId>,
     global_watermark: Arc<AtomicU64>,
@@ -481,10 +481,11 @@ impl TimelyCompiler {
                     }
 
                     let frontier_vec: Vec<u64> = frontier.frontier().iter().copied().collect();
-                    if try_checkpoint(&mut timely_op, &frontier_vec, &rt, is_last_op, worker_index)
+                    if let Some(epoch) =
+                        try_checkpoint(&mut timely_op, &frontier_vec, &rt, is_last_op, worker_index)
                         && let Some(ref n) = notify
                     {
-                        let _ = n.send(());
+                        let _ = n.blocking_send(epoch);
                     }
                 }
             },
@@ -609,16 +610,20 @@ fn advance_watermark(
     }
 }
 
-/// Run checkpoint and return whether to send a notification.
+/// Run checkpoint and return `Some(epoch)` when worker 0's last operator checkpoints.
 fn try_checkpoint(
     timely_op: &mut TimelyErasedOperator,
     frontier_vec: &[u64],
     rt: &tokio::runtime::Handle,
     is_last_op: bool,
     worker_index: usize,
-) -> bool {
-    let did_checkpoint = timely_op.maybe_checkpoint(frontier_vec, rt);
-    is_last_op && did_checkpoint && worker_index == 0
+) -> Option<u64> {
+    let epoch = timely_op.maybe_checkpoint(frontier_vec, rt);
+    if is_last_op && worker_index == 0 {
+        epoch
+    } else {
+        None
+    }
 }
 
 #[cfg(test)]

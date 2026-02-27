@@ -36,6 +36,26 @@ pub(crate) struct TieredStorageConfig {
     pub foyer_config: TieredBackendConfig,
 }
 
+/// Configuration for remote object-store-backed distributed state.
+///
+/// When set, all processes independently open `SlateDB` pointing at the same
+/// remote bucket/container, enabling shared durable state across a cluster.
+/// Supports S3, Azure Blob Storage, and GCS via the `object_store` crate.
+#[cfg(feature = "remote-state")]
+#[derive(Debug, Clone)]
+pub struct RemoteStateConfig {
+    /// Bucket (S3/GCS) or container (Azure Blob) name.
+    pub bucket: String,
+    /// Key prefix inside the bucket/container (e.g. `"rill/state/"`).
+    pub prefix: String,
+    /// Custom endpoint URL (for MinIO, Azurite, fake-gcs-server, etc.).
+    pub endpoint: Option<String>,
+    /// Cloud region (when applicable).
+    pub region: String,
+    /// Allow plain HTTP (for local development backends).
+    pub allow_http: bool,
+}
+
 /// Materializes a [`DataflowGraph`] into an executable pipeline.
 ///
 /// Use [`PipelineController::builder()`] to configure execution parameters, build the
@@ -52,6 +72,9 @@ pub struct PipelineController {
     pub(crate) process_id: Option<usize>,
     /// Peer addresses for multi-process cluster mode (`None` = single-process).
     pub(crate) peers: Option<Vec<String>>,
+    /// S3 state configuration for distributed state backend.
+    #[cfg(feature = "remote-state")]
+    pub(crate) remote_state: Option<RemoteStateConfig>,
 }
 
 /// Builder for [`PipelineController`].
@@ -65,6 +88,8 @@ pub struct PipelineControllerBuilder {
     health: HealthState,
     process_id: Option<usize>,
     peers: Option<Vec<String>>,
+    #[cfg(feature = "remote-state")]
+    remote_state: Option<RemoteStateConfig>,
 }
 
 impl PipelineControllerBuilder {
@@ -115,11 +140,24 @@ impl PipelineControllerBuilder {
         self
     }
 
+    /// Configure remote object-store-backed distributed state.
+    ///
+    /// Each process independently opens `SlateDB` at the same remote path,
+    /// enabling shared durable state across the cluster. Supports S3, Azure
+    /// Blob, and GCS.
+    #[cfg(feature = "remote-state")]
+    pub fn remote_state(mut self, config: RemoteStateConfig) -> Self {
+        self.remote_state = Some(config);
+        self
+    }
+
     /// Read cluster configuration from environment variables.
     ///
     /// - `RILL_WORKERS`: number of worker threads (overrides `.workers()`)
     /// - `RILL_PROCESS_ID`: process ID for cluster mode
     /// - `RILL_PEERS`: comma-separated peer addresses for cluster mode
+    /// - `RILL_REMOTE_BUCKET`, `RILL_REMOTE_PREFIX`, `RILL_REMOTE_ENDPOINT`,
+    ///   `RILL_REMOTE_REGION`, `RILL_REMOTE_ALLOW_HTTP`: remote state config
     pub fn from_env(mut self) -> Self {
         if let Ok(val) = std::env::var("RILL_WORKERS")
             && let Ok(n) = val.parse::<usize>()
@@ -136,6 +174,19 @@ impl PipelineControllerBuilder {
             if !peers.is_empty() {
                 self.peers = Some(peers);
             }
+        }
+        #[cfg(feature = "remote-state")]
+        if let Ok(bucket) = std::env::var("RILL_REMOTE_BUCKET") {
+            self.remote_state = Some(RemoteStateConfig {
+                bucket,
+                prefix: std::env::var("RILL_REMOTE_PREFIX").unwrap_or_default(),
+                endpoint: std::env::var("RILL_REMOTE_ENDPOINT").ok(),
+                region: std::env::var("RILL_REMOTE_REGION")
+                    .unwrap_or_else(|_| "us-east-1".to_string()),
+                allow_http: std::env::var("RILL_REMOTE_ALLOW_HTTP")
+                    .map(|v| v == "1" || v == "true")
+                    .unwrap_or(false),
+            });
         }
         self
     }
@@ -161,6 +212,8 @@ impl PipelineControllerBuilder {
             health: self.health,
             process_id: self.process_id,
             peers: self.peers,
+            #[cfg(feature = "remote-state")]
+            remote_state: self.remote_state,
         }
     }
 }
@@ -177,6 +230,8 @@ impl PipelineController {
             health: HealthState::new(),
             process_id: None,
             peers: None,
+            #[cfg(feature = "remote-state")]
+            remote_state: None,
         }
     }
 
@@ -193,6 +248,8 @@ impl PipelineController {
             health: HealthState::new(),
             process_id: None,
             peers: None,
+            #[cfg(feature = "remote-state")]
+            remote_state: None,
         }
     }
 
@@ -315,14 +372,14 @@ impl PipelineController {
     /// In single-process mode the context is namespaced as
     /// `{operator_name}_w{worker_index}`.
     /// In cluster mode it includes the process ID:
-    /// `p{process_id}_w{worker_index}_{operator_name}`.
+    /// `p{process_id}/w{worker_index}/{operator_name}`.
     pub async fn create_context_for_worker(
         &self,
         operator_name: &str,
         worker_index: usize,
     ) -> anyhow::Result<StateContext> {
         let namespaced = if let Some(pid) = self.process_id {
-            format!("p{pid}_w{worker_index}_{operator_name}")
+            format!("p{pid}/w{worker_index}/{operator_name}")
         } else {
             format!("{operator_name}_w{worker_index}")
         };
@@ -426,27 +483,105 @@ async fn execute_compiled(
 
     let worker_set = WorkerSet::build(graph, controller, shutdown, &rt, restored_offsets).await?;
 
+    // ── Checkpoint coordination setup ──────────────────────────────────
+    // In cluster mode, set up TCP-based cross-process coordination.
+    // Process 0 runs the coordinator; all processes create participants.
+    let mut coord_task_handle: Option<tokio::task::JoinHandle<anyhow::Result<()>>> = None;
+    let coordination: Option<CheckpointCoordination> = if controller.is_cluster() {
+        let peers = controller.peers.as_ref().unwrap();
+        let pid = controller.process_id().unwrap();
+        let n_processes = peers.len();
+        let coord_port = crate::checkpoint_coord::coordination_port(peers);
+        let coord_addr = format!("127.0.0.1:{coord_port}");
+
+        if pid == 0 {
+            // Process 0: run coordinator + use local channels for self-participation.
+            let (coordinator, channels, local_part) =
+                crate::checkpoint_coord::setup_coordinator_full(&coord_addr, n_processes).await?;
+
+            coord_task_handle = Some(tokio::spawn(async move {
+                coordinator
+                    .run(channels.ready_rx, channels.committed_tx)
+                    .await
+            }));
+
+            Some(CheckpointCoordination::Local(local_part))
+        } else {
+            // Non-zero processes: connect as TCP participant.
+            // Retry connection to coordinator with backoff.
+            let mut participant = None;
+            for attempt in 0..20 {
+                match crate::checkpoint_coord::CheckpointParticipant::connect(&coord_addr, pid)
+                    .await
+                {
+                    Ok(p) => {
+                        participant = Some(p);
+                        break;
+                    }
+                    Err(e) => {
+                        if attempt < 19 {
+                            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                        } else {
+                            return Err(anyhow::anyhow!(
+                                "failed to connect to checkpoint coordinator at {coord_addr}: {e}"
+                            ));
+                        }
+                    }
+                }
+            }
+            Some(CheckpointCoordination::Remote(participant.unwrap()))
+        }
+    } else {
+        None
+    };
+
+    // Spawn a mid-execution checkpoint management task that writes manifests
+    // as checkpoints complete during DAG execution (not just at the end).
+    let checkpoint_rx = worker_set.take_checkpoint_rx().await;
+    let ckpt_all_source_offsets = worker_set.source_offset_handles();
+    let ckpt_operator_names = worker_set.all_operator_names.clone();
+    let ckpt_dir = controller.checkpoint_dir.clone();
+    let ckpt_process_id = controller.process_id();
+    let ckpt_n_processes = controller.peers.as_ref().map_or(1, Vec::len);
+
+    let ckpt_config = CheckpointTaskConfig {
+        initial_checkpoint_id,
+        all_source_offsets: ckpt_all_source_offsets,
+        operator_names: ckpt_operator_names,
+        checkpoint_dir: ckpt_dir,
+        process_id: ckpt_process_id,
+        n_processes: ckpt_n_processes,
+    };
+
+    let checkpoint_task =
+        tokio::spawn(
+            async move { run_checkpoint_task(checkpoint_rx, ckpt_config, coordination).await },
+        );
+
     let timely_config = controller.timely_config();
     crate::executor::execute_dag(timely_config, &worker_set, rt.clone(), total_workers).await?;
 
-    // Extract checkpoint data before draining (drain consumes self).
-    let mut checkpoint_id = initial_checkpoint_id;
-    while worker_set
-        .checkpoint_notify_rx
-        .lock()
-        .unwrap()
-        .try_recv()
-        .is_ok()
-    {
-        checkpoint_id += 1;
+    // Cancel the checkpoint task (DAG is done, no more epochs will arrive).
+    checkpoint_task.abort();
+    let last_checkpoint_id = match checkpoint_task.await {
+        Ok(id) => id,
+        Err(e) if e.is_cancelled() => initial_checkpoint_id,
+        Err(e) => return Err(anyhow::anyhow!("checkpoint task panicked: {e}")),
+    };
+
+    // Shut down coordinator task if running.
+    if let Some(handle) = coord_task_handle {
+        handle.abort();
+        let _ = handle.await;
     }
+
     let all_operator_names = worker_set.all_operator_names.clone();
     let source_offsets = worker_set.source_offsets();
 
     worker_set.drain().await?;
 
     // Final manifest (includes all accumulated checkpoint progress).
-    checkpoint_id += 1;
+    let checkpoint_id = last_checkpoint_id + 1;
     let manifest = CheckpointManifest {
         version: 1,
         checkpoint_id,
@@ -455,22 +590,132 @@ async fn execute_compiled(
         source_offsets,
     };
 
-    if let Some(pid) = controller.process_id() {
-        // Cluster mode: write a partial manifest for this process.
-        manifest.save_partial(&controller.checkpoint_dir, pid)?;
-        tracing::debug!(
+    write_manifest(
+        &manifest,
+        &controller.checkpoint_dir,
+        ckpt_process_id,
+        ckpt_n_processes,
+    )?;
+
+    Ok(())
+}
+
+/// Coordination mode for checkpoint management.
+///
+/// In cluster mode, checkpoints are coordinated across processes via TCP.
+/// Process 0 uses in-memory channels; other processes use a TCP participant.
+enum CheckpointCoordination {
+    /// Process 0: uses in-memory channels to the coordinator task.
+    Local(crate::checkpoint_coord::LocalParticipant),
+    /// Non-zero processes: TCP connection to coordinator.
+    Remote(crate::checkpoint_coord::CheckpointParticipant),
+}
+
+/// Configuration for the mid-execution checkpoint task.
+struct CheckpointTaskConfig {
+    initial_checkpoint_id: u64,
+    all_source_offsets: Vec<Arc<std::sync::Mutex<std::collections::HashMap<String, String>>>>,
+    operator_names: Vec<String>,
+    checkpoint_dir: std::path::PathBuf,
+    process_id: Option<usize>,
+    n_processes: usize,
+}
+
+/// Run the mid-execution checkpoint management loop.
+///
+/// Receives epoch notifications from the Timely DAG and writes checkpoint
+/// manifests as each epoch completes. In cluster mode, coordinates with
+/// other processes before writing the manifest.
+///
+/// Returns the last `checkpoint_id` written.
+async fn run_checkpoint_task(
+    mut checkpoint_rx: tokio::sync::mpsc::Receiver<u64>,
+    config: CheckpointTaskConfig,
+    mut coordination: Option<CheckpointCoordination>,
+) -> u64 {
+    let mut checkpoint_id = config.initial_checkpoint_id;
+
+    while let Some(epoch) = checkpoint_rx.recv().await {
+        // In cluster mode, coordinate with other processes.
+        if let Some(coord) = coordination.as_mut() {
+            match coord {
+                CheckpointCoordination::Local(local) => {
+                    if let Err(e) = local.ready_tx.send(epoch).await {
+                        tracing::warn!(error = %e, "failed to send Ready to coordinator");
+                        continue;
+                    }
+                    if let Some(committed_epoch) = local.committed_rx.recv().await {
+                        tracing::debug!(committed_epoch, "epoch committed by coordinator");
+                    } else {
+                        tracing::warn!("coordinator channel closed");
+                        break;
+                    }
+                }
+                CheckpointCoordination::Remote(participant) => {
+                    if let Err(e) = participant.send_ready(epoch).await {
+                        tracing::warn!(error = %e, "failed to send Ready to coordinator");
+                        continue;
+                    }
+                    if let Ok(committed_epoch) = participant.wait_committed().await {
+                        tracing::debug!(committed_epoch, "epoch committed by coordinator");
+                    } else {
+                        tracing::warn!("failed to receive Committed from coordinator");
+                        break;
+                    }
+                }
+            }
+        }
+
+        checkpoint_id += 1;
+        let offsets = crate::worker::merge_source_offsets(&config.all_source_offsets);
+        let manifest = CheckpointManifest {
+            version: 1,
             checkpoint_id,
+            timestamp_ms: now_millis(),
+            operators: config.operator_names.clone(),
+            source_offsets: offsets,
+        };
+
+        if let Err(e) = write_manifest(
+            &manifest,
+            &config.checkpoint_dir,
+            config.process_id,
+            config.n_processes,
+        ) {
+            tracing::error!(error = %e, "mid-execution checkpoint write failed");
+        } else {
+            tracing::debug!(
+                checkpoint_id,
+                "mid-execution checkpoint #{checkpoint_id} saved"
+            );
+        }
+    }
+
+    checkpoint_id
+}
+
+/// Write a checkpoint manifest (partial in cluster mode, full in single-process).
+fn write_manifest(
+    manifest: &CheckpointManifest,
+    checkpoint_dir: &std::path::Path,
+    process_id: Option<usize>,
+    n_processes: usize,
+) -> anyhow::Result<()> {
+    if let Some(pid) = process_id {
+        // Cluster mode: write a partial manifest for this process.
+        manifest.save_partial(checkpoint_dir, pid)?;
+        tracing::debug!(
+            checkpoint_id = manifest.checkpoint_id,
             process_id = pid,
-            "partial checkpoint #{checkpoint_id} saved for process {pid}"
+            "partial checkpoint #{} saved for process {pid}",
+            manifest.checkpoint_id
         );
 
         // Process 0 merges all partial manifests into the final manifest.
         if pid == 0 {
-            let n_processes = controller.peers.as_ref().map_or(1, Vec::len);
-            let merged =
-                CheckpointManifest::merge_partials(&controller.checkpoint_dir, n_processes);
+            let merged = CheckpointManifest::merge_partials(checkpoint_dir, n_processes);
             if let Some(merged) = merged {
-                merged.save(&controller.checkpoint_dir)?;
+                merged.save(checkpoint_dir)?;
                 tracing::debug!(
                     checkpoint_id = merged.checkpoint_id,
                     "merged checkpoint saved"
@@ -481,10 +726,13 @@ async fn execute_compiled(
         }
     } else {
         // Single-process mode: write directly.
-        manifest.save(&controller.checkpoint_dir)?;
-        tracing::debug!(checkpoint_id, "checkpoint #{checkpoint_id} saved");
+        manifest.save(checkpoint_dir)?;
+        tracing::debug!(
+            checkpoint_id = manifest.checkpoint_id,
+            "checkpoint #{} saved",
+            manifest.checkpoint_id
+        );
     }
-
     Ok(())
 }
 

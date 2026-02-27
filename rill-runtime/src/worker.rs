@@ -42,8 +42,8 @@ pub(crate) struct WorkerSet {
     // Shared state
     pub sink_senders: Arc<HashMap<NodeId, tokio::sync::mpsc::Sender<AnyItem>>>,
     pub global_watermark: Arc<AtomicU64>,
-    pub checkpoint_notify_rx: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
-    pub checkpoint_notify_tx: std::sync::mpsc::Sender<()>,
+    pub checkpoint_notify_rx: tokio::sync::Mutex<tokio::sync::mpsc::Receiver<u64>>,
+    pub checkpoint_notify_tx: tokio::sync::mpsc::Sender<u64>,
 
     // Graph metadata
     pub topo_order: Arc<Vec<NodeId>>,
@@ -137,7 +137,7 @@ impl WorkerSet {
         let per_worker_dlq_tx: Vec<Option<Option<DlqSender>>> =
             dlq_senders.into_iter().map(Some).collect();
 
-        let (checkpoint_notify_tx, checkpoint_notify_rx) = std::sync::mpsc::channel::<()>();
+        let (checkpoint_notify_tx, checkpoint_notify_rx) = tokio::sync::mpsc::channel::<u64>(64);
 
         // ── Global watermark computation ──────────────────────────────
         let global_watermark = spawn_global_watermark_task(rt, all_source_watermarks, shutdown);
@@ -161,7 +161,7 @@ impl WorkerSet {
             dlq_tx: Arc::new(std::sync::Mutex::new(per_worker_dlq_tx)),
             sink_senders: Arc::new(sink_senders),
             global_watermark,
-            checkpoint_notify_rx: std::sync::Mutex::new(checkpoint_notify_rx),
+            checkpoint_notify_rx: tokio::sync::Mutex::new(checkpoint_notify_rx),
             checkpoint_notify_tx,
             topo_order: Arc::new(topo_order),
             node_inputs: Arc::new(node_inputs),
@@ -197,6 +197,22 @@ impl WorkerSet {
     /// Merge offsets from all source bridges for checkpoint manifests.
     pub(crate) fn source_offsets(&self) -> HashMap<String, String> {
         merge_source_offsets(&self.all_source_offsets)
+    }
+
+    /// Take the checkpoint notification receiver for the mid-execution checkpoint task.
+    ///
+    /// Returns the receiver, replacing it with a dummy closed channel.
+    pub(crate) async fn take_checkpoint_rx(&self) -> tokio::sync::mpsc::Receiver<u64> {
+        let mut rx = self.checkpoint_notify_rx.lock().await;
+        let (_dummy_tx, dummy_rx) = tokio::sync::mpsc::channel::<u64>(1);
+        std::mem::replace(&mut *rx, dummy_rx)
+    }
+
+    /// Get handles to source offset maps (for the checkpoint task to read concurrently).
+    pub(crate) fn source_offset_handles(
+        &self,
+    ) -> Vec<Arc<std::sync::Mutex<HashMap<String, String>>>> {
+        self.all_source_offsets.clone()
     }
 }
 
@@ -527,7 +543,7 @@ fn setup_dlq_sinks(
 }
 
 /// Merge offsets from all source bridges.
-fn merge_source_offsets(
+pub(crate) fn merge_source_offsets(
     all: &[Arc<std::sync::Mutex<HashMap<String, String>>>],
 ) -> HashMap<String, String> {
     let mut combined = HashMap::new();

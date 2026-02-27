@@ -31,6 +31,8 @@
 pub mod async_operator;
 /// Async-to-sync channel bridges for Timely dataflow integration.
 pub mod bridge;
+/// Cross-process checkpoint coordination via lightweight TCP.
+pub mod checkpoint_coord;
 /// Graph compilation: logical [`DataflowGraph`](dataflow::DataflowGraph) to executable segments.
 pub(crate) mod compiler;
 /// Pipeline configuration, lifecycle orchestration, and checkpointing.

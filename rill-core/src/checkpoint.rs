@@ -75,6 +75,33 @@ impl CheckpointManifest {
         serde_json::from_str(&data).ok()
     }
 
+    /// Persist the manifest to an object store at the given path.
+    ///
+    /// Used for remote checkpoint storage (S3, Azure Blob, GCS) so all
+    /// processes can load the latest manifest on recovery.
+    pub async fn save_to_object_store(
+        &self,
+        store: &dyn object_store::ObjectStore,
+        path: &object_store::path::Path,
+    ) -> anyhow::Result<()> {
+        let json = serde_json::to_string_pretty(self)?;
+        store
+            .put(path, object_store::PutPayload::from(json.into_bytes()))
+            .await?;
+        Ok(())
+    }
+
+    /// Load a manifest from an object store, returning `None` if the object
+    /// does not exist.
+    pub async fn load_from_object_store(
+        store: &dyn object_store::ObjectStore,
+        path: &object_store::path::Path,
+    ) -> Option<Self> {
+        let result = store.get(path).await.ok()?;
+        let bytes = result.bytes().await.ok()?;
+        serde_json::from_slice(&bytes).ok()
+    }
+
     /// Merge partial manifests from all processes into a single manifest.
     ///
     /// Returns `None` if any partial manifest is missing. Source offsets
@@ -228,5 +255,46 @@ mod tests {
         assert!(CheckpointManifest::merge_partials(&dir, 3).is_none());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn object_store_round_trip() {
+        let store = object_store::memory::InMemory::new();
+        let path = object_store::path::Path::from("checkpoints/manifest.json");
+
+        let manifest = CheckpointManifest {
+            version: 1,
+            checkpoint_id: 7,
+            timestamp_ms: 2_000_000_000_000,
+            operators: vec!["join".into(), "window".into()],
+            source_offsets: HashMap::from([
+                ("topic/0".into(), "42".into()),
+                ("topic/1".into(), "99".into()),
+            ]),
+        };
+
+        manifest.save_to_object_store(&store, &path).await.unwrap();
+
+        let loaded = CheckpointManifest::load_from_object_store(&store, &path)
+            .await
+            .expect("manifest should exist in object store");
+
+        assert_eq!(loaded.version, 1);
+        assert_eq!(loaded.checkpoint_id, 7);
+        assert_eq!(loaded.timestamp_ms, 2_000_000_000_000);
+        assert_eq!(loaded.operators, vec!["join", "window"]);
+        assert_eq!(loaded.source_offsets.get("topic/0").unwrap(), "42");
+        assert_eq!(loaded.source_offsets.get("topic/1").unwrap(), "99");
+    }
+
+    #[tokio::test]
+    async fn object_store_load_missing_returns_none() {
+        let store = object_store::memory::InMemory::new();
+        let path = object_store::path::Path::from("nonexistent/manifest.json");
+        assert!(
+            CheckpointManifest::load_from_object_store(&store, &path)
+                .await
+                .is_none()
+        );
     }
 }
