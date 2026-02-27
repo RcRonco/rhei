@@ -635,7 +635,15 @@ async fn run_checkpoint_task(
 ) -> u64 {
     let mut checkpoint_id = config.initial_checkpoint_id;
 
-    while let Some(epoch) = checkpoint_rx.recv().await {
+    while let Some(mut epoch) = checkpoint_rx.recv().await {
+        // Drain any additional epoch notifications that arrived while we were
+        // busy writing the last manifest. This coalesces rapid-fire
+        // checkpoints into a single manifest write, preventing the channel
+        // from filling up and blocking the Timely worker thread.
+        while let Ok(newer_epoch) = checkpoint_rx.try_recv() {
+            epoch = newer_epoch;
+        }
+
         // In cluster mode, coordinate with other processes.
         if let Some(coord) = coordination.as_mut() {
             match coord {
