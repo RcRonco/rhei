@@ -1,16 +1,18 @@
 # Rhei
 
-Stream processing you can actually debug. A stateful streaming engine built on Rust, Timely Dataflow, and SlateDB.
+*From "Panta Rhei" (πάντα ῥεῖ) — everything flows.*
+
+A stateful stream processing engine built on Rust, Timely Dataflow, and SlateDB. Debug locally, deploy distributed.
 
 ## Why Rhei?
 
 **Debuggable.** Replay production state locally. Step through streaming operators in your debugger like any other Rust program. No black-box cluster to SSH into.
 
-**No infrastructure to start.** No JVM. No ZooKeeper. No MiniCluster. `cargo run` starts the full engine on your laptop. Deploy to prod by changing a config flag.
+**No infrastructure to start.** No JVM. No ZooKeeper. No MiniCluster. `cargo run` starts the full engine on your laptop. Deploy to a cluster by setting environment variables.
 
-**Fast.** Rust's zero-cost abstractions, tiered state caching (RAM -> NVMe -> S3), and Timely Dataflow's progress tracking. Hot-path state reads resolve in microseconds without touching disk.
+**Fast.** Rust's zero-cost abstractions, tiered state caching (RAM -> NVMe -> S3/GCS/Azure Blob), and Timely Dataflow's progress tracking. Hot-path state reads resolve in microseconds without touching disk.
 
-**Scalable.** Workers are stateless. Scaling out means adding threads — state lives in S3 via SlateDB, so there are no terabyte-scale checkpoint migrations.
+**Scalable.** From single-thread to multi-process clusters. State lives in object storage via SlateDB — scaling out means adding processes, not migrating terabytes of checkpoints.
 
 ## Quick Start
 
@@ -59,21 +61,35 @@ Rhei separates the dataflow graph definition from execution:
 | Tier | Backend | Latency | Role |
 |------|---------|---------|------|
 | L1 | `HashMap` memtable | Microseconds | Hot working set. Flushed on checkpoint. |
-| L2 | Foyer `HybridCache` | Milliseconds | Local NVMe cache. Avoids S3 round-trips for warm keys. |
-| L3 | SlateDB on S3 | 10-100ms | Durable source of truth. Enables stateless workers. |
+| L2 | Foyer `HybridCache` | Milliseconds | Local NVMe cache. Avoids remote round-trips for warm keys. |
+| L3 | SlateDB on S3/GCS/Azure Blob | 10-100ms | Durable source of truth. Enables stateless workers. |
 
 State reads try L1 first. On a miss, the operator yields to the Tokio runtime to fetch from L2/L3 without blocking the Timely worker thread.
 
 ### Checkpointing
 
-Frontier-based. When Timely's progress frontier advances past an epoch with no pending futures, the executor triggers a checkpoint: L1 dirty keys flush through to SlateDB/S3, and source offsets are committed.
+Frontier-based. When Timely's progress frontier advances past an epoch with no pending futures, the executor triggers a checkpoint: L1 dirty keys flush through to SlateDB, and source offsets are committed.
+
+In cluster mode, a lightweight TCP coordination protocol ensures all processes have flushed state before the checkpoint manifest is committed. Mid-execution checkpoints run concurrently with the dataflow — no stop-the-world pauses.
+
+### Clustering
+
+Rhei scales from a single thread to a multi-process TCP cluster:
+
+| Mode | Config | What changes |
+|------|--------|-------------|
+| Single-thread | `Executor::builder().build()` | One worker, local state |
+| Multi-thread | `.workers(4)` | N worker threads, shared-nothing state per worker |
+| Multi-process | `.from_env()` with `RHEI_PEERS`, `RHEI_PROCESS_ID` | N OS processes over TCP, coordinated checkpoints |
+
+In multi-process mode, each process independently opens SlateDB against the same remote object store. Checkpoint coordination happens out-of-band via a separate TCP channel — process 0 acts as coordinator, collecting readiness from all participants before committing a merged manifest.
 
 ## Workspace
 
 | Crate | Purpose |
 |-------|---------|
 | `rhei-core` | Traits (`StreamFunction`, `Source`, `Sink`), operator library (tumbling/sliding/session windows, temporal joins, combinators), state backends, connectors (Kafka, Vec, Print) |
-| `rhei-runtime` | Dataflow graph builder, compiler, executor with Timely-backed multi-worker execution, async bridges, metrics, tracing |
+| `rhei-runtime` | Dataflow graph builder, compiler, executor with Timely-backed multi-worker/multi-process execution, checkpoint coordination, async bridges, metrics, tracing |
 | `rhei-cli` | CLI (`rhei run`, `rhei run --tui --workers 4`), TUI dashboard with pipeline graph, live metrics, and per-worker logs |
 
 ## Operator Library
