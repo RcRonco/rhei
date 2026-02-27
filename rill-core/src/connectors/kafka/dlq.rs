@@ -1,13 +1,13 @@
 //! Kafka-backed dead-letter queue sink.
 //!
-//! Wraps a [`KafkaSink`](super::kafka::sink::KafkaSink) to accept
+//! Wraps a [`KafkaSink`](super::sink::KafkaSink) to accept
 //! [`DeadLetterRecord`](crate::dlq::DeadLetterRecord)s, serializing them as
 //! JSON payloads with the operator name as the Kafka key.
 
 use async_trait::async_trait;
 
-use super::kafka::sink::KafkaSink;
-use super::kafka::types::KafkaRecord;
+use super::sink::KafkaSink;
+use super::types::KafkaRecord;
 use crate::dlq::{DeadLetterRecord, DlqSinkFactory};
 use crate::traits::Sink;
 
