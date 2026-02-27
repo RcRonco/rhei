@@ -21,7 +21,7 @@
 //! ```
 //!
 //! Self-spawning pattern: the test binary re-invokes itself. When
-//! `RILL_CLUSTER_WORKER` is not set, the orchestrator runs; otherwise
+//! `RHEI_CLUSTER_WORKER` is not set, the orchestrator runs; otherwise
 //! the worker process runs.
 
 use std::collections::HashMap;
@@ -183,7 +183,7 @@ fn allocate_ports(n: usize) -> Vec<u16> {
 #[tokio::test]
 #[allow(clippy::too_many_lines)]
 async fn kafka_cluster_e2e() {
-    if std::env::var("RILL_CLUSTER_WORKER").is_ok() {
+    if std::env::var("RHEI_CLUSTER_WORKER").is_ok() {
         worker_main().await;
     } else {
         orchestrator_main().await;
@@ -247,15 +247,15 @@ async fn orchestrator_main() {
 
         let child = std::process::Command::new(&test_exe)
             .args(["--exact", "kafka_cluster_e2e", "--nocapture"])
-            .env("RILL_CLUSTER_WORKER", "1")
-            .env("RILL_PROCESS_ID", pid.to_string())
-            .env("RILL_PEERS", &peers)
-            .env("RILL_WORKERS", "2")
-            .env("RILL_ORDERS_TOPIC", &orders_topic)
-            .env("RILL_PAYMENTS_TOPIC", &payments_topic)
-            .env("RILL_OUTPUT_PATH", output_path)
-            .env("RILL_CHECKPOINT_DIR", checkpoint_dir.path())
-            .env("RILL_GROUP_ID", &group_id)
+            .env("RHEI_CLUSTER_WORKER", "1")
+            .env("RHEI_PROCESS_ID", pid.to_string())
+            .env("RHEI_PEERS", &peers)
+            .env("RHEI_WORKERS", "2")
+            .env("RHEI_ORDERS_TOPIC", &orders_topic)
+            .env("RHEI_PAYMENTS_TOPIC", &payments_topic)
+            .env("RHEI_OUTPUT_PATH", output_path)
+            .env("RHEI_CHECKPOINT_DIR", checkpoint_dir.path())
+            .env("RHEI_GROUP_ID", &group_id)
             .env("KAFKA_BROKERS", brokers())
             .stdout(std::process::Stdio::inherit())
             .stderr(std::process::Stdio::inherit())
@@ -416,19 +416,19 @@ fn wait_with_timeout(
 async fn worker_main() {
     let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
 
-    let orders_topic = std::env::var("RILL_ORDERS_TOPIC").expect("RILL_ORDERS_TOPIC not set");
-    let payments_topic = std::env::var("RILL_PAYMENTS_TOPIC").expect("RILL_PAYMENTS_TOPIC not set");
+    let orders_topic = std::env::var("RHEI_ORDERS_TOPIC").expect("RHEI_ORDERS_TOPIC not set");
+    let payments_topic = std::env::var("RHEI_PAYMENTS_TOPIC").expect("RHEI_PAYMENTS_TOPIC not set");
     let output_path = std::path::PathBuf::from(
-        std::env::var("RILL_OUTPUT_PATH").expect("RILL_OUTPUT_PATH not set"),
+        std::env::var("RHEI_OUTPUT_PATH").expect("RHEI_OUTPUT_PATH not set"),
     );
     let checkpoint_dir = std::path::PathBuf::from(
-        std::env::var("RILL_CHECKPOINT_DIR").expect("RILL_CHECKPOINT_DIR not set"),
+        std::env::var("RHEI_CHECKPOINT_DIR").expect("RHEI_CHECKPOINT_DIR not set"),
     );
-    let group_id = std::env::var("RILL_GROUP_ID").expect("RILL_GROUP_ID not set");
-    let process_id: usize = std::env::var("RILL_PROCESS_ID")
-        .expect("RILL_PROCESS_ID not set")
+    let group_id = std::env::var("RHEI_GROUP_ID").expect("RHEI_GROUP_ID not set");
+    let process_id: usize = std::env::var("RHEI_PROCESS_ID")
+        .expect("RHEI_PROCESS_ID not set")
         .parse()
-        .expect("RILL_PROCESS_ID not a number");
+        .expect("RHEI_PROCESS_ID not a number");
 
     eprintln!("worker process {process_id} starting");
 

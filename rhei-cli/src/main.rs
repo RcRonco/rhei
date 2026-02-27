@@ -115,13 +115,13 @@ fn cmd_run(
 
     let mut cmd = Command::new("cargo");
     cmd.arg("run");
-    cmd.env("RILL_WORKERS", workers.to_string());
+    cmd.env("RHEI_WORKERS", workers.to_string());
 
     if let Some(pid) = process_id {
-        cmd.env("RILL_PROCESS_ID", pid.to_string());
+        cmd.env("RHEI_PROCESS_ID", pid.to_string());
     }
     if let Some(ref peers) = peers {
-        cmd.env("RILL_PEERS", peers.join(","));
+        cmd.env("RHEI_PEERS", peers.join(","));
     }
 
     let status = cmd.status()?;

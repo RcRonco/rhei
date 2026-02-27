@@ -153,37 +153,37 @@ impl PipelineControllerBuilder {
 
     /// Read cluster configuration from environment variables.
     ///
-    /// - `RILL_WORKERS`: number of worker threads (overrides `.workers()`)
-    /// - `RILL_PROCESS_ID`: process ID for cluster mode
-    /// - `RILL_PEERS`: comma-separated peer addresses for cluster mode
-    /// - `RILL_REMOTE_BUCKET`, `RILL_REMOTE_PREFIX`, `RILL_REMOTE_ENDPOINT`,
-    ///   `RILL_REMOTE_REGION`, `RILL_REMOTE_ALLOW_HTTP`: remote state config
+    /// - `RHEI_WORKERS`: number of worker threads (overrides `.workers()`)
+    /// - `RHEI_PROCESS_ID`: process ID for cluster mode
+    /// - `RHEI_PEERS`: comma-separated peer addresses for cluster mode
+    /// - `RHEI_REMOTE_BUCKET`, `RHEI_REMOTE_PREFIX`, `RHEI_REMOTE_ENDPOINT`,
+    ///   `RHEI_REMOTE_REGION`, `RHEI_REMOTE_ALLOW_HTTP`: remote state config
     pub fn from_env(mut self) -> Self {
-        if let Ok(val) = std::env::var("RILL_WORKERS")
+        if let Ok(val) = std::env::var("RHEI_WORKERS")
             && let Ok(n) = val.parse::<usize>()
         {
             self.workers = n;
         }
-        if let Ok(val) = std::env::var("RILL_PROCESS_ID")
+        if let Ok(val) = std::env::var("RHEI_PROCESS_ID")
             && let Ok(id) = val.parse::<usize>()
         {
             self.process_id = Some(id);
         }
-        if let Ok(val) = std::env::var("RILL_PEERS") {
+        if let Ok(val) = std::env::var("RHEI_PEERS") {
             let peers: Vec<String> = val.split(',').map(|s| s.trim().to_string()).collect();
             if !peers.is_empty() {
                 self.peers = Some(peers);
             }
         }
         #[cfg(feature = "remote-state")]
-        if let Ok(bucket) = std::env::var("RILL_REMOTE_BUCKET") {
+        if let Ok(bucket) = std::env::var("RHEI_REMOTE_BUCKET") {
             self.remote_state = Some(RemoteStateConfig {
                 bucket,
-                prefix: std::env::var("RILL_REMOTE_PREFIX").unwrap_or_default(),
-                endpoint: std::env::var("RILL_REMOTE_ENDPOINT").ok(),
-                region: std::env::var("RILL_REMOTE_REGION")
+                prefix: std::env::var("RHEI_REMOTE_PREFIX").unwrap_or_default(),
+                endpoint: std::env::var("RHEI_REMOTE_ENDPOINT").ok(),
+                region: std::env::var("RHEI_REMOTE_REGION")
                     .unwrap_or_else(|_| "us-east-1".to_string()),
-                allow_http: std::env::var("RILL_REMOTE_ALLOW_HTTP")
+                allow_http: std::env::var("RHEI_REMOTE_ALLOW_HTTP")
                     .map(|v| v == "1" || v == "true")
                     .unwrap_or(false),
             });

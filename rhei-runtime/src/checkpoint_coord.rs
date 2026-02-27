@@ -245,10 +245,10 @@ impl CheckpointParticipant {
 
 /// Derive the checkpoint coordination port from the Timely peer address.
 ///
-/// If `RILL_CHECKPOINT_PORT` is set, uses that. Otherwise takes the first
+/// If `RHEI_CHECKPOINT_PORT` is set, uses that. Otherwise takes the first
 /// peer's port + 1000.
 pub fn coordination_port(peers: &[String]) -> u16 {
-    if let Ok(val) = std::env::var("RILL_CHECKPOINT_PORT")
+    if let Ok(val) = std::env::var("RHEI_CHECKPOINT_PORT")
         && let Ok(port) = val.parse::<u16>()
     {
         return port;
@@ -334,9 +334,9 @@ mod tests {
 
     #[test]
     fn coordination_port_derives_from_peers() {
-        // When RILL_CHECKPOINT_PORT is not set, derives from first peer port + 1000.
+        // When RHEI_CHECKPOINT_PORT is not set, derives from first peer port + 1000.
         // (This test relies on the env var not being set in CI.)
-        if std::env::var("RILL_CHECKPOINT_PORT").is_ok() {
+        if std::env::var("RHEI_CHECKPOINT_PORT").is_ok() {
             return; // Skip if env var is set — can't test derivation.
         }
         let peers = vec!["127.0.0.1:2101".to_string(), "127.0.0.1:2102".to_string()];
@@ -345,7 +345,7 @@ mod tests {
 
     #[test]
     fn coordination_port_fallback_no_peers() {
-        if std::env::var("RILL_CHECKPOINT_PORT").is_ok() {
+        if std::env::var("RHEI_CHECKPOINT_PORT").is_ok() {
             return;
         }
         let peers: Vec<String> = vec![];

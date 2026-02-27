@@ -28,7 +28,7 @@ Process 0 runs a `CheckpointCoordinator`; all other processes connect as `Checkp
 | `Ready` | Participant -> Coordinator | `process_id: usize`, `epoch: u64` |
 | `Committed` | Coordinator -> Participants | `epoch: u64` |
 
-**Port:** Derived from the first Timely peer address port + 1000, or overridden via `RILL_CHECKPOINT_PORT`.
+**Port:** Derived from the first Timely peer address port + 1000, or overridden via `RHEI_CHECKPOINT_PORT`.
 
 ### Checkpoint channel enhancement
 
@@ -44,7 +44,7 @@ Changed cluster-mode prefix from `p{pid}_w{idx}_{op}` to `p{pid}/w{idx}/{op}` to
 
 ### Remote state configuration
 
-`RemoteStateConfig` struct with builder method `.remote_state(config)` and environment variable support (`RILL_REMOTE_BUCKET`, `RILL_REMOTE_PREFIX`, `RILL_REMOTE_ENDPOINT`, `RILL_REMOTE_REGION`, `RILL_REMOTE_ALLOW_HTTP`). Feature-gated on `remote-state`. Supports S3, Azure Blob Storage, and GCS via the `object_store` crate.
+`RemoteStateConfig` struct with builder method `.remote_state(config)` and environment variable support (`RHEI_REMOTE_BUCKET`, `RHEI_REMOTE_PREFIX`, `RHEI_REMOTE_ENDPOINT`, `RHEI_REMOTE_REGION`, `RHEI_REMOTE_ALLOW_HTTP`). Feature-gated on `remote-state`. Supports S3, Azure Blob Storage, and GCS via the `object_store` crate.
 
 `CheckpointManifest` gains `save_to_object_store()` and `load_from_object_store()` for remote manifest storage.
 
