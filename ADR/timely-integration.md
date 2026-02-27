@@ -242,8 +242,8 @@ Rejected. Timely's `Capability<T>` uses `Rc`, making it `!Send`. Storing real ca
 
 | File | Role |
 |------|------|
-| `rill-runtime/src/async_operator.rs` | `AsyncOperator` — hot/cold path split, stash integration, pending futures management |
-| `rill-runtime/src/timely_operator.rs` | `TimelyAsyncOperator` — capability tracking, frontier-driven checkpointing; `TimelyErasedOperator` — type-erased equivalent |
-| `rill-runtime/src/bridge.rs` | `source_bridge`, `sink_bridge`, `erased_source_bridge` — async-to-sync channel bridges |
-| `rill-runtime/src/stash.rs` | `Stash<T>` — FIFO queue preserving element ordering across async state fetches |
-| `rill-runtime/src/executor.rs` | `build_timely_dataflow` — constructs source/transform/operator/sink as Timely stages; `execute_single_worker`, `execute_multi_worker` — spawn Timely with `Config::process(n)` |
+| `rhei-runtime/src/async_operator.rs` | `AsyncOperator` — hot/cold path split, stash integration, pending futures management |
+| `rhei-runtime/src/timely_operator.rs` | `TimelyAsyncOperator` — capability tracking, frontier-driven checkpointing; `TimelyErasedOperator` — type-erased equivalent |
+| `rhei-runtime/src/bridge.rs` | `source_bridge`, `sink_bridge`, `erased_source_bridge` — async-to-sync channel bridges |
+| `rhei-runtime/src/stash.rs` | `Stash<T>` — FIFO queue preserving element ordering across async state fetches |
+| `rhei-runtime/src/executor.rs` | `build_timely_dataflow` — constructs source/transform/operator/sink as Timely stages; `execute_single_worker`, `execute_multi_worker` — spawn Timely with `Config::process(n)` |

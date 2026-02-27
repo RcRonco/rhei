@@ -2619,7 +2619,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "rill-cli"
+name = "rhei-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -2629,8 +2629,8 @@ dependencies = [
  "futures",
  "ratatui",
  "reqwest",
- "rill-core",
- "rill-runtime",
+ "rhei-core",
+ "rhei-runtime",
  "serde",
  "serde_json",
  "tokio",
@@ -2638,7 +2638,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "rill-core"
+name = "rhei-core"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -2659,7 +2659,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "rill-runtime"
+name = "rhei-runtime"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -2671,7 +2671,7 @@ dependencies = [
  "metrics-exporter-prometheus",
  "object_store",
  "rdkafka",
- "rill-core",
+ "rhei-core",
  "seahash",
  "serde",
  "serde_json",

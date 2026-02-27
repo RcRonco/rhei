@@ -7,8 +7,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ```bash
 cargo check --workspace --all-targets
 cargo test --workspace
-cargo test -p rill-core                     # test a single crate
-cargo test -p rill-runtime word_count       # run a single test by name
+cargo test -p rhei-core                     # test a single crate
+cargo test -p rhei-runtime word_count       # run a single test by name
 cargo clippy --workspace --all-targets --no-deps -- -D warnings
 cargo fmt --all -- --check                  # check formatting
 cargo fmt --all                             # fix formatting
@@ -20,9 +20,9 @@ CI also runs `cargo deny check advisories,licenses,bans` for license/advisory en
 
 Three crates:
 
-- **rill-core** — Traits (`StreamFunction`, `Source`, `Sink`), operator library (windows, joins, combinators), state backends (L1 memtable, L2 Foyer, L3 SlateDB), logical plan builder (`StreamGraph`), connectors (Kafka, Vec, Print).
-- **rill-runtime** — Executor that materializes logical plans into Timely dataflows. `AsyncOperator` wraps `StreamFunction` with hot/cold path split. `TimelyAsyncOperator` adds capability tracking. `bridge.rs` bridges async Source/Sink to sync Timely channels. `pipeline.rs` provides the fluent builder API.
-- **rill-cli** — CLI (`rill new`, `rill run`, `rill run --tui`). TUI dashboard with graph view, metrics, and log viewer.
+- **rhei-core** — Traits (`StreamFunction`, `Source`, `Sink`), operator library (windows, joins, combinators), state backends (L1 memtable, L2 Foyer, L3 SlateDB), logical plan builder (`StreamGraph`), connectors (Kafka, Vec, Print).
+- **rhei-runtime** — Executor that materializes logical plans into Timely dataflows. `AsyncOperator` wraps `StreamFunction` with hot/cold path split. `TimelyAsyncOperator` adds capability tracking. `bridge.rs` bridges async Source/Sink to sync Timely channels. `pipeline.rs` provides the fluent builder API.
+- **rhei-cli** — CLI (`rhei new`, `rhei run`, `rhei run --tui`). TUI dashboard with graph view, metrics, and log viewer.
 
 ## Architecture
 
@@ -43,7 +43,7 @@ Three crates:
 - `rustfmt.toml`: max_width=100, edition 2024.
 - Operator types implement `StreamFunction` (async trait with `Input`/`Output` associated types).
 - State access goes through `StateContext` (or the typed `KeyedState<K, V>` wrapper).
-- Kafka integration is behind the `kafka` feature flag on `rill-core`.
+- Kafka integration is behind the `kafka` feature flag on `rhei-core`.
 
 ## ADR (Architecture Decision Records)
 

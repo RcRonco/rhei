@@ -20,7 +20,7 @@ This has two problems:
 
 Introduce a `TimeProvider` trait and two builder convenience methods (`.proc_time_fn()` and `.proc_time_fn_with(provider)`) that delegate to the existing `.time_fn()`. No changes to operator structs, `StreamFunction` trait, or downstream code.
 
-### `TimeProvider` trait (`rill-core/src/time.rs`)
+### `TimeProvider` trait (`rhei-core/src/time.rs`)
 
 ```rust
 pub trait TimeProvider: Send + Sync {
@@ -82,13 +82,13 @@ flowchart LR
 
 ```mermaid
 graph LR
-    subgraph rill-core/src/time.rs
+    subgraph rhei-core/src/time.rs
         TP[TimeProvider trait]
         WC[WallClockProvider]
         FC[FixedClockProvider]
     end
 
-    subgraph rill-core/src/operators
+    subgraph rhei-core/src/operators
         TW[TumblingWindowBuilder]
         SW[SlidingWindowBuilder]
         SEW[SessionWindowBuilder]
@@ -161,8 +161,8 @@ A proc macro could generate the `proc_time_fn` methods for all builders. Rejecte
 
 | File | Change |
 |---|---|
-| `rill-core/src/time.rs` | New — `TimeProvider` trait, `WallClockProvider`, `FixedClockProvider` |
-| `rill-core/src/lib.rs` | Register `pub mod time` |
-| `rill-core/src/operators/tumbling_window.rs` | Add `proc_time_fn()` / `proc_time_fn_with()` to builder, tests |
-| `rill-core/src/operators/sliding_window.rs` | Add `proc_time_fn()` / `proc_time_fn_with()` to builder, tests |
-| `rill-core/src/operators/session_window.rs` | Add `proc_time_fn()` / `proc_time_fn_with()` to builder, tests |
+| `rhei-core/src/time.rs` | New — `TimeProvider` trait, `WallClockProvider`, `FixedClockProvider` |
+| `rhei-core/src/lib.rs` | Register `pub mod time` |
+| `rhei-core/src/operators/tumbling_window.rs` | Add `proc_time_fn()` / `proc_time_fn_with()` to builder, tests |
+| `rhei-core/src/operators/sliding_window.rs` | Add `proc_time_fn()` / `proc_time_fn_with()` to builder, tests |
+| `rhei-core/src/operators/session_window.rs` | Add `proc_time_fn()` / `proc_time_fn_with()` to builder, tests |

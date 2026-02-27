@@ -314,7 +314,7 @@ Deferred. The current compiler supports linear topologies only (source → trans
 
 | File | Role |
 |------|------|
-| `rill-runtime/src/dataflow.rs` | `DataflowGraph`, `Stream<T>`, `KeyedStream<T>`, `AnyItem`, `CloneAnySend`, `NodeKind`, `GraphNode`, `ErasedSource`/`ErasedSink`/`ErasedOperator` with wrappers, `TransformFn`, `KeyFn`, `TransformContext` |
-| `rill-runtime/src/compiler.rs` | `compile()`, `Segment`, `CompiledPipeline`, `split_at_first_exchange()`, `clone_segments()`, `operator_names()` |
-| `rill-runtime/src/executor.rs` | `execute_pipeline()` — routes compiled pipeline to single/multi-worker; `build_timely_dataflow()` — materializes segments into Timely operators |
-| `rill-core/src/traits.rs` | `StreamFunction`, `Source`, `Sink` — the typed traits that underpin the API |
+| `rhei-runtime/src/dataflow.rs` | `DataflowGraph`, `Stream<T>`, `KeyedStream<T>`, `AnyItem`, `CloneAnySend`, `NodeKind`, `GraphNode`, `ErasedSource`/`ErasedSink`/`ErasedOperator` with wrappers, `TransformFn`, `KeyFn`, `TransformContext` |
+| `rhei-runtime/src/compiler.rs` | `compile()`, `Segment`, `CompiledPipeline`, `split_at_first_exchange()`, `clone_segments()`, `operator_names()` |
+| `rhei-runtime/src/executor.rs` | `execute_pipeline()` — routes compiled pipeline to single/multi-worker; `build_timely_dataflow()` — materializes segments into Timely operators |
+| `rhei-core/src/traits.rs` | `StreamFunction`, `Source`, `Sink` — the typed traits that underpin the API |

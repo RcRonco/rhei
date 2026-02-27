@@ -255,10 +255,10 @@ let graph = DataflowGraph::new();
 
 // Sources
 let raw_orders = graph.source(
-    KafkaSource::new("localhost:9092", "rill-app", &["orders"])?
+    KafkaSource::new("localhost:9092", "rhei-app", &["orders"])?
 );
 let raw_shipments = graph.source(
-    KafkaSource::new("localhost:9092", "rill-app", &["shipments"])?
+    KafkaSource::new("localhost:9092", "rhei-app", &["shipments"])?
 );
 
 // Parse each leg

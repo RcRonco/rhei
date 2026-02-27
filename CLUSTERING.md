@@ -21,9 +21,9 @@ The executor uses `timely::execute_directly()`, which runs a single worker on th
 
 **Key characteristics:**
 
-- **Source/sink bridge.** Async `Source` and `Sink` traits are bridged to synchronous Timely channels via `source_bridge` / `sink_bridge` (`rill-runtime/src/bridge.rs`). A Tokio task calls `source.next_batch().await` in a loop and sends batches over a bounded `mpsc` channel. The Timely source operator reads with `try_recv()`.
+- **Source/sink bridge.** Async `Source` and `Sink` traits are bridged to synchronous Timely channels via `source_bridge` / `sink_bridge` (`rhei-runtime/src/bridge.rs`). A Tokio task calls `source.next_batch().await` in a loop and sends batches over a bounded `mpsc` channel. The Timely source operator reads with `try_recv()`.
 
-- **Operator execution.** Each operator is wrapped in `TimelyAsyncOperator` (`rill-runtime/src/timely_operator.rs`), which manages epoch capability tokens and delegates to `AsyncOperator` for the hot/cold path split. `TimelyAsyncOperator` is `!Send` because Timely's `Capability<T>` uses `Rc` internally — it must be constructed inside the worker thread.
+- **Operator execution.** Each operator is wrapped in `TimelyAsyncOperator` (`rhei-runtime/src/timely_operator.rs`), which manages epoch capability tokens and delegates to `AsyncOperator` for the hot/cold path split. `TimelyAsyncOperator` is `!Send` because Timely's `Capability<T>` uses `Rc` internally — it must be constructed inside the worker thread.
 
 - **Data pact.** All operators use the `Pipeline` pact (no data exchange). Every element stays on the single worker.
 
@@ -143,8 +143,8 @@ Each process is started independently with its process ID and the full list of p
 Each process is a separate OS process (potentially on a different machine). The CLI gains cluster flags:
 
 ```
-rill run pipeline.toml --workers 4 --process-id 0 --peers "host0:2101,host1:2101"
-rill run pipeline.toml --workers 4 --process-id 1 --peers "host0:2101,host1:2101"
+rhei run pipeline.toml --workers 4 --process-id 0 --peers "host0:2101,host1:2101"
+rhei run pipeline.toml --workers 4 --process-id 1 --peers "host0:2101,host1:2101"
 ```
 
 A `--hostfile` option can mirror Timely's hostfile convention for clusters with many processes.
@@ -208,11 +208,11 @@ This is the standard approach for Timely-based systems. Partial recovery (replac
 ### CLI Changes
 
 ```
-rill run pipeline.toml                                    # default: 1 worker, local
-rill run pipeline.toml --workers 4                        # Phase 1: 4 threads
-rill run pipeline.toml --workers 4 --process-id 0 \
+rhei run pipeline.toml                                    # default: 1 worker, local
+rhei run pipeline.toml --workers 4                        # Phase 1: 4 threads
+rhei run pipeline.toml --workers 4 --process-id 0 \
     --peers "host0:2101,host1:2101"                       # Phase 2: TCP cluster
-rill run pipeline.toml --workers 4 --hostfile cluster.txt # alternative
+rhei run pipeline.toml --workers 4 --hostfile cluster.txt # alternative
 ```
 
 ---
@@ -225,7 +225,7 @@ Add a Job Manager with consensus-backed metadata, gossip-based discovery, and dy
 
 A gRPC service (built with `tonic`) that:
 
-- Accepts pipeline submissions (`rill submit pipeline.toml`).
+- Accepts pipeline submissions (`rhei submit pipeline.toml`).
 - Schedules pipelines across available TaskManager workers.
 - Tracks checkpoint metadata (latest committed checkpoint ID per job).
 - Coordinates scaling events (add/remove workers, repartition).
@@ -280,12 +280,12 @@ This is a two-phase commit: prepare (flush state + buffer sink writes) and commi
 ### API
 
 ```
-rill submit pipeline.toml           # submit a pipeline to the cluster
-rill status                         # list running jobs and their status
-rill status <job-id>                # detailed status for a specific job
-rill cancel <job-id>                # cancel a running job
-rill scale <job-id> --workers N     # scale a job to N workers
-rill checkpoint <job-id>            # trigger an immediate checkpoint
+rhei submit pipeline.toml           # submit a pipeline to the cluster
+rhei status                         # list running jobs and their status
+rhei status <job-id>                # detailed status for a specific job
+rhei cancel <job-id>                # cancel a running job
+rhei scale <job-id> --workers N     # scale a job to N workers
+rhei checkpoint <job-id>            # trigger an immediate checkpoint
 ```
 
 ---
@@ -350,7 +350,7 @@ Phase 1 does not strictly require serialization (shared-memory channels can move
 |-----------|-----------------|-----------------|
 | Current → Phase 1 | None. `--workers 1` is the default and behaves identically to `execute_directly()`. | None (Timely already supports `Config::process`). |
 | Phase 1 → Phase 2 | `Serialize + DeserializeOwned` bounds on element types. Types containing `Rc`, closures, or other non-serializable fields will not compile. | None new (Timely TCP is built-in). |
-| Phase 2 → Phase 3 | New infrastructure: Raft cluster (3+ Job Manager nodes), S3 or shared storage for checkpoints. CLI changes from direct `rill run` to `rill submit`. | `openraft`, `chitchat`, `tonic` (gRPC). |
+| Phase 2 → Phase 3 | New infrastructure: Raft cluster (3+ Job Manager nodes), S3 or shared storage for checkpoints. CLI changes from direct `rhei run` to `rhei submit`. | `openraft`, `chitchat`, `tonic` (gRPC). |
 
 ---
 
@@ -358,10 +358,10 @@ Phase 1 does not strictly require serialization (shared-memory channels can move
 
 | File | Relevance |
 |------|-----------|
-| `rill-runtime/src/executor.rs` | `execute_directly()` call site, source/sink bridge setup, operator slots |
-| `rill-runtime/src/timely_operator.rs` | `TimelyAsyncOperator` — capability management, `!Send` constraint |
-| `rill-runtime/src/bridge.rs` | `source_bridge` / `sink_bridge` — async-to-sync channel pattern |
-| `rill-runtime/src/async_operator.rs` | `AsyncOperator` — hot/cold path, stash, state context |
-| `rill-core/src/state/prefixed_backend.rs` | Per-operator key namespacing — extends to per-worker prefixing |
-| `rill-core/src/state/tiered_backend.rs` | L1/L2/L3 hierarchy — L3 shared across processes via S3 |
-| `rill-core/src/traits.rs` | `Source`, `Sink`, `StreamFunction` — serialization bound additions |
+| `rhei-runtime/src/executor.rs` | `execute_directly()` call site, source/sink bridge setup, operator slots |
+| `rhei-runtime/src/timely_operator.rs` | `TimelyAsyncOperator` — capability management, `!Send` constraint |
+| `rhei-runtime/src/bridge.rs` | `source_bridge` / `sink_bridge` — async-to-sync channel pattern |
+| `rhei-runtime/src/async_operator.rs` | `AsyncOperator` — hot/cold path, stash, state context |
+| `rhei-core/src/state/prefixed_backend.rs` | Per-operator key namespacing — extends to per-worker prefixing |
+| `rhei-core/src/state/tiered_backend.rs` | L1/L2/L3 hierarchy — L3 shared across processes via S3 |
+| `rhei-core/src/traits.rs` | `Source`, `Sink`, `StreamFunction` — serialization bound additions |

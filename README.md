@@ -15,12 +15,12 @@ Stream processing you can actually debug. A stateful streaming engine built on R
 ## Quick Start
 
 ```bash
-cargo run -p rill-runtime --example word_count
+cargo run -p rhei-runtime --example word_count
 ```
 
 ```rust
-use rill_runtime::dataflow::DataflowGraph;
-use rill_runtime::executor::Executor;
+use rhei_runtime::dataflow::DataflowGraph;
+use rhei_runtime::executor::Executor;
 
 let graph = DataflowGraph::new();
 let stream = graph.source(VecSource::new(lines));
@@ -72,13 +72,13 @@ Frontier-based. When Timely's progress frontier advances past an epoch with no p
 
 | Crate | Purpose |
 |-------|---------|
-| `rill-core` | Traits (`StreamFunction`, `Source`, `Sink`), operator library (tumbling/sliding/session windows, temporal joins, combinators), state backends, connectors (Kafka, Vec, Print) |
-| `rill-runtime` | Dataflow graph builder, compiler, executor with Timely-backed multi-worker execution, async bridges, metrics, tracing |
-| `rill-cli` | CLI (`rill run`, `rill run --tui --workers 4`), TUI dashboard with pipeline graph, live metrics, and per-worker logs |
+| `rhei-core` | Traits (`StreamFunction`, `Source`, `Sink`), operator library (tumbling/sliding/session windows, temporal joins, combinators), state backends, connectors (Kafka, Vec, Print) |
+| `rhei-runtime` | Dataflow graph builder, compiler, executor with Timely-backed multi-worker execution, async bridges, metrics, tracing |
+| `rhei-cli` | CLI (`rhei run`, `rhei run --tui --workers 4`), TUI dashboard with pipeline graph, live metrics, and per-worker logs |
 
 ## Operator Library
 
-Built-in operators in `rill-core`:
+Built-in operators in `rhei-core`:
 
 - **Windows** — `TumblingWindow`, `SlidingWindow`, `SessionWindow` with pluggable aggregators
 - **Joins** — `TemporalJoin` with configurable timeout
@@ -102,7 +102,7 @@ impl StreamFunction for MyOperator {
 ## TUI Dashboard
 
 ```
-rill run --tui --workers 4
+rhei run --tui --workers 4
 ```
 
 ```
@@ -127,7 +127,7 @@ cargo test --workspace
 cargo clippy --workspace --all-targets --no-deps -- -D warnings
 ```
 
-Kafka integration requires the `kafka` feature flag on `rill-core` and `librdkafka` (built via cmake).
+Kafka integration requires the `kafka` feature flag on `rhei-core` and `librdkafka` (built via cmake).
 
 ## License
 

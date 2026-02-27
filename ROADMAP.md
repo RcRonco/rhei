@@ -2,7 +2,7 @@
 
 ## Developer Experience
 
-- [x] Reusable operator library (`rill-core/src/operators/`)
+- [x] Reusable operator library (`rhei-core/src/operators/`)
   - [x] `TemporalJoin<L, R, K, O>` — key-based join with configurable timeout
   - [x] `TumblingWindow<T, A>` — fixed-size time windows with pluggable aggregator
   - [x] `SlidingWindow<T, A>` — overlapping time windows
@@ -12,8 +12,8 @@
 - [x] Fluent pipeline builder API (`DataflowGraph` with `Stream<T>` / `KeyedStream<T>`)
 - [x] Multi-operator chaining in `run_dataflow` (currently single-operator only)
 - [ ] Hot-reload operator logic without full pipeline restart
-- [x] `rill run --attach <url>` — connect to a running pipeline and stream health/metrics/logs to TUI
-- [ ] `rill-cli` improvements: deploy, inspect running pipelines, replay from checkpoint
+- [x] `rhei run --attach <url>` — connect to a running pipeline and stream health/metrics/logs to TUI
+- [ ] `rhei-cli` improvements: deploy, inspect running pipelines, replay from checkpoint
 
 ## Integrations
 

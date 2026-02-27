@@ -1,5 +1,5 @@
 [workspace]
-members = ["rill-core", "rill-runtime", "rill-cli"]
+members = ["rhei-core", "rhei-runtime", "rhei-cli"]
 resolver = "3"
 
 [workspace.dependencies]

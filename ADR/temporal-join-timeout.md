@@ -5,7 +5,7 @@
 
 ## Context
 
-The temporal join operator (`rill-core/src/operators/temporal_join.rs`) buffers unmatched events in operator state indefinitely. If one side of the join never produces a matching event for a given key, state grows without bound. In long-running pipelines with skewed join keys, this leads to OOM (tracked as KI-5).
+The temporal join operator (`rhei-core/src/operators/temporal_join.rs`) buffers unmatched events in operator state indefinitely. If one side of the join never produces a matching event for a given key, state grows without bound. In long-running pipelines with skewed join keys, this leads to OOM (tracked as KI-5).
 
 Window operators already solve a similar problem via watermark-driven eviction in `on_watermark()`. The temporal join needs an analogous mechanism.
 
@@ -133,4 +133,4 @@ Route evicted events to a separate output stream instead of dropping them silent
 
 | File | Change |
 |---|---|
-| `rill-core/src/operators/temporal_join.rs` | Add `timeout`, `last_watermark`, `active_keys` fields; `Stamped<V>` wrapper; `on_watermark()` eviction; builder `.timeout()` method; unit tests |
+| `rhei-core/src/operators/temporal_join.rs` | Add `timeout`, `last_watermark`, `active_keys` fields; `Stamped<V>` wrapper; `on_watermark()` eviction; builder `.timeout()` method; unit tests |
