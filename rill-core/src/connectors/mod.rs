@@ -10,5 +10,6 @@ pub mod print_sink;
 /// A source backed by an in-memory `Vec`.
 pub mod vec_source;
 
+/// Kafka source, sink, and dead-letter queue connectors.
 #[cfg(feature = "kafka")]
 pub mod kafka;

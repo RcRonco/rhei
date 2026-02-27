@@ -299,7 +299,8 @@ impl Source for KafkaSource {
             .map(|&idx| all_partitions[idx].clone())
             .collect();
         for (topic, partition) in &assigned_pairs {
-            tpl.add_partition(topic, *partition);
+            tpl.add_partition_offset(topic, *partition, rdkafka::Offset::Beginning)
+                .expect("failed to add partition offset");
         }
         consumer.assign(&tpl).expect("failed to assign partitions");
 
@@ -414,22 +415,27 @@ impl Source for KafkaPartitionSource {
             return Ok(());
         }
 
+        // Reassign ALL partitions: restored ones at their offset, others from beginning.
+        // assign() replaces the entire assignment, so we must include every partition.
         let mut tpl = TopicPartitionList::new();
+        let mut restored = 0usize;
         for (topic, partition) in &self.assigned_partitions {
             let key = format!("{topic}/{partition}");
             if let Some(offset_str) = offsets.get(&key) {
                 let offset: i64 = offset_str.parse()?;
                 tpl.add_partition_offset(topic, *partition, rdkafka::Offset::Offset(offset + 1))?;
+                restored += 1;
+            } else {
+                tpl.add_partition_offset(topic, *partition, rdkafka::Offset::Beginning)?;
             }
         }
 
-        if tpl.count() > 0 {
-            self.consumer.assign(&tpl)?;
-            tracing::info!(
-                partitions = tpl.count(),
-                "partition source restored offsets via assign()"
-            );
-        }
+        self.consumer.assign(&tpl)?;
+        tracing::info!(
+            restored,
+            total = self.assigned_partitions.len(),
+            "partition source restored offsets via assign()"
+        );
         Ok(())
     }
 
