@@ -52,6 +52,9 @@ pub(crate) async fn execute_dag(
     rt: tokio::runtime::Handle,
     total_workers: usize,
 ) -> anyhow::Result<()> {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    use tokio::task::spawn_blocking;
+
     let sink_senders = worker_set.sink_senders.clone();
     let topo_order = worker_set.topo_order.clone();
     let node_inputs = worker_set.node_inputs.clone();
@@ -73,7 +76,7 @@ pub(crate) async fn execute_dag(
     let contexts = worker_set.contexts.clone();
     let dlq_tx = worker_set.dlq_tx.clone();
 
-    tokio::task::spawn_blocking(move || {
+    spawn_blocking(move || {
         let guards = timely::execute::execute(timely_config, move |worker| {
             let idx = worker.index();
             let _span = tracing::info_span!("worker", worker = idx).entered();
@@ -123,8 +126,15 @@ pub(crate) async fn execute_dag(
         })
         .map_err(|e| anyhow::anyhow!("timely execution failed: {e}"))?;
 
-        drop(guards);
-        Ok::<(), anyhow::Error>(())
+        // Timely's CommsGuard::drop can panic during TCP teardown when
+        // communication threads encounter broken pipes. This is benign:
+        // the dataflow has completed successfully by this point.
+        if let Err(panic_info) = catch_unwind(AssertUnwindSafe(|| drop(guards))) {
+            tracing::warn!(
+                "Timely communication teardown panicked (benign in TCP mode): {panic_info:?}"
+            );
+        }
+        anyhow::Ok(())
     })
     .await
     .map_err(|e| anyhow::anyhow!("spawn_blocking failed: {e}"))??;
