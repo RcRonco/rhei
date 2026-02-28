@@ -18,7 +18,7 @@ use timely::worker::Worker;
 
 use crate::dataflow::{AnyItem, ErasedOperator, NodeId, NodeKind, TransformFn};
 use crate::timely_operator::TimelyErasedOperator;
-use crate::worker::{DlqSender, WorkerSet};
+use crate::worker::{DlqSender, WorkerData, WorkerSet};
 
 // Backward-compatible re-exports so `executor::Executor` still works.
 #[doc(hidden)]
@@ -29,13 +29,23 @@ pub use crate::controller::PipelineControllerBuilder as ExecutorBuilder;
 /// Type alias for a Timely worker scope parameterized by allocator.
 type Scope<'a, A> = Child<'a, Worker<A>, u64>;
 
-/// Sentinel epoch value used to signal shutdown readiness.
+/// Special sentinel values in the `u64` timeline shared by watermarks and epochs.
 ///
-/// After `probe.done()`, the first local worker on each process sends this
-/// sentinel through the checkpoint notification channel. In cluster mode,
-/// the checkpoint task coordinates with other processes before releasing
-/// the shutdown barrier, ensuring all processes tear down TCP simultaneously.
-pub(crate) const SHUTDOWN_SENTINEL: u64 = u64::MAX;
+/// These live at the top of the `u64` range, well above any real timestamp or epoch.
+#[repr(u64)]
+pub(crate) enum Sentinel {
+    /// All data has arrived — sources set their watermark to this value on exhaustion.
+    ///
+    /// The global watermark task propagates this once every source bridge has exited.
+    /// Downstream operators (e.g. `TumblingWindow`) use it to close pending windows.
+    SourceExhausted = u64::MAX - 1,
+
+    /// Shutdown coordination — sent through the checkpoint channel after `probe.done()`.
+    ///
+    /// In cluster mode, the checkpoint task coordinates with other processes before
+    /// releasing the shutdown barrier, ensuring all processes tear down TCP simultaneously.
+    Shutdown = u64::MAX,
+}
 
 // ── Key partitioning ────────────────────────────────────────────────
 
@@ -56,39 +66,25 @@ pub fn partition_key(key: &str, n_workers: usize) -> usize {
 /// and runs `worker.step()` until the probe signals completion.
 ///
 /// In cluster mode, `shutdown_barrier_rx` enables coordinated shutdown:
-/// the first local worker sends a [`SHUTDOWN_SENTINEL`] through the
+/// the first local worker sends a [`Sentinel::Shutdown`] through the
 /// checkpoint channel, then blocks on this receiver until all processes
 /// are ready to tear down. This prevents `CommsGuard::drop` panics
 /// caused by one process closing TCP connections while peers are still
 /// communicating.
 pub(crate) async fn execute_dag(
     timely_config: timely::execute::Config,
-    worker_set: &WorkerSet,
+    worker_set: Arc<WorkerSet>,
     rt: tokio::runtime::Handle,
     total_workers: usize,
     local_first_worker: usize,
     shutdown_barrier_rx: Option<std::sync::mpsc::Receiver<()>>,
 ) -> anyhow::Result<()> {
-    let sink_senders = worker_set.sink_senders.clone();
-    let topo_order = worker_set.topo_order.clone();
-    let node_inputs = worker_set.node_inputs.clone();
-    let node_kinds = worker_set.node_kinds.clone();
-    let last_operator_id = worker_set.last_operator_id;
-    let global_watermark = worker_set.global_watermark.clone();
     let checkpoint_notify_tx = worker_set
         .checkpoint_notify_tx
         .lock()
         .unwrap()
         .as_ref()
         .cloned();
-
-    // Clone Arc fields for per-worker take_worker_data inside the closure.
-    let source_rx = worker_set.source_rx.clone();
-    let transforms = worker_set.transforms.clone();
-    let key_fns = worker_set.key_fns.clone();
-    let operators = worker_set.operators.clone();
-    let contexts = worker_set.contexts.clone();
-    let dlq_tx = worker_set.dlq_tx.clone();
 
     // Wrap the barrier receiver so only the first local worker can take it.
     let shutdown_barrier: Option<Arc<std::sync::Mutex<Option<std::sync::mpsc::Receiver<()>>>>> =
@@ -99,43 +95,26 @@ pub(crate) async fn execute_dag(
             let idx = worker.index();
             let _span = tracing::info_span!("worker", worker = idx).entered();
 
-            // Take per-worker data from shared Mutex vectors.
-            let mut w_data = take_worker_data_from_arcs(
-                idx,
-                &source_rx,
-                &transforms,
-                &key_fns,
-                &operators,
-                &contexts,
-                &dlq_tx,
-            );
+            // Take per-worker data (one-time handoff).
+            let mut w_data = worker_set.take_worker_data(idx);
 
             let compiler = TimelyCompiler {
-                sink_senders: sink_senders.clone(),
-                topo_order: topo_order.clone(),
-                node_inputs: node_inputs.clone(),
-                node_kinds: node_kinds.clone(),
+                sink_senders: worker_set.sink_senders.clone(),
+                topo_order: worker_set.topo_order.clone(),
+                node_inputs: worker_set.node_inputs.clone(),
+                node_kinds: worker_set.node_kinds.clone(),
                 rt: rt.clone(),
                 worker_index: idx,
                 num_workers: total_workers,
                 checkpoint_notify: checkpoint_notify_tx.clone(),
                 dlq_tx: w_data.dlq_tx.take(),
-                last_operator_id,
-                global_watermark: global_watermark.clone(),
+                last_operator_id: worker_set.last_operator_id,
+                global_watermark: worker_set.global_watermark.clone(),
                 local_first_worker,
             };
 
             let dataflow_index = worker.next_dataflow_index();
-            let probe = worker.dataflow::<u64, _, _>(|scope| {
-                compiler.compile(
-                    scope,
-                    &mut w_data.source_rx,
-                    &mut w_data.transforms,
-                    &mut w_data.key_fns,
-                    &mut w_data.operators,
-                    &mut w_data.contexts,
-                )
-            });
+            let probe = worker.dataflow::<u64, _, _>(|scope| compiler.compile(scope, &mut w_data));
 
             while !probe.done() {
                 worker.step();
@@ -148,7 +127,7 @@ pub(crate) async fn execute_dag(
             // panics from broken pipes.
             if idx == local_first_worker {
                 if let Some(ref n) = checkpoint_notify_tx {
-                    let _ = n.blocking_send(SHUTDOWN_SENTINEL);
+                    let _ = n.blocking_send(Sentinel::Shutdown as u64);
                 }
                 if let Some(ref barrier) = shutdown_barrier
                     && let Some(rx) = barrier.lock().unwrap().take()
@@ -170,34 +149,6 @@ pub(crate) async fn execute_dag(
     .map_err(|e| anyhow::anyhow!("spawn_blocking failed: {e}"))??;
 
     Ok(())
-}
-
-/// Inline helper to take per-worker data from Arc<Mutex<Vec<Option<...>>>>.
-///
-/// This avoids needing `WorkerSet` inside the `'static` Timely closure — we
-/// only pass the individual Arc fields.
-#[allow(clippy::type_complexity, clippy::option_option)]
-fn take_worker_data_from_arcs(
-    idx: usize,
-    source_rx: &Arc<
-        std::sync::Mutex<Vec<Option<HashMap<NodeId, tokio::sync::mpsc::Receiver<Vec<AnyItem>>>>>>,
-    >,
-    transforms: &Arc<std::sync::Mutex<Vec<Option<HashMap<NodeId, TransformFn>>>>>,
-    key_fns: &Arc<std::sync::Mutex<Vec<Option<HashMap<NodeId, crate::dataflow::KeyFn>>>>>,
-    operators: &Arc<
-        std::sync::Mutex<Vec<Option<HashMap<NodeId, (String, Box<dyn ErasedOperator>)>>>>,
-    >,
-    contexts: &Arc<std::sync::Mutex<Vec<Option<HashMap<NodeId, StateContext>>>>>,
-    dlq_tx: &Arc<std::sync::Mutex<Vec<Option<Option<DlqSender>>>>>,
-) -> crate::worker::WorkerData {
-    crate::worker::WorkerData {
-        source_rx: source_rx.lock().unwrap()[idx].take().unwrap_or_default(),
-        transforms: transforms.lock().unwrap()[idx].take().unwrap_or_default(),
-        key_fns: key_fns.lock().unwrap()[idx].take().unwrap_or_default(),
-        operators: operators.lock().unwrap()[idx].take().unwrap_or_default(),
-        contexts: contexts.lock().unwrap()[idx].take().unwrap_or_default(),
-        dlq_tx: dlq_tx.lock().unwrap()[idx].take().unwrap_or_default(),
-    }
 }
 
 // ── Node kind classification ────────────────────────────────────────
@@ -257,11 +208,7 @@ impl TimelyCompiler {
     fn compile<A: Allocate>(
         &self,
         scope: &mut Scope<'_, A>,
-        source_receivers: &mut HashMap<NodeId, tokio::sync::mpsc::Receiver<Vec<AnyItem>>>,
-        transforms: &mut HashMap<NodeId, TransformFn>,
-        key_fns: &mut HashMap<NodeId, crate::dataflow::KeyFn>,
-        operators: &mut HashMap<NodeId, (String, Box<dyn ErasedOperator>)>,
-        operator_contexts: &mut HashMap<NodeId, StateContext>,
+        data: &mut WorkerData,
     ) -> probe::Handle<u64> {
         let mut streams: HashMap<NodeId, timely::dataflow::Stream<_, AnyItem>> = HashMap::new();
         let probe = probe::Handle::new();
@@ -272,23 +219,29 @@ impl TimelyCompiler {
 
             match kind {
                 NodeKindTag::Source => {
-                    let stream = self.build_source(scope, node_id, source_receivers);
+                    let stream =
+                        self.build_source(scope, node_id, &mut data.source_rx, &mut data.source_wm);
                     streams.insert(node_id, stream);
                 }
                 NodeKindTag::Transform => {
                     let input_stream = streams[&inputs[0]].clone();
-                    let stream = self.build_transform(scope, node_id, input_stream, transforms);
+                    let stream =
+                        self.build_transform(scope, node_id, input_stream, &mut data.transforms);
                     streams.insert(node_id, stream);
                 }
                 NodeKindTag::KeyBy => {
                     let input_stream = streams[&inputs[0]].clone();
-                    let stream = Self::build_key_by(node_id, input_stream, key_fns);
+                    let stream = Self::build_key_by(node_id, input_stream, &mut data.key_fns);
                     streams.insert(node_id, stream);
                 }
                 NodeKindTag::Operator => {
                     let input_stream = streams[&inputs[0]].clone();
-                    let stream =
-                        self.build_operator(node_id, input_stream, operators, operator_contexts);
+                    let stream = self.build_operator(
+                        node_id,
+                        input_stream,
+                        &mut data.operators,
+                        &mut data.contexts,
+                    );
                     streams.insert(node_id, stream);
                 }
                 NodeKindTag::Merge => {
@@ -311,6 +264,7 @@ impl TimelyCompiler {
         scope: &mut Scope<'a, A>,
         node_id: NodeId,
         source_receivers: &mut HashMap<NodeId, tokio::sync::mpsc::Receiver<Vec<AnyItem>>>,
+        source_watermarks: &mut HashMap<NodeId, Arc<AtomicU64>>,
     ) -> timely::dataflow::Stream<Scope<'a, A>, AnyItem> {
         use timely::dataflow::operators::generic::OutputBuilder;
         use timely::dataflow::operators::generic::builder_rc::OperatorBuilder;
@@ -326,6 +280,7 @@ impl TimelyCompiler {
         let source_rx = source_receivers.remove(&node_id);
         let worker_label = self.worker_index.to_string();
         let gw_drain = self.global_watermark.clone();
+        let per_source_wm = source_watermarks.remove(&node_id);
 
         source_builder.build_reschedule(move |mut capabilities| {
             let mut cap = Some(capabilities.pop().unwrap());
@@ -344,10 +299,11 @@ impl TimelyCompiler {
                     return false;
                 };
 
-                // Draining: source channel closed, wait for global watermark
-                // to reach MAX-1 so downstream operators can close final windows.
+                // Draining: source naturally exhausted, wait for global watermark
+                // to reach SourceExhausted so downstream operators can close final
+                // windows before we drop the capability.
                 if draining {
-                    if gw_drain.load(Ordering::Acquire) >= u64::MAX - 1 {
+                    if gw_drain.load(Ordering::Acquire) >= Sentinel::SourceExhausted as u64 {
                         cap = None;
                         return false;
                     }
@@ -388,9 +344,20 @@ impl TimelyCompiler {
                         true
                     }
                     Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
-                        draining = true;
-                        activator.activate();
-                        true
+                        // Check if this source was naturally exhausted (bridge set
+                        // SourceExhausted) vs shut down (watermark unchanged).
+                        // Only drain on exhaustion — shutdown resumes from checkpoint.
+                        let exhausted = per_source_wm.as_ref().is_some_and(|wm| {
+                            wm.load(Ordering::Acquire) >= Sentinel::SourceExhausted as u64
+                        });
+                        if exhausted {
+                            draining = true;
+                            activator.activate();
+                            true
+                        } else {
+                            cap = None;
+                            false
+                        }
                     }
                 }
             }

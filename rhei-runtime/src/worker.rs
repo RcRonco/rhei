@@ -23,21 +23,11 @@ pub(crate) type DlqSender = tokio::sync::mpsc::Sender<rhei_core::dlq::DeadLetter
 
 /// All per-worker data packaged for Timely execution.
 ///
-/// Per-worker Mutex fields are wrapped in `Arc` so they can be cloned into
-/// the `'static` closure required by `timely::execute::execute`.
-#[allow(clippy::type_complexity)]
+/// Per-worker data is assembled into [`WorkerData`] structs and wrapped in a
+/// single `Arc<Mutex<Vec<Option<…>>>>` for one-time handoff into the Timely closure.
 pub(crate) struct WorkerSet {
     // Per-worker data (sized to total_workers, Some for local, None for remote).
-    pub source_rx: Arc<
-        std::sync::Mutex<Vec<Option<HashMap<NodeId, tokio::sync::mpsc::Receiver<Vec<AnyItem>>>>>>,
-    >,
-    pub transforms: Arc<std::sync::Mutex<Vec<Option<HashMap<NodeId, TransformFn>>>>>,
-    pub key_fns: Arc<std::sync::Mutex<Vec<Option<HashMap<NodeId, crate::dataflow::KeyFn>>>>>,
-    pub operators:
-        Arc<std::sync::Mutex<Vec<Option<HashMap<NodeId, (String, Box<dyn ErasedOperator>)>>>>>,
-    pub contexts: Arc<std::sync::Mutex<Vec<Option<HashMap<NodeId, StateContext>>>>>,
-    #[allow(clippy::option_option)]
-    pub dlq_tx: Arc<std::sync::Mutex<Vec<Option<Option<DlqSender>>>>>,
+    per_worker: Arc<std::sync::Mutex<Vec<Option<WorkerData>>>>,
 
     // Shared state
     pub sink_senders: Arc<HashMap<NodeId, tokio::sync::mpsc::Sender<AnyItem>>>,
@@ -65,6 +55,7 @@ pub(crate) struct WorkerSet {
 /// Returned by [`WorkerSet::take_worker_data`] for consumption inside a Timely closure.
 pub(crate) struct WorkerData {
     pub source_rx: HashMap<NodeId, tokio::sync::mpsc::Receiver<Vec<AnyItem>>>,
+    pub source_wm: HashMap<NodeId, Arc<AtomicU64>>,
     pub transforms: HashMap<NodeId, TransformFn>,
     pub key_fns: HashMap<NodeId, crate::dataflow::KeyFn>,
     pub operators: HashMap<NodeId, (String, Box<dyn ErasedOperator>)>,
@@ -73,6 +64,15 @@ pub(crate) struct WorkerData {
 }
 
 impl WorkerSet {
+    /// Take per-worker data for the given worker index (one-time handoff).
+    ///
+    /// Panics if the data for this worker was already taken or was never populated.
+    pub(crate) fn take_worker_data(&self, idx: usize) -> WorkerData {
+        self.per_worker.lock().unwrap()[idx]
+            .take()
+            .expect("worker data already taken")
+    }
+
     /// Build a `WorkerSet` from a compiled graph and controller configuration.
     ///
     /// Performs DLQ setup, node classification, source/sink bridging,
@@ -89,14 +89,19 @@ impl WorkerSet {
         let n_local = local_range.len();
 
         // ── DLQ setup ─────────────────────────────────────────────────
-        let (dlq_senders, dlq_handles) =
+        let (mut dlq_senders, dlq_handles) =
             setup_dlq_sinks(&controller.error_policy, total_workers, &local_range);
 
         // ── Node classification ───────────────────────────────────────
         let (node_kinds, node_inputs, last_operator_id) = classify_nodes(&graph);
 
         // ── Source bridging ───────────────────────────────────────────
-        let (per_worker_source_rx, all_source_offsets, all_source_watermarks) = bridge_sources(
+        let (
+            mut per_worker_source_rx,
+            mut per_worker_source_wm,
+            all_source_offsets,
+            all_source_watermarks,
+        ) = bridge_sources(
             &mut graph,
             total_workers,
             &local_range,
@@ -117,25 +122,32 @@ impl WorkerSet {
         let (sink_senders, sink_handles) = bridge_sinks(&mut graph);
 
         // ── Per-worker data extraction ────────────────────────────────
-        let (all_transforms, all_key_fns, all_operators, all_contexts) = extract_per_worker_data(
-            &mut graph,
-            controller,
-            &node_kinds,
-            &local_range,
-            total_workers,
-        )
-        .await?;
+        let (mut all_transforms, mut all_key_fns, mut all_operators, mut all_contexts) =
+            extract_per_worker_data(
+                &mut graph,
+                controller,
+                &node_kinds,
+                &local_range,
+                total_workers,
+            )
+            .await?;
 
         let topo_order = graph.topo_order.clone();
         let all_operator_names = graph.operator_names.clone();
 
-        // Wrap per-worker source receivers.
-        let per_worker_source_rx: Vec<
-            Option<HashMap<NodeId, tokio::sync::mpsc::Receiver<Vec<AnyItem>>>>,
-        > = per_worker_source_rx.into_iter().map(Some).collect();
-        // Wrap per-worker DLQ senders.
-        let per_worker_dlq_tx: Vec<Option<Option<DlqSender>>> =
-            dlq_senders.into_iter().map(Some).collect();
+        // Assemble per-worker data into WorkerData structs.
+        let mut per_worker: Vec<Option<WorkerData>> = (0..total_workers).map(|_| None).collect();
+        for idx in local_range.clone() {
+            per_worker[idx] = Some(WorkerData {
+                source_rx: std::mem::take(&mut per_worker_source_rx[idx]),
+                source_wm: std::mem::take(&mut per_worker_source_wm[idx]),
+                transforms: all_transforms[idx].take().unwrap_or_default(),
+                key_fns: all_key_fns[idx].take().unwrap_or_default(),
+                operators: all_operators[idx].take().unwrap_or_default(),
+                contexts: all_contexts[idx].take().unwrap_or_default(),
+                dlq_tx: dlq_senders[idx].take(),
+            });
+        }
 
         let (checkpoint_notify_tx, checkpoint_notify_rx) = tokio::sync::mpsc::channel::<u64>(64);
 
@@ -153,12 +165,7 @@ impl WorkerSet {
         );
 
         Ok(WorkerSet {
-            source_rx: Arc::new(std::sync::Mutex::new(per_worker_source_rx)),
-            transforms: Arc::new(std::sync::Mutex::new(all_transforms)),
-            key_fns: Arc::new(std::sync::Mutex::new(all_key_fns)),
-            operators: Arc::new(std::sync::Mutex::new(all_operators)),
-            contexts: Arc::new(std::sync::Mutex::new(all_contexts)),
-            dlq_tx: Arc::new(std::sync::Mutex::new(per_worker_dlq_tx)),
+            per_worker: Arc::new(std::sync::Mutex::new(per_worker)),
             sink_senders: Arc::new(sink_senders),
             global_watermark,
             checkpoint_notify_rx: tokio::sync::Mutex::new(checkpoint_notify_rx),
@@ -261,7 +268,7 @@ fn classify_nodes(
 /// Bridge all sources in the graph to per-worker mpsc receivers.
 ///
 /// Handles both partitioned and non-partitioned source distribution.
-/// Returns `(per_worker_source_rx, all_source_offsets, all_source_watermarks)`.
+/// Returns `(per_worker_source_rx, per_worker_source_wm, all_source_offsets, all_source_watermarks)`.
 #[allow(clippy::type_complexity)]
 async fn bridge_sources(
     graph: &mut CompiledGraph,
@@ -272,10 +279,13 @@ async fn bridge_sources(
     restored_offsets: &HashMap<String, String>,
 ) -> anyhow::Result<(
     Vec<HashMap<NodeId, tokio::sync::mpsc::Receiver<Vec<AnyItem>>>>,
+    Vec<HashMap<NodeId, Arc<AtomicU64>>>,
     Vec<Arc<std::sync::Mutex<HashMap<String, String>>>>,
     Vec<Arc<AtomicU64>>,
 )> {
     let mut per_worker_source_rx: Vec<HashMap<NodeId, tokio::sync::mpsc::Receiver<Vec<AnyItem>>>> =
+        (0..total_workers).map(|_| HashMap::new()).collect();
+    let mut per_worker_source_wm: Vec<HashMap<NodeId, Arc<AtomicU64>>> =
         (0..total_workers).map(|_| HashMap::new()).collect();
     let mut all_source_offsets: Vec<Arc<std::sync::Mutex<HashMap<String, String>>>> = Vec::new();
     let mut all_source_watermarks: Vec<Arc<AtomicU64>> = Vec::new();
@@ -309,6 +319,7 @@ async fn bridge_sources(
                 let (rx, offsets, wm) =
                     crate::bridge::erased_source_bridge_with_offsets(psrc, rt, shutdown.cloned());
                 per_worker_source_rx[worker_idx].insert(source_id, rx);
+                per_worker_source_wm[worker_idx].insert(source_id, wm.clone());
                 all_source_offsets.push(offsets);
                 all_source_watermarks.push(wm);
             }
@@ -323,6 +334,7 @@ async fn bridge_sources(
                 let (rx, offsets, wm) =
                     crate::bridge::erased_source_bridge_with_offsets(source, rt, shutdown.cloned());
                 per_worker_source_rx[0].insert(source_id, rx);
+                per_worker_source_wm[0].insert(source_id, wm.clone());
                 all_source_offsets.push(offsets);
                 all_source_watermarks.push(wm);
             }
@@ -331,6 +343,7 @@ async fn bridge_sources(
 
     Ok((
         per_worker_source_rx,
+        per_worker_source_wm,
         all_source_offsets,
         all_source_watermarks,
     ))

@@ -544,7 +544,8 @@ async fn execute_compiled(
     let rt = tokio::runtime::Handle::current();
     let total_workers = controller.total_workers();
 
-    let worker_set = WorkerSet::build(graph, controller, shutdown, &rt, restored_offsets).await?;
+    let worker_set =
+        Arc::new(WorkerSet::build(graph, controller, shutdown, &rt, restored_offsets).await?);
 
     let (coordination, coord_task_handle) = setup_coordination(controller).await?;
 
@@ -582,7 +583,7 @@ async fn execute_compiled(
     let local_first_worker = controller.local_worker_range().start;
     crate::executor::execute_dag(
         timely_config,
-        &worker_set,
+        worker_set.clone(),
         rt.clone(),
         total_workers,
         local_first_worker,
@@ -607,7 +608,10 @@ async fn execute_compiled(
     let all_operator_names = worker_set.all_operator_names.clone();
     let source_offsets = worker_set.source_offsets();
 
-    worker_set.drain().await?;
+    Arc::try_unwrap(worker_set)
+        .unwrap_or_else(|_| panic!("WorkerSet Arc still shared after execute_dag"))
+        .drain()
+        .await?;
 
     // Final manifest (includes all accumulated checkpoint progress).
     let checkpoint_id = last_checkpoint_id + 1;
@@ -656,7 +660,7 @@ struct CheckpointTaskConfig {
 /// manifests as each epoch completes. In cluster mode, coordinates with
 /// other processes before writing the manifest.
 ///
-/// When a [`SHUTDOWN_SENTINEL`](crate::executor::SHUTDOWN_SENTINEL) epoch
+/// When a [`Sentinel::Shutdown`](crate::executor::Sentinel::Shutdown) epoch
 /// arrives, the task coordinates shutdown across processes (if in cluster
 /// mode), then releases the barrier so workers can return and Timely's
 /// TCP connections tear down simultaneously.
@@ -681,7 +685,7 @@ async fn run_checkpoint_task(
 
         // Shutdown sentinel: coordinate with other processes, then release
         // the barrier so all workers can return simultaneously.
-        if epoch == crate::executor::SHUTDOWN_SENTINEL {
+        if epoch == crate::executor::Sentinel::Shutdown as u64 {
             tracing::debug!("received shutdown sentinel — coordinating teardown");
             coordinate_epoch(epoch, &mut coordination).await;
             if let Some(ref tx) = shutdown_barrier_tx {
