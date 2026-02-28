@@ -31,6 +31,7 @@ pub(crate) struct WorkerSet {
     pub source_rx: Arc<
         std::sync::Mutex<Vec<Option<HashMap<NodeId, tokio::sync::mpsc::Receiver<Vec<AnyItem>>>>>>,
     >,
+    pub source_wm: Arc<std::sync::Mutex<Vec<Option<HashMap<NodeId, Arc<AtomicU64>>>>>>,
     pub transforms: Arc<std::sync::Mutex<Vec<Option<HashMap<NodeId, TransformFn>>>>>,
     pub key_fns: Arc<std::sync::Mutex<Vec<Option<HashMap<NodeId, crate::dataflow::KeyFn>>>>>,
     pub operators:
@@ -65,6 +66,7 @@ pub(crate) struct WorkerSet {
 /// Returned by [`WorkerSet::take_worker_data`] for consumption inside a Timely closure.
 pub(crate) struct WorkerData {
     pub source_rx: HashMap<NodeId, tokio::sync::mpsc::Receiver<Vec<AnyItem>>>,
+    pub source_wm: HashMap<NodeId, Arc<AtomicU64>>,
     pub transforms: HashMap<NodeId, TransformFn>,
     pub key_fns: HashMap<NodeId, crate::dataflow::KeyFn>,
     pub operators: HashMap<NodeId, (String, Box<dyn ErasedOperator>)>,
@@ -96,15 +98,16 @@ impl WorkerSet {
         let (node_kinds, node_inputs, last_operator_id) = classify_nodes(&graph);
 
         // ── Source bridging ───────────────────────────────────────────
-        let (per_worker_source_rx, all_source_offsets, all_source_watermarks) = bridge_sources(
-            &mut graph,
-            total_workers,
-            &local_range,
-            rt,
-            shutdown,
-            &restored_offsets,
-        )
-        .await?;
+        let (per_worker_source_rx, per_worker_source_wm, all_source_offsets, all_source_watermarks) =
+            bridge_sources(
+                &mut graph,
+                total_workers,
+                &local_range,
+                rt,
+                shutdown,
+                &restored_offsets,
+            )
+            .await?;
 
         if !restored_offsets.is_empty() {
             tracing::info!(
@@ -129,10 +132,12 @@ impl WorkerSet {
         let topo_order = graph.topo_order.clone();
         let all_operator_names = graph.operator_names.clone();
 
-        // Wrap per-worker source receivers.
+        // Wrap per-worker source receivers and watermarks.
         let per_worker_source_rx: Vec<
             Option<HashMap<NodeId, tokio::sync::mpsc::Receiver<Vec<AnyItem>>>>,
         > = per_worker_source_rx.into_iter().map(Some).collect();
+        let per_worker_source_wm: Vec<Option<HashMap<NodeId, Arc<AtomicU64>>>> =
+            per_worker_source_wm.into_iter().map(Some).collect();
         // Wrap per-worker DLQ senders.
         let per_worker_dlq_tx: Vec<Option<Option<DlqSender>>> =
             dlq_senders.into_iter().map(Some).collect();
@@ -154,6 +159,7 @@ impl WorkerSet {
 
         Ok(WorkerSet {
             source_rx: Arc::new(std::sync::Mutex::new(per_worker_source_rx)),
+            source_wm: Arc::new(std::sync::Mutex::new(per_worker_source_wm)),
             transforms: Arc::new(std::sync::Mutex::new(all_transforms)),
             key_fns: Arc::new(std::sync::Mutex::new(all_key_fns)),
             operators: Arc::new(std::sync::Mutex::new(all_operators)),
@@ -261,7 +267,7 @@ fn classify_nodes(
 /// Bridge all sources in the graph to per-worker mpsc receivers.
 ///
 /// Handles both partitioned and non-partitioned source distribution.
-/// Returns `(per_worker_source_rx, all_source_offsets, all_source_watermarks)`.
+/// Returns `(per_worker_source_rx, per_worker_source_wm, all_source_offsets, all_source_watermarks)`.
 #[allow(clippy::type_complexity)]
 async fn bridge_sources(
     graph: &mut CompiledGraph,
@@ -272,10 +278,13 @@ async fn bridge_sources(
     restored_offsets: &HashMap<String, String>,
 ) -> anyhow::Result<(
     Vec<HashMap<NodeId, tokio::sync::mpsc::Receiver<Vec<AnyItem>>>>,
+    Vec<HashMap<NodeId, Arc<AtomicU64>>>,
     Vec<Arc<std::sync::Mutex<HashMap<String, String>>>>,
     Vec<Arc<AtomicU64>>,
 )> {
     let mut per_worker_source_rx: Vec<HashMap<NodeId, tokio::sync::mpsc::Receiver<Vec<AnyItem>>>> =
+        (0..total_workers).map(|_| HashMap::new()).collect();
+    let mut per_worker_source_wm: Vec<HashMap<NodeId, Arc<AtomicU64>>> =
         (0..total_workers).map(|_| HashMap::new()).collect();
     let mut all_source_offsets: Vec<Arc<std::sync::Mutex<HashMap<String, String>>>> = Vec::new();
     let mut all_source_watermarks: Vec<Arc<AtomicU64>> = Vec::new();
@@ -309,6 +318,7 @@ async fn bridge_sources(
                 let (rx, offsets, wm) =
                     crate::bridge::erased_source_bridge_with_offsets(psrc, rt, shutdown.cloned());
                 per_worker_source_rx[worker_idx].insert(source_id, rx);
+                per_worker_source_wm[worker_idx].insert(source_id, wm.clone());
                 all_source_offsets.push(offsets);
                 all_source_watermarks.push(wm);
             }
@@ -323,6 +333,7 @@ async fn bridge_sources(
                 let (rx, offsets, wm) =
                     crate::bridge::erased_source_bridge_with_offsets(source, rt, shutdown.cloned());
                 per_worker_source_rx[0].insert(source_id, rx);
+                per_worker_source_wm[0].insert(source_id, wm.clone());
                 all_source_offsets.push(offsets);
                 all_source_watermarks.push(wm);
             }
@@ -331,6 +342,7 @@ async fn bridge_sources(
 
     Ok((
         per_worker_source_rx,
+        per_worker_source_wm,
         all_source_offsets,
         all_source_watermarks,
     ))

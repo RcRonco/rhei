@@ -105,13 +105,18 @@ pub(crate) fn erased_source_bridge_with_offsets(
                 && handle.is_shutdown()
             {
                 tracing::info!("shutdown requested, stopping source bridge");
-                break;
+                // Don't signal SourceExhausted — shutdown is not exhaustion.
+                // We'll resume from checkpoint on next start.
+                return;
             }
         }
-        // Source finished — signal that no more data will arrive from this source.
-        // The global watermark task will propagate MAX once all sources are done.
-        // Using MAX-1 to avoid collision with SHUTDOWN_SENTINEL (u64::MAX).
-        wm_writer.store(u64::MAX - 1, Ordering::Release);
+        // Source naturally exhausted — signal that no more data will ever arrive.
+        // The global watermark task will propagate this once all sources are done,
+        // allowing downstream operators to close their final windows.
+        wm_writer.store(
+            crate::executor::Sentinel::SourceExhausted as u64,
+            Ordering::Release,
+        );
         // tx drops here, closing the channel
     });
     (rx, shared_offsets, source_watermark)

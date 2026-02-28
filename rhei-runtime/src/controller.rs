@@ -656,7 +656,7 @@ struct CheckpointTaskConfig {
 /// manifests as each epoch completes. In cluster mode, coordinates with
 /// other processes before writing the manifest.
 ///
-/// When a [`SHUTDOWN_SENTINEL`](crate::executor::SHUTDOWN_SENTINEL) epoch
+/// When a [`Sentinel::Shutdown`](crate::executor::Sentinel::Shutdown) epoch
 /// arrives, the task coordinates shutdown across processes (if in cluster
 /// mode), then releases the barrier so workers can return and Timely's
 /// TCP connections tear down simultaneously.
@@ -681,7 +681,7 @@ async fn run_checkpoint_task(
 
         // Shutdown sentinel: coordinate with other processes, then release
         // the barrier so all workers can return simultaneously.
-        if epoch == crate::executor::SHUTDOWN_SENTINEL {
+        if epoch == crate::executor::Sentinel::Shutdown as u64 {
             tracing::debug!("received shutdown sentinel — coordinating teardown");
             coordinate_epoch(epoch, &mut coordination).await;
             if let Some(ref tx) = shutdown_barrier_tx {

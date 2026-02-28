@@ -29,13 +29,23 @@ pub use crate::controller::PipelineControllerBuilder as ExecutorBuilder;
 /// Type alias for a Timely worker scope parameterized by allocator.
 type Scope<'a, A> = Child<'a, Worker<A>, u64>;
 
-/// Sentinel epoch value used to signal shutdown readiness.
+/// Special sentinel values in the `u64` timeline shared by watermarks and epochs.
 ///
-/// After `probe.done()`, the first local worker on each process sends this
-/// sentinel through the checkpoint notification channel. In cluster mode,
-/// the checkpoint task coordinates with other processes before releasing
-/// the shutdown barrier, ensuring all processes tear down TCP simultaneously.
-pub(crate) const SHUTDOWN_SENTINEL: u64 = u64::MAX;
+/// These live at the top of the `u64` range, well above any real timestamp or epoch.
+#[repr(u64)]
+pub(crate) enum Sentinel {
+    /// All data has arrived — sources set their watermark to this value on exhaustion.
+    ///
+    /// The global watermark task propagates this once every source bridge has exited.
+    /// Downstream operators (e.g. `TumblingWindow`) use it to close pending windows.
+    SourceExhausted = u64::MAX - 1,
+
+    /// Shutdown coordination — sent through the checkpoint channel after `probe.done()`.
+    ///
+    /// In cluster mode, the checkpoint task coordinates with other processes before
+    /// releasing the shutdown barrier, ensuring all processes tear down TCP simultaneously.
+    Shutdown = u64::MAX,
+}
 
 // ── Key partitioning ────────────────────────────────────────────────
 
@@ -56,7 +66,7 @@ pub fn partition_key(key: &str, n_workers: usize) -> usize {
 /// and runs `worker.step()` until the probe signals completion.
 ///
 /// In cluster mode, `shutdown_barrier_rx` enables coordinated shutdown:
-/// the first local worker sends a [`SHUTDOWN_SENTINEL`] through the
+/// the first local worker sends a [`Sentinel::Shutdown`] through the
 /// checkpoint channel, then blocks on this receiver until all processes
 /// are ready to tear down. This prevents `CommsGuard::drop` panics
 /// caused by one process closing TCP connections while peers are still
@@ -84,6 +94,7 @@ pub(crate) async fn execute_dag(
 
     // Clone Arc fields for per-worker take_worker_data inside the closure.
     let source_rx = worker_set.source_rx.clone();
+    let source_wm = worker_set.source_wm.clone();
     let transforms = worker_set.transforms.clone();
     let key_fns = worker_set.key_fns.clone();
     let operators = worker_set.operators.clone();
@@ -103,6 +114,7 @@ pub(crate) async fn execute_dag(
             let mut w_data = take_worker_data_from_arcs(
                 idx,
                 &source_rx,
+                &source_wm,
                 &transforms,
                 &key_fns,
                 &operators,
@@ -130,6 +142,7 @@ pub(crate) async fn execute_dag(
                 compiler.compile(
                     scope,
                     &mut w_data.source_rx,
+                    &mut w_data.source_wm,
                     &mut w_data.transforms,
                     &mut w_data.key_fns,
                     &mut w_data.operators,
@@ -148,7 +161,7 @@ pub(crate) async fn execute_dag(
             // panics from broken pipes.
             if idx == local_first_worker {
                 if let Some(ref n) = checkpoint_notify_tx {
-                    let _ = n.blocking_send(SHUTDOWN_SENTINEL);
+                    let _ = n.blocking_send(Sentinel::Shutdown as u64);
                 }
                 if let Some(ref barrier) = shutdown_barrier
                     && let Some(rx) = barrier.lock().unwrap().take()
@@ -176,12 +189,17 @@ pub(crate) async fn execute_dag(
 ///
 /// This avoids needing `WorkerSet` inside the `'static` Timely closure — we
 /// only pass the individual Arc fields.
-#[allow(clippy::type_complexity, clippy::option_option)]
+#[allow(
+    clippy::type_complexity,
+    clippy::option_option,
+    clippy::too_many_arguments
+)]
 fn take_worker_data_from_arcs(
     idx: usize,
     source_rx: &Arc<
         std::sync::Mutex<Vec<Option<HashMap<NodeId, tokio::sync::mpsc::Receiver<Vec<AnyItem>>>>>>,
     >,
+    source_wm: &Arc<std::sync::Mutex<Vec<Option<HashMap<NodeId, Arc<AtomicU64>>>>>>,
     transforms: &Arc<std::sync::Mutex<Vec<Option<HashMap<NodeId, TransformFn>>>>>,
     key_fns: &Arc<std::sync::Mutex<Vec<Option<HashMap<NodeId, crate::dataflow::KeyFn>>>>>,
     operators: &Arc<
@@ -192,6 +210,7 @@ fn take_worker_data_from_arcs(
 ) -> crate::worker::WorkerData {
     crate::worker::WorkerData {
         source_rx: source_rx.lock().unwrap()[idx].take().unwrap_or_default(),
+        source_wm: source_wm.lock().unwrap()[idx].take().unwrap_or_default(),
         transforms: transforms.lock().unwrap()[idx].take().unwrap_or_default(),
         key_fns: key_fns.lock().unwrap()[idx].take().unwrap_or_default(),
         operators: operators.lock().unwrap()[idx].take().unwrap_or_default(),
@@ -254,10 +273,12 @@ impl TimelyCompiler {
     ///
     /// Iterates `topo_order`, matches each node kind to its builder method,
     /// and returns a probe handle for tracking completion.
+    #[allow(clippy::too_many_arguments)]
     fn compile<A: Allocate>(
         &self,
         scope: &mut Scope<'_, A>,
         source_receivers: &mut HashMap<NodeId, tokio::sync::mpsc::Receiver<Vec<AnyItem>>>,
+        source_watermarks: &mut HashMap<NodeId, Arc<AtomicU64>>,
         transforms: &mut HashMap<NodeId, TransformFn>,
         key_fns: &mut HashMap<NodeId, crate::dataflow::KeyFn>,
         operators: &mut HashMap<NodeId, (String, Box<dyn ErasedOperator>)>,
@@ -272,7 +293,8 @@ impl TimelyCompiler {
 
             match kind {
                 NodeKindTag::Source => {
-                    let stream = self.build_source(scope, node_id, source_receivers);
+                    let stream =
+                        self.build_source(scope, node_id, source_receivers, source_watermarks);
                     streams.insert(node_id, stream);
                 }
                 NodeKindTag::Transform => {
@@ -311,6 +333,7 @@ impl TimelyCompiler {
         scope: &mut Scope<'a, A>,
         node_id: NodeId,
         source_receivers: &mut HashMap<NodeId, tokio::sync::mpsc::Receiver<Vec<AnyItem>>>,
+        source_watermarks: &mut HashMap<NodeId, Arc<AtomicU64>>,
     ) -> timely::dataflow::Stream<Scope<'a, A>, AnyItem> {
         use timely::dataflow::operators::generic::OutputBuilder;
         use timely::dataflow::operators::generic::builder_rc::OperatorBuilder;
@@ -326,6 +349,7 @@ impl TimelyCompiler {
         let source_rx = source_receivers.remove(&node_id);
         let worker_label = self.worker_index.to_string();
         let gw_drain = self.global_watermark.clone();
+        let per_source_wm = source_watermarks.remove(&node_id);
 
         source_builder.build_reschedule(move |mut capabilities| {
             let mut cap = Some(capabilities.pop().unwrap());
@@ -344,10 +368,11 @@ impl TimelyCompiler {
                     return false;
                 };
 
-                // Draining: source channel closed, wait for global watermark
-                // to reach MAX-1 so downstream operators can close final windows.
+                // Draining: source naturally exhausted, wait for global watermark
+                // to reach SourceExhausted so downstream operators can close final
+                // windows before we drop the capability.
                 if draining {
-                    if gw_drain.load(Ordering::Acquire) >= u64::MAX - 1 {
+                    if gw_drain.load(Ordering::Acquire) >= Sentinel::SourceExhausted as u64 {
                         cap = None;
                         return false;
                     }
@@ -388,9 +413,20 @@ impl TimelyCompiler {
                         true
                     }
                     Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
-                        draining = true;
-                        activator.activate();
-                        true
+                        // Check if this source was naturally exhausted (bridge set
+                        // SourceExhausted) vs shut down (watermark unchanged).
+                        // Only drain on exhaustion — shutdown resumes from checkpoint.
+                        let exhausted = per_source_wm.as_ref().is_some_and(|wm| {
+                            wm.load(Ordering::Acquire) >= Sentinel::SourceExhausted as u64
+                        });
+                        if exhausted {
+                            draining = true;
+                            activator.activate();
+                            true
+                        } else {
+                            cap = None;
+                            false
+                        }
                     }
                 }
             }
