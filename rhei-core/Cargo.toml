@@ -1,0 +1,31 @@
+[package]
+name = "rhei-core"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+bincode.workspace = true
+futures.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+foyer.workspace = true
+slatedb.workspace = true
+object_store.workspace = true
+bytes.workspace = true
+tracing.workspace = true
+metrics.workspace = true
+rdkafka = { workspace = true, optional = true }
+
+[features]
+kafka = ["rdkafka"]
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full"] }
+tempfile.workspace = true

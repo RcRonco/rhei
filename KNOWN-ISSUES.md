@@ -1,6 +1,6 @@
 # Known Issues
 
-Tracked gaps, limitations, and potential correctness issues in the Rill codebase.
+Tracked gaps, limitations, and potential correctness issues in the Rhei codebase.
 Severity labels: **CRITICAL** (data loss or incorrect results), **HIGH** (resource
 exhaustion, silent misbehaviour), **MEDIUM** (missing feature, workaround exists).
 
@@ -71,7 +71,7 @@ events to a separate stream is not yet implemented.
 
 ### KI-7: L1 memtable has no size limit or eviction
 
-**File:** `rill-core/src/state/memtable.rs:8-11`
+**File:** `rhei-core/src/state/memtable.rs:8-11`
 
 `MemTable` is a plain `HashMap` with a dirty set. There is no capacity limit,
 eviction policy, or backpressure mechanism. Between checkpoints, L1 can grow
@@ -95,7 +95,7 @@ at execution time.
 
 ### KI-10: Sliding window unbounded active windows
 
-**File:** `rill-core/src/operators/sliding_window.rs`
+**File:** `rhei-core/src/operators/sliding_window.rs`
 
 `ActiveWindows` stores all active window start times per key. With small slide
 intervals relative to window size, thousands of overlapping windows can accumulate
@@ -107,7 +107,7 @@ per key with no eviction when windows close.
 
 ### ~~KI-11: Stash ordering under async pending~~ (PARTIALLY RESOLVED)
 
-**File:** `rill-runtime/src/async_operator.rs`
+**File:** `rhei-runtime/src/async_operator.rs`
 
 The `rt = None` data loss path now logs at `error` level with an
 `async_operator_dropped_elements_total` metric. The `let _ = cap` pattern was
@@ -140,7 +140,7 @@ in their `unary_frontier` callback and call `on_watermark()` on the wrapped
 
 ### KI-14: Tracing log channel drops entries under backpressure
 
-**File:** `rill-runtime/src/tracing_capture.rs:103`
+**File:** `rhei-runtime/src/tracing_capture.rs:103`
 
 ```rust
 let _ = self.tx.try_send(entry);

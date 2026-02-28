@@ -68,7 +68,7 @@ sequenceDiagram
 
 ```mermaid
 graph LR
-    subgraph rill-core
+    subgraph rhei-core
         ST[Source trait<br/>current_watermark]
         SF[StreamFunction trait<br/>on_watermark]
         KS[KafkaSource]
@@ -77,7 +77,7 @@ graph LR
         SESS[SessionWindow]
     end
 
-    subgraph rill-runtime
+    subgraph rhei-runtime
         BR[bridge.rs<br/>Arc AtomicU64 per source]
         EX[executor.rs<br/>global watermark task]
         TEO[TimelyErasedOperator<br/>process_watermark]
@@ -133,13 +133,13 @@ Each operator maintains its own watermark and forwards it downstream. Watermarks
 
 | File | Change |
 |---|---|
-| `rill-core/src/traits.rs` | Add `current_watermark()` to `Source`, `on_watermark()` to `StreamFunction` |
-| `rill-core/src/connectors/kafka_source.rs` | Track `max_timestamp`, implement `current_watermark()`, add `with_allowed_lateness()` |
-| `rill-core/src/operators/tumbling_window.rs` | Add `active_keys`, `allowed_lateness`, `last_watermark`; implement `on_watermark()`; late event detection |
-| `rill-core/src/operators/sliding_window.rs` | Same pattern as tumbling |
-| `rill-core/src/operators/session_window.rs` | Same pattern adapted for session semantics |
-| `rill-runtime/src/dataflow.rs` | Add `current_watermark()` to `ErasedSource`, `on_watermark()` to `ErasedOperator` |
-| `rill-runtime/src/timely_operator.rs` | Add `process_watermark()` to `TimelyErasedOperator` |
-| `rill-runtime/src/bridge.rs` | Return `Arc<AtomicU64>` from bridge, publish watermark after each batch |
-| `rill-runtime/src/executor.rs` | Collect source watermarks, spawn global watermark task, pass to `build_timely_dag`, read in operator closure |
-| `rill-runtime/tests/watermark.rs` | Integration test with `WatermarkVecSource` |
+| `rhei-core/src/traits.rs` | Add `current_watermark()` to `Source`, `on_watermark()` to `StreamFunction` |
+| `rhei-core/src/connectors/kafka_source.rs` | Track `max_timestamp`, implement `current_watermark()`, add `with_allowed_lateness()` |
+| `rhei-core/src/operators/tumbling_window.rs` | Add `active_keys`, `allowed_lateness`, `last_watermark`; implement `on_watermark()`; late event detection |
+| `rhei-core/src/operators/sliding_window.rs` | Same pattern as tumbling |
+| `rhei-core/src/operators/session_window.rs` | Same pattern adapted for session semantics |
+| `rhei-runtime/src/dataflow.rs` | Add `current_watermark()` to `ErasedSource`, `on_watermark()` to `ErasedOperator` |
+| `rhei-runtime/src/timely_operator.rs` | Add `process_watermark()` to `TimelyErasedOperator` |
+| `rhei-runtime/src/bridge.rs` | Return `Arc<AtomicU64>` from bridge, publish watermark after each batch |
+| `rhei-runtime/src/executor.rs` | Collect source watermarks, spawn global watermark task, pass to `build_timely_dag`, read in operator closure |
+| `rhei-runtime/tests/watermark.rs` | Integration test with `WatermarkVecSource` |

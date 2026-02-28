@@ -1,5 +1,5 @@
-# Architecture Design: Rill Overview
-Overview Rill is a distributed, stateful stream processing engine written in Rust. It utilizes a Shared-Nothing, Disaggregated State architecture, separating compute from durable storage to enable instant autoscaling and eliminate heavy local-disk state migrations.
+# Architecture Design: Rhei Overview
+Overview Rhei is a distributed, stateful stream processing engine written in Rust. It utilizes a Shared-Nothing, Disaggregated State architecture, separating compute from durable storage to enable instant autoscaling and eliminate heavy local-disk state migrations.
 
 ## 1. System Topology
 ```mermaid

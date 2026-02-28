@@ -223,12 +223,12 @@ Rejected. L3 access (S3) is inherently I/O-bound with 10-100ms latency. A synchr
 
 | File | Role |
 |------|------|
-| `rill-core/src/state/backend.rs` | `StateBackend` trait definition |
-| `rill-core/src/state/context.rs` | `StateContext` — L1 memtable + backend integration |
-| `rill-core/src/state/memtable.rs` | `MemTable` — in-memory HashMap with dirty tracking |
-| `rill-core/src/state/local_backend.rs` | `LocalBackend` — JSON file backend for development |
-| `rill-core/src/state/prefixed_backend.rs` | `PrefixedBackend` — per-operator key namespacing |
-| `rill-core/src/state/tiered_backend.rs` | `TieredBackend` — L2 Foyer + L3 SlateDB composition |
-| `rill-core/src/state/slatedb_backend.rs` | `SlateDbBackend` — S3-backed LSM tree |
-| `rill-runtime/src/executor.rs` | `create_context`, `create_context_for_worker` — backend selection and wiring |
-| `rill-runtime/src/async_operator.rs` | Hot/cold path split — synchronous poll + async fallback |
+| `rhei-core/src/state/backend.rs` | `StateBackend` trait definition |
+| `rhei-core/src/state/context.rs` | `StateContext` — L1 memtable + backend integration |
+| `rhei-core/src/state/memtable.rs` | `MemTable` — in-memory HashMap with dirty tracking |
+| `rhei-core/src/state/local_backend.rs` | `LocalBackend` — JSON file backend for development |
+| `rhei-core/src/state/prefixed_backend.rs` | `PrefixedBackend` — per-operator key namespacing |
+| `rhei-core/src/state/tiered_backend.rs` | `TieredBackend` — L2 Foyer + L3 SlateDB composition |
+| `rhei-core/src/state/slatedb_backend.rs` | `SlateDbBackend` — S3-backed LSM tree |
+| `rhei-runtime/src/executor.rs` | `create_context`, `create_context_for_worker` — backend selection and wiring |
+| `rhei-runtime/src/async_operator.rs` | Hot/cold path split — synchronous poll + async fallback |

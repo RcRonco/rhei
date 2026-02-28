@@ -138,10 +138,10 @@ Considered but rejected. Abomonation is zero-copy but unsafe and requires fixed-
 
 | File | Change |
 |---|---|
-| `rill-runtime/Cargo.toml` | Add `bincode` dependency |
-| `rill-runtime/src/dataflow.rs` | Extend `CloneAnySend` with serialization, add type registry, `Serialize`/`Deserialize` for `AnyItem`, serde bounds on all graph API types |
-| `rill-runtime/src/compiler.rs` | Replace linear `compile()` with DAG-aware `compile_graph()` using Kahn's algorithm |
-| `rill-runtime/src/executor.rs` | Replace two-stage executor with unified `execute_graph()` and `build_timely_dag()` |
+| `rhei-runtime/Cargo.toml` | Add `bincode` dependency |
+| `rhei-runtime/src/dataflow.rs` | Extend `CloneAnySend` with serialization, add type registry, `Serialize`/`Deserialize` for `AnyItem`, serde bounds on all graph API types |
+| `rhei-runtime/src/compiler.rs` | Replace linear `compile()` with DAG-aware `compile_graph()` using Kahn's algorithm |
+| `rhei-runtime/src/executor.rs` | Replace two-stage executor with unified `execute_graph()` and `build_timely_dag()` |
 | `ADR/timely-exchange-dag.md` | This ADR |
 | `KNOWN-ISSUES.md` | Mark KI-4, KI-9, KI-17 as resolved |
 | `ROADMAP.md` | Check off topology items |

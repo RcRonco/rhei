@@ -5,7 +5,7 @@
 
 ## Context
 
-Rill's initial executor used `timely::execute_directly()`, running a single worker on one thread. All stateful operators, stateless transforms, source reads, and sink writes shared a single thread — limiting throughput to one CPU core.
+Rhei's initial executor used `timely::execute_directly()`, running a single worker on one thread. All stateful operators, stateless transforms, source reads, and sink writes shared a single thread — limiting throughput to one CPU core.
 
 For keyed stateful operators (windows, aggregations, joins), elements with different keys are independent and can be processed in parallel. The system needs a multi-threaded execution path that preserves key affinity (same key always goes to the same worker) while enabling parallel stateful processing.
 
@@ -180,8 +180,8 @@ Rejected. Rust's default `HashMap` hasher uses a random seed, producing differen
 
 | File | Role |
 |------|------|
-| `rill-runtime/src/executor.rs` | `execute_multi_worker`, `partition_key`, barrier coordination, worker spawning |
-| `rill-runtime/src/compiler.rs` | `split_at_first_exchange` — pipeline splitting at Exchange boundary |
-| `rill-runtime/src/dataflow.rs` | `KeyFn`, `NodeKind::KeyBy` — key extraction and exchange node types |
-| `rill-runtime/src/bridge.rs` | `erased_source_bridge` — async source to sync channel bridge |
-| `rill-runtime/src/timely_operator.rs` | `TimelyErasedOperator` — frontier-aware checkpoint triggering |
+| `rhei-runtime/src/executor.rs` | `execute_multi_worker`, `partition_key`, barrier coordination, worker spawning |
+| `rhei-runtime/src/compiler.rs` | `split_at_first_exchange` — pipeline splitting at Exchange boundary |
+| `rhei-runtime/src/dataflow.rs` | `KeyFn`, `NodeKind::KeyBy` — key extraction and exchange node types |
+| `rhei-runtime/src/bridge.rs` | `erased_source_bridge` — async source to sync channel bridge |
+| `rhei-runtime/src/timely_operator.rs` | `TimelyErasedOperator` — frontier-aware checkpoint triggering |

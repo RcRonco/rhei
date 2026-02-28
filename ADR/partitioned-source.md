@@ -110,14 +110,14 @@ sequenceDiagram
 
 ```mermaid
 graph LR
-    subgraph rill-core
+    subgraph rhei-core
         ST[Source trait<br/>partition_count<br/>create_partition_source]
         KS[KafkaSource]
         KPS[KafkaPartitionSource]
         PVS[PartitionedVecSource]
     end
 
-    subgraph rill-runtime
+    subgraph rhei-runtime
         ES[ErasedSource]
         SW[SourceWrapper]
         DSW[DynSourceWrapper]
@@ -174,10 +174,10 @@ Each source could internally spawn threads for parallel partition reading. Rejec
 
 | File | Change |
 |---|---|
-| `rill-core/src/traits.rs` | Add `partition_count()` and `create_partition_source()` to `Source` |
-| `rill-core/src/connectors/kafka_source.rs` | Store factory config, add `KafkaPartitionSource`, implement partitioning |
-| `rill-core/src/connectors/partitioned_vec_source.rs` | New — `PartitionedVecSource` for testing |
-| `rill-core/src/connectors/mod.rs` | Register `partitioned_vec_source` module |
-| `rill-runtime/src/dataflow.rs` | Add partitioning to `ErasedSource`, implement in `SourceWrapper`, add `DynSourceWrapper` |
-| `rill-runtime/src/executor.rs` | Partition-aware source bridging, per-worker source distribution, new tests |
+| `rhei-core/src/traits.rs` | Add `partition_count()` and `create_partition_source()` to `Source` |
+| `rhei-core/src/connectors/kafka_source.rs` | Store factory config, add `KafkaPartitionSource`, implement partitioning |
+| `rhei-core/src/connectors/partitioned_vec_source.rs` | New — `PartitionedVecSource` for testing |
+| `rhei-core/src/connectors/mod.rs` | Register `partitioned_vec_source` module |
+| `rhei-runtime/src/dataflow.rs` | Add partitioning to `ErasedSource`, implement in `SourceWrapper`, add `DynSourceWrapper` |
+| `rhei-runtime/src/executor.rs` | Partition-aware source bridging, per-worker source distribution, new tests |
 | `ROADMAP.md` | Mark partitioned source consumption as completed |

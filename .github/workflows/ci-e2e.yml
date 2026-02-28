@@ -46,9 +46,9 @@ jobs:
           shared-key: stable-kafka
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Run Kafka E2E tests
-        run: cargo test -p rill-runtime --features kafka --test kafka_e2e -- --nocapture
+        run: cargo test -p rhei-runtime --features kafka --test kafka_e2e -- --nocapture
       - name: Run Kafka Cluster E2E tests
-        run: cargo test -p rill-runtime --features kafka --test kafka_cluster_e2e -- --nocapture
+        run: cargo test -p rhei-runtime --features kafka --test kafka_cluster_e2e -- --nocapture
 
   checkpoint-coord-e2e:
     name: Checkpoint Coordination E2E
@@ -64,7 +64,7 @@ jobs:
           shared-key: stable
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Run Checkpoint Coordination E2E tests
-        run: cargo test -p rill-runtime --test checkpoint_coord_e2e -- --nocapture
+        run: cargo test -p rhei-runtime --test checkpoint_coord_e2e -- --nocapture
 
   s3-e2e:
     name: S3 E2E
@@ -88,7 +88,7 @@ jobs:
             sleep 2
           done
       - name: Create S3 test bucket
-        run: aws --endpoint-url http://localhost:9000 s3 mb s3://rill-test
+        run: aws --endpoint-url http://localhost:9000 s3 mb s3://rhei-test
         env:
           AWS_ACCESS_KEY_ID: minioadmin
           AWS_SECRET_ACCESS_KEY: minioadmin
@@ -101,10 +101,10 @@ jobs:
           shared-key: stable-remote-state
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Run S3 E2E tests
-        run: cargo test -p rill-runtime --features remote-state --test s3_e2e -- --nocapture
+        run: cargo test -p rhei-runtime --features remote-state --test s3_e2e -- --nocapture
         env:
           S3_ENDPOINT: http://localhost:9000
-          S3_BUCKET: rill-test
+          S3_BUCKET: rhei-test
           S3_ACCESS_KEY: minioadmin
           S3_SECRET_KEY: minioadmin
           S3_REGION: us-east-1

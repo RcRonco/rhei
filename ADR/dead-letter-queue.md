@@ -132,13 +132,13 @@ graph LR
 
 ```mermaid
 graph LR
-    subgraph rill-core
+    subgraph rhei-core
         DLQ[dlq.rs<br/>DeadLetterRecord<br/>ErrorPolicy<br/>DlqSinkFactory]
         FSINK[DlqFileSink<br/>Sink impl]
         KSINK[KafkaDlqSink<br/>Sink impl]
     end
 
-    subgraph rill-runtime
+    subgraph rhei-runtime
         EB[ExecutorBuilder<br/>error_policy config]
         EX[Executor<br/>setup_dlq_sinks]
         TD[build_timely_dag<br/>error routing via channel]
@@ -187,7 +187,7 @@ Rejected as the default because it makes pipelines fragile. A single malformed r
 
 | File | Role |
 |------|------|
-| `rill-core/src/dlq.rs` | `DeadLetterRecord`, `ErrorPolicy`, `DlqSinkFactory`, `DlqFileSinkFactory` |
-| `rill-core/src/connectors/dlq_file_sink.rs` | `DlqFileSink` — append-only JSON Lines writer, implements `Sink` |
-| `rill-core/src/connectors/kafka_dlq.rs` | `KafkaDlqSink`, `KafkaDlqFactory` — Kafka DLQ adapter (behind `kafka` feature) |
-| `rill-runtime/src/executor.rs` | `setup_dlq_sinks()`, per-worker channel bridge, error routing in `build_timely_dag` |
+| `rhei-core/src/dlq.rs` | `DeadLetterRecord`, `ErrorPolicy`, `DlqSinkFactory`, `DlqFileSinkFactory` |
+| `rhei-core/src/connectors/dlq_file_sink.rs` | `DlqFileSink` — append-only JSON Lines writer, implements `Sink` |
+| `rhei-core/src/connectors/kafka_dlq.rs` | `KafkaDlqSink`, `KafkaDlqFactory` — Kafka DLQ adapter (behind `kafka` feature) |
+| `rhei-runtime/src/executor.rs` | `setup_dlq_sinks()`, per-worker channel bridge, error routing in `build_timely_dag` |

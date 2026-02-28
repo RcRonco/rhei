@@ -71,13 +71,13 @@ sequenceDiagram
 
 ```mermaid
 graph LR
-    subgraph rill-core
+    subgraph rhei-core
         ST[Source trait<br/>restore_offsets default no-op]
         KS[KafkaSource<br/>assign with offsets]
         VS[VecSource<br/>inherits no-op]
     end
 
-    subgraph rill-runtime
+    subgraph rhei-runtime
         ES[ErasedSource trait<br/>restore_offsets]
         SW[SourceWrapper<br/>delegates to Source]
         EX[Executor run_graph<br/>calls restore_offsets]
@@ -146,8 +146,8 @@ Deferred. Batch-based intervals are simpler to reason about and sufficient for c
 | File | Change |
 |---|---|
 | `ADR/checkpoint-restore.md` | New — this ADR |
-| `rill-core/src/traits.rs` | Add `restore_offsets()` default method to `Source` |
-| `rill-core/src/connectors/kafka_source.rs` | Implement `restore_offsets()` with `consumer.assign()` |
-| `rill-runtime/src/dataflow.rs` | Add `restore_offsets()` to `ErasedSource` + `SourceWrapper` |
-| `rill-runtime/src/bridge.rs` | Add `erased_source_bridge_with_offsets()` |
-| `rill-runtime/src/executor.rs` | Configurable interval, single-worker coordination, offset restore wiring |
+| `rhei-core/src/traits.rs` | Add `restore_offsets()` default method to `Source` |
+| `rhei-core/src/connectors/kafka_source.rs` | Implement `restore_offsets()` with `consumer.assign()` |
+| `rhei-runtime/src/dataflow.rs` | Add `restore_offsets()` to `ErasedSource` + `SourceWrapper` |
+| `rhei-runtime/src/bridge.rs` | Add `erased_source_bridge_with_offsets()` |
+| `rhei-runtime/src/executor.rs` | Configurable interval, single-worker coordination, offset restore wiring |

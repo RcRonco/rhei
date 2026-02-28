@@ -28,7 +28,7 @@ Process 0 runs a `CheckpointCoordinator`; all other processes connect as `Checkp
 | `Ready` | Participant -> Coordinator | `process_id: usize`, `epoch: u64` |
 | `Committed` | Coordinator -> Participants | `epoch: u64` |
 
-**Port:** Derived from the first Timely peer address port + 1000, or overridden via `RILL_CHECKPOINT_PORT`.
+**Port:** Derived from the first Timely peer address port + 1000, or overridden via `RHEI_CHECKPOINT_PORT`.
 
 ### Checkpoint channel enhancement
 
@@ -44,7 +44,7 @@ Changed cluster-mode prefix from `p{pid}_w{idx}_{op}` to `p{pid}/w{idx}/{op}` to
 
 ### Remote state configuration
 
-`RemoteStateConfig` struct with builder method `.remote_state(config)` and environment variable support (`RILL_REMOTE_BUCKET`, `RILL_REMOTE_PREFIX`, `RILL_REMOTE_ENDPOINT`, `RILL_REMOTE_REGION`, `RILL_REMOTE_ALLOW_HTTP`). Feature-gated on `remote-state`. Supports S3, Azure Blob Storage, and GCS via the `object_store` crate.
+`RemoteStateConfig` struct with builder method `.remote_state(config)` and environment variable support (`RHEI_REMOTE_BUCKET`, `RHEI_REMOTE_PREFIX`, `RHEI_REMOTE_ENDPOINT`, `RHEI_REMOTE_REGION`, `RHEI_REMOTE_ALLOW_HTTP`). Feature-gated on `remote-state`. Supports S3, Azure Blob Storage, and GCS via the `object_store` crate.
 
 `CheckpointManifest` gains `save_to_object_store()` and `load_from_object_store()` for remote manifest storage.
 
@@ -84,11 +84,11 @@ sequenceDiagram
 
 ```mermaid
 graph LR
-    subgraph rill-core
+    subgraph rhei-core
         CM[CheckpointManifest<br/>save/load/remote]
     end
 
-    subgraph rill-runtime
+    subgraph rhei-runtime
         CC[checkpoint_coord.rs<br/>Coordinator + Participant]
         CT[controller.rs<br/>CheckpointTaskConfig<br/>run_checkpoint_task]
         WS[worker.rs<br/>WorkerSet<br/>checkpoint_notify channel]
@@ -138,12 +138,12 @@ Process 0 polls for partial manifests from all processes in a loop. Rejected: re
 
 | File | Change |
 |------|--------|
-| `rill-runtime/src/checkpoint_coord.rs` | New: coordinator + participant protocol |
-| `rill-runtime/src/controller.rs` | Prefix fix, remote state config, mid-execution checkpoint task, coordinator integration |
-| `rill-runtime/src/worker.rs` | Channel `()` -> `u64`, `std::sync::mpsc` -> `tokio::sync::mpsc` |
-| `rill-runtime/src/executor.rs` | Forward epoch from `try_checkpoint` |
-| `rill-runtime/src/timely_operator.rs` | `maybe_checkpoint` returns `Option<u64>` |
-| `rill-runtime/src/lib.rs` | Register `checkpoint_coord` module |
-| `rill-core/src/checkpoint.rs` | `save_to_object_store` / `load_from_object_store` |
-| `rill-runtime/tests/checkpoint_coord_e2e.rs` | New: cross-process coordination E2E |
+| `rhei-runtime/src/checkpoint_coord.rs` | New: coordinator + participant protocol |
+| `rhei-runtime/src/controller.rs` | Prefix fix, remote state config, mid-execution checkpoint task, coordinator integration |
+| `rhei-runtime/src/worker.rs` | Channel `()` -> `u64`, `std::sync::mpsc` -> `tokio::sync::mpsc` |
+| `rhei-runtime/src/executor.rs` | Forward epoch from `try_checkpoint` |
+| `rhei-runtime/src/timely_operator.rs` | `maybe_checkpoint` returns `Option<u64>` |
+| `rhei-runtime/src/lib.rs` | Register `checkpoint_coord` module |
+| `rhei-core/src/checkpoint.rs` | `save_to_object_store` / `load_from_object_store` |
+| `rhei-runtime/tests/checkpoint_coord_e2e.rs` | New: cross-process coordination E2E |
 | `ROADMAP.md` | Mark Phase 2 items complete |

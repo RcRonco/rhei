@@ -33,8 +33,8 @@ Each process is started independently with its own `process_id` and the full pee
 ### Deployment model
 
 ```
-rill run pipeline.toml --workers 4 --process-id 0 --peers "host0:2101,host1:2101"
-rill run pipeline.toml --workers 4 --process-id 1 --peers "host0:2101,host1:2101"
+rhei run pipeline.toml --workers 4 --process-id 0 --peers "host0:2101,host1:2101"
+rhei run pipeline.toml --workers 4 --process-id 1 --peers "host0:2101,host1:2101"
 ```
 
 Each command starts one process with 4 worker threads. The two processes form a cluster with 8 total workers.
@@ -218,8 +218,8 @@ Rejected for Phase 2. Timely does not support partial failure recovery — its p
 
 | File | Change |
 |------|--------|
-| `rill-runtime/src/executor.rs` | Add `Config::Cluster` path, process ID handling, TCP address config |
-| `rill-core/src/traits.rs` | Add `Serialize + DeserializeOwned` bounds to `StreamFunction::Input`/`Output` |
-| `rill-core/src/state/prefixed_backend.rs` | Extend prefix scheme with process ID |
-| `rill-cli/src/main.rs` | Add `--process-id`, `--peers`, `--hostfile` CLI flags |
+| `rhei-runtime/src/executor.rs` | Add `Config::Cluster` path, process ID handling, TCP address config |
+| `rhei-core/src/traits.rs` | Add `Serialize + DeserializeOwned` bounds to `StreamFunction::Input`/`Output` |
+| `rhei-core/src/state/prefixed_backend.rs` | Extend prefix scheme with process ID |
+| `rhei-cli/src/main.rs` | Add `--process-id`, `--peers`, `--hostfile` CLI flags |
 | `CLUSTERING.md` | Reference implementation document |

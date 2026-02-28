@@ -1,0 +1,105 @@
+//! Word-count example using the dataflow API.
+//!
+//! Demonstrates `Stream`, `KeyedStream`, and stateful operators with
+//! automatic per-worker state context creation.
+//!
+//! Run with: `cargo run -p rhei-runtime --example word_count`
+
+use async_trait::async_trait;
+use rhei_core::connectors::print_sink::PrintSink;
+use rhei_core::connectors::vec_source::VecSource;
+use rhei_core::operators::KeyedState;
+use rhei_core::state::context::StateContext;
+use rhei_core::traits::StreamFunction;
+use rhei_runtime::dataflow::{DataflowGraph, TransformContext};
+use rhei_runtime::executor::Executor;
+
+/// A stateful word-count operator using [`KeyedState`] for typed state access.
+///
+/// Splits each input line into words and maintains a running count for each
+/// word. Emits `"word: count"` strings.
+#[derive(Clone)]
+struct WordCounter;
+
+#[async_trait]
+impl StreamFunction for WordCounter {
+    type Input = String;
+    type Output = String;
+
+    async fn process(
+        &mut self,
+        input: String,
+        ctx: &mut StateContext,
+    ) -> anyhow::Result<Vec<String>> {
+        let mut outputs = Vec::new();
+        for word in input.split_whitespace() {
+            let key = word.to_string();
+            let count = {
+                let mut state = KeyedState::<String, u64>::new(ctx, "count");
+                let count = state.get(&key).await.unwrap_or(None).unwrap_or(0) + 1;
+                state.put(&key, &count);
+                count
+            };
+            outputs.push(format!("{word}: {count}"));
+        }
+        Ok(outputs)
+    }
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let dir = std::env::temp_dir().join("rhei_word_count_example");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir)?;
+
+    let lines = vec![
+        "hello world".to_string(),
+        "hello rhei".to_string(),
+        "rhei is a stream processor".to_string(),
+        "hello world again".to_string(),
+    ];
+
+    // ── Single-worker ────────────────────────────────────────────────
+    println!("=== Single-worker ===");
+    {
+        let graph = DataflowGraph::new();
+        let stream = graph.source(VecSource::new(lines.clone()));
+        stream
+            .flat_map(|line: String| line.split_whitespace().map(String::from).collect())
+            .key_by(|word: &String| word.clone())
+            .operator("word_counter", WordCounter)
+            .map_ctx(|result: String, ctx: &TransformContext| {
+                format!("[W{}] {result}", ctx.worker_index)
+            })
+            .sink(PrintSink::new());
+
+        let executor = Executor::builder()
+            .checkpoint_dir(dir.join("single"))
+            .build();
+        executor.run(graph).await?;
+    }
+
+    // ── Multi-worker (2 workers) ─────────────────────────────────────
+    println!("\n=== Multi-worker (3 workers) ===");
+    {
+        let graph = DataflowGraph::new();
+        let stream = graph.source(VecSource::new(lines));
+        stream
+            .flat_map(|line: String| line.split_whitespace().map(String::from).collect())
+            .key_by(|word: &String| word.to_lowercase())
+            .operator("word_counter", WordCounter)
+            .map_ctx(|result: String, ctx: &TransformContext| {
+                format!("[W{}/{}] {result}", ctx.worker_index, ctx.num_workers)
+            })
+            .sink(PrintSink::new());
+
+        let executor = Executor::builder()
+            .checkpoint_dir(dir.join("multi"))
+            .workers(3)
+            .build();
+        executor.run(graph).await?;
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+    Ok(())
+}

@@ -5,7 +5,7 @@
 
 ## Context
 
-Rill's checkpoint infrastructure already persists operator state on each checkpoint cycle: `LocalBackend` writes JSON files that auto-load on construction, and `SlateDbBackend` is durable on S3. Kafka offsets are committed to Kafka's `__consumer_offsets` topic via `on_checkpoint_complete()`. A pipeline restart "happens to work" if you reuse the same checkpoint directory and Kafka consumer group, but there is no formal mechanism to:
+Rhei's checkpoint infrastructure already persists operator state on each checkpoint cycle: `LocalBackend` writes JSON files that auto-load on construction, and `SlateDbBackend` is durable on S3. Kafka offsets are committed to Kafka's `__consumer_offsets` topic via `on_checkpoint_complete()`. A pipeline restart "happens to work" if you reuse the same checkpoint directory and Kafka consumer group, but there is no formal mechanism to:
 
 - **Record** what was checkpointed (operators, source offsets, timestamp).
 - **Verify** consistency at startup (e.g. detect topology changes).
@@ -114,13 +114,13 @@ flowchart TD
 
 ```mermaid
 graph LR
-    subgraph rill-core
+    subgraph rhei-core
         CM[CheckpointManifest]
         ST[Source trait<br/>current_offsets]
         KS[KafkaSource]
     end
 
-    subgraph rill-runtime
+    subgraph rhei-runtime
         EX[Executor]
         ES[ErasedSource /<br/>SourceWrapper]
         CO[compiler::operator_names]
@@ -173,11 +173,11 @@ Rejected as over-engineering for the current stage. A single atomic manifest fil
 
 | File | Change |
 |---|---|
-| `rill-core/src/checkpoint.rs` | New — `CheckpointManifest` with `save`/`load` |
-| `rill-core/src/lib.rs` | Register `pub mod checkpoint` |
-| `rill-core/src/traits.rs` | Add `current_offsets()` default to `Source` |
-| `rill-core/src/connectors/kafka_source.rs` | Implement `current_offsets()` |
-| `rill-runtime/src/dataflow.rs` | Add `current_offsets()` to `ErasedSource` + `SourceWrapper` |
-| `rill-runtime/src/compiler.rs` | Add `operator_names()` helper |
-| `rill-runtime/src/executor.rs` | Manifest load/save, startup validation, checkpoint recording |
-| `rill-runtime/tests/checkpoint_restart.rs` | New — E2E restart and mismatch tests |
+| `rhei-core/src/checkpoint.rs` | New — `CheckpointManifest` with `save`/`load` |
+| `rhei-core/src/lib.rs` | Register `pub mod checkpoint` |
+| `rhei-core/src/traits.rs` | Add `current_offsets()` default to `Source` |
+| `rhei-core/src/connectors/kafka_source.rs` | Implement `current_offsets()` |
+| `rhei-runtime/src/dataflow.rs` | Add `current_offsets()` to `ErasedSource` + `SourceWrapper` |
+| `rhei-runtime/src/compiler.rs` | Add `operator_names()` helper |
+| `rhei-runtime/src/executor.rs` | Manifest load/save, startup validation, checkpoint recording |
+| `rhei-runtime/tests/checkpoint_restart.rs` | New — E2E restart and mismatch tests |

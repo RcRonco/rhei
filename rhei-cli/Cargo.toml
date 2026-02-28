@@ -1,0 +1,23 @@
+[package]
+name = "rhei-cli"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+clap.workspace = true
+crossterm.workspace = true
+futures.workspace = true
+ratatui.workspace = true
+rhei-core = { path = "../rhei-core" }
+rhei-runtime = { path = "../rhei-runtime" }
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true
