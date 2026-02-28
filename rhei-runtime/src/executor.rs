@@ -1,7 +1,7 @@
 //! Pure DAG compilation and Timely execution engine.
 //!
-//! This module contains [`TimelyCompiler`] for building Timely dataflows from
-//! compiled graphs, and the [`execute_dag`] entry point that launches Timely workers.
+//! This module contains [`DataflowExecutor`] for building and running Timely dataflows
+//! from compiled graphs.
 //!
 //! For pipeline configuration and lifecycle orchestration, see
 //! [`controller::PipelineController`](crate::controller::PipelineController).
@@ -17,8 +17,8 @@ use timely::dataflow::scopes::Child;
 use timely::worker::Worker;
 
 use crate::dataflow::{AnyItem, ErasedOperator, NodeId, NodeKind, TransformFn};
+use crate::task_manager::{DlqSender, ExecutorData};
 use crate::timely_operator::TimelyErasedOperator;
-use crate::worker::{DlqSender, WorkerData, WorkerSet};
 
 // Backward-compatible re-exports so `executor::Executor` still works.
 #[doc(hidden)]
@@ -58,99 +58,6 @@ pub fn partition_key(key: &str, n_workers: usize) -> usize {
     (seahash::hash(key.as_bytes()) as usize) % n_workers
 }
 
-// ── DAG Execution ───────────────────────────────────────────────────
-
-/// Launch Timely execution over a prepared [`WorkerSet`].
-///
-/// Spawns a blocking task, creates one Timely dataflow per worker,
-/// and runs `worker.step()` until the probe signals completion.
-///
-/// In cluster mode, `shutdown_barrier_rx` enables coordinated shutdown:
-/// the first local worker sends a [`Sentinel::Shutdown`] through the
-/// checkpoint channel, then blocks on this receiver until all processes
-/// are ready to tear down. This prevents `CommsGuard::drop` panics
-/// caused by one process closing TCP connections while peers are still
-/// communicating.
-pub(crate) async fn execute_dag(
-    timely_config: timely::execute::Config,
-    worker_set: Arc<WorkerSet>,
-    rt: tokio::runtime::Handle,
-    total_workers: usize,
-    local_first_worker: usize,
-    shutdown_barrier_rx: Option<std::sync::mpsc::Receiver<()>>,
-) -> anyhow::Result<()> {
-    let checkpoint_notify_tx = worker_set
-        .checkpoint_notify_tx
-        .lock()
-        .unwrap()
-        .as_ref()
-        .cloned();
-
-    // Wrap the barrier receiver so only the first local worker can take it.
-    let shutdown_barrier: Option<Arc<std::sync::Mutex<Option<std::sync::mpsc::Receiver<()>>>>> =
-        shutdown_barrier_rx.map(|rx| Arc::new(std::sync::Mutex::new(Some(rx))));
-
-    tokio::task::spawn_blocking(move || {
-        let guards = timely::execute::execute(timely_config, move |worker| {
-            let idx = worker.index();
-            let _span = tracing::info_span!("worker", worker = idx).entered();
-
-            // Take per-worker data (one-time handoff).
-            let mut w_data = worker_set.take_worker_data(idx);
-
-            let compiler = TimelyCompiler {
-                sink_senders: worker_set.sink_senders.clone(),
-                topo_order: worker_set.topo_order.clone(),
-                node_inputs: worker_set.node_inputs.clone(),
-                node_kinds: worker_set.node_kinds.clone(),
-                rt: rt.clone(),
-                worker_index: idx,
-                num_workers: total_workers,
-                checkpoint_notify: checkpoint_notify_tx.clone(),
-                dlq_tx: w_data.dlq_tx.take(),
-                last_operator_id: worker_set.last_operator_id,
-                global_watermark: worker_set.global_watermark.clone(),
-                local_first_worker,
-            };
-
-            let dataflow_index = worker.next_dataflow_index();
-            let probe = worker.dataflow::<u64, _, _>(|scope| compiler.compile(scope, &mut w_data));
-
-            while !probe.done() {
-                worker.step();
-            }
-
-            // Coordinated shutdown barrier: the first local worker on each
-            // process signals readiness and waits for all processes to be
-            // ready before returning. This ensures WorkerGuards/CommsGuard
-            // drop simultaneously across processes, preventing TCP teardown
-            // panics from broken pipes.
-            if idx == local_first_worker {
-                if let Some(ref n) = checkpoint_notify_tx {
-                    let _ = n.blocking_send(Sentinel::Shutdown as u64);
-                }
-                if let Some(ref barrier) = shutdown_barrier
-                    && let Some(rx) = barrier.lock().unwrap().take()
-                {
-                    tracing::debug!("worker {idx} waiting on shutdown barrier");
-                    let _ = rx.recv();
-                    tracing::debug!("worker {idx} shutdown barrier released");
-                }
-            }
-
-            worker.drop_dataflow(dataflow_index);
-        })
-        .map_err(|e| anyhow::anyhow!("timely execution failed: {e}"))?;
-
-        drop(guards);
-        anyhow::Ok(())
-    })
-    .await
-    .map_err(|e| anyhow::anyhow!("spawn_blocking failed: {e}"))??;
-
-    Ok(())
-}
-
 // ── Node kind classification ────────────────────────────────────────
 
 /// Lightweight tag for classifying graph nodes without moving data.
@@ -177,14 +84,14 @@ impl NodeKindTag {
     }
 }
 
-// ── TimelyCompiler ──────────────────────────────────────────────────
+// ── DataflowExecutor ────────────────────────────────────────────────
 
-/// Compiles a Timely dataflow from compiled graph metadata.
+/// Compiles and runs a Timely dataflow from compiled graph metadata.
 ///
-/// Constructed per-worker inside the Timely closure, owns shared references
-/// to graph topology and per-worker configuration. Each `build_*` method
-/// constructs one category of Timely operator.
-pub(crate) struct TimelyCompiler {
+/// Constructed per-worker via [`TaskManager::create_executor`](crate::task_manager::TaskManager::create_executor),
+/// owns shared references to graph topology and per-worker configuration.
+/// Each `build_*` method constructs one category of Timely operator.
+pub(crate) struct DataflowExecutor {
     sink_senders: Arc<HashMap<NodeId, tokio::sync::mpsc::Sender<AnyItem>>>,
     topo_order: Arc<Vec<NodeId>>,
     node_inputs: Arc<HashMap<NodeId, Vec<NodeId>>>,
@@ -198,9 +105,82 @@ pub(crate) struct TimelyCompiler {
     global_watermark: Arc<AtomicU64>,
     /// First worker index on this process (used for checkpoint notifications).
     local_first_worker: usize,
+    /// Owned per-worker data for this executor (taken once during `run()`).
+    data: Option<ExecutorData>,
+    /// Shutdown barrier for coordinated process teardown (cluster mode only).
+    shutdown_barrier: Option<Arc<std::sync::Mutex<Option<std::sync::mpsc::Receiver<()>>>>>,
 }
 
-impl TimelyCompiler {
+impl DataflowExecutor {
+    /// Create a new `DataflowExecutor` with all required fields.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        sink_senders: Arc<HashMap<NodeId, tokio::sync::mpsc::Sender<AnyItem>>>,
+        topo_order: Arc<Vec<NodeId>>,
+        node_inputs: Arc<HashMap<NodeId, Vec<NodeId>>>,
+        node_kinds: Arc<HashMap<NodeId, NodeKindTag>>,
+        rt: tokio::runtime::Handle,
+        worker_index: usize,
+        num_workers: usize,
+        checkpoint_notify: Option<tokio::sync::mpsc::Sender<u64>>,
+        dlq_tx: Option<DlqSender>,
+        last_operator_id: Option<NodeId>,
+        global_watermark: Arc<AtomicU64>,
+        local_first_worker: usize,
+        data: ExecutorData,
+        shutdown_barrier: Option<Arc<std::sync::Mutex<Option<std::sync::mpsc::Receiver<()>>>>>,
+    ) -> Self {
+        Self {
+            sink_senders,
+            topo_order,
+            node_inputs,
+            node_kinds,
+            rt,
+            worker_index,
+            num_workers,
+            checkpoint_notify,
+            dlq_tx,
+            last_operator_id,
+            global_watermark,
+            local_first_worker,
+            data: Some(data),
+            shutdown_barrier,
+        }
+    }
+
+    /// Run the Timely dataflow: compile, step until done, then coordinate shutdown.
+    pub(crate) fn run<A: Allocate>(mut self, worker: &mut Worker<A>) {
+        let _span = tracing::info_span!("worker", worker = self.worker_index).entered();
+        let mut data = self.data.take().expect("executor data already taken");
+
+        let dataflow_index = worker.next_dataflow_index();
+        let probe = worker.dataflow::<u64, _, _>(|scope| self.compile(scope, &mut data));
+
+        while !probe.done() {
+            worker.step();
+        }
+
+        // Coordinated shutdown barrier: the first local worker on each
+        // process signals readiness and waits for all processes to be
+        // ready before returning. This ensures WorkerGuards/CommsGuard
+        // drop simultaneously across processes, preventing TCP teardown
+        // panics from broken pipes.
+        if self.worker_index == self.local_first_worker {
+            if let Some(ref n) = self.checkpoint_notify {
+                let _ = n.blocking_send(Sentinel::Shutdown as u64);
+            }
+            if let Some(ref barrier) = self.shutdown_barrier
+                && let Some(rx) = barrier.lock().unwrap().take()
+            {
+                tracing::debug!("worker {} waiting on shutdown barrier", self.worker_index);
+                let _ = rx.recv();
+                tracing::debug!("worker {} shutdown barrier released", self.worker_index);
+            }
+        }
+
+        worker.drop_dataflow(dataflow_index);
+    }
+
     /// Build the full Timely dataflow, dispatching to per-node builders.
     ///
     /// Iterates `topo_order`, matches each node kind to its builder method,
@@ -208,7 +188,7 @@ impl TimelyCompiler {
     fn compile<A: Allocate>(
         &self,
         scope: &mut Scope<'_, A>,
-        data: &mut WorkerData,
+        data: &mut ExecutorData,
     ) -> probe::Handle<u64> {
         let mut streams: HashMap<NodeId, timely::dataflow::Stream<_, AnyItem>> = HashMap::new();
         let probe = probe::Handle::new();

@@ -3,7 +3,8 @@
 //! This crate provides the machinery to run logical plans built with `rhei-core`:
 //!
 //! - [`controller::PipelineController`] — configuration, lifecycle orchestration, and checkpointing
-//! - [`executor`] — pure Timely DAG construction and execution
+//! - [`executor`] — per-worker Timely DAG compilation and execution
+//! - [`task_manager`] — task management, I/O bridging, and checkpoint orchestration
 //! - [`dataflow::DataflowGraph`] — type-erased graph builder with
 //!   [`Stream<T>`](dataflow::Stream) and [`KeyedStream<T>`](dataflow::KeyedStream)
 //! - [`bridge`] — async-to-sync channel bridges for Timely integration
@@ -54,14 +55,14 @@ pub mod metrics_snapshot;
 pub mod shutdown;
 /// FIFO event stash for pending state fetches.
 pub mod stash;
+/// Task management, I/O bridging, and checkpoint orchestration for Timely execution.
+pub(crate) mod task_manager;
 /// Tracing and Prometheus metrics initialization.
 pub mod telemetry;
 /// Timely-aware operator wrappers with capability management.
 pub mod timely_operator;
 /// Log capture layer for dashboards and log aggregation.
 pub mod tracing_capture;
-/// I/O bridging and per-worker data preparation for Timely execution.
-pub(crate) mod worker;
 
 // Backward-compatible re-exports.
 #[doc(hidden)]
