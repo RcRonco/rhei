@@ -466,22 +466,16 @@ async fn extract_per_worker_data(
 fn spawn_global_watermark_task(
     rt: &tokio::runtime::Handle,
     all_source_watermarks: Vec<Arc<AtomicU64>>,
-    shutdown: Option<&ShutdownHandle>,
+    _shutdown: Option<&ShutdownHandle>,
 ) -> Arc<AtomicU64> {
     let global_watermark: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
     if !all_source_watermarks.is_empty() {
         let gw = global_watermark.clone();
         let source_wms = all_source_watermarks;
-        let shutdown_for_wm = shutdown.cloned();
         rt.spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_millis(100));
             loop {
                 interval.tick().await;
-                if let Some(ref h) = shutdown_for_wm
-                    && h.is_shutdown()
-                {
-                    break;
-                }
                 // Global watermark = min of all non-zero source watermarks.
                 let mut min_wm: Option<u64> = None;
                 for sw in &source_wms {

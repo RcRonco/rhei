@@ -108,6 +108,10 @@ pub(crate) fn erased_source_bridge_with_offsets(
                 break;
             }
         }
+        // Source finished — signal that no more data will arrive from this source.
+        // The global watermark task will propagate MAX once all sources are done.
+        // Using MAX-1 to avoid collision with SHUTDOWN_SENTINEL (u64::MAX).
+        wm_writer.store(u64::MAX - 1, Ordering::Release);
         // tx drops here, closing the channel
     });
     (rx, shared_offsets, source_watermark)

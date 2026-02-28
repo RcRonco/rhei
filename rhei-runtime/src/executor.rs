@@ -325,11 +325,13 @@ impl TimelyCompiler {
 
         let source_rx = source_receivers.remove(&node_id);
         let worker_label = self.worker_index.to_string();
+        let gw_drain = self.global_watermark.clone();
 
         source_builder.build_reschedule(move |mut capabilities| {
             let mut cap = Some(capabilities.pop().unwrap());
             let mut epoch: u64 = 0;
             let mut rx = source_rx;
+            let mut draining = false;
 
             move |_frontiers| {
                 if cap.is_none() {
@@ -341,6 +343,17 @@ impl TimelyCompiler {
                     cap = None;
                     return false;
                 };
+
+                // Draining: source channel closed, wait for global watermark
+                // to reach MAX-1 so downstream operators can close final windows.
+                if draining {
+                    if gw_drain.load(Ordering::Acquire) >= u64::MAX - 1 {
+                        cap = None;
+                        return false;
+                    }
+                    activator.activate();
+                    return true;
+                }
 
                 match source_rx.try_recv() {
                     Ok(batch) => {
@@ -375,8 +388,9 @@ impl TimelyCompiler {
                         true
                     }
                     Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
-                        cap = None;
-                        false
+                        draining = true;
+                        activator.activate();
+                        true
                     }
                 }
             }
