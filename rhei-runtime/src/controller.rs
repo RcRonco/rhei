@@ -470,6 +470,69 @@ async fn run_graph(
     result
 }
 
+/// Set up cross-process checkpoint coordination for cluster mode.
+///
+/// Process 0 spawns a coordinator task and uses local channels.
+/// Other processes connect as TCP participants with retry/backoff.
+/// Returns `(coordination, coordinator_task_handle)`.
+async fn setup_coordination(
+    controller: &PipelineController,
+) -> anyhow::Result<(
+    Option<CheckpointCoordination>,
+    Option<tokio::task::JoinHandle<anyhow::Result<()>>>,
+)> {
+    if !controller.is_cluster() {
+        return Ok((None, None));
+    }
+
+    let peers = controller.peers.as_ref().unwrap();
+    let pid = controller.process_id().unwrap();
+    let n_processes = peers.len();
+    let coord_port = crate::checkpoint_coord::coordination_port(peers);
+    let coord_addr = format!("127.0.0.1:{coord_port}");
+
+    if pid == 0 {
+        // Process 0: run coordinator + use local channels for self-participation.
+        let (coordinator, channels, local_part) =
+            crate::checkpoint_coord::setup_coordinator_full(&coord_addr, n_processes).await?;
+
+        let handle = tokio::spawn(async move {
+            coordinator
+                .run(channels.ready_rx, channels.committed_tx)
+                .await
+        });
+
+        Ok((
+            Some(CheckpointCoordination::Local(local_part)),
+            Some(handle),
+        ))
+    } else {
+        // Non-zero processes: connect as TCP participant with backoff.
+        let mut participant = None;
+        for attempt in 0..20 {
+            match crate::checkpoint_coord::CheckpointParticipant::connect(&coord_addr, pid).await {
+                Ok(p) => {
+                    participant = Some(p);
+                    break;
+                }
+                Err(e) => {
+                    if attempt < 19 {
+                        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                    } else {
+                        return Err(anyhow::anyhow!(
+                            "failed to connect to checkpoint coordinator at {coord_addr}: {e}"
+                        ));
+                    }
+                }
+            }
+        }
+        Ok((
+            Some(CheckpointCoordination::Remote(participant.unwrap())),
+            None,
+        ))
+    }
+}
+
 /// Execute a compiled graph: build workers, run DAG, checkpoint.
 async fn execute_compiled(
     graph: crate::compiler::CompiledGraph,
@@ -483,83 +546,49 @@ async fn execute_compiled(
 
     let worker_set = WorkerSet::build(graph, controller, shutdown, &rt, restored_offsets).await?;
 
-    // ── Checkpoint coordination setup ──────────────────────────────────
-    // In cluster mode, set up TCP-based cross-process coordination.
-    // Process 0 runs the coordinator; all processes create participants.
-    let mut coord_task_handle: Option<tokio::task::JoinHandle<anyhow::Result<()>>> = None;
-    let coordination: Option<CheckpointCoordination> = if controller.is_cluster() {
-        let peers = controller.peers.as_ref().unwrap();
-        let pid = controller.process_id().unwrap();
-        let n_processes = peers.len();
-        let coord_port = crate::checkpoint_coord::coordination_port(peers);
-        let coord_addr = format!("127.0.0.1:{coord_port}");
-
-        if pid == 0 {
-            // Process 0: run coordinator + use local channels for self-participation.
-            let (coordinator, channels, local_part) =
-                crate::checkpoint_coord::setup_coordinator_full(&coord_addr, n_processes).await?;
-
-            coord_task_handle = Some(tokio::spawn(async move {
-                coordinator
-                    .run(channels.ready_rx, channels.committed_tx)
-                    .await
-            }));
-
-            Some(CheckpointCoordination::Local(local_part))
-        } else {
-            // Non-zero processes: connect as TCP participant.
-            // Retry connection to coordinator with backoff.
-            let mut participant = None;
-            for attempt in 0..20 {
-                match crate::checkpoint_coord::CheckpointParticipant::connect(&coord_addr, pid)
-                    .await
-                {
-                    Ok(p) => {
-                        participant = Some(p);
-                        break;
-                    }
-                    Err(e) => {
-                        if attempt < 19 {
-                            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-                        } else {
-                            return Err(anyhow::anyhow!(
-                                "failed to connect to checkpoint coordinator at {coord_addr}: {e}"
-                            ));
-                        }
-                    }
-                }
-            }
-            Some(CheckpointCoordination::Remote(participant.unwrap()))
-        }
-    } else {
-        None
-    };
+    let (coordination, coord_task_handle) = setup_coordination(controller).await?;
 
     // Spawn a mid-execution checkpoint management task that writes manifests
     // as checkpoints complete during DAG execution (not just at the end).
-    let checkpoint_rx = worker_set.take_checkpoint_rx().await;
-    let ckpt_all_source_offsets = worker_set.source_offset_handles();
-    let ckpt_operator_names = worker_set.all_operator_names.clone();
-    let ckpt_dir = controller.checkpoint_dir.clone();
     let ckpt_process_id = controller.process_id();
     let ckpt_n_processes = controller.peers.as_ref().map_or(1, Vec::len);
 
     let ckpt_config = CheckpointTaskConfig {
         initial_checkpoint_id,
-        all_source_offsets: ckpt_all_source_offsets,
-        operator_names: ckpt_operator_names,
-        checkpoint_dir: ckpt_dir,
+        all_source_offsets: worker_set.source_offset_handles(),
+        operator_names: worker_set.all_operator_names.clone(),
+        checkpoint_dir: controller.checkpoint_dir.clone(),
         process_id: ckpt_process_id,
         n_processes: ckpt_n_processes,
     };
 
-    let checkpoint_task =
-        tokio::spawn(
-            async move { run_checkpoint_task(checkpoint_rx, ckpt_config, coordination).await },
-        );
+    // Create a shutdown barrier for coordinated process teardown.
+    // In cluster mode, the first local worker blocks on barrier_rx after
+    // probe.done() until all processes are ready, preventing TCP teardown
+    // panics from broken pipes. In single-process mode, no barrier is used.
+    let (barrier_tx, barrier_rx) = if controller.is_cluster() {
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        (Some(tx), Some(rx))
+    } else {
+        (None, None)
+    };
+
+    let checkpoint_rx = worker_set.take_checkpoint_rx().await;
+    let checkpoint_task = tokio::spawn(async move {
+        run_checkpoint_task(checkpoint_rx, ckpt_config, coordination, barrier_tx).await
+    });
 
     let timely_config = controller.timely_config();
-    crate::executor::execute_dag(timely_config, &worker_set, rt.clone(), total_workers).await?;
+    let local_first_worker = controller.local_worker_range().start;
+    crate::executor::execute_dag(
+        timely_config,
+        &worker_set,
+        rt.clone(),
+        total_workers,
+        local_first_worker,
+        barrier_rx,
+    )
+    .await?;
 
     // Close the checkpoint channel so the task drains remaining notifications
     // and exits cleanly (recv() returns None when all senders are dropped).
@@ -627,11 +656,17 @@ struct CheckpointTaskConfig {
 /// manifests as each epoch completes. In cluster mode, coordinates with
 /// other processes before writing the manifest.
 ///
+/// When a [`SHUTDOWN_SENTINEL`](crate::executor::SHUTDOWN_SENTINEL) epoch
+/// arrives, the task coordinates shutdown across processes (if in cluster
+/// mode), then releases the barrier so workers can return and Timely's
+/// TCP connections tear down simultaneously.
+///
 /// Returns the last `checkpoint_id` written.
 async fn run_checkpoint_task(
     mut checkpoint_rx: tokio::sync::mpsc::Receiver<u64>,
     config: CheckpointTaskConfig,
     mut coordination: Option<CheckpointCoordination>,
+    shutdown_barrier_tx: Option<std::sync::mpsc::Sender<()>>,
 ) -> u64 {
     let mut checkpoint_id = config.initial_checkpoint_id;
 
@@ -644,35 +679,23 @@ async fn run_checkpoint_task(
             epoch = newer_epoch;
         }
 
-        // In cluster mode, coordinate with other processes.
-        if let Some(coord) = coordination.as_mut() {
-            match coord {
-                CheckpointCoordination::Local(local) => {
-                    if let Err(e) = local.ready_tx.send(epoch).await {
-                        tracing::warn!(error = %e, "failed to send Ready to coordinator");
-                        continue;
-                    }
-                    if let Some(committed_epoch) = local.committed_rx.recv().await {
-                        tracing::debug!(committed_epoch, "epoch committed by coordinator");
-                    } else {
-                        tracing::warn!("coordinator channel closed");
-                        break;
-                    }
-                }
-                CheckpointCoordination::Remote(participant) => {
-                    if let Err(e) = participant.send_ready(epoch).await {
-                        tracing::warn!(error = %e, "failed to send Ready to coordinator");
-                        continue;
-                    }
-                    if let Ok(committed_epoch) = participant.wait_committed().await {
-                        tracing::debug!(committed_epoch, "epoch committed by coordinator");
-                    } else {
-                        tracing::warn!("failed to receive Committed from coordinator");
-                        break;
-                    }
-                }
+        // Shutdown sentinel: coordinate with other processes, then release
+        // the barrier so all workers can return simultaneously.
+        if epoch == crate::executor::SHUTDOWN_SENTINEL {
+            tracing::debug!("received shutdown sentinel — coordinating teardown");
+            coordinate_epoch(epoch, &mut coordination).await;
+            if let Some(ref tx) = shutdown_barrier_tx {
+                let _ = tx.send(());
             }
+            continue;
         }
+
+        // Regular checkpoints are process-local: each process writes its
+        // own partial manifest without waiting for other processes. This
+        // avoids blocking the checkpoint task on cross-process coordination,
+        // which would cause the notification channel to fill up and
+        // back-pressure the Timely worker threads (blocking_send deadlock).
+        // The merged manifest is written after DAG completion.
 
         checkpoint_id += 1;
         let offsets = crate::worker::merge_source_offsets(&config.all_source_offsets);
@@ -700,6 +723,40 @@ async fn run_checkpoint_task(
     }
 
     checkpoint_id
+}
+
+/// Coordinate a single epoch across processes (if in cluster mode).
+///
+/// Sends a `Ready` message and waits for `Committed` from the coordinator.
+/// In single-process mode (coordination is `None`), this is a no-op.
+async fn coordinate_epoch(epoch: u64, coordination: &mut Option<CheckpointCoordination>) {
+    let Some(coord) = coordination.as_mut() else {
+        return;
+    };
+    match coord {
+        CheckpointCoordination::Local(local) => {
+            if let Err(e) = local.ready_tx.send(epoch).await {
+                tracing::warn!(error = %e, "failed to send Ready to coordinator");
+                return;
+            }
+            if let Some(committed_epoch) = local.committed_rx.recv().await {
+                tracing::debug!(committed_epoch, "epoch committed by coordinator");
+            } else {
+                tracing::warn!("coordinator channel closed");
+            }
+        }
+        CheckpointCoordination::Remote(participant) => {
+            if let Err(e) = participant.send_ready(epoch).await {
+                tracing::warn!(error = %e, "failed to send Ready to coordinator");
+                return;
+            }
+            if let Ok(committed_epoch) = participant.wait_committed().await {
+                tracing::debug!(committed_epoch, "epoch committed by coordinator");
+            } else {
+                tracing::warn!("failed to receive Committed from coordinator");
+            }
+        }
+    }
 }
 
 /// Write a checkpoint manifest (partial in cluster mode, full in single-process).

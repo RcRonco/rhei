@@ -91,8 +91,16 @@ impl CheckpointCoordinator {
     /// Run the coordinator loop.
     ///
     /// Accepts connections from N-1 remote participants (process 0 uses
-    /// the local participant channel). Collects `Ready` messages per epoch,
-    /// then broadcasts `Committed` once all processes have reported.
+    /// the local participant channel). Collects `Ready` messages from all
+    /// processes, then broadcasts `Committed` once every process has
+    /// reported for the current round.
+    ///
+    /// The coordinator is **process-based**, not epoch-based: it tracks
+    /// which processes have sent `Ready` (regardless of their individual
+    /// epoch numbers). Once all N processes have reported, it commits
+    /// using the maximum epoch seen. This avoids deadlocks when the
+    /// checkpoint drain loop coalesces to different epochs on different
+    /// processes.
     ///
     /// `local_ready_rx` receives epoch numbers from the local (process 0)
     /// checkpoint task. `local_committed_tx` signals the local task that
@@ -112,8 +120,8 @@ impl CheckpointCoordinator {
             streams.push(stream);
         }
 
-        // Per-epoch ready tracking.
-        let mut ready_counts: HashMap<u64, usize> = HashMap::new();
+        // Per-round: track which processes have reported and the max epoch.
+        let mut process_epochs: HashMap<usize, u64> = HashMap::new();
 
         loop {
             // Wait for either a local or remote Ready message.
@@ -137,15 +145,17 @@ impl CheckpointCoordinator {
 
             if let CoordMessage::Ready { process_id, epoch } = msg {
                 tracing::debug!(process_id, epoch, "received Ready");
-                let count = ready_counts.entry(epoch).or_insert(0);
-                *count += 1;
+                process_epochs.insert(process_id, epoch);
 
-                if *count >= n {
-                    tracing::info!(epoch, "all processes ready — committing");
-                    ready_counts.remove(&epoch);
+                if process_epochs.len() >= n {
+                    let committed_epoch = *process_epochs.values().max().unwrap();
+                    tracing::info!(committed_epoch, "all {} processes ready — committing", n);
+                    process_epochs.clear();
 
                     // Broadcast Committed to remote participants.
-                    let committed = encode_message(&CoordMessage::Committed { epoch });
+                    let committed = encode_message(&CoordMessage::Committed {
+                        epoch: committed_epoch,
+                    });
                     for stream in &mut streams {
                         if let Err(e) = stream.write_all(&committed).await {
                             tracing::warn!(error = %e, "failed to send Committed");
@@ -153,7 +163,7 @@ impl CheckpointCoordinator {
                     }
 
                     // Signal local participant.
-                    let _ = local_committed_tx.send(epoch).await;
+                    let _ = local_committed_tx.send(committed_epoch).await;
                 }
             }
         }

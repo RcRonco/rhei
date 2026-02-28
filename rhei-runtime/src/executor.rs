@@ -29,6 +29,14 @@ pub use crate::controller::PipelineControllerBuilder as ExecutorBuilder;
 /// Type alias for a Timely worker scope parameterized by allocator.
 type Scope<'a, A> = Child<'a, Worker<A>, u64>;
 
+/// Sentinel epoch value used to signal shutdown readiness.
+///
+/// After `probe.done()`, the first local worker on each process sends this
+/// sentinel through the checkpoint notification channel. In cluster mode,
+/// the checkpoint task coordinates with other processes before releasing
+/// the shutdown barrier, ensuring all processes tear down TCP simultaneously.
+pub(crate) const SHUTDOWN_SENTINEL: u64 = u64::MAX;
+
 // ── Key partitioning ────────────────────────────────────────────────
 
 /// Deterministic key-to-worker assignment using `seahash`.
@@ -46,15 +54,21 @@ pub fn partition_key(key: &str, n_workers: usize) -> usize {
 ///
 /// Spawns a blocking task, creates one Timely dataflow per worker,
 /// and runs `worker.step()` until the probe signals completion.
+///
+/// In cluster mode, `shutdown_barrier_rx` enables coordinated shutdown:
+/// the first local worker sends a [`SHUTDOWN_SENTINEL`] through the
+/// checkpoint channel, then blocks on this receiver until all processes
+/// are ready to tear down. This prevents `CommsGuard::drop` panics
+/// caused by one process closing TCP connections while peers are still
+/// communicating.
 pub(crate) async fn execute_dag(
     timely_config: timely::execute::Config,
     worker_set: &WorkerSet,
     rt: tokio::runtime::Handle,
     total_workers: usize,
+    local_first_worker: usize,
+    shutdown_barrier_rx: Option<std::sync::mpsc::Receiver<()>>,
 ) -> anyhow::Result<()> {
-    use std::panic::{AssertUnwindSafe, catch_unwind};
-    use tokio::task::spawn_blocking;
-
     let sink_senders = worker_set.sink_senders.clone();
     let topo_order = worker_set.topo_order.clone();
     let node_inputs = worker_set.node_inputs.clone();
@@ -76,7 +90,11 @@ pub(crate) async fn execute_dag(
     let contexts = worker_set.contexts.clone();
     let dlq_tx = worker_set.dlq_tx.clone();
 
-    spawn_blocking(move || {
+    // Wrap the barrier receiver so only the first local worker can take it.
+    let shutdown_barrier: Option<Arc<std::sync::Mutex<Option<std::sync::mpsc::Receiver<()>>>>> =
+        shutdown_barrier_rx.map(|rx| Arc::new(std::sync::Mutex::new(Some(rx))));
+
+    tokio::task::spawn_blocking(move || {
         let guards = timely::execute::execute(timely_config, move |worker| {
             let idx = worker.index();
             let _span = tracing::info_span!("worker", worker = idx).entered();
@@ -104,6 +122,7 @@ pub(crate) async fn execute_dag(
                 dlq_tx: w_data.dlq_tx.take(),
                 last_operator_id,
                 global_watermark: global_watermark.clone(),
+                local_first_worker,
             };
 
             let dataflow_index = worker.next_dataflow_index();
@@ -122,18 +141,29 @@ pub(crate) async fn execute_dag(
                 worker.step();
             }
 
+            // Coordinated shutdown barrier: the first local worker on each
+            // process signals readiness and waits for all processes to be
+            // ready before returning. This ensures WorkerGuards/CommsGuard
+            // drop simultaneously across processes, preventing TCP teardown
+            // panics from broken pipes.
+            if idx == local_first_worker {
+                if let Some(ref n) = checkpoint_notify_tx {
+                    let _ = n.blocking_send(SHUTDOWN_SENTINEL);
+                }
+                if let Some(ref barrier) = shutdown_barrier
+                    && let Some(rx) = barrier.lock().unwrap().take()
+                {
+                    tracing::debug!("worker {idx} waiting on shutdown barrier");
+                    let _ = rx.recv();
+                    tracing::debug!("worker {idx} shutdown barrier released");
+                }
+            }
+
             worker.drop_dataflow(dataflow_index);
         })
         .map_err(|e| anyhow::anyhow!("timely execution failed: {e}"))?;
 
-        // Timely's CommsGuard::drop can panic during TCP teardown when
-        // communication threads encounter broken pipes. This is benign:
-        // the dataflow has completed successfully by this point.
-        if let Err(panic_info) = catch_unwind(AssertUnwindSafe(|| drop(guards))) {
-            tracing::warn!(
-                "Timely communication teardown panicked (benign in TCP mode): {panic_info:?}"
-            );
-        }
+        drop(guards);
         anyhow::Ok(())
     })
     .await
@@ -215,6 +245,8 @@ pub(crate) struct TimelyCompiler {
     dlq_tx: Option<DlqSender>,
     last_operator_id: Option<NodeId>,
     global_watermark: Arc<AtomicU64>,
+    /// First worker index on this process (used for checkpoint notifications).
+    local_first_worker: usize,
 }
 
 impl TimelyCompiler {
@@ -446,6 +478,7 @@ impl TimelyCompiler {
         let dlq = self.dlq_tx.clone();
         let gw = self.global_watermark.clone();
         let worker_index = self.worker_index;
+        let local_first_worker = self.local_first_worker;
 
         input_stream.unary_frontier::<CapacityContainerBuilder<Vec<AnyItem>>, _, _, _>(
             Pipeline,
@@ -496,9 +529,14 @@ impl TimelyCompiler {
                     }
 
                     let frontier_vec: Vec<u64> = frontier.frontier().iter().copied().collect();
-                    if let Some(epoch) =
-                        try_checkpoint(&mut timely_op, &frontier_vec, &rt, is_last_op, worker_index)
-                        && let Some(ref n) = notify
+                    if let Some(epoch) = try_checkpoint(
+                        &mut timely_op,
+                        &frontier_vec,
+                        &rt,
+                        is_last_op,
+                        worker_index,
+                        local_first_worker,
+                    ) && let Some(ref n) = notify
                     {
                         let _ = n.blocking_send(epoch);
                     }
@@ -625,16 +663,21 @@ fn advance_watermark(
     }
 }
 
-/// Run checkpoint and return `Some(epoch)` when worker 0's last operator checkpoints.
+/// Run checkpoint on the first local worker of the last operator.
+///
+/// Returns `Some(epoch)` when the checkpoint fires, `None` otherwise.
+/// Uses `local_first_worker` instead of hardcoded worker 0 so that
+/// every process in a cluster sends checkpoint notifications.
 fn try_checkpoint(
     timely_op: &mut TimelyErasedOperator,
     frontier_vec: &[u64],
     rt: &tokio::runtime::Handle,
     is_last_op: bool,
     worker_index: usize,
+    local_first_worker: usize,
 ) -> Option<u64> {
     let epoch = timely_op.maybe_checkpoint(frontier_vec, rt);
-    if is_last_op && worker_index == 0 {
+    if is_last_op && worker_index == local_first_worker {
         epoch
     } else {
         None
