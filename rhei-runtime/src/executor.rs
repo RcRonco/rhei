@@ -18,7 +18,7 @@ use timely::worker::Worker;
 
 use crate::dataflow::{AnyItem, ErasedOperator, NodeId, NodeKind, TransformFn};
 use crate::timely_operator::TimelyErasedOperator;
-use crate::worker::{DlqSender, WorkerSet};
+use crate::worker::{DlqSender, WorkerData, WorkerSet};
 
 // Backward-compatible re-exports so `executor::Executor` still works.
 #[doc(hidden)]
@@ -73,33 +73,18 @@ pub fn partition_key(key: &str, n_workers: usize) -> usize {
 /// communicating.
 pub(crate) async fn execute_dag(
     timely_config: timely::execute::Config,
-    worker_set: &WorkerSet,
+    worker_set: Arc<WorkerSet>,
     rt: tokio::runtime::Handle,
     total_workers: usize,
     local_first_worker: usize,
     shutdown_barrier_rx: Option<std::sync::mpsc::Receiver<()>>,
 ) -> anyhow::Result<()> {
-    let sink_senders = worker_set.sink_senders.clone();
-    let topo_order = worker_set.topo_order.clone();
-    let node_inputs = worker_set.node_inputs.clone();
-    let node_kinds = worker_set.node_kinds.clone();
-    let last_operator_id = worker_set.last_operator_id;
-    let global_watermark = worker_set.global_watermark.clone();
     let checkpoint_notify_tx = worker_set
         .checkpoint_notify_tx
         .lock()
         .unwrap()
         .as_ref()
         .cloned();
-
-    // Clone Arc fields for per-worker take_worker_data inside the closure.
-    let source_rx = worker_set.source_rx.clone();
-    let source_wm = worker_set.source_wm.clone();
-    let transforms = worker_set.transforms.clone();
-    let key_fns = worker_set.key_fns.clone();
-    let operators = worker_set.operators.clone();
-    let contexts = worker_set.contexts.clone();
-    let dlq_tx = worker_set.dlq_tx.clone();
 
     // Wrap the barrier receiver so only the first local worker can take it.
     let shutdown_barrier: Option<Arc<std::sync::Mutex<Option<std::sync::mpsc::Receiver<()>>>>> =
@@ -110,45 +95,26 @@ pub(crate) async fn execute_dag(
             let idx = worker.index();
             let _span = tracing::info_span!("worker", worker = idx).entered();
 
-            // Take per-worker data from shared Mutex vectors.
-            let mut w_data = take_worker_data_from_arcs(
-                idx,
-                &source_rx,
-                &source_wm,
-                &transforms,
-                &key_fns,
-                &operators,
-                &contexts,
-                &dlq_tx,
-            );
+            // Take per-worker data (one-time handoff).
+            let mut w_data = worker_set.take_worker_data(idx);
 
             let compiler = TimelyCompiler {
-                sink_senders: sink_senders.clone(),
-                topo_order: topo_order.clone(),
-                node_inputs: node_inputs.clone(),
-                node_kinds: node_kinds.clone(),
+                sink_senders: worker_set.sink_senders.clone(),
+                topo_order: worker_set.topo_order.clone(),
+                node_inputs: worker_set.node_inputs.clone(),
+                node_kinds: worker_set.node_kinds.clone(),
                 rt: rt.clone(),
                 worker_index: idx,
                 num_workers: total_workers,
                 checkpoint_notify: checkpoint_notify_tx.clone(),
                 dlq_tx: w_data.dlq_tx.take(),
-                last_operator_id,
-                global_watermark: global_watermark.clone(),
+                last_operator_id: worker_set.last_operator_id,
+                global_watermark: worker_set.global_watermark.clone(),
                 local_first_worker,
             };
 
             let dataflow_index = worker.next_dataflow_index();
-            let probe = worker.dataflow::<u64, _, _>(|scope| {
-                compiler.compile(
-                    scope,
-                    &mut w_data.source_rx,
-                    &mut w_data.source_wm,
-                    &mut w_data.transforms,
-                    &mut w_data.key_fns,
-                    &mut w_data.operators,
-                    &mut w_data.contexts,
-                )
-            });
+            let probe = worker.dataflow::<u64, _, _>(|scope| compiler.compile(scope, &mut w_data));
 
             while !probe.done() {
                 worker.step();
@@ -183,40 +149,6 @@ pub(crate) async fn execute_dag(
     .map_err(|e| anyhow::anyhow!("spawn_blocking failed: {e}"))??;
 
     Ok(())
-}
-
-/// Inline helper to take per-worker data from Arc<Mutex<Vec<Option<...>>>>.
-///
-/// This avoids needing `WorkerSet` inside the `'static` Timely closure — we
-/// only pass the individual Arc fields.
-#[allow(
-    clippy::type_complexity,
-    clippy::option_option,
-    clippy::too_many_arguments
-)]
-fn take_worker_data_from_arcs(
-    idx: usize,
-    source_rx: &Arc<
-        std::sync::Mutex<Vec<Option<HashMap<NodeId, tokio::sync::mpsc::Receiver<Vec<AnyItem>>>>>>,
-    >,
-    source_wm: &Arc<std::sync::Mutex<Vec<Option<HashMap<NodeId, Arc<AtomicU64>>>>>>,
-    transforms: &Arc<std::sync::Mutex<Vec<Option<HashMap<NodeId, TransformFn>>>>>,
-    key_fns: &Arc<std::sync::Mutex<Vec<Option<HashMap<NodeId, crate::dataflow::KeyFn>>>>>,
-    operators: &Arc<
-        std::sync::Mutex<Vec<Option<HashMap<NodeId, (String, Box<dyn ErasedOperator>)>>>>,
-    >,
-    contexts: &Arc<std::sync::Mutex<Vec<Option<HashMap<NodeId, StateContext>>>>>,
-    dlq_tx: &Arc<std::sync::Mutex<Vec<Option<Option<DlqSender>>>>>,
-) -> crate::worker::WorkerData {
-    crate::worker::WorkerData {
-        source_rx: source_rx.lock().unwrap()[idx].take().unwrap_or_default(),
-        source_wm: source_wm.lock().unwrap()[idx].take().unwrap_or_default(),
-        transforms: transforms.lock().unwrap()[idx].take().unwrap_or_default(),
-        key_fns: key_fns.lock().unwrap()[idx].take().unwrap_or_default(),
-        operators: operators.lock().unwrap()[idx].take().unwrap_or_default(),
-        contexts: contexts.lock().unwrap()[idx].take().unwrap_or_default(),
-        dlq_tx: dlq_tx.lock().unwrap()[idx].take().unwrap_or_default(),
-    }
 }
 
 // ── Node kind classification ────────────────────────────────────────
@@ -273,16 +205,10 @@ impl TimelyCompiler {
     ///
     /// Iterates `topo_order`, matches each node kind to its builder method,
     /// and returns a probe handle for tracking completion.
-    #[allow(clippy::too_many_arguments)]
     fn compile<A: Allocate>(
         &self,
         scope: &mut Scope<'_, A>,
-        source_receivers: &mut HashMap<NodeId, tokio::sync::mpsc::Receiver<Vec<AnyItem>>>,
-        source_watermarks: &mut HashMap<NodeId, Arc<AtomicU64>>,
-        transforms: &mut HashMap<NodeId, TransformFn>,
-        key_fns: &mut HashMap<NodeId, crate::dataflow::KeyFn>,
-        operators: &mut HashMap<NodeId, (String, Box<dyn ErasedOperator>)>,
-        operator_contexts: &mut HashMap<NodeId, StateContext>,
+        data: &mut WorkerData,
     ) -> probe::Handle<u64> {
         let mut streams: HashMap<NodeId, timely::dataflow::Stream<_, AnyItem>> = HashMap::new();
         let probe = probe::Handle::new();
@@ -294,23 +220,28 @@ impl TimelyCompiler {
             match kind {
                 NodeKindTag::Source => {
                     let stream =
-                        self.build_source(scope, node_id, source_receivers, source_watermarks);
+                        self.build_source(scope, node_id, &mut data.source_rx, &mut data.source_wm);
                     streams.insert(node_id, stream);
                 }
                 NodeKindTag::Transform => {
                     let input_stream = streams[&inputs[0]].clone();
-                    let stream = self.build_transform(scope, node_id, input_stream, transforms);
+                    let stream =
+                        self.build_transform(scope, node_id, input_stream, &mut data.transforms);
                     streams.insert(node_id, stream);
                 }
                 NodeKindTag::KeyBy => {
                     let input_stream = streams[&inputs[0]].clone();
-                    let stream = Self::build_key_by(node_id, input_stream, key_fns);
+                    let stream = Self::build_key_by(node_id, input_stream, &mut data.key_fns);
                     streams.insert(node_id, stream);
                 }
                 NodeKindTag::Operator => {
                     let input_stream = streams[&inputs[0]].clone();
-                    let stream =
-                        self.build_operator(node_id, input_stream, operators, operator_contexts);
+                    let stream = self.build_operator(
+                        node_id,
+                        input_stream,
+                        &mut data.operators,
+                        &mut data.contexts,
+                    );
                     streams.insert(node_id, stream);
                 }
                 NodeKindTag::Merge => {

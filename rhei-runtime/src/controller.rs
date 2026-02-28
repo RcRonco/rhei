@@ -544,7 +544,8 @@ async fn execute_compiled(
     let rt = tokio::runtime::Handle::current();
     let total_workers = controller.total_workers();
 
-    let worker_set = WorkerSet::build(graph, controller, shutdown, &rt, restored_offsets).await?;
+    let worker_set =
+        Arc::new(WorkerSet::build(graph, controller, shutdown, &rt, restored_offsets).await?);
 
     let (coordination, coord_task_handle) = setup_coordination(controller).await?;
 
@@ -582,7 +583,7 @@ async fn execute_compiled(
     let local_first_worker = controller.local_worker_range().start;
     crate::executor::execute_dag(
         timely_config,
-        &worker_set,
+        worker_set.clone(),
         rt.clone(),
         total_workers,
         local_first_worker,
@@ -607,7 +608,10 @@ async fn execute_compiled(
     let all_operator_names = worker_set.all_operator_names.clone();
     let source_offsets = worker_set.source_offsets();
 
-    worker_set.drain().await?;
+    Arc::try_unwrap(worker_set)
+        .unwrap_or_else(|_| panic!("WorkerSet Arc still shared after execute_dag"))
+        .drain()
+        .await?;
 
     // Final manifest (includes all accumulated checkpoint progress).
     let checkpoint_id = last_checkpoint_id + 1;
