@@ -108,8 +108,8 @@
 - [x] `--workers <N>` CLI flag
 
 ### Phase 2: Multi-process (done)
-- [x] Controller / Worker / Executor split (`PipelineController` → `WorkerSet` → `execute_dag`)
-- [x] `TimelyCompiler` struct for per-worker DAG construction
+- [x] Controller / TaskManager / Executor split (`PipelineController` → `TaskManager` → `DataflowExecutor`)
+- [x] `DataflowExecutor` struct for per-worker DAG compilation and execution
 - [x] Multi-process Timely cluster with TCP communication
 - [x] Remote state configuration (`RemoteStateConfig` + env vars for distributed SlateDB)
 - [x] Remote checkpoint manifest storage (`save_to_object_store` / `load_from_object_store`)
@@ -125,7 +125,7 @@
 - [ ] State repartitioning strategy after topology changes
   - [ ] Decide approach: lazy migration (read-through old prefix) vs eager compaction
   - [ ] Decouple state prefix from `(process_id, worker_index)` pair
-- [ ] WorkerSet rebuild path: checkpoint → build fresh WorkerSet → restart Timely
+- [ ] TaskManager rebuild path: checkpoint → build fresh TaskManager → restart Timely
 - [ ] Source partition rebalance on scale events (re-trigger Kafka consumer group)
 - [ ] Job Manager integration: chitchat gossip for failure detection, OpenRaft for coordination
 - [ ] Leader election and failure detection

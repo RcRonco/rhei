@@ -91,7 +91,7 @@ The Controller no longer spawns checkpoint tasks, sets up coordination, or manag
 
 ## 3. TaskManager
 
-One TaskManager per process. Replaces the current `WorkerSet` struct and absorbs the checkpoint/coordination orchestration currently in `execute_compiled`. Owns all shared infrastructure and every background task.
+One TaskManager per process (`task_manager.rs`). Owns all shared infrastructure and every background task.
 
 **Naming rationale:** Follows Flink's convention (TaskManager = per-process manager) to avoid collision with Timely's `Worker` (per-thread).
 
@@ -139,20 +139,20 @@ pub(crate) struct TaskManager {
 | `create_executor(idx) -> Executor` | Construct an Executor for worker `idx`, taking its `ExecutorData` from the Mutex-Vec. Called inside the Timely closure. |
 | `run(controller) -> Result<()>` | Setup coordination, spawn checkpoint task, launch `timely::execute`, step loop, coordinated shutdown, drain sinks/DLQ. |
 
-The `build()` method performs the same work as the current `WorkerSet::build()`: DLQ setup, node classification, source bridging, sink bridging, per-worker data extraction, and global watermark task spawning. The difference is that `run()` also absorbs the orchestration currently split between `execute_compiled` and `execute_dag`.
+The `build()` method performs DLQ setup, node classification, source bridging, sink bridging, per-worker data extraction, and global watermark task spawning. The `run()` method handles coordination setup, checkpoint task spawning, Timely execution, and teardown.
 
 ---
 
 ## 4. Executor
 
-One Executor per Timely worker thread. Replaces the current `TimelyCompiler`. Constructed by `TaskManager::create_executor(idx)` inside the Timely closure, so it is never moved across threads (satisfying `!Send` constraints from Timely capabilities).
+One `DataflowExecutor` per Timely worker thread (`executor.rs`). Constructed by `TaskManager::create_executor(idx)` inside the Timely closure, so it is never moved across threads (satisfying `!Send` constraints from Timely capabilities).
 
 **Struct sketch:**
 
 ```rust
-pub(crate) struct Executor {
+pub(crate) struct DataflowExecutor {
     // ── Per-worker data (owned, not shared) ────────────────
-    data: ExecutorData,
+    data: Option<ExecutorData>,
 
     // ── Shared refs (cloned from TaskManager) ──────────────
     sink_senders: Arc<HashMap<NodeId, mpsc::Sender<AnyItem>>>,
@@ -169,14 +169,17 @@ pub(crate) struct Executor {
     last_operator_id: Option<NodeId>,
     global_watermark: Arc<AtomicU64>,
     local_first_worker: usize,
+
+    // ── Shutdown coordination ──────────────────────────────
+    shutdown_barrier: Option<Arc<Mutex<Option<mpsc::Receiver<()>>>>>,
 }
 ```
 
 **Key method:**
 
 ```rust
-impl Executor {
-    fn run<A: Allocate>(self, worker: &mut Worker<A>) {
+impl DataflowExecutor {
+    fn run<A: Allocate>(mut self, worker: &mut Worker<A>) {
         let dataflow_index = worker.next_dataflow_index();
         let probe = worker.dataflow(|scope| self.compile(scope));
         while !probe.done() {
@@ -189,7 +192,7 @@ impl Executor {
 }
 ```
 
-The Executor receives everything it needs at construction time. No `Arc<Mutex<Vec<Option<...>>>>` handoff at runtime — `create_executor(idx)` takes the data from the Vec and passes it directly into the Executor constructor.
+The `DataflowExecutor` receives everything it needs at construction time. `create_executor(idx)` takes the data from the Vec and passes it directly into the constructor.
 
 ---
 
