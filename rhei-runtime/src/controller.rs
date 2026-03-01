@@ -18,7 +18,7 @@ use crate::compiler::compile_graph;
 use crate::dataflow::DataflowGraph;
 use crate::health::{HealthState, PipelineStatus};
 use crate::shutdown::ShutdownHandle;
-use crate::worker::WorkerSet;
+use crate::task_manager::TaskManager;
 
 /// Current time as Unix milliseconds (saturating to `u64::MAX`).
 #[allow(clippy::cast_possible_truncation)]
@@ -457,159 +457,26 @@ async fn run_graph(
 
     controller.health.set_status(PipelineStatus::Running);
 
-    let result = execute_compiled(
-        compiled,
-        controller,
-        shutdown.as_ref(),
-        initial_checkpoint_id,
-        restored_offsets,
-    )
-    .await;
+    let task_manager = Arc::new(
+        TaskManager::build(
+            compiled,
+            controller,
+            shutdown.as_ref(),
+            restored_offsets,
+            initial_checkpoint_id,
+        )
+        .await?,
+    );
 
-    controller.health.set_status(PipelineStatus::Stopped);
-    result
-}
+    let last_checkpoint_id = task_manager.clone().run(controller).await?;
 
-/// Set up cross-process checkpoint coordination for cluster mode.
-///
-/// Process 0 spawns a coordinator task and uses local channels.
-/// Other processes connect as TCP participants with retry/backoff.
-/// Returns `(coordination, coordinator_task_handle)`.
-async fn setup_coordination(
-    controller: &PipelineController,
-) -> anyhow::Result<(
-    Option<CheckpointCoordination>,
-    Option<tokio::task::JoinHandle<anyhow::Result<()>>>,
-)> {
-    if !controller.is_cluster() {
-        return Ok((None, None));
-    }
-
-    let peers = controller.peers.as_ref().unwrap();
-    let pid = controller.process_id().unwrap();
-    let n_processes = peers.len();
-    let coord_port = crate::checkpoint_coord::coordination_port(peers);
-    let coord_addr = format!("127.0.0.1:{coord_port}");
-
-    if pid == 0 {
-        // Process 0: run coordinator + use local channels for self-participation.
-        let (coordinator, channels, local_part) =
-            crate::checkpoint_coord::setup_coordinator_full(&coord_addr, n_processes).await?;
-
-        let handle = tokio::spawn(async move {
-            coordinator
-                .run(channels.ready_rx, channels.committed_tx)
-                .await
-        });
-
-        Ok((
-            Some(CheckpointCoordination::Local(local_part)),
-            Some(handle),
-        ))
-    } else {
-        // Non-zero processes: connect as TCP participant with backoff.
-        let mut participant = None;
-        for attempt in 0..20 {
-            match crate::checkpoint_coord::CheckpointParticipant::connect(&coord_addr, pid).await {
-                Ok(p) => {
-                    participant = Some(p);
-                    break;
-                }
-                Err(e) => {
-                    if attempt < 19 {
-                        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-                    } else {
-                        return Err(anyhow::anyhow!(
-                            "failed to connect to checkpoint coordinator at {coord_addr}: {e}"
-                        ));
-                    }
-                }
-            }
-        }
-        Ok((
-            Some(CheckpointCoordination::Remote(participant.unwrap())),
-            None,
-        ))
-    }
-}
-
-/// Execute a compiled graph: build workers, run DAG, checkpoint.
-async fn execute_compiled(
-    graph: crate::compiler::CompiledGraph,
-    controller: &PipelineController,
-    shutdown: Option<&ShutdownHandle>,
-    initial_checkpoint_id: u64,
-    restored_offsets: std::collections::HashMap<String, String>,
-) -> anyhow::Result<()> {
-    let rt = tokio::runtime::Handle::current();
-    let total_workers = controller.total_workers();
-
-    let worker_set =
-        Arc::new(WorkerSet::build(graph, controller, shutdown, &rt, restored_offsets).await?);
-
-    let (coordination, coord_task_handle) = setup_coordination(controller).await?;
-
-    // Spawn a mid-execution checkpoint management task that writes manifests
-    // as checkpoints complete during DAG execution (not just at the end).
+    let source_offsets = task_manager.source_offsets();
+    let operator_names = task_manager.operator_names().to_vec();
     let ckpt_process_id = controller.process_id();
     let ckpt_n_processes = controller.peers.as_ref().map_or(1, Vec::len);
 
-    let ckpt_config = CheckpointTaskConfig {
-        initial_checkpoint_id,
-        all_source_offsets: worker_set.source_offset_handles(),
-        operator_names: worker_set.all_operator_names.clone(),
-        checkpoint_dir: controller.checkpoint_dir.clone(),
-        process_id: ckpt_process_id,
-        n_processes: ckpt_n_processes,
-    };
-
-    // Create a shutdown barrier for coordinated process teardown.
-    // In cluster mode, the first local worker blocks on barrier_rx after
-    // probe.done() until all processes are ready, preventing TCP teardown
-    // panics from broken pipes. In single-process mode, no barrier is used.
-    let (barrier_tx, barrier_rx) = if controller.is_cluster() {
-        let (tx, rx) = std::sync::mpsc::channel::<()>();
-        (Some(tx), Some(rx))
-    } else {
-        (None, None)
-    };
-
-    let checkpoint_rx = worker_set.take_checkpoint_rx().await;
-    let checkpoint_task = tokio::spawn(async move {
-        run_checkpoint_task(checkpoint_rx, ckpt_config, coordination, barrier_tx).await
-    });
-
-    let timely_config = controller.timely_config();
-    let local_first_worker = controller.local_worker_range().start;
-    crate::executor::execute_dag(
-        timely_config,
-        worker_set.clone(),
-        rt.clone(),
-        total_workers,
-        local_first_worker,
-        barrier_rx,
-    )
-    .await?;
-
-    // Close the checkpoint channel so the task drains remaining notifications
-    // and exits cleanly (recv() returns None when all senders are dropped).
-    worker_set.close_checkpoint_channel();
-    let last_checkpoint_id = match checkpoint_task.await {
-        Ok(id) => id,
-        Err(e) => return Err(anyhow::anyhow!("checkpoint task panicked: {e}")),
-    };
-
-    // Shut down coordinator task if running.
-    if let Some(handle) = coord_task_handle {
-        handle.abort();
-        let _ = handle.await;
-    }
-
-    let all_operator_names = worker_set.all_operator_names.clone();
-    let source_offsets = worker_set.source_offsets();
-
-    Arc::try_unwrap(worker_set)
-        .unwrap_or_else(|_| panic!("WorkerSet Arc still shared after execute_dag"))
+    Arc::try_unwrap(task_manager)
+        .unwrap_or_else(|_| panic!("TaskManager Arc still shared after run"))
         .drain()
         .await?;
 
@@ -619,189 +486,18 @@ async fn execute_compiled(
         version: 1,
         checkpoint_id,
         timestamp_ms: now_millis(),
-        operators: all_operator_names,
+        operators: operator_names,
         source_offsets,
     };
 
-    write_manifest(
+    crate::task_manager::write_manifest(
         &manifest,
         &controller.checkpoint_dir,
         ckpt_process_id,
         ckpt_n_processes,
     )?;
 
-    Ok(())
-}
-
-/// Coordination mode for checkpoint management.
-///
-/// In cluster mode, checkpoints are coordinated across processes via TCP.
-/// Process 0 uses in-memory channels; other processes use a TCP participant.
-enum CheckpointCoordination {
-    /// Process 0: uses in-memory channels to the coordinator task.
-    Local(crate::checkpoint_coord::LocalParticipant),
-    /// Non-zero processes: TCP connection to coordinator.
-    Remote(crate::checkpoint_coord::CheckpointParticipant),
-}
-
-/// Configuration for the mid-execution checkpoint task.
-struct CheckpointTaskConfig {
-    initial_checkpoint_id: u64,
-    all_source_offsets: Vec<Arc<std::sync::Mutex<std::collections::HashMap<String, String>>>>,
-    operator_names: Vec<String>,
-    checkpoint_dir: std::path::PathBuf,
-    process_id: Option<usize>,
-    n_processes: usize,
-}
-
-/// Run the mid-execution checkpoint management loop.
-///
-/// Receives epoch notifications from the Timely DAG and writes checkpoint
-/// manifests as each epoch completes. In cluster mode, coordinates with
-/// other processes before writing the manifest.
-///
-/// When a [`Sentinel::Shutdown`](crate::executor::Sentinel::Shutdown) epoch
-/// arrives, the task coordinates shutdown across processes (if in cluster
-/// mode), then releases the barrier so workers can return and Timely's
-/// TCP connections tear down simultaneously.
-///
-/// Returns the last `checkpoint_id` written.
-async fn run_checkpoint_task(
-    mut checkpoint_rx: tokio::sync::mpsc::Receiver<u64>,
-    config: CheckpointTaskConfig,
-    mut coordination: Option<CheckpointCoordination>,
-    shutdown_barrier_tx: Option<std::sync::mpsc::Sender<()>>,
-) -> u64 {
-    let mut checkpoint_id = config.initial_checkpoint_id;
-
-    while let Some(mut epoch) = checkpoint_rx.recv().await {
-        // Drain any additional epoch notifications that arrived while we were
-        // busy writing the last manifest. This coalesces rapid-fire
-        // checkpoints into a single manifest write, preventing the channel
-        // from filling up and blocking the Timely worker thread.
-        while let Ok(newer_epoch) = checkpoint_rx.try_recv() {
-            epoch = newer_epoch;
-        }
-
-        // Shutdown sentinel: coordinate with other processes, then release
-        // the barrier so all workers can return simultaneously.
-        if epoch == crate::executor::Sentinel::Shutdown as u64 {
-            tracing::debug!("received shutdown sentinel — coordinating teardown");
-            coordinate_epoch(epoch, &mut coordination).await;
-            if let Some(ref tx) = shutdown_barrier_tx {
-                let _ = tx.send(());
-            }
-            continue;
-        }
-
-        // Regular checkpoints are process-local: each process writes its
-        // own partial manifest without waiting for other processes. This
-        // avoids blocking the checkpoint task on cross-process coordination,
-        // which would cause the notification channel to fill up and
-        // back-pressure the Timely worker threads (blocking_send deadlock).
-        // The merged manifest is written after DAG completion.
-
-        checkpoint_id += 1;
-        let offsets = crate::worker::merge_source_offsets(&config.all_source_offsets);
-        let manifest = CheckpointManifest {
-            version: 1,
-            checkpoint_id,
-            timestamp_ms: now_millis(),
-            operators: config.operator_names.clone(),
-            source_offsets: offsets,
-        };
-
-        if let Err(e) = write_manifest(
-            &manifest,
-            &config.checkpoint_dir,
-            config.process_id,
-            config.n_processes,
-        ) {
-            tracing::error!(error = %e, "mid-execution checkpoint write failed");
-        } else {
-            tracing::debug!(
-                checkpoint_id,
-                "mid-execution checkpoint #{checkpoint_id} saved"
-            );
-        }
-    }
-
-    checkpoint_id
-}
-
-/// Coordinate a single epoch across processes (if in cluster mode).
-///
-/// Sends a `Ready` message and waits for `Committed` from the coordinator.
-/// In single-process mode (coordination is `None`), this is a no-op.
-async fn coordinate_epoch(epoch: u64, coordination: &mut Option<CheckpointCoordination>) {
-    let Some(coord) = coordination.as_mut() else {
-        return;
-    };
-    match coord {
-        CheckpointCoordination::Local(local) => {
-            if let Err(e) = local.ready_tx.send(epoch).await {
-                tracing::warn!(error = %e, "failed to send Ready to coordinator");
-                return;
-            }
-            if let Some(committed_epoch) = local.committed_rx.recv().await {
-                tracing::debug!(committed_epoch, "epoch committed by coordinator");
-            } else {
-                tracing::warn!("coordinator channel closed");
-            }
-        }
-        CheckpointCoordination::Remote(participant) => {
-            if let Err(e) = participant.send_ready(epoch).await {
-                tracing::warn!(error = %e, "failed to send Ready to coordinator");
-                return;
-            }
-            if let Ok(committed_epoch) = participant.wait_committed().await {
-                tracing::debug!(committed_epoch, "epoch committed by coordinator");
-            } else {
-                tracing::warn!("failed to receive Committed from coordinator");
-            }
-        }
-    }
-}
-
-/// Write a checkpoint manifest (partial in cluster mode, full in single-process).
-fn write_manifest(
-    manifest: &CheckpointManifest,
-    checkpoint_dir: &std::path::Path,
-    process_id: Option<usize>,
-    n_processes: usize,
-) -> anyhow::Result<()> {
-    if let Some(pid) = process_id {
-        // Cluster mode: write a partial manifest for this process.
-        manifest.save_partial(checkpoint_dir, pid)?;
-        tracing::debug!(
-            checkpoint_id = manifest.checkpoint_id,
-            process_id = pid,
-            "partial checkpoint #{} saved for process {pid}",
-            manifest.checkpoint_id
-        );
-
-        // Process 0 merges all partial manifests into the final manifest.
-        if pid == 0 {
-            let merged = CheckpointManifest::merge_partials(checkpoint_dir, n_processes);
-            if let Some(merged) = merged {
-                merged.save(checkpoint_dir)?;
-                tracing::debug!(
-                    checkpoint_id = merged.checkpoint_id,
-                    "merged checkpoint saved"
-                );
-            } else {
-                tracing::warn!("not all partial manifests available for merge");
-            }
-        }
-    } else {
-        // Single-process mode: write directly.
-        manifest.save(checkpoint_dir)?;
-        tracing::debug!(
-            checkpoint_id = manifest.checkpoint_id,
-            "checkpoint #{} saved",
-            manifest.checkpoint_id
-        );
-    }
+    controller.health.set_status(PipelineStatus::Stopped);
     Ok(())
 }
 

@@ -1,7 +1,7 @@
 //! Pure DAG compilation and Timely execution engine.
 //!
-//! This module contains [`TimelyCompiler`] for building Timely dataflows from
-//! compiled graphs, and the [`execute_dag`] entry point that launches Timely workers.
+//! This module contains [`DataflowExecutor`] for building and running Timely dataflows
+//! from compiled graphs.
 //!
 //! For pipeline configuration and lifecycle orchestration, see
 //! [`controller::PipelineController`](crate::controller::PipelineController).
@@ -17,8 +17,8 @@ use timely::dataflow::scopes::Child;
 use timely::worker::Worker;
 
 use crate::dataflow::{AnyItem, ErasedOperator, NodeId, NodeKind, TransformFn};
+use crate::task_manager::{DlqSender, ExecutorData};
 use crate::timely_operator::TimelyErasedOperator;
-use crate::worker::{DlqSender, WorkerData, WorkerSet};
 
 // Backward-compatible re-exports so `executor::Executor` still works.
 #[doc(hidden)]
@@ -58,99 +58,6 @@ pub fn partition_key(key: &str, n_workers: usize) -> usize {
     (seahash::hash(key.as_bytes()) as usize) % n_workers
 }
 
-// ── DAG Execution ───────────────────────────────────────────────────
-
-/// Launch Timely execution over a prepared [`WorkerSet`].
-///
-/// Spawns a blocking task, creates one Timely dataflow per worker,
-/// and runs `worker.step()` until the probe signals completion.
-///
-/// In cluster mode, `shutdown_barrier_rx` enables coordinated shutdown:
-/// the first local worker sends a [`Sentinel::Shutdown`] through the
-/// checkpoint channel, then blocks on this receiver until all processes
-/// are ready to tear down. This prevents `CommsGuard::drop` panics
-/// caused by one process closing TCP connections while peers are still
-/// communicating.
-pub(crate) async fn execute_dag(
-    timely_config: timely::execute::Config,
-    worker_set: Arc<WorkerSet>,
-    rt: tokio::runtime::Handle,
-    total_workers: usize,
-    local_first_worker: usize,
-    shutdown_barrier_rx: Option<std::sync::mpsc::Receiver<()>>,
-) -> anyhow::Result<()> {
-    let checkpoint_notify_tx = worker_set
-        .checkpoint_notify_tx
-        .lock()
-        .unwrap()
-        .as_ref()
-        .cloned();
-
-    // Wrap the barrier receiver so only the first local worker can take it.
-    let shutdown_barrier: Option<Arc<std::sync::Mutex<Option<std::sync::mpsc::Receiver<()>>>>> =
-        shutdown_barrier_rx.map(|rx| Arc::new(std::sync::Mutex::new(Some(rx))));
-
-    tokio::task::spawn_blocking(move || {
-        let guards = timely::execute::execute(timely_config, move |worker| {
-            let idx = worker.index();
-            let _span = tracing::info_span!("worker", worker = idx).entered();
-
-            // Take per-worker data (one-time handoff).
-            let mut w_data = worker_set.take_worker_data(idx);
-
-            let compiler = TimelyCompiler {
-                sink_senders: worker_set.sink_senders.clone(),
-                topo_order: worker_set.topo_order.clone(),
-                node_inputs: worker_set.node_inputs.clone(),
-                node_kinds: worker_set.node_kinds.clone(),
-                rt: rt.clone(),
-                worker_index: idx,
-                num_workers: total_workers,
-                checkpoint_notify: checkpoint_notify_tx.clone(),
-                dlq_tx: w_data.dlq_tx.take(),
-                last_operator_id: worker_set.last_operator_id,
-                global_watermark: worker_set.global_watermark.clone(),
-                local_first_worker,
-            };
-
-            let dataflow_index = worker.next_dataflow_index();
-            let probe = worker.dataflow::<u64, _, _>(|scope| compiler.compile(scope, &mut w_data));
-
-            while !probe.done() {
-                worker.step();
-            }
-
-            // Coordinated shutdown barrier: the first local worker on each
-            // process signals readiness and waits for all processes to be
-            // ready before returning. This ensures WorkerGuards/CommsGuard
-            // drop simultaneously across processes, preventing TCP teardown
-            // panics from broken pipes.
-            if idx == local_first_worker {
-                if let Some(ref n) = checkpoint_notify_tx {
-                    let _ = n.blocking_send(Sentinel::Shutdown as u64);
-                }
-                if let Some(ref barrier) = shutdown_barrier
-                    && let Some(rx) = barrier.lock().unwrap().take()
-                {
-                    tracing::debug!("worker {idx} waiting on shutdown barrier");
-                    let _ = rx.recv();
-                    tracing::debug!("worker {idx} shutdown barrier released");
-                }
-            }
-
-            worker.drop_dataflow(dataflow_index);
-        })
-        .map_err(|e| anyhow::anyhow!("timely execution failed: {e}"))?;
-
-        drop(guards);
-        anyhow::Ok(())
-    })
-    .await
-    .map_err(|e| anyhow::anyhow!("spawn_blocking failed: {e}"))??;
-
-    Ok(())
-}
-
 // ── Node kind classification ────────────────────────────────────────
 
 /// Lightweight tag for classifying graph nodes without moving data.
@@ -177,30 +84,152 @@ impl NodeKindTag {
     }
 }
 
-// ── TimelyCompiler ──────────────────────────────────────────────────
+// ── DataflowExecutor ────────────────────────────────────────────────
 
-/// Compiles a Timely dataflow from compiled graph metadata.
+/// Compiles and runs a Timely dataflow from compiled graph metadata.
 ///
-/// Constructed per-worker inside the Timely closure, owns shared references
-/// to graph topology and per-worker configuration. Each `build_*` method
-/// constructs one category of Timely operator.
-pub(crate) struct TimelyCompiler {
-    sink_senders: Arc<HashMap<NodeId, tokio::sync::mpsc::Sender<AnyItem>>>,
+/// Constructed per-worker via [`TaskManager::create_executor`](crate::task_manager::TaskManager::create_executor),
+/// owns shared references to graph topology and per-worker configuration.
+/// Each `build_*` method constructs one category of Timely operator.
+pub(crate) struct DataflowExecutor {
+    sink_senders: Arc<HashMap<NodeId, flume::Sender<AnyItem>>>,
     topo_order: Arc<Vec<NodeId>>,
     node_inputs: Arc<HashMap<NodeId, Vec<NodeId>>>,
     node_kinds: Arc<HashMap<NodeId, NodeKindTag>>,
     rt: tokio::runtime::Handle,
     worker_index: usize,
     num_workers: usize,
-    checkpoint_notify: Option<tokio::sync::mpsc::Sender<u64>>,
+    checkpoint_notify: Option<flume::Sender<u64>>,
     dlq_tx: Option<DlqSender>,
     last_operator_id: Option<NodeId>,
-    global_watermark: Arc<AtomicU64>,
+    all_source_watermarks: Arc<Vec<Arc<AtomicU64>>>,
     /// First worker index on this process (used for checkpoint notifications).
     local_first_worker: usize,
+    /// Owned per-worker data for this executor (taken once during `run()`).
+    data: Option<ExecutorData>,
+    /// Shutdown barrier for coordinated process teardown (cluster mode only).
+    shutdown_barrier: Option<Arc<std::sync::Mutex<Option<std::sync::mpsc::Receiver<()>>>>>,
 }
 
-impl TimelyCompiler {
+impl DataflowExecutor {
+    /// Create a new `DataflowExecutor` with all required fields.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        sink_senders: Arc<HashMap<NodeId, flume::Sender<AnyItem>>>,
+        topo_order: Arc<Vec<NodeId>>,
+        node_inputs: Arc<HashMap<NodeId, Vec<NodeId>>>,
+        node_kinds: Arc<HashMap<NodeId, NodeKindTag>>,
+        rt: tokio::runtime::Handle,
+        worker_index: usize,
+        num_workers: usize,
+        checkpoint_notify: Option<flume::Sender<u64>>,
+        dlq_tx: Option<DlqSender>,
+        last_operator_id: Option<NodeId>,
+        all_source_watermarks: Arc<Vec<Arc<AtomicU64>>>,
+        local_first_worker: usize,
+        data: ExecutorData,
+        shutdown_barrier: Option<Arc<std::sync::Mutex<Option<std::sync::mpsc::Receiver<()>>>>>,
+    ) -> Self {
+        Self {
+            sink_senders,
+            topo_order,
+            node_inputs,
+            node_kinds,
+            rt,
+            worker_index,
+            num_workers,
+            checkpoint_notify,
+            dlq_tx,
+            last_operator_id,
+            all_source_watermarks,
+            local_first_worker,
+            data: Some(data),
+            shutdown_barrier,
+        }
+    }
+
+    /// Run the Timely dataflow: compile, step until done, then coordinate shutdown.
+    ///
+    /// Creates a per-worker `current_thread` Tokio runtime and bridges sources
+    /// locally via `spawn_local`, co-locating source I/O with the Timely worker
+    /// on the same core. The step loop alternates between `worker.step()` and
+    /// ticking the local runtime to advance source tasks.
+    ///
+    /// When the worker thread already has a Tokio runtime context (e.g. when
+    /// Timely runs worker 0 on the `spawn_blocking` thread), the shared runtime
+    /// is used via `block_in_place` instead of creating a new one. The cold-path
+    /// state fetches in `async_operator.rs` use `block_in_place(|| rt.block_on())`
+    /// which is safe in either case.
+    pub(crate) fn run<A: Allocate>(mut self, worker: &mut Worker<A>) {
+        let _span = tracing::info_span!("worker", worker = self.worker_index).entered();
+
+        let core_ids = core_affinity::get_core_ids().unwrap_or_default();
+        if !core_ids.is_empty() {
+            let core = core_ids[self.worker_index % core_ids.len()];
+            if core_affinity::set_for_current(core) {
+                tracing::info!(worker = self.worker_index, core = core.id, "pinned to core");
+            }
+        }
+
+        let mut data = self.data.take().expect("executor data already taken");
+
+        // Bridge sources on the shared Tokio runtime. Source bridges run
+        // continuously and concurrently with the Timely step loop, matching
+        // the pre-per-worker-runtime behavior. This is critical because the
+        // out-of-band watermark (shared atomic) must stay roughly in sync
+        // with the in-band data flowing through Timely exchanges — spawning
+        // sources on a cooperative per-worker runtime makes the watermark
+        // race ahead of the exchange, causing downstream operators to close
+        // windows before all items arrive.
+        //
+        // TODO: once watermarks are propagated in-band (as special stream
+        // elements), sources can be moved to a per-worker `current_thread`
+        // runtime for core co-location.
+        let mut source_rx: HashMap<NodeId, flume::Receiver<crate::bridge::SourceBatch>> =
+            HashMap::new();
+        for (node_id, source) in data.sources.drain() {
+            let (tx, rx) = flume::bounded(16);
+            let offsets = data
+                .source_offsets
+                .remove(&node_id)
+                .unwrap_or_else(|| Arc::new(std::sync::Mutex::new(HashMap::new())));
+            let wm = data.source_wm[&node_id].clone();
+            let shutdown = data.shutdown.clone();
+            self.rt.spawn(crate::bridge::local_source_bridge(
+                source, tx, offsets, wm, shutdown,
+            ));
+            source_rx.insert(node_id, rx);
+        }
+
+        let dataflow_index = worker.next_dataflow_index();
+        let probe =
+            worker.dataflow::<u64, _, _>(|scope| self.compile(scope, &mut data, &mut source_rx));
+
+        while !probe.done() {
+            worker.step();
+        }
+
+        // Coordinated shutdown barrier: the first local worker on each
+        // process signals readiness and waits for all processes to be
+        // ready before returning. This ensures WorkerGuards/CommsGuard
+        // drop simultaneously across processes, preventing TCP teardown
+        // panics from broken pipes.
+        if self.worker_index == self.local_first_worker {
+            if let Some(ref n) = self.checkpoint_notify {
+                let _ = n.send(Sentinel::Shutdown as u64);
+            }
+            if let Some(ref barrier) = self.shutdown_barrier
+                && let Some(rx) = barrier.lock().unwrap().take()
+            {
+                tracing::debug!("worker {} waiting on shutdown barrier", self.worker_index);
+                let _ = rx.recv();
+                tracing::debug!("worker {} shutdown barrier released", self.worker_index);
+            }
+        }
+
+        worker.drop_dataflow(dataflow_index);
+    }
+
     /// Build the full Timely dataflow, dispatching to per-node builders.
     ///
     /// Iterates `topo_order`, matches each node kind to its builder method,
@@ -208,7 +237,8 @@ impl TimelyCompiler {
     fn compile<A: Allocate>(
         &self,
         scope: &mut Scope<'_, A>,
-        data: &mut WorkerData,
+        data: &mut ExecutorData,
+        source_rx: &mut HashMap<NodeId, flume::Receiver<crate::bridge::SourceBatch>>,
     ) -> probe::Handle<u64> {
         let mut streams: HashMap<NodeId, timely::dataflow::Stream<_, AnyItem>> = HashMap::new();
         let probe = probe::Handle::new();
@@ -219,8 +249,7 @@ impl TimelyCompiler {
 
             match kind {
                 NodeKindTag::Source => {
-                    let stream =
-                        self.build_source(scope, node_id, &mut data.source_rx, &mut data.source_wm);
+                    let stream = self.build_source(scope, node_id, source_rx, &mut data.source_wm);
                     streams.insert(node_id, stream);
                 }
                 NodeKindTag::Transform => {
@@ -263,7 +292,7 @@ impl TimelyCompiler {
         &self,
         scope: &mut Scope<'a, A>,
         node_id: NodeId,
-        source_receivers: &mut HashMap<NodeId, tokio::sync::mpsc::Receiver<Vec<AnyItem>>>,
+        source_receivers: &mut HashMap<NodeId, flume::Receiver<crate::bridge::SourceBatch>>,
         source_watermarks: &mut HashMap<NodeId, Arc<AtomicU64>>,
     ) -> timely::dataflow::Stream<Scope<'a, A>, AnyItem> {
         use timely::dataflow::operators::generic::OutputBuilder;
@@ -279,7 +308,7 @@ impl TimelyCompiler {
 
         let source_rx = source_receivers.remove(&node_id);
         let worker_label = self.worker_index.to_string();
-        let gw_drain = self.global_watermark.clone();
+        let all_wms = self.all_source_watermarks.clone();
         let per_source_wm = source_watermarks.remove(&node_id);
 
         source_builder.build_reschedule(move |mut capabilities| {
@@ -303,7 +332,7 @@ impl TimelyCompiler {
                 // to reach SourceExhausted so downstream operators can close final
                 // windows before we drop the capability.
                 if draining {
-                    if gw_drain.load(Ordering::Acquire) >= Sentinel::SourceExhausted as u64 {
+                    if compute_min_watermark(&all_wms) >= Sentinel::SourceExhausted as u64 {
                         cap = None;
                         return false;
                     }
@@ -312,7 +341,7 @@ impl TimelyCompiler {
                 }
 
                 match source_rx.try_recv() {
-                    Ok(batch) => {
+                    Ok((batch, wm)) => {
                         #[allow(clippy::cast_possible_truncation)]
                         let batch_len = batch.len() as u64;
                         if let Some(ref c) = cap {
@@ -321,6 +350,12 @@ impl TimelyCompiler {
                             for item in batch {
                                 session.give(item);
                             }
+                        }
+                        // Update the shared watermark for exhaustion tracking.
+                        if let Some(wm) = wm
+                            && let Some(ref wm_atomic) = per_source_wm
+                        {
+                            wm_atomic.fetch_max(wm, Ordering::Release);
                         }
                         metrics::counter!(
                             "executor_batches_total",
@@ -332,18 +367,27 @@ impl TimelyCompiler {
                             "worker" => worker_label.clone()
                         )
                         .increment(batch_len);
-                        epoch += 1;
+                        // Use the watermark as the epoch so the Timely frontier
+                        // tracks event time. Downstream operators read the
+                        // frontier (in-band) instead of the shared atomic
+                        // (out-of-band), preventing the watermark from racing
+                        // ahead of data in the exchange.
+                        if let Some(wm) = wm {
+                            epoch = epoch.max(wm);
+                        } else {
+                            epoch += 1;
+                        }
                         if let Some(ref mut c) = cap {
                             c.downgrade(&epoch);
                         }
                         activator.activate();
                         true
                     }
-                    Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
+                    Err(flume::TryRecvError::Empty) => {
                         activator.activate();
                         true
                     }
-                    Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                    Err(flume::TryRecvError::Disconnected) => {
                         // Check if this source was naturally exhausted (bridge set
                         // SourceExhausted) vs shut down (watermark unchanged).
                         // Only drain on exhaustion — shutdown resumes from checkpoint.
@@ -351,6 +395,13 @@ impl TimelyCompiler {
                             wm.load(Ordering::Acquire) >= Sentinel::SourceExhausted as u64
                         });
                         if exhausted {
+                            // Advance epoch to SourceExhausted so the downstream
+                            // frontier reaches this value, allowing time-based
+                            // operators to close all remaining windows.
+                            epoch = epoch.max(Sentinel::SourceExhausted as u64);
+                            if let Some(ref mut c) = cap {
+                                c.downgrade(&epoch);
+                            }
                             draining = true;
                             activator.activate();
                             true
@@ -457,7 +508,6 @@ impl TimelyCompiler {
         let is_last_op = self.last_operator_id == Some(node_id);
         let notify = self.checkpoint_notify.clone();
         let dlq = self.dlq_tx.clone();
-        let gw = self.global_watermark.clone();
         let worker_index = self.worker_index;
         let local_first_worker = self.local_first_worker;
 
@@ -491,8 +541,24 @@ impl TimelyCompiler {
                         record_batch_durations(&batch_durations, &wl);
                     });
 
-                    let wm_results =
-                        advance_watermark(&mut timely_op, &gw, &mut last_watermark, &rt);
+                    // Use the Timely frontier as the watermark. The source
+                    // operator encodes watermarks as epochs, so the frontier
+                    // tracks event-time progress in-band — it only advances
+                    // past epoch E once all items at epoch E have been
+                    // delivered through the exchange. This prevents the
+                    // watermark from racing ahead of data in multi-worker
+                    // setups.
+                    let frontier_wm = if frontier.frontier().is_empty() {
+                        u64::MAX
+                    } else {
+                        frontier.frontier().iter().copied().min().unwrap_or(0)
+                    };
+                    let wm_results = if frontier_wm > last_watermark {
+                        last_watermark = frontier_wm;
+                        timely_op.process_watermark(frontier_wm, &rt)
+                    } else {
+                        Vec::new()
+                    };
                     if !wm_results.is_empty()
                         && let Some(ref cap) = retained_cap
                     {
@@ -519,7 +585,7 @@ impl TimelyCompiler {
                         local_first_worker,
                     ) && let Some(ref n) = notify
                     {
-                        let _ = n.blocking_send(epoch);
+                        let _ = n.send(epoch);
                     }
                 }
             },
@@ -561,7 +627,7 @@ impl TimelyCompiler {
                     move |input, _output| {
                         input.for_each(|_cap, data| {
                             for item in data.drain(..) {
-                                if let Err(e) = sink_tx.blocking_send(item) {
+                                if let Err(e) = sink_tx.send(item) {
                                     tracing::error!(error = %e, "sink channel send failed — item dropped");
                                     metrics::counter!("sink_send_errors_total").increment(1);
                                 }
@@ -602,7 +668,7 @@ fn route_errors_to_dlq(
                     format!("{}", d.as_secs())
                 },
             };
-            if let Err(e) = dlq.blocking_send(record) {
+            if let Err(e) = dlq.send(record) {
                 tracing::error!(
                     error = %e,
                     operator = %op_name,
@@ -628,20 +694,20 @@ fn record_batch_durations(durations: &[f64], worker_label: &str) {
     metrics::gauge!("executor_element_duration_p99", "worker" => worker_label.to_owned()).set(p99);
 }
 
-/// Check for watermark advancement, returning any outputs (e.g. closed windows).
-fn advance_watermark(
-    timely_op: &mut TimelyErasedOperator,
-    gw: &AtomicU64,
-    last_watermark: &mut u64,
-    rt: &tokio::runtime::Handle,
-) -> Vec<AnyItem> {
-    let current_wm = gw.load(Ordering::Acquire);
-    if current_wm > *last_watermark {
-        *last_watermark = current_wm;
-        timely_op.process_watermark(current_wm, rt)
-    } else {
-        Vec::new()
+/// Compute the minimum of all non-zero source watermarks.
+///
+/// Used by the source operator's draining logic to detect when all sources
+/// have been exhausted (all watermarks >= `SourceExhausted`). Downstream
+/// operators use the Timely frontier for watermark advancement instead.
+fn compute_min_watermark(all: &[Arc<AtomicU64>]) -> u64 {
+    let mut min_wm: Option<u64> = None;
+    for wm in all {
+        let v = wm.load(Ordering::Acquire);
+        if v > 0 {
+            min_wm = Some(min_wm.map_or(v, |m: u64| m.min(v)));
+        }
     }
+    min_wm.unwrap_or(0)
 }
 
 /// Run checkpoint on the first local worker of the last operator.
@@ -693,5 +759,65 @@ mod tests {
         let bytes = bincode::serialize(&item).unwrap();
         let restored: AnyItem = bincode::deserialize(&bytes).unwrap();
         assert_eq!(restored.downcast::<i32>(), 42);
+    }
+
+    /// Verify that flume checkpoint channel works synchronously (no .await needed).
+    #[test]
+    fn flume_checkpoint_channel_sync() {
+        let (tx, rx) = flume::bounded::<u64>(64);
+
+        // Send synchronously — this is how the Timely worker thread sends.
+        tx.send(42).unwrap();
+        tx.send(100).unwrap();
+
+        // Receive synchronously.
+        assert_eq!(rx.try_recv().unwrap(), 42);
+        assert_eq!(rx.try_recv().unwrap(), 100);
+        assert!(rx.try_recv().is_err());
+    }
+
+    /// Verify that flume sink channel works with blocking send (no Tokio context needed).
+    #[test]
+    fn flume_sink_send_no_tokio_context() {
+        let (tx, rx) = flume::bounded::<AnyItem>(16);
+
+        // Send without any Tokio runtime — this is how build_sink sends items.
+        let item = AnyItem::new("test".to_string());
+        tx.send(item).unwrap();
+
+        let received = rx.try_recv().unwrap();
+        assert_eq!(received.downcast::<String>(), "test");
+    }
+
+    /// Verify that the local runtime detection works: on a Tokio-owned thread,
+    /// `Handle::try_current()` returns Ok, so we skip creating a new runtime.
+    #[tokio::test]
+    async fn local_runtime_fallback_on_tokio_thread() {
+        // We're inside a #[tokio::test], so try_current should succeed.
+        assert!(
+            tokio::runtime::Handle::try_current().is_ok(),
+            "should detect existing Tokio runtime"
+        );
+    }
+
+    /// Verify that on a plain thread, we can create a new `current_thread` runtime.
+    #[test]
+    fn local_runtime_created_on_plain_thread() {
+        let handle = std::thread::spawn(|| {
+            // No Tokio runtime on this thread.
+            assert!(tokio::runtime::Handle::try_current().is_err());
+
+            // Should be able to create a current_thread runtime.
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("should create runtime on plain thread");
+
+            rt.block_on(async { 42 })
+        })
+        .join()
+        .unwrap();
+
+        assert_eq!(handle, 42);
     }
 }

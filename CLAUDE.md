@@ -6,15 +6,15 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ```bash
 cargo check --workspace --all-targets
-cargo test --workspace
-cargo test -p rhei-core                     # test a single crate
-cargo test -p rhei-runtime word_count       # run a single test by name
+cargo nextest run --workspace               # run all tests (nextest)
+cargo nextest run -p rhei-core              # test a single crate
+cargo nextest run -p rhei-runtime -E 'test(word_count)'  # run a single test by name
 cargo clippy --workspace --all-targets --no-deps -- -D warnings
 cargo fmt --all -- --check                  # check formatting
 cargo fmt --all                             # fix formatting
 ```
 
-CI also runs `cargo deny check advisories,licenses,bans` for license/advisory enforcement.
+CI uses [cargo-nextest](https://nexte.st/) with JUnit reporting for GitHub test summaries. Install locally with `cargo install cargo-nextest`. CI also runs `cargo deny check advisories,licenses,bans` for license/advisory enforcement.
 
 ## Workspace Structure
 
@@ -26,7 +26,7 @@ Three crates:
 
 ## Architecture
 
-**Execution model:** Timely Dataflow runs on a blocking thread (`spawn_blocking`). Async sources/sinks are bridged via bounded `tokio::sync::mpsc` channels. Currently single-threaded (`execute_directly()`). Clustering design in `CLUSTERING.md`.
+**Execution model:** Timely Dataflow runs on a blocking thread (`spawn_blocking`). Async sources/sinks are bridged via bounded `flume` channels. Each Timely worker gets a per-worker `current_thread` Tokio runtime for source I/O co-location. Clustering design in `CLUSTERING.md`.
 
 **Hot/cold path:** `AsyncOperator` polls the `StreamFunction` future once synchronously. If it resolves (L1 cache hit), output is returned immediately. If pending (state miss), `block_in_place` drives the future on the Tokio runtime to fetch from L2/L3.
 

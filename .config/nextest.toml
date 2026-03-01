@@ -1,0 +1,11 @@
+[profile.default]
+failure-output = "immediate-final"
+status-level = "skip"
+
+[profile.ci]
+failure-output = "immediate-final"
+status-level = "skip"
+
+[profile.ci.junit]
+path = "junit.xml"
+report-name = "tests"

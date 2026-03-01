@@ -5,6 +5,10 @@ on:
     branches: [main]
   pull_request:
 
+permissions:
+  checks: write
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
@@ -40,13 +44,27 @@ jobs:
         uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ matrix.toolchain }}
+      - name: Install nextest
+        uses: taiki-e/install-action@nextest
       - name: Cache dependencies
         uses: Swatinem/rust-cache@v2
         with:
           shared-key: ${{ matrix.toolchain }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Run tests
-        run: cargo test --workspace
+        run: cargo nextest run --workspace --profile ci
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results-${{ matrix.toolchain }}
+          path: target/nextest/ci/junit.xml
+      - name: Publish test report
+        if: always()
+        uses: mikepenz/action-junit-report@v5
+        with:
+          report_paths: target/nextest/ci/junit.xml
+          check_name: Test Results (${{ matrix.toolchain }})
 
   fmt:
     name: Format

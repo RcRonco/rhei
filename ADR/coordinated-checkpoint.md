@@ -90,17 +90,16 @@ graph LR
 
     subgraph rhei-runtime
         CC[checkpoint_coord.rs<br/>Coordinator + Participant]
-        CT[controller.rs<br/>CheckpointTaskConfig<br/>run_checkpoint_task]
-        WS[worker.rs<br/>WorkerSet<br/>checkpoint_notify channel]
-        EX[executor.rs<br/>try_checkpoint → Option&lt;u64&gt;]
+        TM[task_manager.rs<br/>TaskManager<br/>checkpoint_notify channel<br/>run_checkpoint_task]
+        EX[executor.rs<br/>DataflowExecutor<br/>try_checkpoint → Option&lt;u64&gt;]
         TO[timely_operator.rs<br/>maybe_checkpoint → Option&lt;u64&gt;]
     end
 
     TO -->|epoch| EX
-    EX -->|blocking_send| WS
-    WS -->|take_checkpoint_rx| CT
-    CT -->|Ready/Committed| CC
-    CT -->|save| CM
+    EX -->|blocking_send| TM
+    TM -->|take_checkpoint_rx| TM
+    TM -->|Ready/Committed| CC
+    TM -->|save| CM
 ```
 
 ## Alternatives considered
