@@ -102,7 +102,7 @@ pub(crate) struct DataflowExecutor {
     checkpoint_notify: Option<tokio::sync::mpsc::Sender<u64>>,
     dlq_tx: Option<DlqSender>,
     last_operator_id: Option<NodeId>,
-    global_watermark: Arc<AtomicU64>,
+    all_source_watermarks: Arc<Vec<Arc<AtomicU64>>>,
     /// First worker index on this process (used for checkpoint notifications).
     local_first_worker: usize,
     /// Owned per-worker data for this executor (taken once during `run()`).
@@ -125,7 +125,7 @@ impl DataflowExecutor {
         checkpoint_notify: Option<tokio::sync::mpsc::Sender<u64>>,
         dlq_tx: Option<DlqSender>,
         last_operator_id: Option<NodeId>,
-        global_watermark: Arc<AtomicU64>,
+        all_source_watermarks: Arc<Vec<Arc<AtomicU64>>>,
         local_first_worker: usize,
         data: ExecutorData,
         shutdown_barrier: Option<Arc<std::sync::Mutex<Option<std::sync::mpsc::Receiver<()>>>>>,
@@ -141,7 +141,7 @@ impl DataflowExecutor {
             checkpoint_notify,
             dlq_tx,
             last_operator_id,
-            global_watermark,
+            all_source_watermarks,
             local_first_worker,
             data: Some(data),
             shutdown_barrier,
@@ -151,6 +151,15 @@ impl DataflowExecutor {
     /// Run the Timely dataflow: compile, step until done, then coordinate shutdown.
     pub(crate) fn run<A: Allocate>(mut self, worker: &mut Worker<A>) {
         let _span = tracing::info_span!("worker", worker = self.worker_index).entered();
+
+        let core_ids = core_affinity::get_core_ids().unwrap_or_default();
+        if !core_ids.is_empty() {
+            let core = core_ids[self.worker_index % core_ids.len()];
+            if core_affinity::set_for_current(core) {
+                tracing::info!(worker = self.worker_index, core = core.id, "pinned to core");
+            }
+        }
+
         let mut data = self.data.take().expect("executor data already taken");
 
         let dataflow_index = worker.next_dataflow_index();
@@ -259,7 +268,7 @@ impl DataflowExecutor {
 
         let source_rx = source_receivers.remove(&node_id);
         let worker_label = self.worker_index.to_string();
-        let gw_drain = self.global_watermark.clone();
+        let all_wms = self.all_source_watermarks.clone();
         let per_source_wm = source_watermarks.remove(&node_id);
 
         source_builder.build_reschedule(move |mut capabilities| {
@@ -283,7 +292,7 @@ impl DataflowExecutor {
                 // to reach SourceExhausted so downstream operators can close final
                 // windows before we drop the capability.
                 if draining {
-                    if gw_drain.load(Ordering::Acquire) >= Sentinel::SourceExhausted as u64 {
+                    if compute_min_watermark(&all_wms) >= Sentinel::SourceExhausted as u64 {
                         cap = None;
                         return false;
                     }
@@ -437,7 +446,7 @@ impl DataflowExecutor {
         let is_last_op = self.last_operator_id == Some(node_id);
         let notify = self.checkpoint_notify.clone();
         let dlq = self.dlq_tx.clone();
-        let gw = self.global_watermark.clone();
+        let all_wms = self.all_source_watermarks.clone();
         let worker_index = self.worker_index;
         let local_first_worker = self.local_first_worker;
 
@@ -472,7 +481,7 @@ impl DataflowExecutor {
                     });
 
                     let wm_results =
-                        advance_watermark(&mut timely_op, &gw, &mut last_watermark, &rt);
+                        advance_watermark(&mut timely_op, &all_wms, &mut last_watermark, &rt);
                     if !wm_results.is_empty()
                         && let Some(ref cap) = retained_cap
                     {
@@ -608,14 +617,29 @@ fn record_batch_durations(durations: &[f64], worker_label: &str) {
     metrics::gauge!("executor_element_duration_p99", "worker" => worker_label.to_owned()).set(p99);
 }
 
+/// Compute the minimum of all non-zero source watermarks.
+///
+/// Each executor calls this inline instead of reading a single global atomic,
+/// eliminating the cross-core cache-line bottleneck and 100ms polling latency.
+fn compute_min_watermark(all: &[Arc<AtomicU64>]) -> u64 {
+    let mut min_wm: Option<u64> = None;
+    for wm in all {
+        let v = wm.load(Ordering::Acquire);
+        if v > 0 {
+            min_wm = Some(min_wm.map_or(v, |m: u64| m.min(v)));
+        }
+    }
+    min_wm.unwrap_or(0)
+}
+
 /// Check for watermark advancement, returning any outputs (e.g. closed windows).
 fn advance_watermark(
     timely_op: &mut TimelyErasedOperator,
-    gw: &AtomicU64,
+    all_wms: &[Arc<AtomicU64>],
     last_watermark: &mut u64,
     rt: &tokio::runtime::Handle,
 ) -> Vec<AnyItem> {
-    let current_wm = gw.load(Ordering::Acquire);
+    let current_wm = compute_min_watermark(all_wms);
     if current_wm > *last_watermark {
         *last_watermark = current_wm;
         timely_op.process_watermark(current_wm, rt)

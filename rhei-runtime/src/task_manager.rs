@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::ops::Range;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::AtomicU64;
 
 use rhei_core::checkpoint::CheckpointManifest;
 use rhei_core::dlq::ErrorPolicy;
@@ -34,7 +34,7 @@ pub(crate) struct TaskManager {
 
     // Shared state
     pub sink_senders: Arc<HashMap<NodeId, tokio::sync::mpsc::Sender<AnyItem>>>,
-    pub global_watermark: Arc<AtomicU64>,
+    pub all_source_watermarks: Arc<Vec<Arc<AtomicU64>>>,
     pub checkpoint_notify_rx: tokio::sync::Mutex<tokio::sync::mpsc::Receiver<u64>>,
     pub checkpoint_notify_tx: std::sync::Mutex<Option<tokio::sync::mpsc::Sender<u64>>>,
 
@@ -163,8 +163,7 @@ impl TaskManager {
 
         let (checkpoint_notify_tx, checkpoint_notify_rx) = tokio::sync::mpsc::channel::<u64>(64);
 
-        // ── Global watermark computation ──────────────────────────────
-        let global_watermark = spawn_global_watermark_task(rt, all_source_watermarks, shutdown);
+        let all_source_watermarks = Arc::new(all_source_watermarks);
 
         let checkpoint_dir = controller.checkpoint_dir.clone();
         let process_id = controller.process_id();
@@ -183,7 +182,7 @@ impl TaskManager {
         Ok(TaskManager {
             per_executor: Arc::new(std::sync::Mutex::new(per_executor)),
             sink_senders: Arc::new(sink_senders),
-            global_watermark,
+            all_source_watermarks,
             checkpoint_notify_rx: tokio::sync::Mutex::new(checkpoint_notify_rx),
             checkpoint_notify_tx: std::sync::Mutex::new(Some(checkpoint_notify_tx)),
             topo_order: Arc::new(topo_order),
@@ -281,7 +280,7 @@ impl TaskManager {
             checkpoint_notify,
             dlq_tx,
             self.last_operator_id,
-            self.global_watermark.clone(),
+            self.all_source_watermarks.clone(),
             local_first_worker,
             data,
             shutdown_barrier,
@@ -849,39 +848,6 @@ async fn extract_per_worker_data(
     }
 
     Ok((all_transforms, all_key_fns, all_operators, all_contexts))
-}
-
-/// Spawn a background task that computes the global watermark every 100ms.
-///
-/// The global watermark is the minimum of all non-zero source watermarks.
-fn spawn_global_watermark_task(
-    rt: &tokio::runtime::Handle,
-    all_source_watermarks: Vec<Arc<AtomicU64>>,
-    _shutdown: Option<&ShutdownHandle>,
-) -> Arc<AtomicU64> {
-    let global_watermark: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
-    if !all_source_watermarks.is_empty() {
-        let gw = global_watermark.clone();
-        let source_wms = all_source_watermarks;
-        rt.spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_millis(100));
-            loop {
-                interval.tick().await;
-                // Global watermark = min of all non-zero source watermarks.
-                let mut min_wm: Option<u64> = None;
-                for sw in &source_wms {
-                    let wm = sw.load(Ordering::Acquire);
-                    if wm > 0 {
-                        min_wm = Some(min_wm.map_or(wm, |m: u64| m.min(wm)));
-                    }
-                }
-                if let Some(wm) = min_wm {
-                    gw.fetch_max(wm, Ordering::Release);
-                }
-            }
-        });
-    }
-    global_watermark
 }
 
 // ── Other helpers ───────────────────────────────────────────────────

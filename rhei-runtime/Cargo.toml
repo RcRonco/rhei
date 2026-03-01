@@ -20,6 +20,7 @@ tracing-subscriber.workspace = true
 metrics.workspace = true
 metrics-exporter-prometheus.workspace = true
 seahash = "4"
+core_affinity = "0.8"
 # rdkafka is an optional dep activated by the `kafka` feature so that
 # `cargo test --workspace` (without --features kafka) doesn't require
 # libcurl-dev / cmake to build librdkafka.
