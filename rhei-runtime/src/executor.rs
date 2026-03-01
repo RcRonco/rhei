@@ -192,7 +192,8 @@ impl DataflowExecutor {
 
         // Bridge sources: use spawn_local when we have a local runtime (core
         // co-location), fall back to shared runtime spawn otherwise.
-        let mut source_rx: HashMap<NodeId, flume::Receiver<Vec<AnyItem>>> = HashMap::new();
+        let mut source_rx: HashMap<NodeId, flume::Receiver<crate::bridge::SourceBatch>> =
+            HashMap::new();
         if let Some(rt) = &local_rt {
             rt.block_on(local_set.run_until(async {
                 for (node_id, source) in data.sources.drain() {
@@ -269,7 +270,7 @@ impl DataflowExecutor {
         &self,
         scope: &mut Scope<'_, A>,
         data: &mut ExecutorData,
-        source_rx: &mut HashMap<NodeId, flume::Receiver<Vec<AnyItem>>>,
+        source_rx: &mut HashMap<NodeId, flume::Receiver<crate::bridge::SourceBatch>>,
     ) -> probe::Handle<u64> {
         let mut streams: HashMap<NodeId, timely::dataflow::Stream<_, AnyItem>> = HashMap::new();
         let probe = probe::Handle::new();
@@ -323,7 +324,7 @@ impl DataflowExecutor {
         &self,
         scope: &mut Scope<'a, A>,
         node_id: NodeId,
-        source_receivers: &mut HashMap<NodeId, flume::Receiver<Vec<AnyItem>>>,
+        source_receivers: &mut HashMap<NodeId, flume::Receiver<crate::bridge::SourceBatch>>,
         source_watermarks: &mut HashMap<NodeId, Arc<AtomicU64>>,
     ) -> timely::dataflow::Stream<Scope<'a, A>, AnyItem> {
         use timely::dataflow::operators::generic::OutputBuilder;
@@ -372,7 +373,7 @@ impl DataflowExecutor {
                 }
 
                 match source_rx.try_recv() {
-                    Ok(batch) => {
+                    Ok((batch, wm)) => {
                         #[allow(clippy::cast_possible_truncation)]
                         let batch_len = batch.len() as u64;
                         if let Some(ref c) = cap {
@@ -381,6 +382,14 @@ impl DataflowExecutor {
                             for item in batch {
                                 session.give(item);
                             }
+                        }
+                        // Update the shared watermark AFTER emitting items so
+                        // the watermark never races ahead of the data in the
+                        // Timely exchange.
+                        if let Some(wm) = wm
+                            && let Some(ref wm_atomic) = per_source_wm
+                        {
+                            wm_atomic.fetch_max(wm, Ordering::Release);
                         }
                         metrics::counter!(
                             "executor_batches_total",

@@ -57,16 +57,25 @@ where
     tx
 }
 
+/// A batch produced by the source bridge, carrying data and an optional
+/// watermark. The watermark is applied by the Timely source operator *after*
+/// emitting items into the exchange, preventing the watermark from racing
+/// ahead of the data.
+pub(crate) type SourceBatch = (Vec<AnyItem>, Option<u64>);
+
 /// Creates a future that bridges a type-erased [`ErasedSource`] into a
 /// `flume::Sender`, suitable for `spawn_local` on a per-worker runtime.
 ///
-/// Returns a future (for `tokio::task::spawn_local`) that reads batches from
-/// the source, updates shared offsets/watermarks, and sends batches through
-/// the flume channel. Source I/O is co-located with the Timely worker on
-/// the same core.
+/// Reads batches from the source and sends `(items, watermark)` tuples through
+/// the flume channel. The watermark is NOT written to the shared atomic here —
+/// the Timely source operator does that after emitting items, ensuring the
+/// watermark never races ahead of the data in the exchange.
+///
+/// The only direct atomic write is the `SourceExhausted` sentinel when the
+/// source is naturally exhausted (returns `None`).
 pub(crate) async fn local_source_bridge(
     mut source: Box<dyn ErasedSource>,
-    tx: flume::Sender<Vec<AnyItem>>,
+    tx: flume::Sender<SourceBatch>,
     offsets_writer: Arc<Mutex<HashMap<String, String>>>,
     wm_writer: Arc<AtomicU64>,
     shutdown: Option<ShutdownHandle>,
@@ -78,12 +87,12 @@ pub(crate) async fn local_source_bridge(
             *offsets_writer.lock().unwrap() = offsets;
         }
 
-        // Update source watermark monotonically.
-        if let Some(wm) = source.current_watermark() {
-            wm_writer.fetch_max(wm, Ordering::Release);
-        }
+        // Capture watermark to send alongside the batch data. The Timely
+        // source operator will commit it to the shared atomic after emitting
+        // the items, keeping the watermark in sync with the data flow.
+        let wm = source.current_watermark();
 
-        if tx.send_async(batch).await.is_err() {
+        if tx.send_async((batch, wm)).await.is_err() {
             break; // receiver dropped
         }
         if let Some(ref handle) = shutdown
@@ -93,7 +102,8 @@ pub(crate) async fn local_source_bridge(
             return;
         }
     }
-    // Source naturally exhausted.
+    // Source naturally exhausted — written directly because there is no
+    // more data to synchronize with.
     wm_writer.store(
         crate::executor::Sentinel::SourceExhausted as u64,
         Ordering::Release,
@@ -191,7 +201,7 @@ mod tests {
 
         // Collect all received batches.
         let mut received = Vec::new();
-        while let Ok(batch) = rx.try_recv() {
+        while let Ok((batch, _wm)) = rx.try_recv() {
             received.push(batch);
         }
         assert_eq!(received.len(), 2);
@@ -234,7 +244,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn local_source_bridge_updates_watermark() {
+    async fn local_source_bridge_sends_watermark_with_batch() {
         let source = MockErasedSource::new(vec![vec![AnyItem::new(1i32)]]).with_watermarks(5000);
         let (tx, rx) = flume::bounded(16);
         let offsets = Arc::new(Mutex::new(HashMap::new()));
@@ -242,9 +252,11 @@ mod tests {
 
         local_source_bridge(Box::new(source), tx, offsets, wm.clone(), None).await;
 
-        let _ = rx.try_recv();
-        // After exhaustion, watermark is SourceExhausted, but the intermediate
-        // value of 5000 was written before the sentinel.
+        let (batch, batch_wm) = rx.try_recv().unwrap();
+        assert_eq!(batch.len(), 1);
+        // Watermark is sent alongside the batch, not written to the atomic.
+        assert_eq!(batch_wm, Some(5000));
+        // The shared atomic is NOT updated by the bridge (only SourceExhausted is).
         assert_eq!(wm.load(Ordering::Acquire), Sentinel::SourceExhausted as u64);
     }
 
@@ -268,7 +280,7 @@ mod tests {
         local_source_bridge(Box::new(source), tx, offsets, wm.clone(), Some(handle)).await;
 
         let mut received = Vec::new();
-        while let Ok(batch) = rx.try_recv() {
+        while let Ok((batch, _wm)) = rx.try_recv() {
             received.push(batch);
         }
         // Only the first batch should have been delivered before shutdown was detected.
