@@ -28,6 +28,58 @@ impl Default for TieredBackendConfig {
     }
 }
 
+/// A shared Foyer L2 cache that can be used across multiple operators.
+///
+/// Clone is cheap — `HybridCache` is internally `Arc`-based.
+#[derive(Clone)]
+pub struct SharedL2Cache {
+    cache: HybridCache<Vec<u8>, Vec<u8>>,
+}
+
+impl SharedL2Cache {
+    /// Build a shared cache with the given config.
+    pub async fn open(config: &TieredBackendConfig) -> anyhow::Result<Self> {
+        std::fs::create_dir_all(&config.foyer_dir)?;
+
+        let device = FsDeviceBuilder::new(&config.foyer_dir)
+            .with_capacity(config.foyer_disk_capacity)
+            .build()?;
+
+        let cache = HybridCacheBuilder::new()
+            .memory(config.foyer_memory_capacity)
+            .storage()
+            .with_engine_config(
+                foyer::BlockEngineConfig::new(device).with_block_size(4 * 1024 * 1024),
+            )
+            .build()
+            .await?;
+
+        Ok(Self { cache })
+    }
+
+    /// Build a memory-only shared cache (for tests).
+    pub async fn memory_only() -> Self {
+        let cache = HybridCacheBuilder::new()
+            .memory(1024 * 1024)
+            .storage()
+            .build()
+            .await
+            .expect("failed to build memory-only HybridCache");
+        Self { cache }
+    }
+
+    /// Create a `TieredBackend` using this shared cache.
+    pub fn create_tiered_backend(&self, l3: Arc<SlateDbBackend>) -> TieredBackend {
+        TieredBackend::with_cache(self.cache.clone(), l3)
+    }
+}
+
+impl std::fmt::Debug for SharedL2Cache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SharedL2Cache").finish_non_exhaustive()
+    }
+}
+
 /// L2 + L3 backend: Foyer `HybridCache` (disk/memory) in front of `SlateDB` (object storage).
 ///
 /// Read path: L2 Foyer → L3 `SlateDB` → backfill L2 on hit.
@@ -216,5 +268,38 @@ mod tests {
         assert_eq!(val, None);
 
         backend.close().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shared_l2_cache_across_operators() {
+        use crate::state::prefixed_backend::PrefixedBackend;
+
+        let store = Arc::new(InMemory::new());
+        let l3 = Arc::new(SlateDbBackend::open("test_shared_l2", store).await.unwrap());
+
+        let shared = SharedL2Cache::memory_only().await;
+
+        // Two operators sharing the same L2 cache (namespaced via PrefixedBackend).
+        let backend_a = shared.create_tiered_backend(l3.clone());
+        let op_a = PrefixedBackend::new("op_a", Box::new(backend_a));
+
+        let backend_b = shared.create_tiered_backend(l3.clone());
+        let op_b = PrefixedBackend::new("op_b", Box::new(backend_b));
+
+        // Write via op_a, read via op_a — should work.
+        op_a.put(b"key", b"val_a").await.unwrap();
+        assert_eq!(op_a.get(b"key").await.unwrap(), Some(b"val_a".to_vec()));
+
+        // op_b's "key" is namespaced differently — should not see op_a's data.
+        assert_eq!(op_b.get(b"key").await.unwrap(), None);
+
+        // Write via op_b independently.
+        op_b.put(b"key", b"val_b").await.unwrap();
+        assert_eq!(op_b.get(b"key").await.unwrap(), Some(b"val_b".to_vec()));
+
+        // op_a's data is unchanged.
+        assert_eq!(op_a.get(b"key").await.unwrap(), Some(b"val_a".to_vec()));
+
+        l3.close().await.unwrap();
     }
 }

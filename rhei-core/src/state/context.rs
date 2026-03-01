@@ -37,6 +37,12 @@ impl StateContext {
         self
     }
 
+    /// Replace the memtable with one using the given configuration.
+    pub fn with_memtable_config(mut self, config: super::memtable::MemTableConfig) -> Self {
+        self.memtable = MemTable::with_config(config);
+        self
+    }
+
     /// Get a value — checks memtable first, then falls back to backend.
     pub async fn get(&mut self, key: &[u8]) -> anyhow::Result<Option<Vec<u8>>> {
         if let Some(ref wl) = self.worker_label {

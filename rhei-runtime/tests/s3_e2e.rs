@@ -158,11 +158,13 @@ async fn s3_tiered_storage_e2e() {
         foyer_disk_capacity: 16 * 1024 * 1024,
     };
 
-    let executor = Executor::new(checkpoint_dir.path().to_path_buf()).with_tiered_storage(
-        checkpoint_dir.path().to_path_buf(),
-        l3.clone(),
-        foyer_config,
-    );
+    let executor = Executor::new(checkpoint_dir.path().to_path_buf())
+        .with_tiered_storage(
+            checkpoint_dir.path().to_path_buf(),
+            l3.clone(),
+            foyer_config,
+        )
+        .await;
 
     // ── 3. Build pipeline ──────────────────────────────────────────
     let words = generate_words();
