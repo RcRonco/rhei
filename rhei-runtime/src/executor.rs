@@ -351,9 +351,7 @@ impl DataflowExecutor {
                                 session.give(item);
                             }
                         }
-                        // Update the shared watermark AFTER emitting items so
-                        // the watermark never races ahead of the data in the
-                        // Timely exchange.
+                        // Update the shared watermark for exhaustion tracking.
                         if let Some(wm) = wm
                             && let Some(ref wm_atomic) = per_source_wm
                         {
@@ -369,7 +367,16 @@ impl DataflowExecutor {
                             "worker" => worker_label.clone()
                         )
                         .increment(batch_len);
-                        epoch += 1;
+                        // Use the watermark as the epoch so the Timely frontier
+                        // tracks event time. Downstream operators read the
+                        // frontier (in-band) instead of the shared atomic
+                        // (out-of-band), preventing the watermark from racing
+                        // ahead of data in the exchange.
+                        if let Some(wm) = wm {
+                            epoch = epoch.max(wm);
+                        } else {
+                            epoch += 1;
+                        }
                         if let Some(ref mut c) = cap {
                             c.downgrade(&epoch);
                         }
@@ -388,6 +395,13 @@ impl DataflowExecutor {
                             wm.load(Ordering::Acquire) >= Sentinel::SourceExhausted as u64
                         });
                         if exhausted {
+                            // Advance epoch to SourceExhausted so the downstream
+                            // frontier reaches this value, allowing time-based
+                            // operators to close all remaining windows.
+                            epoch = epoch.max(Sentinel::SourceExhausted as u64);
+                            if let Some(ref mut c) = cap {
+                                c.downgrade(&epoch);
+                            }
                             draining = true;
                             activator.activate();
                             true
@@ -494,7 +508,6 @@ impl DataflowExecutor {
         let is_last_op = self.last_operator_id == Some(node_id);
         let notify = self.checkpoint_notify.clone();
         let dlq = self.dlq_tx.clone();
-        let all_wms = self.all_source_watermarks.clone();
         let worker_index = self.worker_index;
         let local_first_worker = self.local_first_worker;
 
@@ -528,8 +541,24 @@ impl DataflowExecutor {
                         record_batch_durations(&batch_durations, &wl);
                     });
 
-                    let wm_results =
-                        advance_watermark(&mut timely_op, &all_wms, &mut last_watermark, &rt);
+                    // Use the Timely frontier as the watermark. The source
+                    // operator encodes watermarks as epochs, so the frontier
+                    // tracks event-time progress in-band — it only advances
+                    // past epoch E once all items at epoch E have been
+                    // delivered through the exchange. This prevents the
+                    // watermark from racing ahead of data in multi-worker
+                    // setups.
+                    let frontier_wm = if frontier.frontier().is_empty() {
+                        u64::MAX
+                    } else {
+                        frontier.frontier().iter().copied().min().unwrap_or(0)
+                    };
+                    let wm_results = if frontier_wm > last_watermark {
+                        last_watermark = frontier_wm;
+                        timely_op.process_watermark(frontier_wm, &rt)
+                    } else {
+                        Vec::new()
+                    };
                     if !wm_results.is_empty()
                         && let Some(ref cap) = retained_cap
                     {
@@ -667,8 +696,9 @@ fn record_batch_durations(durations: &[f64], worker_label: &str) {
 
 /// Compute the minimum of all non-zero source watermarks.
 ///
-/// Each executor calls this inline instead of reading a single global atomic,
-/// eliminating the cross-core cache-line bottleneck and 100ms polling latency.
+/// Used by the source operator's draining logic to detect when all sources
+/// have been exhausted (all watermarks >= `SourceExhausted`). Downstream
+/// operators use the Timely frontier for watermark advancement instead.
 fn compute_min_watermark(all: &[Arc<AtomicU64>]) -> u64 {
     let mut min_wm: Option<u64> = None;
     for wm in all {
@@ -678,22 +708,6 @@ fn compute_min_watermark(all: &[Arc<AtomicU64>]) -> u64 {
         }
     }
     min_wm.unwrap_or(0)
-}
-
-/// Check for watermark advancement, returning any outputs (e.g. closed windows).
-fn advance_watermark(
-    timely_op: &mut TimelyErasedOperator,
-    all_wms: &[Arc<AtomicU64>],
-    last_watermark: &mut u64,
-    rt: &tokio::runtime::Handle,
-) -> Vec<AnyItem> {
-    let current_wm = compute_min_watermark(all_wms);
-    if current_wm > *last_watermark {
-        *last_watermark = current_wm;
-        timely_op.process_watermark(current_wm, rt)
-    } else {
-        Vec::new()
-    }
 }
 
 /// Run checkpoint on the first local worker of the last operator.
