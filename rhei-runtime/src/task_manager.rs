@@ -141,8 +141,7 @@ impl TaskManager {
                 &node_kinds,
                 &local_range,
                 total_workers,
-            )
-            .await?;
+            )?;
 
         let topo_order = graph.topo_order.clone();
         let all_operator_names = graph.operator_names.clone();
@@ -784,7 +783,7 @@ fn bridge_sinks(
 ///
 /// Creates clones for each local worker from the originals in the graph.
 #[allow(clippy::type_complexity)]
-async fn extract_per_worker_data(
+fn extract_per_worker_data(
     graph: &mut CompiledGraph,
     controller: &PipelineController,
     node_kinds: &HashMap<NodeId, NodeKindTag>,
@@ -858,9 +857,7 @@ async fn extract_per_worker_data(
         for &nid in &operator_ids {
             let (ref name, ref op) = orig_operators[&nid];
             let (name, op) = (name.clone(), op.clone_erased());
-            let ctx = controller
-                .create_context_for_worker(&name, worker_idx)
-                .await?;
+            let ctx = controller.create_context_for_worker(&name, worker_idx)?;
             w_contexts.insert(nid, ctx);
             w_operators.insert(nid, (name, op));
         }

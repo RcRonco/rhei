@@ -10,9 +10,10 @@ use rhei_core::checkpoint::CheckpointManifest;
 use rhei_core::dlq::ErrorPolicy;
 use rhei_core::state::context::StateContext;
 use rhei_core::state::local_backend::LocalBackend;
+use rhei_core::state::memtable::MemTableConfig;
 use rhei_core::state::prefixed_backend::PrefixedBackend;
 use rhei_core::state::slatedb_backend::SlateDbBackend;
-use rhei_core::state::tiered_backend::{TieredBackend, TieredBackendConfig};
+use rhei_core::state::tiered_backend::{SharedL2Cache, TieredBackendConfig};
 
 use crate::compiler::compile_graph;
 use crate::dataflow::DataflowGraph;
@@ -33,7 +34,7 @@ pub(crate) fn now_millis() -> u64 {
 #[derive(Debug)]
 pub(crate) struct TieredStorageConfig {
     pub l3: Arc<SlateDbBackend>,
-    pub foyer_config: TieredBackendConfig,
+    pub shared_l2: SharedL2Cache,
 }
 
 /// Configuration for remote object-store-backed distributed state.
@@ -72,6 +73,8 @@ pub struct PipelineController {
     pub(crate) process_id: Option<usize>,
     /// Peer addresses for multi-process cluster mode (`None` = single-process).
     pub(crate) peers: Option<Vec<String>>,
+    /// Bounded memtable configuration for L1 LRU eviction.
+    pub(crate) memtable_config: MemTableConfig,
     /// S3 state configuration for distributed state backend.
     #[cfg(feature = "remote-state")]
     pub(crate) remote_state: Option<RemoteStateConfig>,
@@ -88,6 +91,7 @@ pub struct PipelineControllerBuilder {
     health: HealthState,
     process_id: Option<usize>,
     peers: Option<Vec<String>>,
+    memtable_config: MemTableConfig,
     #[cfg(feature = "remote-state")]
     remote_state: Option<RemoteStateConfig>,
 }
@@ -137,6 +141,12 @@ impl PipelineControllerBuilder {
     /// Set peer addresses for multi-process cluster mode.
     pub fn peers(mut self, peers: Vec<String>) -> Self {
         self.peers = Some(peers);
+        self
+    }
+
+    /// Set the memtable configuration for L1 LRU eviction.
+    pub fn memtable_config(mut self, config: MemTableConfig) -> Self {
+        self.memtable_config = config;
         self
     }
 
@@ -212,6 +222,7 @@ impl PipelineControllerBuilder {
             health: self.health,
             process_id: self.process_id,
             peers: self.peers,
+            memtable_config: self.memtable_config,
             #[cfg(feature = "remote-state")]
             remote_state: self.remote_state,
         }
@@ -230,6 +241,7 @@ impl PipelineController {
             health: HealthState::new(),
             process_id: None,
             peers: None,
+            memtable_config: MemTableConfig::default(),
             #[cfg(feature = "remote-state")]
             remote_state: None,
         }
@@ -248,6 +260,7 @@ impl PipelineController {
             health: HealthState::new(),
             process_id: None,
             peers: None,
+            memtable_config: MemTableConfig::default(),
             #[cfg(feature = "remote-state")]
             remote_state: None,
         }
@@ -352,18 +365,29 @@ impl PipelineController {
         run_graph(graph, self, Some(shutdown)).await
     }
 
+    /// Set the memtable configuration for L1 LRU eviction.
+    #[must_use]
+    pub fn with_memtable_config(mut self, config: MemTableConfig) -> Self {
+        self.memtable_config = config;
+        self
+    }
+
     /// Configure tiered storage (L2 Foyer + L3 `SlateDB`) for this controller.
     ///
+    /// Builds a single shared Foyer L2 cache per process (all operators share it).
     /// When set, `create_context` will produce contexts backed by a per-operator
     /// `PrefixedBackend` wrapping a `TieredBackend`.
-    pub fn with_tiered_storage(
+    pub async fn with_tiered_storage(
         mut self,
         checkpoint_dir: std::path::PathBuf,
         l3: Arc<SlateDbBackend>,
         foyer_config: TieredBackendConfig,
     ) -> Self {
         self.checkpoint_dir = checkpoint_dir;
-        self.tiered = Some(TieredStorageConfig { l3, foyer_config });
+        let shared_l2 = SharedL2Cache::open(&foyer_config)
+            .await
+            .expect("failed to build shared L2 cache");
+        self.tiered = Some(TieredStorageConfig { l3, shared_l2 });
         self
     }
 
@@ -373,7 +397,7 @@ impl PipelineController {
     /// `{operator_name}_w{worker_index}`.
     /// In cluster mode it includes the process ID:
     /// `p{process_id}/w{worker_index}/{operator_name}`.
-    pub async fn create_context_for_worker(
+    pub fn create_context_for_worker(
         &self,
         operator_name: &str,
         worker_index: usize,
@@ -383,33 +407,27 @@ impl PipelineController {
         } else {
             format!("{operator_name}_w{worker_index}")
         };
-        self.create_context(&namespaced).await
+        self.create_context(&namespaced)
     }
 
     /// Create a `StateContext` for the given operator.
     ///
     /// When tiered storage is configured, produces a context backed by
     /// `PrefixedBackend(TieredBackend)`. Otherwise falls back to `LocalBackend`.
-    pub async fn create_context(&self, operator_name: &str) -> anyhow::Result<StateContext> {
-        if let Some(ref tiered) = self.tiered {
-            let foyer_dir = tiered.foyer_config.foyer_dir.join(operator_name);
-
-            let config = TieredBackendConfig {
-                foyer_dir,
-                foyer_memory_capacity: tiered.foyer_config.foyer_memory_capacity,
-                foyer_disk_capacity: tiered.foyer_config.foyer_disk_capacity,
-            };
-
-            let tiered_backend = TieredBackend::open(config, tiered.l3.clone()).await?;
+    pub fn create_context(&self, operator_name: &str) -> anyhow::Result<StateContext> {
+        let ctx = if let Some(ref tiered) = self.tiered {
+            let tiered_backend = tiered.shared_l2.create_tiered_backend(tiered.l3.clone());
             let prefixed = PrefixedBackend::new(operator_name, Box::new(tiered_backend));
-            Ok(StateContext::new(Box::new(prefixed)))
+            StateContext::new(Box::new(prefixed))
         } else {
             let path = self
                 .checkpoint_dir
                 .join(format!("{operator_name}.checkpoint.json"));
             let backend = LocalBackend::new(path, None)?;
-            Ok(StateContext::new(Box::new(backend)))
-        }
+            StateContext::new(Box::new(backend))
+        };
+
+        Ok(ctx.with_memtable_config(self.memtable_config.clone()))
     }
 }
 
@@ -1471,7 +1489,6 @@ mod tests {
 
     #[test]
     fn cluster_state_prefix_includes_process_id() {
-        let rt = tokio::runtime::Runtime::new().unwrap();
         let ctrl = super::PipelineController::builder()
             .checkpoint_dir(temp_dir("cluster_prefix"))
             .workers(2)
@@ -1479,9 +1496,7 @@ mod tests {
             .peers(vec!["h0:2101".into(), "h1:2101".into()])
             .build();
 
-        let ctx = rt
-            .block_on(ctrl.create_context_for_worker("my_op", 3))
-            .unwrap();
+        let ctx = ctrl.create_context_for_worker("my_op", 3).unwrap();
         // The context should have been created with prefix "p1_w3_my_op"
         // We can verify via the backend path for LocalBackend
         // Just check it doesn't panic with the cluster prefix format
@@ -1490,15 +1505,12 @@ mod tests {
 
     #[test]
     fn single_process_state_prefix_unchanged() {
-        let rt = tokio::runtime::Runtime::new().unwrap();
         let dir = temp_dir("single_prefix");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
 
         let ctrl = super::PipelineController::new(dir.clone());
-        let ctx = rt
-            .block_on(ctrl.create_context_for_worker("my_op", 0))
-            .unwrap();
+        let ctx = ctrl.create_context_for_worker("my_op", 0).unwrap();
         // Should not panic; prefix is "my_op_w0" (original format)
         drop(ctx);
         let _ = std::fs::remove_dir_all(&dir);
