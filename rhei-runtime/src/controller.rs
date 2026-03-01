@@ -457,13 +457,11 @@ async fn run_graph(
 
     controller.health.set_status(PipelineStatus::Running);
 
-    let rt = tokio::runtime::Handle::current();
     let task_manager = Arc::new(
         TaskManager::build(
             compiled,
             controller,
             shutdown.as_ref(),
-            &rt,
             restored_offsets,
             initial_checkpoint_id,
         )

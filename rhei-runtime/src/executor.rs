@@ -92,14 +92,14 @@ impl NodeKindTag {
 /// owns shared references to graph topology and per-worker configuration.
 /// Each `build_*` method constructs one category of Timely operator.
 pub(crate) struct DataflowExecutor {
-    sink_senders: Arc<HashMap<NodeId, tokio::sync::mpsc::Sender<AnyItem>>>,
+    sink_senders: Arc<HashMap<NodeId, flume::Sender<AnyItem>>>,
     topo_order: Arc<Vec<NodeId>>,
     node_inputs: Arc<HashMap<NodeId, Vec<NodeId>>>,
     node_kinds: Arc<HashMap<NodeId, NodeKindTag>>,
     rt: tokio::runtime::Handle,
     worker_index: usize,
     num_workers: usize,
-    checkpoint_notify: Option<tokio::sync::mpsc::Sender<u64>>,
+    checkpoint_notify: Option<flume::Sender<u64>>,
     dlq_tx: Option<DlqSender>,
     last_operator_id: Option<NodeId>,
     all_source_watermarks: Arc<Vec<Arc<AtomicU64>>>,
@@ -115,14 +115,14 @@ impl DataflowExecutor {
     /// Create a new `DataflowExecutor` with all required fields.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
-        sink_senders: Arc<HashMap<NodeId, tokio::sync::mpsc::Sender<AnyItem>>>,
+        sink_senders: Arc<HashMap<NodeId, flume::Sender<AnyItem>>>,
         topo_order: Arc<Vec<NodeId>>,
         node_inputs: Arc<HashMap<NodeId, Vec<NodeId>>>,
         node_kinds: Arc<HashMap<NodeId, NodeKindTag>>,
         rt: tokio::runtime::Handle,
         worker_index: usize,
         num_workers: usize,
-        checkpoint_notify: Option<tokio::sync::mpsc::Sender<u64>>,
+        checkpoint_notify: Option<flume::Sender<u64>>,
         dlq_tx: Option<DlqSender>,
         last_operator_id: Option<NodeId>,
         all_source_watermarks: Arc<Vec<Arc<AtomicU64>>>,
@@ -149,6 +149,17 @@ impl DataflowExecutor {
     }
 
     /// Run the Timely dataflow: compile, step until done, then coordinate shutdown.
+    ///
+    /// Creates a per-worker `current_thread` Tokio runtime and bridges sources
+    /// locally via `spawn_local`, co-locating source I/O with the Timely worker
+    /// on the same core. The step loop alternates between `worker.step()` and
+    /// ticking the local runtime to advance source tasks.
+    ///
+    /// When the worker thread already has a Tokio runtime context (e.g. when
+    /// Timely runs worker 0 on the `spawn_blocking` thread), the shared runtime
+    /// is used via `block_in_place` instead of creating a new one. The cold-path
+    /// state fetches in `async_operator.rs` use `block_in_place(|| rt.block_on())`
+    /// which is safe in either case.
     pub(crate) fn run<A: Allocate>(mut self, worker: &mut Worker<A>) {
         let _span = tracing::info_span!("worker", worker = self.worker_index).entered();
 
@@ -162,11 +173,71 @@ impl DataflowExecutor {
 
         let mut data = self.data.take().expect("executor data already taken");
 
-        let dataflow_index = worker.next_dataflow_index();
-        let probe = worker.dataflow::<u64, _, _>(|scope| self.compile(scope, &mut data));
+        // Try to create a per-worker local runtime. This succeeds on Timely's
+        // own worker threads (no Tokio context). On the `spawn_blocking` thread
+        // (where Timely may run worker 0), creating a new runtime panics, so we
+        // detect the existing context and fall back to spawning sources on the
+        // shared runtime (no core co-location for that worker, but safe).
+        let local_rt = if tokio::runtime::Handle::try_current().is_err() {
+            Some(
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("failed to build per-worker tokio runtime"),
+            )
+        } else {
+            None
+        };
+        let local_set = tokio::task::LocalSet::new();
 
+        // Bridge sources: use spawn_local when we have a local runtime (core
+        // co-location), fall back to shared runtime spawn otherwise.
+        let mut source_rx: HashMap<NodeId, flume::Receiver<Vec<AnyItem>>> = HashMap::new();
+        if let Some(rt) = &local_rt {
+            rt.block_on(local_set.run_until(async {
+                for (node_id, source) in data.sources.drain() {
+                    let (tx, rx) = flume::bounded(16);
+                    let offsets = data
+                        .source_offsets
+                        .remove(&node_id)
+                        .unwrap_or_else(|| Arc::new(std::sync::Mutex::new(HashMap::new())));
+                    let wm = data.source_wm[&node_id].clone();
+                    let shutdown = data.shutdown.clone();
+                    tokio::task::spawn_local(crate::bridge::local_source_bridge(
+                        source, tx, offsets, wm, shutdown,
+                    ));
+                    source_rx.insert(node_id, rx);
+                }
+            }));
+        } else {
+            // Fallback: spawn source tasks on the shared runtime.
+            for (node_id, source) in data.sources.drain() {
+                let (tx, rx) = flume::bounded(16);
+                let offsets = data
+                    .source_offsets
+                    .remove(&node_id)
+                    .unwrap_or_else(|| Arc::new(std::sync::Mutex::new(HashMap::new())));
+                let wm = data.source_wm[&node_id].clone();
+                let shutdown = data.shutdown.clone();
+                self.rt.spawn(crate::bridge::local_source_bridge(
+                    source, tx, offsets, wm, shutdown,
+                ));
+                source_rx.insert(node_id, rx);
+            }
+        }
+
+        let dataflow_index = worker.next_dataflow_index();
+        let probe =
+            worker.dataflow::<u64, _, _>(|scope| self.compile(scope, &mut data, &mut source_rx));
+
+        // Step loop: alternate between Timely steps and ticking the local
+        // runtime to advance source tasks. When sources run on the shared
+        // runtime (fallback), no ticking is needed — they advance on their own.
         while !probe.done() {
             worker.step();
+            if let Some(rt) = &local_rt {
+                rt.block_on(local_set.run_until(tokio::task::yield_now()));
+            }
         }
 
         // Coordinated shutdown barrier: the first local worker on each
@@ -176,7 +247,7 @@ impl DataflowExecutor {
         // panics from broken pipes.
         if self.worker_index == self.local_first_worker {
             if let Some(ref n) = self.checkpoint_notify {
-                let _ = n.blocking_send(Sentinel::Shutdown as u64);
+                let _ = n.send(Sentinel::Shutdown as u64);
             }
             if let Some(ref barrier) = self.shutdown_barrier
                 && let Some(rx) = barrier.lock().unwrap().take()
@@ -198,6 +269,7 @@ impl DataflowExecutor {
         &self,
         scope: &mut Scope<'_, A>,
         data: &mut ExecutorData,
+        source_rx: &mut HashMap<NodeId, flume::Receiver<Vec<AnyItem>>>,
     ) -> probe::Handle<u64> {
         let mut streams: HashMap<NodeId, timely::dataflow::Stream<_, AnyItem>> = HashMap::new();
         let probe = probe::Handle::new();
@@ -208,8 +280,7 @@ impl DataflowExecutor {
 
             match kind {
                 NodeKindTag::Source => {
-                    let stream =
-                        self.build_source(scope, node_id, &mut data.source_rx, &mut data.source_wm);
+                    let stream = self.build_source(scope, node_id, source_rx, &mut data.source_wm);
                     streams.insert(node_id, stream);
                 }
                 NodeKindTag::Transform => {
@@ -252,7 +323,7 @@ impl DataflowExecutor {
         &self,
         scope: &mut Scope<'a, A>,
         node_id: NodeId,
-        source_receivers: &mut HashMap<NodeId, tokio::sync::mpsc::Receiver<Vec<AnyItem>>>,
+        source_receivers: &mut HashMap<NodeId, flume::Receiver<Vec<AnyItem>>>,
         source_watermarks: &mut HashMap<NodeId, Arc<AtomicU64>>,
     ) -> timely::dataflow::Stream<Scope<'a, A>, AnyItem> {
         use timely::dataflow::operators::generic::OutputBuilder;
@@ -328,11 +399,11 @@ impl DataflowExecutor {
                         activator.activate();
                         true
                     }
-                    Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
+                    Err(flume::TryRecvError::Empty) => {
                         activator.activate();
                         true
                     }
-                    Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                    Err(flume::TryRecvError::Disconnected) => {
                         // Check if this source was naturally exhausted (bridge set
                         // SourceExhausted) vs shut down (watermark unchanged).
                         // Only drain on exhaustion — shutdown resumes from checkpoint.
@@ -508,7 +579,7 @@ impl DataflowExecutor {
                         local_first_worker,
                     ) && let Some(ref n) = notify
                     {
-                        let _ = n.blocking_send(epoch);
+                        let _ = n.send(epoch);
                     }
                 }
             },
@@ -550,7 +621,7 @@ impl DataflowExecutor {
                     move |input, _output| {
                         input.for_each(|_cap, data| {
                             for item in data.drain(..) {
-                                if let Err(e) = sink_tx.blocking_send(item) {
+                                if let Err(e) = sink_tx.send(item) {
                                     tracing::error!(error = %e, "sink channel send failed — item dropped");
                                     metrics::counter!("sink_send_errors_total").increment(1);
                                 }
@@ -591,7 +662,7 @@ fn route_errors_to_dlq(
                     format!("{}", d.as_secs())
                 },
             };
-            if let Err(e) = dlq.blocking_send(record) {
+            if let Err(e) = dlq.send(record) {
                 tracing::error!(
                     error = %e,
                     operator = %op_name,

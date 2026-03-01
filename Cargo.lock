@@ -2667,6 +2667,7 @@ dependencies = [
  "axum",
  "bincode",
  "core_affinity",
+ "flume",
  "futures",
  "metrics",
  "metrics-exporter-prometheus",

@@ -22,7 +22,7 @@ use crate::executor::NodeKindTag;
 use crate::shutdown::ShutdownHandle;
 
 /// DLQ channel sender type for per-worker DLQ writes.
-pub(crate) type DlqSender = tokio::sync::mpsc::Sender<rhei_core::dlq::DeadLetterRecord>;
+pub(crate) type DlqSender = flume::Sender<rhei_core::dlq::DeadLetterRecord>;
 
 /// All per-executor data packaged for Timely execution, plus checkpoint orchestration.
 ///
@@ -33,10 +33,10 @@ pub(crate) struct TaskManager {
     per_executor: Arc<std::sync::Mutex<Vec<Option<ExecutorData>>>>,
 
     // Shared state
-    pub sink_senders: Arc<HashMap<NodeId, tokio::sync::mpsc::Sender<AnyItem>>>,
+    pub sink_senders: Arc<HashMap<NodeId, flume::Sender<AnyItem>>>,
     pub all_source_watermarks: Arc<Vec<Arc<AtomicU64>>>,
-    pub checkpoint_notify_rx: tokio::sync::Mutex<tokio::sync::mpsc::Receiver<u64>>,
-    pub checkpoint_notify_tx: std::sync::Mutex<Option<tokio::sync::mpsc::Sender<u64>>>,
+    pub checkpoint_notify_rx: std::sync::Mutex<Option<flume::Receiver<u64>>>,
+    pub checkpoint_notify_tx: std::sync::Mutex<Option<flume::Sender<u64>>>,
 
     // Graph metadata
     pub topo_order: Arc<Vec<NodeId>>,
@@ -64,8 +64,10 @@ pub(crate) struct TaskManager {
 ///
 /// Returned by [`TaskManager::take_executor_data`] for consumption inside a Timely closure.
 pub(crate) struct ExecutorData {
-    pub source_rx: HashMap<NodeId, tokio::sync::mpsc::Receiver<Vec<AnyItem>>>,
+    pub sources: HashMap<NodeId, Box<dyn ErasedSource>>,
     pub source_wm: HashMap<NodeId, Arc<AtomicU64>>,
+    pub source_offsets: HashMap<NodeId, Arc<std::sync::Mutex<HashMap<String, String>>>>,
+    pub shutdown: Option<ShutdownHandle>,
     pub transforms: HashMap<NodeId, TransformFn>,
     pub key_fns: HashMap<NodeId, crate::dataflow::KeyFn>,
     pub operators: HashMap<NodeId, (String, Box<dyn ErasedOperator>)>,
@@ -91,7 +93,6 @@ impl TaskManager {
         mut graph: CompiledGraph,
         controller: &PipelineController,
         shutdown: Option<&ShutdownHandle>,
-        rt: &tokio::runtime::Handle,
         restored_offsets: HashMap<String, String>,
         initial_checkpoint_id: u64,
     ) -> anyhow::Result<Self> {
@@ -106,17 +107,17 @@ impl TaskManager {
         // ── Node classification ───────────────────────────────────────
         let (node_kinds, node_inputs, last_operator_id) = classify_nodes(&graph);
 
-        // ── Source bridging ───────────────────────────────────────────
+        // ── Source preparation ─────────────────────────────────────────
         let (
-            mut per_worker_source_rx,
+            mut per_worker_sources,
             mut per_worker_source_wm,
+            mut per_worker_source_offsets,
             all_source_offsets,
             all_source_watermarks,
-        ) = bridge_sources(
+        ) = prepare_sources(
             &mut graph,
             total_workers,
             &local_range,
-            rt,
             shutdown,
             &restored_offsets,
         )
@@ -151,8 +152,10 @@ impl TaskManager {
             (0..total_workers).map(|_| None).collect();
         for idx in local_range.clone() {
             per_executor[idx] = Some(ExecutorData {
-                source_rx: std::mem::take(&mut per_worker_source_rx[idx]),
+                sources: std::mem::take(&mut per_worker_sources[idx]),
                 source_wm: std::mem::take(&mut per_worker_source_wm[idx]),
+                source_offsets: std::mem::take(&mut per_worker_source_offsets[idx]),
+                shutdown: shutdown.cloned(),
                 transforms: all_transforms[idx].take().unwrap_or_default(),
                 key_fns: all_key_fns[idx].take().unwrap_or_default(),
                 operators: all_operators[idx].take().unwrap_or_default(),
@@ -161,7 +164,7 @@ impl TaskManager {
             });
         }
 
-        let (checkpoint_notify_tx, checkpoint_notify_rx) = tokio::sync::mpsc::channel::<u64>(64);
+        let (checkpoint_notify_tx, checkpoint_notify_rx) = flume::bounded::<u64>(64);
 
         let all_source_watermarks = Arc::new(all_source_watermarks);
 
@@ -183,7 +186,7 @@ impl TaskManager {
             per_executor: Arc::new(std::sync::Mutex::new(per_executor)),
             sink_senders: Arc::new(sink_senders),
             all_source_watermarks,
-            checkpoint_notify_rx: tokio::sync::Mutex::new(checkpoint_notify_rx),
+            checkpoint_notify_rx: std::sync::Mutex::new(Some(checkpoint_notify_rx)),
             checkpoint_notify_tx: std::sync::Mutex::new(Some(checkpoint_notify_tx)),
             topo_order: Arc::new(topo_order),
             node_inputs: Arc::new(node_inputs),
@@ -233,11 +236,13 @@ impl TaskManager {
 
     /// Take the checkpoint notification receiver for the mid-execution checkpoint task.
     ///
-    /// Returns the receiver, replacing it with a dummy closed channel.
-    pub(crate) async fn take_checkpoint_rx(&self) -> tokio::sync::mpsc::Receiver<u64> {
-        let mut rx = self.checkpoint_notify_rx.lock().await;
-        let (_dummy_tx, dummy_rx) = tokio::sync::mpsc::channel::<u64>(1);
-        std::mem::replace(&mut *rx, dummy_rx)
+    /// Returns the receiver. Can only be called once.
+    pub(crate) fn take_checkpoint_rx(&self) -> flume::Receiver<u64> {
+        self.checkpoint_notify_rx
+            .lock()
+            .unwrap()
+            .take()
+            .expect("checkpoint_rx already taken")
     }
 
     /// Get handles to source offset maps (for the checkpoint task to read concurrently).
@@ -262,7 +267,7 @@ impl TaskManager {
     pub(crate) fn create_executor(
         &self,
         idx: usize,
-        checkpoint_notify: Option<tokio::sync::mpsc::Sender<u64>>,
+        checkpoint_notify: Option<flume::Sender<u64>>,
         shutdown_barrier: Option<Arc<std::sync::Mutex<Option<std::sync::mpsc::Receiver<()>>>>>,
         local_first_worker: usize,
         rt: tokio::runtime::Handle,
@@ -314,7 +319,7 @@ impl TaskManager {
             (None, None)
         };
 
-        let checkpoint_rx = self.take_checkpoint_rx().await;
+        let checkpoint_rx = self.take_checkpoint_rx();
         let checkpoint_task = tokio::spawn(async move {
             run_checkpoint_task(checkpoint_rx, ckpt_config, coordination, barrier_tx).await
         });
@@ -470,14 +475,14 @@ async fn setup_coordination(
 ///
 /// Returns the last `checkpoint_id` written.
 async fn run_checkpoint_task(
-    mut checkpoint_rx: tokio::sync::mpsc::Receiver<u64>,
+    checkpoint_rx: flume::Receiver<u64>,
     config: CheckpointTaskConfig,
     mut coordination: Option<CheckpointCoordination>,
     shutdown_barrier_tx: Option<std::sync::mpsc::Sender<()>>,
 ) -> u64 {
     let mut checkpoint_id = config.initial_checkpoint_id;
 
-    while let Some(mut epoch) = checkpoint_rx.recv().await {
+    while let Ok(mut epoch) = checkpoint_rx.recv_async().await {
         // Drain any additional epoch notifications that arrived while we were
         // busy writing the last manifest. This coalesces rapid-fire
         // checkpoints into a single manifest write, preventing the channel
@@ -642,33 +647,47 @@ fn classify_nodes(
     (node_kinds, node_inputs, last_operator_id)
 }
 
-/// Bridge all sources in the graph to per-worker mpsc receivers.
+/// Prepare all sources for per-worker execution without spawning tasks or creating channels.
 ///
-/// Handles both partitioned and non-partitioned source distribution.
-/// Returns `(per_worker_source_rx, per_worker_source_wm, all_source_offsets, all_source_watermarks)`.
+/// Extracts sources from the graph, restores offsets, distributes across workers,
+/// and creates shared watermark/offset state. Raw `Box<dyn ErasedSource>` instances
+/// are stored per-worker for later bridging inside the executor's local runtime.
+///
+/// Returns `(per_worker_sources, per_worker_source_wm, per_worker_source_offsets, all_source_offsets, all_source_watermarks)`.
 #[allow(clippy::type_complexity)]
-async fn bridge_sources(
+async fn prepare_sources(
     graph: &mut CompiledGraph,
     total_workers: usize,
     local_range: &Range<usize>,
-    rt: &tokio::runtime::Handle,
     shutdown: Option<&ShutdownHandle>,
     restored_offsets: &HashMap<String, String>,
 ) -> anyhow::Result<(
-    Vec<HashMap<NodeId, tokio::sync::mpsc::Receiver<Vec<AnyItem>>>>,
+    Vec<HashMap<NodeId, Box<dyn ErasedSource>>>,
     Vec<HashMap<NodeId, Arc<AtomicU64>>>,
+    Vec<HashMap<NodeId, Arc<std::sync::Mutex<HashMap<String, String>>>>>,
     Vec<Arc<std::sync::Mutex<HashMap<String, String>>>>,
     Vec<Arc<AtomicU64>>,
 )> {
-    let mut per_worker_source_rx: Vec<HashMap<NodeId, tokio::sync::mpsc::Receiver<Vec<AnyItem>>>> =
+    let mut per_worker_sources: Vec<HashMap<NodeId, Box<dyn ErasedSource>>> =
         (0..total_workers).map(|_| HashMap::new()).collect();
     let mut per_worker_source_wm: Vec<HashMap<NodeId, Arc<AtomicU64>>> =
         (0..total_workers).map(|_| HashMap::new()).collect();
+    let mut per_worker_source_offsets: Vec<
+        HashMap<NodeId, Arc<std::sync::Mutex<HashMap<String, String>>>>,
+    > = (0..total_workers).map(|_| HashMap::new()).collect();
     let mut all_source_offsets: Vec<Arc<std::sync::Mutex<HashMap<String, String>>>> = Vec::new();
     let mut all_source_watermarks: Vec<Arc<AtomicU64>> = Vec::new();
 
+    // Suppress unused variable warning when shutdown is not used directly here
+    // (it is passed through to ExecutorData for per-worker bridge creation).
+    let _ = shutdown;
+
     for &source_id in &graph.source_ids {
         let source = extract_source(&mut graph.nodes[source_id.0]);
+
+        // Register the output type in the global AnyItem type registry before
+        // Timely starts, so cross-process deserialization works.
+        source.register_output_type();
 
         if let Some(n_partitions) = source.partition_count() {
             // Partitioned: round-robin distribute partitions across total workers.
@@ -682,7 +701,7 @@ async fn bridge_sources(
             for p in 0..n_partitions {
                 worker_partitions[p % total_workers].push(p);
             }
-            // Only create bridges for workers in local_range.
+            // Only prepare sources for workers in local_range.
             for (worker_idx, parts) in worker_partitions.into_iter().enumerate() {
                 if parts.is_empty() || !local_range.contains(&worker_idx) {
                     continue;
@@ -693,25 +712,29 @@ async fn bridge_sources(
                 if !restored_offsets.is_empty() {
                     psrc.restore_offsets(restored_offsets).await?;
                 }
-                let (rx, offsets, wm) =
-                    crate::bridge::erased_source_bridge_with_offsets(psrc, rt, shutdown.cloned());
-                per_worker_source_rx[worker_idx].insert(source_id, rx);
+                let offsets: Arc<std::sync::Mutex<HashMap<String, String>>> =
+                    Arc::new(std::sync::Mutex::new(HashMap::new()));
+                let wm: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
+                per_worker_sources[worker_idx].insert(source_id, psrc);
                 per_worker_source_wm[worker_idx].insert(source_id, wm.clone());
+                per_worker_source_offsets[worker_idx].insert(source_id, offsets.clone());
                 all_source_offsets.push(offsets);
                 all_source_watermarks.push(wm);
             }
         } else {
             // Non-partitioned: only global worker 0 reads.
-            // In cluster mode, only process 0 creates this bridge.
+            // In cluster mode, only process 0 creates this source.
             if local_range.contains(&0) {
                 let mut source = source;
                 if !restored_offsets.is_empty() {
                     source.restore_offsets(restored_offsets).await?;
                 }
-                let (rx, offsets, wm) =
-                    crate::bridge::erased_source_bridge_with_offsets(source, rt, shutdown.cloned());
-                per_worker_source_rx[0].insert(source_id, rx);
+                let offsets: Arc<std::sync::Mutex<HashMap<String, String>>> =
+                    Arc::new(std::sync::Mutex::new(HashMap::new()));
+                let wm: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
+                per_worker_sources[0].insert(source_id, source);
                 per_worker_source_wm[0].insert(source_id, wm.clone());
+                per_worker_source_offsets[0].insert(source_id, offsets.clone());
                 all_source_offsets.push(offsets);
                 all_source_watermarks.push(wm);
             }
@@ -719,8 +742,9 @@ async fn bridge_sources(
     }
 
     Ok((
-        per_worker_source_rx,
+        per_worker_sources,
         per_worker_source_wm,
+        per_worker_source_offsets,
         all_source_offsets,
         all_source_watermarks,
     ))
@@ -733,19 +757,19 @@ async fn bridge_sources(
 fn bridge_sinks(
     graph: &mut CompiledGraph,
 ) -> (
-    HashMap<NodeId, tokio::sync::mpsc::Sender<AnyItem>>,
+    HashMap<NodeId, flume::Sender<AnyItem>>,
     Vec<JoinHandle<anyhow::Result<()>>>,
 ) {
-    let mut sink_senders: HashMap<NodeId, tokio::sync::mpsc::Sender<AnyItem>> = HashMap::new();
+    let mut sink_senders: HashMap<NodeId, flume::Sender<AnyItem>> = HashMap::new();
     let mut sink_handles: Vec<JoinHandle<anyhow::Result<()>>> = Vec::new();
 
     for &sink_id in &graph.sink_ids {
         let sink = extract_sink(&mut graph.nodes[sink_id.0]);
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<AnyItem>(16);
+        let (tx, rx) = flume::bounded::<AnyItem>(16);
         sink_senders.insert(sink_id, tx);
         sink_handles.push(tokio::spawn(async move {
             let mut sink = sink;
-            while let Some(item) = rx.recv().await {
+            while let Ok(item) = rx.recv_async().await {
                 sink.write(item).await?;
             }
             sink.flush().await?;
@@ -873,12 +897,11 @@ fn setup_dlq_sinks(
             for i in local_range.clone() {
                 match factory.create(i) {
                     Ok(sink) => {
-                        let (tx, mut rx) =
-                            tokio::sync::mpsc::channel::<rhei_core::dlq::DeadLetterRecord>(64);
+                        let (tx, rx) = flume::bounded::<rhei_core::dlq::DeadLetterRecord>(64);
                         senders[i] = Some(tx);
                         handles.push(tokio::spawn(async move {
                             let mut sink = sink;
-                            while let Some(record) = rx.recv().await {
+                            while let Ok(record) = rx.recv_async().await {
                                 sink.write(record).await?;
                             }
                             sink.flush().await?;

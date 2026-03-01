@@ -203,6 +203,11 @@ pub(crate) trait ErasedSource: Send {
     fn create_partition_source(&self, assigned: &[usize]) -> Option<Box<dyn ErasedSource>>;
     /// Returns the current event-time watermark (millis), if available.
     fn current_watermark(&self) -> Option<u64>;
+    /// Register the output type in the global `AnyItem` type registry.
+    ///
+    /// Must be called before Timely starts exchanging data across processes,
+    /// so that cross-process deserialization can find the correct type.
+    fn register_output_type(&self);
 }
 
 /// Wraps a typed [`Source`] into an [`ErasedSource`].
@@ -247,6 +252,10 @@ where
 
     fn current_watermark(&self) -> Option<u64> {
         self.0.current_watermark()
+    }
+
+    fn register_output_type(&self) {
+        register_type::<S::Output>();
     }
 }
 
@@ -298,6 +307,10 @@ where
 
     fn current_watermark(&self) -> Option<u64> {
         self.0.current_watermark()
+    }
+
+    fn register_output_type(&self) {
+        register_type::<T>();
     }
 }
 
