@@ -173,72 +173,40 @@ impl DataflowExecutor {
 
         let mut data = self.data.take().expect("executor data already taken");
 
-        // Try to create a per-worker local runtime. This succeeds on Timely's
-        // own worker threads (no Tokio context). On the `spawn_blocking` thread
-        // (where Timely may run worker 0), creating a new runtime panics, so we
-        // detect the existing context and fall back to spawning sources on the
-        // shared runtime (no core co-location for that worker, but safe).
-        let local_rt = if tokio::runtime::Handle::try_current().is_err() {
-            Some(
-                tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .expect("failed to build per-worker tokio runtime"),
-            )
-        } else {
-            None
-        };
-        let local_set = tokio::task::LocalSet::new();
-
-        // Bridge sources: use spawn_local when we have a local runtime (core
-        // co-location), fall back to shared runtime spawn otherwise.
+        // Bridge sources on the shared Tokio runtime. Source bridges run
+        // continuously and concurrently with the Timely step loop, matching
+        // the pre-per-worker-runtime behavior. This is critical because the
+        // out-of-band watermark (shared atomic) must stay roughly in sync
+        // with the in-band data flowing through Timely exchanges — spawning
+        // sources on a cooperative per-worker runtime makes the watermark
+        // race ahead of the exchange, causing downstream operators to close
+        // windows before all items arrive.
+        //
+        // TODO: once watermarks are propagated in-band (as special stream
+        // elements), sources can be moved to a per-worker `current_thread`
+        // runtime for core co-location.
         let mut source_rx: HashMap<NodeId, flume::Receiver<crate::bridge::SourceBatch>> =
             HashMap::new();
-        if let Some(rt) = &local_rt {
-            rt.block_on(local_set.run_until(async {
-                for (node_id, source) in data.sources.drain() {
-                    let (tx, rx) = flume::bounded(16);
-                    let offsets = data
-                        .source_offsets
-                        .remove(&node_id)
-                        .unwrap_or_else(|| Arc::new(std::sync::Mutex::new(HashMap::new())));
-                    let wm = data.source_wm[&node_id].clone();
-                    let shutdown = data.shutdown.clone();
-                    tokio::task::spawn_local(crate::bridge::local_source_bridge(
-                        source, tx, offsets, wm, shutdown,
-                    ));
-                    source_rx.insert(node_id, rx);
-                }
-            }));
-        } else {
-            // Fallback: spawn source tasks on the shared runtime.
-            for (node_id, source) in data.sources.drain() {
-                let (tx, rx) = flume::bounded(16);
-                let offsets = data
-                    .source_offsets
-                    .remove(&node_id)
-                    .unwrap_or_else(|| Arc::new(std::sync::Mutex::new(HashMap::new())));
-                let wm = data.source_wm[&node_id].clone();
-                let shutdown = data.shutdown.clone();
-                self.rt.spawn(crate::bridge::local_source_bridge(
-                    source, tx, offsets, wm, shutdown,
-                ));
-                source_rx.insert(node_id, rx);
-            }
+        for (node_id, source) in data.sources.drain() {
+            let (tx, rx) = flume::bounded(16);
+            let offsets = data
+                .source_offsets
+                .remove(&node_id)
+                .unwrap_or_else(|| Arc::new(std::sync::Mutex::new(HashMap::new())));
+            let wm = data.source_wm[&node_id].clone();
+            let shutdown = data.shutdown.clone();
+            self.rt.spawn(crate::bridge::local_source_bridge(
+                source, tx, offsets, wm, shutdown,
+            ));
+            source_rx.insert(node_id, rx);
         }
 
         let dataflow_index = worker.next_dataflow_index();
         let probe =
             worker.dataflow::<u64, _, _>(|scope| self.compile(scope, &mut data, &mut source_rx));
 
-        // Step loop: alternate between Timely steps and ticking the local
-        // runtime to advance source tasks. When sources run on the shared
-        // runtime (fallback), no ticking is needed — they advance on their own.
         while !probe.done() {
             worker.step();
-            if let Some(rt) = &local_rt {
-                rt.block_on(local_set.run_until(tokio::task::yield_now()));
-            }
         }
 
         // Coordinated shutdown barrier: the first local worker on each
