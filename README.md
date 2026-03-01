@@ -122,17 +122,17 @@ rhei run --tui --workers 4
 ```
 
 ```
-┌─ Pipeline ──────────────────────────────────────────────────────────────┐
+┌─ Pipeline ─────────────────────────────────────────────────────────────────┐
 │ [SensorSource] ──▶ [RangeFilter] ╌╌ ◆ BySensorId ◆ ╌╌▶ [Window] ──▶ [Sink] │
-├─ Dashboard ─────────────────────────────────────────────────────────────┤
-│ Status: Running  Workers: 4  Uptime: 00:05:23                         │
-│ Elements: 1.2M  Batches: 48K  Throughput: 3,800 elem/s               │
-│ L1 Hit: 94.2%   L2 Hit: 5.1%  L3 Hit: 0.7%                          │
-├─ Logs [↑↓] ────────────────────────────────────────────────────────────┤
-│ 12:34:56  INFO  Worker=0  processing batch epoch=42                   │
-│ 12:34:56  INFO  Worker=1  processing batch epoch=42                   │
-│ 12:34:57  INFO  Worker=0  checkpoint complete duration=12ms           │
-└─────────────────────────────────────────────────────────────────────────┘
+├─ Dashboard ────────────────────────────────────────────────────────────────┤
+│ Status: Running  Workers: 4  Uptime: 00:05:23                              │
+│ Elements: 1.2M  Batches: 48K  Throughput: 3,800 elem/s                     │
+│ L1 Hit: 94.2%   L2 Hit: 5.1%  L3 Hit: 0.7%                                 │
+├─ Logs [↑↓] ────────────────────────────────────────────────────────────────┤
+│ 12:34:56  INFO  Worker=0  processing batch epoch=42                        │
+│ 12:34:56  INFO  Worker=1  processing batch epoch=42                        │
+│ 12:34:57  INFO  Worker=0  checkpoint complete duration=12ms                │
+└────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ## Building
