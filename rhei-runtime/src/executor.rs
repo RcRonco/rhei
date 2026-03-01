@@ -769,4 +769,64 @@ mod tests {
         let restored: AnyItem = bincode::deserialize(&bytes).unwrap();
         assert_eq!(restored.downcast::<i32>(), 42);
     }
+
+    /// Verify that flume checkpoint channel works synchronously (no .await needed).
+    #[test]
+    fn flume_checkpoint_channel_sync() {
+        let (tx, rx) = flume::bounded::<u64>(64);
+
+        // Send synchronously — this is how the Timely worker thread sends.
+        tx.send(42).unwrap();
+        tx.send(100).unwrap();
+
+        // Receive synchronously.
+        assert_eq!(rx.try_recv().unwrap(), 42);
+        assert_eq!(rx.try_recv().unwrap(), 100);
+        assert!(rx.try_recv().is_err());
+    }
+
+    /// Verify that flume sink channel works with blocking send (no Tokio context needed).
+    #[test]
+    fn flume_sink_send_no_tokio_context() {
+        let (tx, rx) = flume::bounded::<AnyItem>(16);
+
+        // Send without any Tokio runtime — this is how build_sink sends items.
+        let item = AnyItem::new("test".to_string());
+        tx.send(item).unwrap();
+
+        let received = rx.try_recv().unwrap();
+        assert_eq!(received.downcast::<String>(), "test");
+    }
+
+    /// Verify that the local runtime detection works: on a Tokio-owned thread,
+    /// `Handle::try_current()` returns Ok, so we skip creating a new runtime.
+    #[tokio::test]
+    async fn local_runtime_fallback_on_tokio_thread() {
+        // We're inside a #[tokio::test], so try_current should succeed.
+        assert!(
+            tokio::runtime::Handle::try_current().is_ok(),
+            "should detect existing Tokio runtime"
+        );
+    }
+
+    /// Verify that on a plain thread, we can create a new `current_thread` runtime.
+    #[test]
+    fn local_runtime_created_on_plain_thread() {
+        let handle = std::thread::spawn(|| {
+            // No Tokio runtime on this thread.
+            assert!(tokio::runtime::Handle::try_current().is_err());
+
+            // Should be able to create a current_thread runtime.
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("should create runtime on plain thread");
+
+            rt.block_on(async { 42 })
+        })
+        .join()
+        .unwrap();
+
+        assert_eq!(handle, 42);
+    }
 }

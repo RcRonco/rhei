@@ -930,3 +930,38 @@ impl<
         );
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn register_output_type_makes_anyitem_deserializable() {
+        // Register String in the type registry.
+        register_type::<String>();
+
+        // Serialize an AnyItem<String>.
+        let item = AnyItem::new("hello".to_string());
+        let bytes = bincode::serialize(&item).unwrap();
+
+        // Deserialize — should succeed because String is registered.
+        let restored: AnyItem = bincode::deserialize(&bytes).unwrap();
+        assert_eq!(restored.downcast::<String>(), "hello");
+    }
+
+    #[test]
+    fn source_wrapper_registers_output_type() {
+        // Create a VecSource<u16> and wrap it.
+        let source = rhei_core::connectors::vec_source::VecSource::new(vec![1u16, 2, 3]);
+        let wrapper = SourceWrapper(source);
+
+        // Calling register_output_type should register u16.
+        wrapper.register_output_type();
+
+        // Verify by serializing + deserializing an AnyItem<u16>.
+        let item = AnyItem::new(42u16);
+        let bytes = bincode::serialize(&item).unwrap();
+        let restored: AnyItem = bincode::deserialize(&bytes).unwrap();
+        assert_eq!(restored.downcast::<u16>(), 42);
+    }
+}
