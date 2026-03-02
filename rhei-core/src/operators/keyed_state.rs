@@ -54,7 +54,7 @@ where
     /// Retrieves the value for the given key, or `None` if absent.
     pub async fn get(&mut self, key: &K) -> anyhow::Result<Option<V>> {
         let encoded_key = format!("{}:{}", self.prefix, serde_json::to_string(key)?);
-        match self.ctx.get(encoded_key.as_bytes()).await? {
+        match self.ctx.get_raw(encoded_key.as_bytes()).await? {
             Some(bytes) => Ok(Some(serde_json::from_slice(&bytes)?)),
             None => Ok(None),
         }
@@ -64,7 +64,7 @@ where
     pub fn put(&mut self, key: &K, value: &V) {
         let encoded_key = format!("{}:{}", self.prefix, serde_json::to_string(key).unwrap());
         let encoded_value = serde_json::to_vec(value).unwrap();
-        self.ctx.put(encoded_key.as_bytes(), &encoded_value);
+        self.ctx.put_raw(encoded_key.as_bytes(), &encoded_value);
     }
 
     /// Deletes the given key.

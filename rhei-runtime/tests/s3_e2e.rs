@@ -88,14 +88,8 @@ impl StreamFunction for WordCounter {
     ) -> anyhow::Result<Vec<String>> {
         let word = input.trim();
         let key = word.as_bytes();
-        let count = match ctx.get(key).await? {
-            Some(bytes) => {
-                let n = u64::from_le_bytes(<[u8; 8]>::try_from(bytes.as_ref()).unwrap_or([0; 8]));
-                n + 1
-            }
-            None => 1,
-        };
-        ctx.put(key, &count.to_le_bytes());
+        let count = ctx.get::<u64>(key).await?.unwrap_or(0) + 1;
+        ctx.put(key, &count);
         Ok(vec![format!("{word}:{count}")])
     }
 }
@@ -242,11 +236,8 @@ async fn s3_tiered_storage_e2e() {
         );
 
         let bytes = val.unwrap();
-        let arr: [u8; 8] = bytes
-            .as_ref()
-            .try_into()
-            .expect("persisted value has wrong length");
-        let count = u64::from_le_bytes(arr);
+        let count: u64 =
+            bincode::deserialize(&bytes).expect("failed to deserialize persisted count");
         assert_eq!(
             count, 5,
             "persisted count for '{word}': actual={count}, expected=5"

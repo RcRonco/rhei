@@ -52,7 +52,7 @@ mod compile_tests {
             input: String,
             ctx: &mut StateContext,
         ) -> anyhow::Result<Vec<String>> {
-            let _ = ctx.get(b"key").await;
+            let _ = ctx.get_raw(b"key").await;
             Ok(vec![input])
         }
     }
