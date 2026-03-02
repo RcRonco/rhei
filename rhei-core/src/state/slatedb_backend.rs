@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use bytes::Bytes;
 use object_store::path::Path;
 
 use super::backend::StateBackend;
@@ -38,9 +39,9 @@ impl SlateDbBackend {
 
 #[async_trait]
 impl StateBackend for SlateDbBackend {
-    async fn get(&self, key: &[u8]) -> anyhow::Result<Option<Vec<u8>>> {
+    async fn get(&self, key: &[u8]) -> anyhow::Result<Option<Bytes>> {
         let result = self.db.get(key).await?;
-        Ok(result.map(|b| b.to_vec()))
+        Ok(result)
     }
 
     async fn put(&self, key: &[u8], value: &[u8]) -> anyhow::Result<()> {
@@ -62,6 +63,7 @@ impl StateBackend for SlateDbBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::Bytes;
     use object_store::memory::InMemory;
 
     async fn open_test_db(store: Arc<InMemory>, path: &str) -> SlateDbBackend {
@@ -75,7 +77,7 @@ mod tests {
 
         backend.put(b"hello", b"world").await.unwrap();
         let val = backend.get(b"hello").await.unwrap();
-        assert_eq!(val, Some(b"world".to_vec()));
+        assert_eq!(val, Some(Bytes::from_static(b"world")));
 
         backend.close().await.unwrap();
     }
@@ -120,7 +122,7 @@ mod tests {
         {
             let backend = open_test_db(store, "test_persist").await;
             let val = backend.get(b"survive").await.unwrap();
-            assert_eq!(val, Some(b"restart".to_vec()));
+            assert_eq!(val, Some(Bytes::from_static(b"restart")));
             backend.close().await.unwrap();
         }
     }

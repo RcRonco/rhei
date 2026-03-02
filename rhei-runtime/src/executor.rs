@@ -523,22 +523,29 @@ impl DataflowExecutor {
                 move |(input, frontier), output| {
                     input.for_each(|cap, data| {
                         let owned_cap = cap.retain();
-                        let mut batch_durations = Vec::new();
-                        for item in data.drain(..) {
-                            let input_repr = item.debug_repr();
-                            let elem_start = std::time::Instant::now();
-                            let (results, errors) = timely_op.process(item, &rt);
-                            batch_durations.push(elem_start.elapsed().as_secs_f64());
-                            route_errors_to_dlq(&errors, &input_repr, &op_name, dlq.as_ref());
-                            if !results.is_empty() {
-                                let mut session = output.session(&owned_cap);
-                                for r in results {
-                                    session.give(r);
-                                }
+                        let batch: Vec<AnyItem> = std::mem::take(data);
+                        if batch.is_empty() {
+                            return;
+                        }
+                        let batch_start = std::time::Instant::now();
+                        let (results, errors) = timely_op.process_batch(batch, &rt);
+                        let batch_duration = batch_start.elapsed().as_secs_f64();
+                        record_batch_durations(&[batch_duration], &wl);
+                        for e in &errors {
+                            route_errors_to_dlq(
+                                std::slice::from_ref(e),
+                                "batch",
+                                &op_name,
+                                dlq.as_ref(),
+                            );
+                        }
+                        if !results.is_empty() {
+                            let mut session = output.session(&owned_cap);
+                            for r in results {
+                                session.give(r);
                             }
                         }
                         retained_cap = Some(owned_cap);
-                        record_batch_durations(&batch_durations, &wl);
                     });
 
                     // Use the Timely frontier as the watermark. The source

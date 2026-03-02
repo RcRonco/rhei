@@ -229,7 +229,7 @@ impl rhei_core::traits::StreamFunction for CharCounter {
         let key = input.as_bytes();
         let count = match ctx.get(key).await? {
             Some(bytes) => {
-                let n = u64::from_le_bytes(bytes.try_into().unwrap_or([0; 8]));
+                let n = u64::from_le_bytes(<[u8; 8]>::try_from(bytes.as_ref()).unwrap_or([0; 8]));
                 n + 1
             }
             None => 1,

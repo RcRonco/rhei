@@ -21,6 +21,21 @@ pub trait StreamFunction: Send + Sync {
         ctx: &mut StateContext,
     ) -> anyhow::Result<Vec<Self::Output>>;
 
+    /// Process a batch of inputs. Default: process each element individually.
+    /// Operators that benefit from batch processing (e.g. batch state lookups)
+    /// can override this.
+    async fn process_batch(
+        &mut self,
+        inputs: Vec<Self::Input>,
+        ctx: &mut StateContext,
+    ) -> anyhow::Result<Vec<Self::Output>> {
+        let mut outputs = Vec::new();
+        for input in inputs {
+            outputs.extend(self.process(input, ctx).await?);
+        }
+        Ok(outputs)
+    }
+
     /// Called when the global watermark advances. Window operators use this
     /// to close eligible windows. Default: no output.
     async fn on_watermark(

@@ -1,3 +1,5 @@
+use bytes::Bytes;
+
 use super::backend::StateBackend;
 use super::memtable::MemTable;
 
@@ -44,7 +46,7 @@ impl StateContext {
     }
 
     /// Get a value — checks memtable first, then falls back to backend.
-    pub async fn get(&mut self, key: &[u8]) -> anyhow::Result<Option<Vec<u8>>> {
+    pub async fn get(&mut self, key: &[u8]) -> anyhow::Result<Option<Bytes>> {
         if let Some(ref wl) = self.worker_label {
             metrics::counter!("state_gets_total", "worker" => wl.clone()).increment(1);
         } else {
@@ -95,7 +97,8 @@ impl StateContext {
         } else {
             metrics::counter!("state_puts_total").increment(1);
         }
-        self.memtable.put(key.to_vec(), value.to_vec());
+        self.memtable
+            .put(key.to_vec(), Bytes::copy_from_slice(value));
     }
 
     /// Delete a key — marks as deleted in memtable.
@@ -137,6 +140,7 @@ impl StateContext {
 mod tests {
     use super::*;
     use crate::state::local_backend::LocalBackend;
+    use bytes::Bytes;
     use std::path::PathBuf;
 
     fn temp_path(name: &str) -> PathBuf {
@@ -153,7 +157,7 @@ mod tests {
 
         ctx.put(b"key", b"value");
         let val = ctx.get(b"key").await.unwrap();
-        assert_eq!(val, Some(b"value".to_vec()));
+        assert_eq!(val, Some(Bytes::from_static(b"value")));
 
         let _ = std::fs::remove_file(&path);
     }
@@ -169,7 +173,7 @@ mod tests {
 
         let mut ctx = StateContext::new(Box::new(backend));
         let val = ctx.get(b"backend_key").await.unwrap();
-        assert_eq!(val, Some(b"backend_val".to_vec()));
+        assert_eq!(val, Some(Bytes::from_static(b"backend_val")));
 
         let _ = std::fs::remove_file(&path);
     }
@@ -189,8 +193,14 @@ mod tests {
 
         // Verify persistence via a new backend
         let backend = LocalBackend::new(path.clone(), None).unwrap();
-        assert_eq!(backend.get(b"a").await.unwrap(), Some(b"1".to_vec()));
-        assert_eq!(backend.get(b"b").await.unwrap(), Some(b"2".to_vec()));
+        assert_eq!(
+            backend.get(b"a").await.unwrap(),
+            Some(Bytes::from_static(b"1"))
+        );
+        assert_eq!(
+            backend.get(b"b").await.unwrap(),
+            Some(Bytes::from_static(b"2"))
+        );
 
         let _ = std::fs::remove_file(&path);
     }

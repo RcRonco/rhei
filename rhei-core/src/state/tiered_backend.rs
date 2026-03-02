@@ -2,6 +2,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use bytes::Bytes;
 use foyer::{DeviceBuilder, FsDeviceBuilder, HybridCache, HybridCacheBuilder};
 
 use super::backend::StateBackend;
@@ -33,7 +34,7 @@ impl Default for TieredBackendConfig {
 /// Clone is cheap — `HybridCache` is internally `Arc`-based.
 #[derive(Clone)]
 pub struct SharedL2Cache {
-    cache: HybridCache<Vec<u8>, Vec<u8>>,
+    cache: HybridCache<Vec<u8>, Bytes>,
 }
 
 impl SharedL2Cache {
@@ -85,7 +86,7 @@ impl std::fmt::Debug for SharedL2Cache {
 /// Read path: L2 Foyer → L3 `SlateDB` → backfill L2 on hit.
 /// Write path: write-through to L3, update L2.
 pub struct TieredBackend {
-    l2: HybridCache<Vec<u8>, Vec<u8>>,
+    l2: HybridCache<Vec<u8>, Bytes>,
     l3: Arc<SlateDbBackend>,
 }
 
@@ -122,7 +123,7 @@ impl TieredBackend {
     }
 
     /// Build a `TieredBackend` with a pre-built `HybridCache` (useful for testing).
-    pub fn with_cache(l2: HybridCache<Vec<u8>, Vec<u8>>, l3: Arc<SlateDbBackend>) -> Self {
+    pub fn with_cache(l2: HybridCache<Vec<u8>, Bytes>, l3: Arc<SlateDbBackend>) -> Self {
         Self { l2, l3 }
     }
 
@@ -136,7 +137,7 @@ impl TieredBackend {
 
 #[async_trait]
 impl StateBackend for TieredBackend {
-    async fn get(&self, key: &[u8]) -> anyhow::Result<Option<Vec<u8>>> {
+    async fn get(&self, key: &[u8]) -> anyhow::Result<Option<Bytes>> {
         let key_vec = key.to_vec();
 
         // Check L2 first
@@ -163,11 +164,10 @@ impl StateBackend for TieredBackend {
 
     async fn put(&self, key: &[u8], value: &[u8]) -> anyhow::Result<()> {
         let key_vec = key.to_vec();
-        let value_vec = value.to_vec();
 
         // Write-through: L3 first, then update L2
         self.l3.put(key, value).await?;
-        self.l2.insert(key_vec, value_vec);
+        self.l2.insert(key_vec, Bytes::from(value.to_vec()));
         Ok(())
     }
 
@@ -189,11 +189,12 @@ impl StateBackend for TieredBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::Bytes;
     use object_store::memory::InMemory;
 
     /// Build a memory-only `HybridCache` for fast tests (no disk I/O).
     /// Skips `.with_engine_config()` so foyer treats storage as noop.
-    async fn memory_only_cache() -> HybridCache<Vec<u8>, Vec<u8>> {
+    async fn memory_only_cache() -> HybridCache<Vec<u8>, Bytes> {
         HybridCacheBuilder::new()
             .memory(1024 * 1024)
             .storage()
@@ -219,7 +220,7 @@ mod tests {
 
         backend.put(b"key", b"value").await.unwrap();
         let val = backend.get(b"key").await.unwrap();
-        assert_eq!(val, Some(b"value".to_vec()));
+        assert_eq!(val, Some(Bytes::from_static(b"value")));
 
         backend.close().await.unwrap();
     }
@@ -237,12 +238,12 @@ mod tests {
 
         // First read: L2 miss → L3 hit → backfill L2
         let val = backend.get(b"deep").await.unwrap();
-        assert_eq!(val, Some(b"value".to_vec()));
+        assert_eq!(val, Some(Bytes::from_static(b"value")));
 
         // Second read should hit L2 (we can't easily assert which layer,
         // but the value should still be correct)
         let val = backend.get(b"deep").await.unwrap();
-        assert_eq!(val, Some(b"value".to_vec()));
+        assert_eq!(val, Some(Bytes::from_static(b"value")));
 
         backend.close().await.unwrap();
     }
@@ -288,17 +289,26 @@ mod tests {
 
         // Write via op_a, read via op_a — should work.
         op_a.put(b"key", b"val_a").await.unwrap();
-        assert_eq!(op_a.get(b"key").await.unwrap(), Some(b"val_a".to_vec()));
+        assert_eq!(
+            op_a.get(b"key").await.unwrap(),
+            Some(Bytes::from_static(b"val_a"))
+        );
 
         // op_b's "key" is namespaced differently — should not see op_a's data.
         assert_eq!(op_b.get(b"key").await.unwrap(), None);
 
         // Write via op_b independently.
         op_b.put(b"key", b"val_b").await.unwrap();
-        assert_eq!(op_b.get(b"key").await.unwrap(), Some(b"val_b".to_vec()));
+        assert_eq!(
+            op_b.get(b"key").await.unwrap(),
+            Some(Bytes::from_static(b"val_b"))
+        );
 
         // op_a's data is unchanged.
-        assert_eq!(op_a.get(b"key").await.unwrap(), Some(b"val_a".to_vec()));
+        assert_eq!(
+            op_a.get(b"key").await.unwrap(),
+            Some(Bytes::from_static(b"val_a"))
+        );
 
         l3.close().await.unwrap();
     }
