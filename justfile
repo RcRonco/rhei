@@ -58,21 +58,21 @@ e2e-down:
 
 # Run Kafka E2E tests (requires: just e2e-up)
 e2e-kafka:
-    cargo test -p rill-runtime --features kafka --test kafka_e2e -- --nocapture
-    cargo test -p rill-runtime --features kafka --test kafka_cluster_e2e -- --nocapture
+    cargo test -p rhei-runtime --features kafka --test kafka_e2e -- --nocapture
+    cargo test -p rhei-runtime --features kafka --test kafka_cluster_e2e -- --nocapture
 
 # Run S3/MinIO E2E tests (requires: just e2e-up)
 e2e-s3:
     S3_ENDPOINT=http://localhost:9000 \
-    S3_BUCKET=rill-test \
+    S3_BUCKET=rhei-test \
     S3_ACCESS_KEY=minioadmin \
     S3_SECRET_KEY=minioadmin \
     S3_REGION=us-east-1 \
-    cargo test -p rill-runtime --features remote-state --test s3_e2e -- --nocapture
+    cargo test -p rhei-runtime --features remote-state --test s3_e2e -- --nocapture
 
 # Run checkpoint coordination E2E test (no external deps)
 e2e-checkpoint:
-    cargo test -p rill-runtime --test checkpoint_coord_e2e -- --nocapture
+    cargo test -p rhei-runtime --test checkpoint_coord_e2e -- --nocapture
 
 # ── CI (mirrors GitHub Actions) ─────────────────────────────────────
 

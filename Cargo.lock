@@ -2645,6 +2645,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "rhei"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "rhei-core",
+ "rhei-macros",
+ "rhei-runtime",
+ "serde",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "rhei-cli"
 version = "0.1.0"
 dependencies = [
@@ -2683,6 +2697,15 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "rhei-macros"
+version = "0.1.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.115",
 ]
 
 [[package]]
