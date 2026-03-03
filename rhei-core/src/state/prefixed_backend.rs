@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use bytes::Bytes;
 
 use super::backend::StateBackend;
 
@@ -41,7 +42,7 @@ impl PrefixedBackend {
 
 #[async_trait]
 impl StateBackend for PrefixedBackend {
-    async fn get(&self, key: &[u8]) -> anyhow::Result<Option<Vec<u8>>> {
+    async fn get(&self, key: &[u8]) -> anyhow::Result<Option<Bytes>> {
         self.inner.get(&self.prefixed_key(key)).await
     }
 
@@ -62,6 +63,7 @@ impl StateBackend for PrefixedBackend {
 mod tests {
     use super::*;
     use crate::state::local_backend::LocalBackend;
+    use bytes::Bytes;
 
     fn temp_path(name: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!("rhei_prefix_test_{name}_{}", std::process::id()))
@@ -86,13 +88,22 @@ mod tests {
         op_b.put(b"count", b"20").await.unwrap();
 
         // Each sees its own value
-        assert_eq!(op_a.get(b"count").await.unwrap(), Some(b"10".to_vec()));
-        assert_eq!(op_b.get(b"count").await.unwrap(), Some(b"20".to_vec()));
+        assert_eq!(
+            op_a.get(b"count").await.unwrap(),
+            Some(Bytes::from_static(b"10"))
+        );
+        assert_eq!(
+            op_b.get(b"count").await.unwrap(),
+            Some(Bytes::from_static(b"20"))
+        );
 
         // Delete from one doesn't affect the other
         op_a.delete(b"count").await.unwrap();
         assert_eq!(op_a.get(b"count").await.unwrap(), None);
-        assert_eq!(op_b.get(b"count").await.unwrap(), Some(b"20".to_vec()));
+        assert_eq!(
+            op_b.get(b"count").await.unwrap(),
+            Some(Bytes::from_static(b"20"))
+        );
 
         let _ = std::fs::remove_file(&path);
     }
@@ -110,7 +121,7 @@ mod tests {
 
         // The raw backend should have the prefixed key
         let raw = shared.get(b"myop/key").await.unwrap();
-        assert_eq!(raw, Some(b"val".to_vec()));
+        assert_eq!(raw, Some(Bytes::from_static(b"val")));
 
         // Non-prefixed key should not exist
         let raw = shared.get(b"key").await.unwrap();
@@ -124,7 +135,7 @@ mod tests {
 
     #[async_trait]
     impl<T: StateBackend> StateBackend for ArcBackend<T> {
-        async fn get(&self, key: &[u8]) -> anyhow::Result<Option<Vec<u8>>> {
+        async fn get(&self, key: &[u8]) -> anyhow::Result<Option<Bytes>> {
             self.0.get(key).await
         }
         async fn put(&self, key: &[u8], value: &[u8]) -> anyhow::Result<()> {

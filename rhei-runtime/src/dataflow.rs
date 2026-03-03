@@ -154,6 +154,7 @@ impl AnyItem {
     }
 
     /// Best-effort debug representation for DLQ diagnostics.
+    #[allow(dead_code)]
     pub(crate) fn debug_repr(&self) -> String {
         self.0.debug_repr()
     }
@@ -343,9 +344,16 @@ where
 /// Type-erased stateful operator. Must be cloneable for multi-worker.
 #[async_trait]
 pub(crate) trait ErasedOperator: Send {
+    #[allow(dead_code)]
     async fn process(
         &mut self,
         input: AnyItem,
+        ctx: &mut StateContext,
+    ) -> anyhow::Result<Vec<AnyItem>>;
+    /// Process a batch of inputs in a single async call.
+    async fn process_batch(
+        &mut self,
+        inputs: Vec<AnyItem>,
         ctx: &mut StateContext,
     ) -> anyhow::Result<Vec<AnyItem>>;
     /// Called when the global watermark advances.
@@ -374,6 +382,16 @@ where
     ) -> anyhow::Result<Vec<AnyItem>> {
         let typed: F::Input = input.downcast();
         let results = self.0.process(typed, ctx).await?;
+        Ok(results.into_iter().map(AnyItem::new).collect())
+    }
+
+    async fn process_batch(
+        &mut self,
+        inputs: Vec<AnyItem>,
+        ctx: &mut StateContext,
+    ) -> anyhow::Result<Vec<AnyItem>> {
+        let typed: Vec<F::Input> = inputs.into_iter().map(AnyItem::downcast).collect();
+        let results = self.0.process_batch(typed, ctx).await?;
         Ok(results.into_iter().map(AnyItem::new).collect())
     }
 

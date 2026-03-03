@@ -130,12 +130,25 @@ impl TimelyErasedOperator {
     /// we're running on a Timely worker thread (not a Tokio thread).
     ///
     /// Returns `(outputs, errors)`.
+    #[allow(dead_code)]
     pub fn process(
         &mut self,
         input: AnyItem,
         rt: &tokio::runtime::Handle,
     ) -> (Vec<AnyItem>, Vec<anyhow::Error>) {
         match rt.block_on(self.op.process(input, &mut self.ctx)) {
+            Ok(results) => (results, vec![]),
+            Err(e) => (vec![], vec![e]),
+        }
+    }
+
+    /// Process a batch of items with a single `block_on` call.
+    pub fn process_batch(
+        &mut self,
+        inputs: Vec<AnyItem>,
+        rt: &tokio::runtime::Handle,
+    ) -> (Vec<AnyItem>, Vec<anyhow::Error>) {
+        match rt.block_on(self.op.process_batch(inputs, &mut self.ctx)) {
             Ok(results) => (results, vec![]),
             Err(e) => (vec![], vec![e]),
         }

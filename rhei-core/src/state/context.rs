@@ -1,3 +1,7 @@
+use bytes::Bytes;
+use serde::Serialize;
+use serde::de::DeserializeOwned;
+
 use super::backend::StateBackend;
 use super::memtable::MemTable;
 
@@ -43,8 +47,22 @@ impl StateContext {
         self
     }
 
-    /// Get a value — checks memtable first, then falls back to backend.
-    pub async fn get(&mut self, key: &[u8]) -> anyhow::Result<Option<Vec<u8>>> {
+    /// Get a typed value — deserializes via bincode.
+    pub async fn get<V: DeserializeOwned>(&mut self, key: &[u8]) -> anyhow::Result<Option<V>> {
+        match self.get_raw(key).await? {
+            Some(bytes) => Ok(Some(bincode::deserialize(&bytes)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Put a typed value — serializes via bincode.
+    pub fn put<V: Serialize>(&mut self, key: &[u8], value: &V) {
+        let encoded = bincode::serialize(value).expect("bincode serialization failed");
+        self.put_raw(key, &encoded);
+    }
+
+    /// Get raw bytes — checks memtable first, then falls back to backend.
+    pub async fn get_raw(&mut self, key: &[u8]) -> anyhow::Result<Option<Bytes>> {
         if let Some(ref wl) = self.worker_label {
             metrics::counter!("state_gets_total", "worker" => wl.clone()).increment(1);
         } else {
@@ -88,14 +106,15 @@ impl StateContext {
         result
     }
 
-    /// Put a value — writes to memtable only (synchronous).
-    pub fn put(&mut self, key: &[u8], value: &[u8]) {
+    /// Put raw bytes — writes to memtable only (synchronous).
+    pub fn put_raw(&mut self, key: &[u8], value: &[u8]) {
         if let Some(ref wl) = self.worker_label {
             metrics::counter!("state_puts_total", "worker" => wl.clone()).increment(1);
         } else {
             metrics::counter!("state_puts_total").increment(1);
         }
-        self.memtable.put(key.to_vec(), value.to_vec());
+        self.memtable
+            .put(key.to_vec(), Bytes::copy_from_slice(value));
     }
 
     /// Delete a key — marks as deleted in memtable.
@@ -144,53 +163,56 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn read_your_own_writes() {
-        let path = temp_path("ryw");
+    async fn typed_read_your_own_writes() {
+        let path = temp_path("typed_ryw");
         let _ = std::fs::remove_file(&path);
 
         let backend = LocalBackend::new(path.clone(), None).unwrap();
         let mut ctx = StateContext::new(Box::new(backend));
 
-        ctx.put(b"key", b"value");
-        let val = ctx.get(b"key").await.unwrap();
-        assert_eq!(val, Some(b"value".to_vec()));
+        ctx.put(b"count", &42u64);
+        let val: Option<u64> = ctx.get(b"count").await.unwrap();
+        assert_eq!(val, Some(42));
 
         let _ = std::fs::remove_file(&path);
     }
 
     #[tokio::test]
-    async fn read_falls_through_to_backend() {
-        let path = temp_path("fallthrough");
+    async fn raw_read_your_own_writes() {
+        let path = temp_path("raw_ryw");
         let _ = std::fs::remove_file(&path);
 
-        // Pre-populate the backend
         let backend = LocalBackend::new(path.clone(), None).unwrap();
-        backend.put(b"backend_key", b"backend_val").await.unwrap();
-
         let mut ctx = StateContext::new(Box::new(backend));
-        let val = ctx.get(b"backend_key").await.unwrap();
-        assert_eq!(val, Some(b"backend_val".to_vec()));
+
+        ctx.put_raw(b"key", b"value");
+        let val = ctx.get_raw(b"key").await.unwrap();
+        assert_eq!(val.as_deref(), Some(b"value".as_slice()));
 
         let _ = std::fs::remove_file(&path);
     }
 
     #[tokio::test]
-    async fn checkpoint_persists_to_backend() {
-        let path = temp_path("ckpt");
+    async fn typed_checkpoint_roundtrip() {
+        let path = temp_path("typed_ckpt");
         let _ = std::fs::remove_file(&path);
 
         {
             let backend = LocalBackend::new(path.clone(), None).unwrap();
             let mut ctx = StateContext::new(Box::new(backend));
-            ctx.put(b"a", b"1");
-            ctx.put(b"b", b"2");
+            ctx.put(b"a", &100u64);
+            ctx.put(b"b", &"hello".to_string());
             ctx.checkpoint().await.unwrap();
         }
 
-        // Verify persistence via a new backend
+        // Reopen and verify via a fresh context
         let backend = LocalBackend::new(path.clone(), None).unwrap();
-        assert_eq!(backend.get(b"a").await.unwrap(), Some(b"1".to_vec()));
-        assert_eq!(backend.get(b"b").await.unwrap(), Some(b"2".to_vec()));
+        let mut ctx = StateContext::new(Box::new(backend));
+        assert_eq!(ctx.get::<u64>(b"a").await.unwrap(), Some(100));
+        assert_eq!(
+            ctx.get::<String>(b"b").await.unwrap().as_deref(),
+            Some("hello")
+        );
 
         let _ = std::fs::remove_file(&path);
     }
@@ -205,7 +227,7 @@ mod tests {
 
         let mut ctx = StateContext::new(Box::new(backend));
         ctx.delete(b"key");
-        let val = ctx.get(b"key").await.unwrap();
+        let val = ctx.get_raw(b"key").await.unwrap();
         assert_eq!(val, None);
 
         let _ = std::fs::remove_file(&path);

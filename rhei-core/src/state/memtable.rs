@@ -1,5 +1,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 
+use bytes::Bytes;
+
 /// Configuration for bounding the L1 `MemTable` size.
 #[derive(Debug, Clone)]
 pub struct MemTableConfig {
@@ -27,7 +29,7 @@ impl Default for MemTableConfig {
 /// evicted in LRU order to bound memory usage per [`MemTableConfig`].
 #[derive(Debug)]
 pub struct MemTable {
-    data: HashMap<Vec<u8>, Option<Vec<u8>>>,
+    data: HashMap<Vec<u8>, Option<Bytes>>,
     dirty: HashSet<Vec<u8>>,
     config: MemTableConfig,
     /// LRU queue tracking access order for clean entries only.
@@ -58,7 +60,7 @@ impl MemTable {
     /// tombstone, or `Some(Some(v))` for a value.
     ///
     /// On hit of a clean entry, promotes it in the LRU queue.
-    pub fn get(&mut self, key: &[u8]) -> Option<Option<&Vec<u8>>> {
+    pub fn get(&mut self, key: &[u8]) -> Option<Option<&Bytes>> {
         // Check existence first to avoid borrow issues.
         if !self.data.contains_key(key) {
             return None;
@@ -73,12 +75,12 @@ impl MemTable {
     }
 
     /// Inserts a key-value pair and marks the key as dirty.
-    pub fn put(&mut self, key: Vec<u8>, value: Vec<u8>) {
+    pub fn put(&mut self, key: Vec<u8>, value: Bytes) {
         let new_bytes = key.len() + value.len();
 
         // Subtract old entry size if overwriting.
         if let Some(old_value) = self.data.get(&key) {
-            let old_bytes = key.len() + old_value.as_ref().map_or(0, Vec::len);
+            let old_bytes = key.len() + old_value.as_ref().map_or(0, Bytes::len);
             self.approx_bytes = self.approx_bytes.saturating_sub(old_bytes);
         }
 
@@ -98,7 +100,7 @@ impl MemTable {
 
         // Subtract old entry size if overwriting.
         if let Some(old_value) = self.data.get(&key) {
-            let old_bytes = key.len() + old_value.as_ref().map_or(0, Vec::len);
+            let old_bytes = key.len() + old_value.as_ref().map_or(0, Bytes::len);
             self.approx_bytes = self.approx_bytes.saturating_sub(old_bytes);
         }
 
@@ -117,8 +119,8 @@ impl MemTable {
     ///
     /// After flush, all remaining entries are clean. The LRU queue is rebuilt
     /// from `data.keys()` so that previously-dirty entries become evictable.
-    pub fn flush(&mut self) -> Vec<(Vec<u8>, Option<Vec<u8>>)> {
-        let entries: Vec<(Vec<u8>, Option<Vec<u8>>)> = self
+    pub fn flush(&mut self) -> Vec<(Vec<u8>, Option<Bytes>)> {
+        let entries: Vec<(Vec<u8>, Option<Bytes>)> = self
             .dirty
             .drain()
             .filter_map(|key| {
@@ -137,7 +139,7 @@ impl MemTable {
     }
 
     /// Load data from the backend into the memtable (only for keys not already present).
-    pub fn merge(&mut self, key: Vec<u8>, value: Vec<u8>) {
+    pub fn merge(&mut self, key: Vec<u8>, value: Bytes) {
         if self.data.contains_key(&key) {
             return;
         }
@@ -164,7 +166,7 @@ impl MemTable {
                 continue;
             }
             if let Some(entry) = self.data.remove(&key) {
-                let entry_bytes = key.len() + entry.as_ref().map_or(0, Vec::len);
+                let entry_bytes = key.len() + entry.as_ref().map_or(0, Bytes::len);
                 self.approx_bytes = self.approx_bytes.saturating_sub(entry_bytes);
             }
         }
@@ -199,8 +201,8 @@ mod tests {
     #[test]
     fn put_get_roundtrip() {
         let mut mt = MemTable::new();
-        mt.put(b"key1".to_vec(), b"val1".to_vec());
-        assert_eq!(mt.get(b"key1"), Some(Some(&b"val1".to_vec())));
+        mt.put(b"key1".to_vec(), Bytes::from_static(b"val1"));
+        assert_eq!(mt.get(b"key1"), Some(Some(&Bytes::from_static(b"val1"))));
     }
 
     #[test]
@@ -212,7 +214,7 @@ mod tests {
     #[test]
     fn delete_marks_tombstone() {
         let mut mt = MemTable::new();
-        mt.put(b"key1".to_vec(), b"val1".to_vec());
+        mt.put(b"key1".to_vec(), Bytes::from_static(b"val1"));
         mt.delete(b"key1".to_vec());
         // Should return Some(None) indicating the key was explicitly deleted
         assert_eq!(mt.get(b"key1"), Some(None));
@@ -221,16 +223,16 @@ mod tests {
     #[test]
     fn flush_returns_dirty_entries() {
         let mut mt = MemTable::new();
-        mt.put(b"a".to_vec(), b"1".to_vec());
-        mt.put(b"b".to_vec(), b"2".to_vec());
+        mt.put(b"a".to_vec(), Bytes::from_static(b"1"));
+        mt.put(b"b".to_vec(), Bytes::from_static(b"2"));
         mt.delete(b"c".to_vec());
 
         let mut flushed = mt.flush();
         flushed.sort_by(|a, b| a.0.cmp(&b.0));
 
         assert_eq!(flushed.len(), 3);
-        assert_eq!(flushed[0], (b"a".to_vec(), Some(b"1".to_vec())));
-        assert_eq!(flushed[1], (b"b".to_vec(), Some(b"2".to_vec())));
+        assert_eq!(flushed[0], (b"a".to_vec(), Some(Bytes::from_static(b"1"))));
+        assert_eq!(flushed[1], (b"b".to_vec(), Some(Bytes::from_static(b"2"))));
         assert_eq!(flushed[2], (b"c".to_vec(), None));
 
         // Second flush should be empty
@@ -240,16 +242,16 @@ mod tests {
     #[test]
     fn merge_does_not_overwrite() {
         let mut mt = MemTable::new();
-        mt.put(b"key".to_vec(), b"local".to_vec());
-        mt.merge(b"key".to_vec(), b"backend".to_vec());
-        assert_eq!(mt.get(b"key"), Some(Some(&b"local".to_vec())));
+        mt.put(b"key".to_vec(), Bytes::from_static(b"local"));
+        mt.merge(b"key".to_vec(), Bytes::from_static(b"backend"));
+        assert_eq!(mt.get(b"key"), Some(Some(&Bytes::from_static(b"local"))));
     }
 
     #[test]
     fn merge_fills_missing() {
         let mut mt = MemTable::new();
-        mt.merge(b"key".to_vec(), b"backend".to_vec());
-        assert_eq!(mt.get(b"key"), Some(Some(&b"backend".to_vec())));
+        mt.merge(b"key".to_vec(), Bytes::from_static(b"backend"));
+        assert_eq!(mt.get(b"key"), Some(Some(&Bytes::from_static(b"backend"))));
     }
 
     #[test]
@@ -261,13 +263,13 @@ mod tests {
         let mut mt = MemTable::with_config(config);
 
         // Merge 4 clean entries — should evict the oldest one.
-        mt.merge(b"a".to_vec(), b"1".to_vec());
-        mt.merge(b"b".to_vec(), b"2".to_vec());
-        mt.merge(b"c".to_vec(), b"3".to_vec());
+        mt.merge(b"a".to_vec(), Bytes::from_static(b"1"));
+        mt.merge(b"b".to_vec(), Bytes::from_static(b"2"));
+        mt.merge(b"c".to_vec(), Bytes::from_static(b"3"));
         // At this point we have 3 entries = max_entries, no eviction yet.
         assert_eq!(mt.data.len(), 3);
 
-        mt.merge(b"d".to_vec(), b"4".to_vec());
+        mt.merge(b"d".to_vec(), Bytes::from_static(b"4"));
         // Now we exceeded max_entries — "a" (oldest LRU entry) should be evicted.
         assert_eq!(mt.data.len(), 3);
         assert!(mt.get(b"a").is_none());
@@ -285,9 +287,9 @@ mod tests {
         let mut mt = MemTable::with_config(config);
 
         // Put 3 entries (all dirty). None should be evicted.
-        mt.put(b"a".to_vec(), b"1".to_vec());
-        mt.put(b"b".to_vec(), b"2".to_vec());
-        mt.put(b"c".to_vec(), b"3".to_vec());
+        mt.put(b"a".to_vec(), Bytes::from_static(b"1"));
+        mt.put(b"b".to_vec(), Bytes::from_static(b"2"));
+        mt.put(b"c".to_vec(), Bytes::from_static(b"3"));
 
         // All 3 dirty entries survive even though max_entries=2.
         assert!(mt.get(b"a").is_some());
@@ -304,15 +306,15 @@ mod tests {
         };
         let mut mt = MemTable::with_config(config);
 
-        mt.merge(b"a".to_vec(), b"1".to_vec());
-        mt.merge(b"b".to_vec(), b"2".to_vec());
-        mt.merge(b"c".to_vec(), b"3".to_vec());
+        mt.merge(b"a".to_vec(), Bytes::from_static(b"1"));
+        mt.merge(b"b".to_vec(), Bytes::from_static(b"2"));
+        mt.merge(b"c".to_vec(), Bytes::from_static(b"3"));
 
         // Access "a" to promote it — now LRU order is b, c, a.
         let _ = mt.get(b"a");
 
         // Insert a 4th entry — "b" (oldest untouched) should be evicted.
-        mt.merge(b"d".to_vec(), b"4".to_vec());
+        mt.merge(b"d".to_vec(), Bytes::from_static(b"4"));
         assert!(
             mt.get(b"b").is_none(),
             "b should have been evicted (oldest)"
@@ -334,15 +336,15 @@ mod tests {
         let mut mt = MemTable::with_config(config);
 
         // Put 2 dirty entries.
-        mt.put(b"a".to_vec(), b"1".to_vec());
-        mt.put(b"b".to_vec(), b"2".to_vec());
+        mt.put(b"a".to_vec(), Bytes::from_static(b"1"));
+        mt.put(b"b".to_vec(), Bytes::from_static(b"2"));
 
         // Flush — now both are clean and in LRU.
         let _ = mt.flush();
         assert_eq!(mt.data.len(), 2);
 
         // Merge a 3rd entry — should evict one of the now-clean entries.
-        mt.merge(b"c".to_vec(), b"3".to_vec());
+        mt.merge(b"c".to_vec(), Bytes::from_static(b"3"));
         assert_eq!(
             mt.data.len(),
             2,

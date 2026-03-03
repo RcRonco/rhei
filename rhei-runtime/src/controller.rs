@@ -657,14 +657,8 @@ mod tests {
             let mut outputs = Vec::new();
             for word in input.split_whitespace() {
                 let key = word.as_bytes();
-                let count = match ctx.get(key).await.unwrap_or(None) {
-                    Some(bytes) => {
-                        let n = u64::from_le_bytes(bytes.try_into().unwrap_or([0; 8]));
-                        n + 1
-                    }
-                    None => 1,
-                };
-                ctx.put(key, &count.to_le_bytes());
+                let count = ctx.get::<u64>(key).await.unwrap_or(None).unwrap_or(0) + 1;
+                ctx.put(key, &count);
                 outputs.push(format!("{word}: {count}"));
             }
             Ok(outputs)

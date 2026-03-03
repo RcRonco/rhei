@@ -4,6 +4,7 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use bytes::Bytes;
 
 use super::backend::StateBackend;
 
@@ -48,10 +49,10 @@ impl LocalBackend {
 
 #[async_trait]
 impl StateBackend for LocalBackend {
-    async fn get(&self, key: &[u8]) -> anyhow::Result<Option<Vec<u8>>> {
+    async fn get(&self, key: &[u8]) -> anyhow::Result<Option<Bytes>> {
         self.maybe_sleep().await;
         let data = self.data.lock().unwrap();
-        Ok(data.get(key).cloned())
+        Ok(data.get(key).map(|v| Bytes::from(v.clone())))
     }
 
     async fn put(&self, key: &[u8], value: &[u8]) -> anyhow::Result<()> {
@@ -85,6 +86,7 @@ impl StateBackend for LocalBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::Bytes;
     use std::path::PathBuf;
 
     fn temp_path(name: &str) -> PathBuf {
@@ -99,7 +101,7 @@ mod tests {
         let backend = LocalBackend::new(path.clone(), None).unwrap();
         backend.put(b"hello", b"world").await.unwrap();
         let val = backend.get(b"hello").await.unwrap();
-        assert_eq!(val, Some(b"world".to_vec()));
+        assert_eq!(val, Some(Bytes::from_static(b"world")));
 
         let _ = std::fs::remove_file(&path);
     }
@@ -118,8 +120,14 @@ mod tests {
 
         // Load from disk
         let backend = LocalBackend::new(path.clone(), None).unwrap();
-        assert_eq!(backend.get(b"key1").await.unwrap(), Some(b"val1".to_vec()));
-        assert_eq!(backend.get(b"key2").await.unwrap(), Some(b"val2".to_vec()));
+        assert_eq!(
+            backend.get(b"key1").await.unwrap(),
+            Some(Bytes::from_static(b"val1"))
+        );
+        assert_eq!(
+            backend.get(b"key2").await.unwrap(),
+            Some(Bytes::from_static(b"val2"))
+        );
 
         let _ = std::fs::remove_file(&path);
     }
