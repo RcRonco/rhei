@@ -77,7 +77,7 @@ impl StateContext {
                 } else {
                     metrics::counter!("state_l1_hits_total").increment(1);
                 }
-                Ok(Some(v.clone()))
+                Ok(Some(v))
             }
             Some(None) => {
                 if let Some(ref wl) = self.worker_label {

@@ -18,6 +18,7 @@ object_store.workspace = true
 bytes.workspace = true
 tracing.workspace = true
 metrics.workspace = true
+moka.workspace = true
 rdkafka = { workspace = true, optional = true }
 
 [features]

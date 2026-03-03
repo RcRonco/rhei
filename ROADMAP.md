@@ -60,7 +60,7 @@
 - [x] Batch-level processing in operators (process `Vec<Input>` instead of element-at-a-time)
 - [x] Zero-copy state reads (`Bytes` instead of `Vec<u8>` cloning)
 - [ ] Reusable per-operator buffers to avoid repeated `Vec` allocation in batch processing
-- [ ] Memtable compaction and eviction policies (bounded memory) (KI-7)
+- [x] Memtable compaction and eviction policies (bounded memory) (KI-7)
 - [ ] Async state prefetch — predict upcoming keys and warm L2/L3 cache
 - [ ] Columnar in-memory representation for windowed aggregations
 - [ ] Benchmark suite with throughput/latency targets

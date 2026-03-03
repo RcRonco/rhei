@@ -1,14 +1,15 @@
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::HashMap;
 
 use bytes::Bytes;
+use moka::sync::Cache;
 
 /// Configuration for bounding the L1 `MemTable` size.
 #[derive(Debug, Clone)]
 pub struct MemTableConfig {
-    /// Maximum approximate bytes (key + value sizes) before evicting clean entries.
+    /// Maximum approximate bytes for the clean entry cache.
     /// Default: 32 MiB.
     pub max_bytes: usize,
-    /// Maximum number of entries before evicting clean entries.
+    /// Maximum number of entries in the clean entry cache.
     /// Default: 500,000.
     pub max_entries: usize,
 }
@@ -22,21 +23,59 @@ impl Default for MemTableConfig {
     }
 }
 
-/// L1 in-memory write buffer with dirty tracking and LRU eviction.
+/// L1 in-memory write buffer with dirty tracking and W-TinyLFU eviction.
 ///
-/// All writes go here first (synchronous, fast). Dirty keys are flushed to the
-/// backend during checkpoint. Clean entries (already persisted to L2/L3) are
-/// evicted in LRU order to bound memory usage per [`MemTableConfig`].
-#[derive(Debug)]
+/// Dirty entries (written since last flush) live in a `HashMap` and are never
+/// evicted. Clean entries (already persisted to L2/L3) live in a [`moka`] cache
+/// with W-TinyLFU admission and eviction to bound memory usage per
+/// [`MemTableConfig`].
 pub struct MemTable {
-    data: HashMap<Vec<u8>, Option<Bytes>>,
-    dirty: HashSet<Vec<u8>>,
-    config: MemTableConfig,
-    /// LRU queue tracking access order for clean entries only.
-    /// Front = oldest (evict first), back = most recently accessed.
-    lru: VecDeque<Vec<u8>>,
-    /// Running tally of `key.len() + value.len()` for all entries in `data`.
-    approx_bytes: usize,
+    /// Dirty entries not yet flushed to the backend. Never evicted.
+    dirty: HashMap<Vec<u8>, Option<Bytes>>,
+    /// Clean entry cache with W-TinyLFU eviction policy.
+    clean: Cache<Vec<u8>, Bytes>,
+}
+
+impl std::fmt::Debug for MemTable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MemTable")
+            .field("dirty_count", &self.dirty.len())
+            .field("clean_count", &self.clean.entry_count())
+            .finish()
+    }
+}
+
+/// Build the moka clean cache from config.
+///
+/// When `max_bytes` is `usize::MAX` (i.e. byte-bounding is disabled), the cache
+/// uses entry-count based eviction via `max_entries`. Otherwise byte-weighted
+/// eviction is used, with a minimum weight per entry derived from
+/// `max_bytes / max_entries` to enforce the entry count limit as well.
+fn build_clean_cache(config: &MemTableConfig) -> Cache<Vec<u8>, Bytes> {
+    if config.max_bytes == usize::MAX {
+        // Entry count-based eviction only (used in tests with unbounded bytes).
+        Cache::builder()
+            .max_capacity(config.max_entries as u64)
+            .build()
+    } else {
+        // Byte-weighted eviction. A minimum weight per entry also enforces
+        // the entry count limit: `max_entries` entries × `min_weight` ≈ `max_bytes`.
+        let max_bytes = config.max_bytes;
+        let max_entries = config.max_entries;
+        let min_weight = if max_entries > 0 {
+            (max_bytes / max_entries).max(1)
+        } else {
+            1
+        };
+
+        Cache::builder()
+            .max_capacity(max_bytes as u64)
+            .weigher(move |key: &Vec<u8>, value: &Bytes| -> u32 {
+                let actual = key.len() + value.len();
+                u32::try_from(actual.max(min_weight)).unwrap_or(u32::MAX)
+            })
+            .build()
+    }
 }
 
 impl MemTable {
@@ -47,144 +86,71 @@ impl MemTable {
 
     /// Creates a memtable with the given configuration.
     pub fn with_config(config: MemTableConfig) -> Self {
+        let clean = build_clean_cache(&config);
         Self {
-            data: HashMap::new(),
-            dirty: HashSet::new(),
-            config,
-            lru: VecDeque::new(),
-            approx_bytes: 0,
+            dirty: HashMap::new(),
+            clean,
         }
     }
 
     /// Looks up a key. Returns `None` on cache miss, `Some(None)` for a
     /// tombstone, or `Some(Some(v))` for a value.
-    ///
-    /// On hit of a clean entry, promotes it in the LRU queue.
-    pub fn get(&mut self, key: &[u8]) -> Option<Option<&Bytes>> {
-        // Check existence first to avoid borrow issues.
-        if !self.data.contains_key(key) {
-            return None;
+    pub fn get(&self, key: &[u8]) -> Option<Option<Bytes>> {
+        // Check dirty map first (read-your-own-writes).
+        if let Some(value) = self.dirty.get(key) {
+            return Some(value.clone());
         }
 
-        // Promote clean entries in LRU (dirty entries aren't tracked in LRU).
-        if !self.dirty.contains(key) {
-            self.lru_promote(key);
-        }
-
-        self.data.get(key).map(|v| v.as_ref())
+        // Check clean cache.
+        self.clean.get(&key.to_vec()).map(Some)
     }
 
     /// Inserts a key-value pair and marks the key as dirty.
     pub fn put(&mut self, key: Vec<u8>, value: Bytes) {
-        let new_bytes = key.len() + value.len();
-
-        // Subtract old entry size if overwriting.
-        if let Some(old_value) = self.data.get(&key) {
-            let old_bytes = key.len() + old_value.as_ref().map_or(0, Bytes::len);
-            self.approx_bytes = self.approx_bytes.saturating_sub(old_bytes);
-        }
-
-        // If this key was clean (in LRU), remove it — it's now dirty.
-        if !self.dirty.contains(&key) {
-            self.lru_remove(&key);
-        }
-
-        self.dirty.insert(key.clone());
-        self.data.insert(key, Some(value));
-        self.approx_bytes += new_bytes;
+        // Remove from clean cache — this key is now dirty.
+        self.clean.invalidate(&key);
+        self.dirty.insert(key, Some(value));
     }
 
     /// Records a tombstone for the key and marks it as dirty.
     pub fn delete(&mut self, key: Vec<u8>) {
-        let new_bytes = key.len(); // tombstone: key only, no value
-
-        // Subtract old entry size if overwriting.
-        if let Some(old_value) = self.data.get(&key) {
-            let old_bytes = key.len() + old_value.as_ref().map_or(0, Bytes::len);
-            self.approx_bytes = self.approx_bytes.saturating_sub(old_bytes);
-        }
-
-        // If this key was clean (in LRU), remove it — it's now dirty.
-        if !self.dirty.contains(&key) {
-            self.lru_remove(&key);
-        }
-
-        self.dirty.insert(key.clone());
-        self.data.insert(key, None);
-        self.approx_bytes += new_bytes;
+        // Remove from clean cache — this key is now dirty.
+        self.clean.invalidate(&key);
+        self.dirty.insert(key, None);
     }
 
-    /// Returns dirty entries and clears the dirty set.
-    /// Each entry is `(key, Option<value>)` — `None` means the key was deleted.
-    ///
-    /// After flush, all remaining entries are clean. The LRU queue is rebuilt
-    /// from `data.keys()` so that previously-dirty entries become evictable.
+    /// Returns dirty entries and clears the dirty set. Flushed values
+    /// (non-tombstones) are moved into the clean cache so they remain
+    /// available for reads.
     pub fn flush(&mut self) -> Vec<(Vec<u8>, Option<Bytes>)> {
-        let entries: Vec<(Vec<u8>, Option<Bytes>)> = self
-            .dirty
-            .drain()
-            .filter_map(|key| {
-                let value = self.data.get(&key)?.clone();
-                Some((key, value))
-            })
-            .collect();
+        let entries: Vec<(Vec<u8>, Option<Bytes>)> = self.dirty.drain().collect();
 
-        // After flush, all remaining entries are clean — rebuild LRU.
-        self.lru.clear();
-        for key in self.data.keys() {
-            self.lru.push_back(key.clone());
+        // Move flushed values into the clean cache. Tombstones are not cached —
+        // after the backend processes the delete, a cache miss will correctly
+        // fall through to the backend which returns None.
+        for (key, value) in &entries {
+            if let Some(v) = value {
+                self.clean.insert(key.clone(), v.clone());
+            }
         }
 
         entries
     }
 
-    /// Load data from the backend into the memtable (only for keys not already present).
+    /// Load data from the backend into the clean cache (only for keys not
+    /// already present).
     pub fn merge(&mut self, key: Vec<u8>, value: Bytes) {
-        if self.data.contains_key(&key) {
+        // Don't overwrite dirty entries (read-your-own-writes).
+        if self.dirty.contains_key(&key) {
             return;
         }
 
-        let entry_bytes = key.len() + value.len();
-        self.approx_bytes += entry_bytes;
-
-        // New merged entry is clean — add to LRU.
-        self.lru.push_back(key.clone());
-
-        self.data.insert(key, Some(value));
-        self.maybe_evict();
-    }
-
-    /// Evict the oldest clean entries until we're within configured limits.
-    fn maybe_evict(&mut self) {
-        while (self.approx_bytes > self.config.max_bytes
-            || self.data.len() > self.config.max_entries)
-            && !self.lru.is_empty()
-        {
-            let key = self.lru.pop_front().unwrap();
-            if self.dirty.contains(&key) {
-                // Dirty entry shouldn't be in LRU, but be safe — skip.
-                continue;
-            }
-            if let Some(entry) = self.data.remove(&key) {
-                let entry_bytes = key.len() + entry.as_ref().map_or(0, Bytes::len);
-                self.approx_bytes = self.approx_bytes.saturating_sub(entry_bytes);
-            }
+        // Don't re-insert if already in clean cache.
+        if self.clean.contains_key(&key) {
+            return;
         }
-    }
 
-    /// Promote a key to the back of the LRU queue (most recently used).
-    fn lru_promote(&mut self, key: &[u8]) {
-        if let Some(pos) = self.lru.iter().position(|k| k.as_slice() == key) {
-            self.lru.remove(pos);
-            self.lru.push_back(key.to_vec());
-        }
-    }
-
-    /// Remove a key from the LRU queue.
-    fn lru_remove(&mut self, key: &[u8]) {
-        if let Some(pos) = self.lru.iter().position(|k| k.as_slice() == key) {
-            self.lru.remove(pos);
-        }
+        self.clean.insert(key, value);
     }
 }
 
@@ -202,12 +168,12 @@ mod tests {
     fn put_get_roundtrip() {
         let mut mt = MemTable::new();
         mt.put(b"key1".to_vec(), Bytes::from_static(b"val1"));
-        assert_eq!(mt.get(b"key1"), Some(Some(&Bytes::from_static(b"val1"))));
+        assert_eq!(mt.get(b"key1"), Some(Some(Bytes::from_static(b"val1"))));
     }
 
     #[test]
     fn get_miss() {
-        let mut mt = MemTable::new();
+        let mt = MemTable::new();
         assert_eq!(mt.get(b"missing"), None);
     }
 
@@ -216,7 +182,7 @@ mod tests {
         let mut mt = MemTable::new();
         mt.put(b"key1".to_vec(), Bytes::from_static(b"val1"));
         mt.delete(b"key1".to_vec());
-        // Should return Some(None) indicating the key was explicitly deleted
+        // Should return Some(None) indicating the key was explicitly deleted.
         assert_eq!(mt.get(b"key1"), Some(None));
     }
 
@@ -235,7 +201,7 @@ mod tests {
         assert_eq!(flushed[1], (b"b".to_vec(), Some(Bytes::from_static(b"2"))));
         assert_eq!(flushed[2], (b"c".to_vec(), None));
 
-        // Second flush should be empty
+        // Second flush should be empty.
         assert!(mt.flush().is_empty());
     }
 
@@ -244,38 +210,38 @@ mod tests {
         let mut mt = MemTable::new();
         mt.put(b"key".to_vec(), Bytes::from_static(b"local"));
         mt.merge(b"key".to_vec(), Bytes::from_static(b"backend"));
-        assert_eq!(mt.get(b"key"), Some(Some(&Bytes::from_static(b"local"))));
+        assert_eq!(mt.get(b"key"), Some(Some(Bytes::from_static(b"local"))));
     }
 
     #[test]
     fn merge_fills_missing() {
         let mut mt = MemTable::new();
         mt.merge(b"key".to_vec(), Bytes::from_static(b"backend"));
-        assert_eq!(mt.get(b"key"), Some(Some(&Bytes::from_static(b"backend"))));
+        assert_eq!(mt.get(b"key"), Some(Some(Bytes::from_static(b"backend"))));
     }
 
     #[test]
-    fn eviction_when_over_max_entries() {
+    fn eviction_bounds_clean_entries() {
         let config = MemTableConfig {
             max_bytes: usize::MAX,
             max_entries: 3,
         };
         let mut mt = MemTable::with_config(config);
 
-        // Merge 4 clean entries — should evict the oldest one.
+        // Merge 4 clean entries — should evict to stay within max_entries.
         mt.merge(b"a".to_vec(), Bytes::from_static(b"1"));
         mt.merge(b"b".to_vec(), Bytes::from_static(b"2"));
         mt.merge(b"c".to_vec(), Bytes::from_static(b"3"));
-        // At this point we have 3 entries = max_entries, no eviction yet.
-        assert_eq!(mt.data.len(), 3);
+        mt.clean.run_pending_tasks();
+        assert_eq!(mt.clean.entry_count(), 3);
 
         mt.merge(b"d".to_vec(), Bytes::from_static(b"4"));
-        // Now we exceeded max_entries — "a" (oldest LRU entry) should be evicted.
-        assert_eq!(mt.data.len(), 3);
-        assert!(mt.get(b"a").is_none());
-        assert!(mt.get(b"b").is_some());
-        assert!(mt.get(b"c").is_some());
-        assert!(mt.get(b"d").is_some());
+        mt.clean.run_pending_tasks();
+        assert!(
+            mt.clean.entry_count() <= 3,
+            "clean cache should not exceed max_entries, got {}",
+            mt.clean.entry_count()
+        );
     }
 
     #[test]
@@ -295,36 +261,7 @@ mod tests {
         assert!(mt.get(b"a").is_some());
         assert!(mt.get(b"b").is_some());
         assert!(mt.get(b"c").is_some());
-        assert_eq!(mt.data.len(), 3);
-    }
-
-    #[test]
-    fn lru_evicts_oldest_first() {
-        let config = MemTableConfig {
-            max_bytes: usize::MAX,
-            max_entries: 3,
-        };
-        let mut mt = MemTable::with_config(config);
-
-        mt.merge(b"a".to_vec(), Bytes::from_static(b"1"));
-        mt.merge(b"b".to_vec(), Bytes::from_static(b"2"));
-        mt.merge(b"c".to_vec(), Bytes::from_static(b"3"));
-
-        // Access "a" to promote it — now LRU order is b, c, a.
-        let _ = mt.get(b"a");
-
-        // Insert a 4th entry — "b" (oldest untouched) should be evicted.
-        mt.merge(b"d".to_vec(), Bytes::from_static(b"4"));
-        assert!(
-            mt.get(b"b").is_none(),
-            "b should have been evicted (oldest)"
-        );
-        assert!(
-            mt.get(b"a").is_some(),
-            "a should survive (recently accessed)"
-        );
-        assert!(mt.get(b"c").is_some());
-        assert!(mt.get(b"d").is_some());
+        assert_eq!(mt.dirty.len(), 3);
     }
 
     #[test]
@@ -339,17 +276,56 @@ mod tests {
         mt.put(b"a".to_vec(), Bytes::from_static(b"1"));
         mt.put(b"b".to_vec(), Bytes::from_static(b"2"));
 
-        // Flush — now both are clean and in LRU.
+        // Flush — now both are clean and in moka cache.
         let _ = mt.flush();
-        assert_eq!(mt.data.len(), 2);
+        mt.clean.run_pending_tasks();
+        assert!(mt.dirty.is_empty());
+        assert_eq!(mt.clean.entry_count(), 2);
 
-        // Merge a 3rd entry — should evict one of the now-clean entries.
+        // Merge a 3rd entry — the cache should stay bounded. With W-TinyLFU
+        // admission, the new entry may itself be rejected if existing entries
+        // have higher estimated frequency, which is fine — the key invariant
+        // is that flushed entries became evictable.
         mt.merge(b"c".to_vec(), Bytes::from_static(b"3"));
-        assert_eq!(
-            mt.data.len(),
-            2,
-            "should have evicted to stay at max_entries"
+        mt.clean.run_pending_tasks();
+        assert!(
+            mt.clean.entry_count() <= 2,
+            "should have evicted to stay at max_entries, got {}",
+            mt.clean.entry_count()
         );
-        assert!(mt.get(b"c").is_some(), "newly merged entry should exist");
+    }
+
+    #[test]
+    fn byte_weighted_eviction() {
+        // Use a small byte budget — entries are evicted by total weight.
+        let config = MemTableConfig {
+            max_bytes: 100,
+            max_entries: 1_000,
+        };
+        let mut mt = MemTable::with_config(config);
+
+        // Insert entries that total ~80 bytes (key 4 + value 16 = 20 each).
+        for i in 0u32..4 {
+            let key = format!("k{i:>3}").into_bytes();
+            mt.merge(key, Bytes::from(vec![0u8; 16]));
+        }
+        mt.clean.run_pending_tasks();
+
+        // All 4 should fit (~80 bytes < 100 byte budget).
+        assert_eq!(mt.clean.entry_count(), 4);
+
+        // Add more entries to exceed the budget.
+        for i in 4u32..10 {
+            let key = format!("k{i:>3}").into_bytes();
+            mt.merge(key, Bytes::from(vec![0u8; 16]));
+        }
+        mt.clean.run_pending_tasks();
+
+        // Cache should be bounded around the byte budget.
+        let weighted = mt.clean.weighted_size();
+        assert!(
+            weighted <= 120, // allow some slack for async eviction
+            "weighted size {weighted} should be near max_bytes=100"
+        );
     }
 }

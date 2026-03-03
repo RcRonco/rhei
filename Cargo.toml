@@ -21,6 +21,7 @@ bytes = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 metrics = "0.24"
+moka = { version = "0.12", features = ["sync"] }
 metrics-exporter-prometheus = "0.16"
 ratatui = "0.29"
 axum = "0.8"
