@@ -4,6 +4,7 @@ use serde::de::DeserializeOwned;
 
 use super::backend::StateBackend;
 use super::memtable::MemTable;
+use super::timer_service::TimerService;
 
 /// Operator-scoped state context.
 ///
@@ -15,6 +16,8 @@ pub struct StateContext {
     backend: Box<dyn StateBackend>,
     /// Optional worker label for per-worker metrics. `None` means no label.
     worker_label: Option<String>,
+    /// Lazy-initialized timer service for event-time callbacks.
+    timer_service: Option<TimerService>,
 }
 
 impl std::fmt::Debug for StateContext {
@@ -32,6 +35,7 @@ impl StateContext {
             memtable: MemTable::new(),
             backend,
             worker_label: None,
+            timer_service: None,
         }
     }
 
@@ -127,6 +131,24 @@ impl StateContext {
         self.memtable.delete(key.to_vec());
     }
 
+    /// Returns a mutable reference to the timer service, creating it if needed.
+    pub fn timers(&mut self) -> &mut TimerService {
+        self.timer_service.get_or_insert_with(TimerService::new)
+    }
+
+    /// Returns `true` if a timer service has been created and has registered timers.
+    pub fn has_timers(&self) -> bool {
+        self.timer_service.as_ref().is_some_and(|ts| !ts.is_empty())
+    }
+
+    /// Restore timer state from the backend.
+    pub async fn restore_timers(&mut self) -> anyhow::Result<()> {
+        if let Some(bytes) = self.get_raw(super::timer_service::TIMER_STATE_KEY).await? {
+            self.timer_service = Some(TimerService::restore(&bytes)?);
+        }
+        Ok(())
+    }
+
     /// Flush dirty entries from memtable to backend, then trigger backend checkpoint.
     pub async fn checkpoint(&mut self) -> anyhow::Result<()> {
         let start = std::time::Instant::now();
@@ -143,6 +165,18 @@ impl StateContext {
                 None => self.backend.delete(&key).await?,
             }
         }
+
+        // Persist timer state if dirty.
+        if let Some(ref mut ts) = self.timer_service
+            && ts.is_dirty()
+        {
+            let timer_bytes = ts.serialize();
+            self.backend
+                .put(super::timer_service::TIMER_STATE_KEY, &timer_bytes)
+                .await?;
+            ts.clear_dirty();
+        }
+
         self.backend.checkpoint().await?;
 
         metrics::counter!("state_checkpoints_total").increment(1);

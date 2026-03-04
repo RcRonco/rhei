@@ -45,6 +45,30 @@ pub trait StreamFunction: Send + Sync {
     ) -> anyhow::Result<Vec<Self::Output>> {
         Ok(vec![])
     }
+
+    /// Called once when the operator is first initialized, before any `process` calls.
+    /// Override to perform setup such as loading external configuration or pre-warming
+    /// caches.
+    async fn open(&mut self, _ctx: &mut StateContext) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// Called once when the operator is shutting down (frontier is empty).
+    /// Override to release resources or flush external systems.
+    async fn close(&mut self) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// Called when a registered timer fires (watermark >= timer timestamp).
+    /// Override to perform time-based actions. Default: no output.
+    async fn on_timer(
+        &mut self,
+        _timestamp: u64,
+        _key: &str,
+        _ctx: &mut StateContext,
+    ) -> anyhow::Result<Vec<Self::Output>> {
+        Ok(vec![])
+    }
 }
 
 /// A source that produces elements into a stream.
@@ -178,5 +202,95 @@ mod tests {
     async fn source_defaults_should_emit_watermark_is_false() {
         let src = MinimalSource;
         assert!(!src.should_emit_watermark());
+    }
+
+    /// Verify open/close lifecycle hooks work with default impls and custom overrides.
+    mod lifecycle {
+        use super::*;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        use crate::state::context::StateContext;
+        use crate::state::local_backend::LocalBackend;
+
+        struct LifecycleOp {
+            opened: Arc<AtomicBool>,
+            closed: Arc<AtomicBool>,
+        }
+
+        #[async_trait]
+        impl StreamFunction for LifecycleOp {
+            type Input = String;
+            type Output = String;
+
+            async fn process(
+                &mut self,
+                input: String,
+                _ctx: &mut StateContext,
+            ) -> anyhow::Result<Vec<String>> {
+                Ok(vec![input])
+            }
+
+            async fn open(&mut self, _ctx: &mut StateContext) -> anyhow::Result<()> {
+                self.opened.store(true, Ordering::SeqCst);
+                Ok(())
+            }
+
+            async fn close(&mut self) -> anyhow::Result<()> {
+                self.closed.store(true, Ordering::SeqCst);
+                Ok(())
+            }
+        }
+
+        fn test_ctx(name: &str) -> StateContext {
+            let path = std::env::temp_dir()
+                .join(format!("rhei_lifecycle_test_{name}_{}", std::process::id()));
+            let _ = std::fs::remove_file(&path);
+            let backend = LocalBackend::new(path, None).unwrap();
+            StateContext::new(Box::new(backend))
+        }
+
+        #[tokio::test]
+        async fn open_close_set_flags() {
+            let opened = Arc::new(AtomicBool::new(false));
+            let closed = Arc::new(AtomicBool::new(false));
+            let mut op = LifecycleOp {
+                opened: opened.clone(),
+                closed: closed.clone(),
+            };
+            let mut ctx = test_ctx("flags");
+
+            assert!(!opened.load(Ordering::SeqCst));
+            assert!(!closed.load(Ordering::SeqCst));
+
+            op.open(&mut ctx).await.unwrap();
+            assert!(opened.load(Ordering::SeqCst));
+            assert!(!closed.load(Ordering::SeqCst));
+
+            op.close().await.unwrap();
+            assert!(closed.load(Ordering::SeqCst));
+        }
+
+        #[tokio::test]
+        async fn default_open_close_are_noop() {
+            struct NoopOp;
+            #[async_trait]
+            impl StreamFunction for NoopOp {
+                type Input = String;
+                type Output = String;
+                async fn process(
+                    &mut self,
+                    input: String,
+                    _ctx: &mut StateContext,
+                ) -> anyhow::Result<Vec<String>> {
+                    Ok(vec![input])
+                }
+            }
+
+            let mut op = NoopOp;
+            let mut ctx = test_ctx("noop");
+            op.open(&mut ctx).await.unwrap();
+            op.close().await.unwrap();
+        }
     }
 }
