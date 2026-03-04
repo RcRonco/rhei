@@ -92,6 +92,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sum_per_key() {
+        let mut ctx = test_ctx("sum");
+        let mut op = RollingAggregateOp::new(
+            |v: &(String, f64)| v.0.clone(),
+            crate::operators::aggregator::Sum::new(|v: &(String, f64)| v.1),
+        );
+
+        let r = op.process(("a".into(), 10.0), &mut ctx).await.unwrap();
+        assert_eq!(r, vec![10.0]);
+
+        let r = op.process(("b".into(), 5.0), &mut ctx).await.unwrap();
+        assert_eq!(r, vec![5.0]);
+
+        let r = op.process(("a".into(), 3.0), &mut ctx).await.unwrap();
+        assert_eq!(r, vec![13.0]);
+
+        let r = op.process(("b".into(), 7.0), &mut ctx).await.unwrap();
+        assert_eq!(r, vec![12.0]);
+
+        let r = op.process(("a".into(), 2.0), &mut ctx).await.unwrap();
+        assert_eq!(r, vec![15.0]);
+    }
+
+    #[tokio::test]
+    async fn avg_per_key() {
+        let mut ctx = test_ctx("avg");
+        let mut op = RollingAggregateOp::new(
+            |v: &(String, f64)| v.0.clone(),
+            crate::operators::aggregator::Avg::new(|v: &(String, f64)| v.1),
+        );
+
+        let r = op.process(("a".into(), 10.0), &mut ctx).await.unwrap();
+        assert!((r[0] - 10.0).abs() < f64::EPSILON);
+
+        let r = op.process(("a".into(), 20.0), &mut ctx).await.unwrap();
+        assert!((r[0] - 15.0).abs() < f64::EPSILON);
+
+        let r = op.process(("b".into(), 6.0), &mut ctx).await.unwrap();
+        assert!((r[0] - 6.0).abs() < f64::EPSILON);
+
+        let r = op.process(("a".into(), 30.0), &mut ctx).await.unwrap();
+        assert!((r[0] - 20.0).abs() < f64::EPSILON);
+
+        let r = op.process(("b".into(), 12.0), &mut ctx).await.unwrap();
+        assert!((r[0] - 9.0).abs() < f64::EPSILON);
+    }
+
+    #[tokio::test]
     async fn count_per_key() {
         let mut ctx = test_ctx("count");
         let mut op = RollingAggregateOp::new(

@@ -1528,4 +1528,307 @@ mod tests {
             .peers(vec!["h0:2101".into(), "h1:2101".into()])
             .build();
     }
+
+    // ── Flink-inspired feature integration tests ─────────────────────
+
+    #[derive(Clone)]
+    struct LifecycleOp {
+        opened: Arc<std::sync::atomic::AtomicBool>,
+        closed: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    #[async_trait]
+    impl StreamFunction for LifecycleOp {
+        type Input = String;
+        type Output = String;
+
+        async fn open(&mut self, _ctx: &mut StateContext) -> anyhow::Result<()> {
+            self.opened.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+
+        async fn close(&mut self) -> anyhow::Result<()> {
+            self.closed.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+
+        async fn process(
+            &mut self,
+            input: String,
+            _ctx: &mut StateContext,
+        ) -> anyhow::Result<Vec<String>> {
+            Ok(vec![input])
+        }
+    }
+
+    #[tokio::test]
+    async fn lifecycle_open_close() {
+        let dir = temp_dir("lifecycle");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let opened = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let graph = DataflowGraph::new();
+        let source = VecSource::new(vec!["a".to_string(), "b".to_string()]);
+        let collected = Arc::new(Mutex::new(Vec::new()));
+
+        let stream = graph.source(source);
+        stream
+            .key_by(|s: &String| s.clone())
+            .operator(
+                "lifecycle",
+                LifecycleOp {
+                    opened: opened.clone(),
+                    closed: closed.clone(),
+                },
+            )
+            .sink(CollectSink {
+                collected: collected.clone(),
+            });
+
+        let controller = super::PipelineController::new(dir.clone());
+        controller.run(graph).await.unwrap();
+
+        assert!(
+            opened.load(std::sync::atomic::Ordering::SeqCst),
+            "open() should have been called"
+        );
+        assert!(
+            closed.load(std::sync::atomic::Ordering::SeqCst),
+            "close() should have been called"
+        );
+        let mut results = collected.lock().unwrap().clone();
+        results.sort();
+        assert_eq!(results, vec!["a", "b"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn reduce_pipeline() {
+        let dir = temp_dir("reduce");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let graph = DataflowGraph::new();
+        let source = VecSource::new(vec![
+            ("a".to_string(), 10i64),
+            ("b".to_string(), 100),
+            ("a".to_string(), 5),
+            ("a".to_string(), 3),
+            ("b".to_string(), 50),
+        ]);
+        let collected = Arc::new(Mutex::new(Vec::new()));
+
+        let stream = graph.source(source);
+        stream
+            .key_by(|v: &(String, i64)| v.0.clone())
+            .reduce(
+                "sum",
+                |v: &(String, i64)| v.0.clone(),
+                |a: (String, i64), b: (String, i64)| (a.0, a.1 + b.1),
+            )
+            .sink(CollectSink {
+                collected: collected.clone(),
+            });
+
+        let controller = super::PipelineController::new(dir.clone());
+        controller.run(graph).await.unwrap();
+
+        let results = collected.lock().unwrap().clone();
+        assert_eq!(results.len(), 5);
+        // Last "a" should be 18, last "b" should be 150
+        assert!(results.contains(&("a".to_string(), 18)));
+        assert!(results.contains(&("b".to_string(), 150)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn aggregate_pipeline() {
+        use rhei_core::operators::aggregator::Count;
+
+        let dir = temp_dir("aggregate");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let graph = DataflowGraph::new();
+        let source = VecSource::new(vec![
+            "x".to_string(),
+            "y".to_string(),
+            "x".to_string(),
+            "x".to_string(),
+            "y".to_string(),
+        ]);
+        let collected = Arc::new(Mutex::new(Vec::new()));
+
+        let stream = graph.source(source);
+        stream
+            .key_by(|s: &String| s.clone())
+            .aggregate("count", |s: &String| s.clone(), Count::<String>::new())
+            .sink(CollectSink {
+                collected: collected.clone(),
+            });
+
+        let controller = super::PipelineController::new(dir.clone());
+        controller.run(graph).await.unwrap();
+
+        let results = collected.lock().unwrap().clone();
+        assert_eq!(results.len(), 5);
+        // Rolling counts: x emits 1, 2, 3; y emits 1, 2
+        assert!(results.contains(&3u64));
+        assert!(results.contains(&2u64));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn count_window_pipeline() {
+        use rhei_core::operators::aggregator::Count;
+        use rhei_core::operators::count_window::{CountWindow, CountWindowOutput};
+
+        let dir = temp_dir("count_win");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let graph = DataflowGraph::new();
+        let source = VecSource::new(vec![
+            "a".to_string(),
+            "a".to_string(),
+            "b".to_string(),
+            "a".to_string(), // triggers window for "a" at count=3
+            "b".to_string(),
+            "b".to_string(), // triggers window for "b" at count=3
+        ]);
+        let collected: Arc<Mutex<Vec<CountWindowOutput<u64>>>> = Arc::new(Mutex::new(Vec::new()));
+
+        let window = CountWindow::<String, _, _>::builder()
+            .count(3)
+            .key_fn(|s: &String| s.clone())
+            .aggregator(Count::<String>::new())
+            .build();
+
+        let stream = graph.source(source);
+        stream
+            .key_by(|s: &String| s.clone())
+            .operator("count_window", window)
+            .sink(CollectSink {
+                collected: collected.clone(),
+            });
+
+        let controller = super::PipelineController::new(dir.clone());
+        controller.run(graph).await.unwrap();
+
+        let results = collected.lock().unwrap().clone();
+        assert_eq!(results.len(), 2);
+        let a_win = results
+            .iter()
+            .find(|w| w.key == "a")
+            .expect("window for 'a'");
+        assert_eq!(a_win.count, 3);
+        assert_eq!(a_win.value, 3);
+        let b_win = results
+            .iter()
+            .find(|w| w.key == "b")
+            .expect("window for 'b'");
+        assert_eq!(b_win.count, 3);
+        assert_eq!(b_win.value, 3);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[derive(Clone)]
+    struct SideOutputOp;
+
+    #[async_trait]
+    impl StreamFunction for SideOutputOp {
+        type Input = String;
+        type Output = rhei_core::operators::with_side::WithSide<String, String>;
+
+        async fn process(
+            &mut self,
+            input: String,
+            _ctx: &mut StateContext,
+        ) -> anyhow::Result<Vec<rhei_core::operators::with_side::WithSide<String, String>>>
+        {
+            use rhei_core::operators::with_side::WithSide;
+            if input.starts_with("ERR:") {
+                Ok(vec![WithSide::side(input)])
+            } else {
+                Ok(vec![WithSide::main(input)])
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn split_side_routing() {
+        let dir = temp_dir("side_output");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let graph = DataflowGraph::new();
+        let source = VecSource::new(vec![
+            "hello".to_string(),
+            "ERR:bad".to_string(),
+            "world".to_string(),
+            "ERR:oops".to_string(),
+        ]);
+        let main_collected = Arc::new(Mutex::new(Vec::new()));
+        let side_collected = Arc::new(Mutex::new(Vec::new()));
+
+        let stream = graph.source(source);
+        let tagged = stream
+            .key_by(|s: &String| s.clone())
+            .operator("tagger", SideOutputOp);
+        let (main_stream, side_stream) = tagged.split_side();
+
+        main_stream.sink(CollectSink {
+            collected: main_collected.clone(),
+        });
+        side_stream.sink(CollectSink {
+            collected: side_collected.clone(),
+        });
+
+        let controller = super::PipelineController::new(dir.clone());
+        controller.run(graph).await.unwrap();
+
+        let mut main_results = main_collected.lock().unwrap().clone();
+        main_results.sort();
+        assert_eq!(main_results, vec!["hello", "world"]);
+
+        let mut side_results = side_collected.lock().unwrap().clone();
+        side_results.sort();
+        assert_eq!(side_results, vec!["ERR:bad", "ERR:oops"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn enrich_pipeline() {
+        let dir = temp_dir("enrich");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let graph = DataflowGraph::new();
+        let source = VecSource::new(vec![1i32, 2, 3]);
+        let collected = Arc::new(Mutex::new(Vec::new()));
+
+        let stream = graph.source(source);
+        stream
+            .key_by(|x: &i32| x.to_string())
+            .enrich(
+                "lookup",
+                2,
+                std::time::Duration::from_secs(1),
+                |x: i32| async move { Ok(format!("enriched:{x}")) },
+            )
+            .sink(CollectSink {
+                collected: collected.clone(),
+            });
+
+        let controller = super::PipelineController::new(dir.clone());
+        controller.run(graph).await.unwrap();
+
+        let mut results = collected.lock().unwrap().clone();
+        results.sort();
+        assert_eq!(results, vec!["enriched:1", "enriched:2", "enriched:3"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

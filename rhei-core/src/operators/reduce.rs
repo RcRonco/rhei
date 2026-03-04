@@ -113,6 +113,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn checkpoint_recovery() {
+        let path =
+            std::env::temp_dir().join(format!("rhei_reduce_test_ckpt_{}", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+
+        let mut op = ReduceOp::new(
+            |v: &(String, i64)| v.0.clone(),
+            |a: (String, i64), b: (String, i64)| (a.0, a.1 + b.1),
+        );
+
+        // Process two elements, then checkpoint
+        {
+            let backend = LocalBackend::new(path.clone(), None).unwrap();
+            let mut ctx = StateContext::new(Box::new(backend));
+            let r = op.process(("k".into(), 10), &mut ctx).await.unwrap();
+            assert_eq!(r, vec![("k".into(), 10)]);
+            let r = op.process(("k".into(), 5), &mut ctx).await.unwrap();
+            assert_eq!(r, vec![("k".into(), 15)]);
+            ctx.checkpoint().await.unwrap();
+        }
+
+        // Reopen from same path — state should be recovered
+        {
+            let backend = LocalBackend::new(path.clone(), None).unwrap();
+            let mut ctx = StateContext::new(Box::new(backend));
+            let r = op.process(("k".into(), 3), &mut ctx).await.unwrap();
+            assert_eq!(r, vec![("k".into(), 18)]);
+        }
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
     async fn first_element_emitted_directly() {
         let mut ctx = test_ctx("first");
         let mut op = ReduceOp::new(|v: &i64| v.to_string(), |a: i64, b: i64| a + b);

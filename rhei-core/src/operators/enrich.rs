@@ -159,6 +159,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn failed_lookup_returns_error() {
+        let mut ctx = test_ctx("failed");
+        let mut op = EnrichOp::new(2, Duration::from_secs(1), |x: i32| async move {
+            if x < 0 {
+                Err(anyhow::anyhow!("negative lookup"))
+            } else {
+                Ok(x * 10)
+            }
+        });
+
+        // Successful lookup
+        let r = op.process(5, &mut ctx).await;
+        assert!(r.is_ok());
+        assert_eq!(r.unwrap(), vec![50]);
+
+        // Failed lookup
+        let r = op.process(-1, &mut ctx).await;
+        assert!(r.is_err());
+        assert!(r.unwrap_err().to_string().contains("negative lookup"));
+    }
+
+    #[tokio::test]
     async fn timeout_returns_error() {
         let mut ctx = test_ctx("timeout");
         let mut op = EnrichOp::new(2, Duration::from_millis(10), |_x: i32| async move {
