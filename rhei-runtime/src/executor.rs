@@ -484,7 +484,7 @@ impl DataflowExecutor {
         )
     }
 
-    /// Build a stateful operator with DLQ, watermark, and checkpoint support.
+    /// Build a stateful operator with DLQ, watermark, timer, and checkpoint support.
     fn build_operator<'a, A: Allocate>(
         &self,
         node_id: NodeId,
@@ -500,99 +500,80 @@ impl DataflowExecutor {
         let (op_name, op) = operators.remove(&node_id).expect("missing operator");
         let ctx = operator_contexts
             .remove(&node_id)
-            .expect("missing StateContext for operator");
-
-        let stage_name = format!("Op_{}", node_id.0);
-        let rt_op = self.rt.clone();
-        let worker_label = self.worker_index.to_string();
-        let is_last_op = self.last_operator_id == Some(node_id);
-        let notify = self.checkpoint_notify.clone();
-        let dlq = self.dlq_tx.clone();
-        let worker_index = self.worker_index;
-        let local_first_worker = self.local_first_worker;
+            .expect("missing operator ctx");
+        let oc = OperatorCfg {
+            rt: self.rt.clone(),
+            worker_label: self.worker_index.to_string(),
+            is_last_op: self.last_operator_id == Some(node_id),
+            notify: self.checkpoint_notify.clone(),
+            dlq: self.dlq_tx.clone(),
+            worker_index: self.worker_index,
+            local_first_worker: self.local_first_worker,
+        };
 
         input_stream.unary_frontier::<CapacityContainerBuilder<Vec<AnyItem>>, _, _, _>(
             Pipeline,
-            &stage_name,
+            &format!("Op_{}", node_id.0),
             move |_init_cap, _info| {
                 let mut timely_op = TimelyErasedOperator::new(op, ctx);
-                let rt = rt_op;
-                let wl = worker_label;
+                timely_op.open(&oc.rt);
                 let mut last_watermark: u64 = 0;
                 let mut retained_cap: Option<Capability<u64>> = None;
+                let mut closed = false;
                 move |(input, frontier), output| {
+                    let mut emit = |items: Vec<AnyItem>, cap: &Option<Capability<u64>>| {
+                        if let Some(c) = cap
+                            && !items.is_empty()
+                        {
+                            let mut s = output.session(c);
+                            for r in items {
+                                s.give(r);
+                            }
+                        }
+                    };
                     input.for_each(|cap, data| {
                         let owned_cap = cap.retain();
                         let batch: Vec<AnyItem> = std::mem::take(data);
                         if batch.is_empty() {
                             return;
                         }
-                        let batch_start = std::time::Instant::now();
-                        let (results, errors) = timely_op.process_batch(batch, &rt);
-                        let batch_duration = batch_start.elapsed().as_secs_f64();
-                        record_batch_durations(&[batch_duration], &wl);
+                        let t = std::time::Instant::now();
+                        let (results, errors) = timely_op.process_batch(batch, &oc.rt);
+                        record_batch_durations(&[t.elapsed().as_secs_f64()], &oc.worker_label);
                         for e in &errors {
                             route_errors_to_dlq(
                                 std::slice::from_ref(e),
                                 "batch",
                                 &op_name,
-                                dlq.as_ref(),
+                                oc.dlq.as_ref(),
                             );
                         }
-                        if !results.is_empty() {
-                            let mut session = output.session(&owned_cap);
-                            for r in results {
-                                session.give(r);
-                            }
-                        }
+                        emit(results, &Some(owned_cap.clone()));
                         retained_cap = Some(owned_cap);
                     });
-
-                    // Use the Timely frontier as the watermark. The source
-                    // operator encodes watermarks as epochs, so the frontier
-                    // tracks event-time progress in-band — it only advances
-                    // past epoch E once all items at epoch E have been
-                    // delivered through the exchange. This prevents the
-                    // watermark from racing ahead of data in multi-worker
-                    // setups.
-                    let frontier_wm = if frontier.frontier().is_empty() {
-                        u64::MAX
-                    } else {
-                        frontier.frontier().iter().copied().min().unwrap_or(0)
-                    };
-                    let wm_results = if frontier_wm > last_watermark {
-                        last_watermark = frontier_wm;
-                        timely_op.process_watermark(frontier_wm, &rt)
-                    } else {
-                        Vec::new()
-                    };
-                    if !wm_results.is_empty()
-                        && let Some(ref cap) = retained_cap
-                    {
-                        let mut session = output.session(cap);
-                        for r in wm_results {
-                            session.give(r);
-                        }
-                    }
-
-                    // Drop retained cap if frontier has advanced past it.
+                    let wm = frontier_min_or_max(frontier.frontier());
+                    let time_results = timely_op.advance_time(wm, &mut last_watermark, &oc.rt);
+                    emit(time_results, &retained_cap);
                     if let Some(ref cap) = retained_cap
                         && !frontier.less_equal(cap.time())
                     {
                         retained_cap = None;
                     }
-
-                    let frontier_vec: Vec<u64> = frontier.frontier().iter().copied().collect();
+                    let fv: Vec<u64> = frontier.frontier().iter().copied().collect();
                     if let Some(epoch) = try_checkpoint(
                         &mut timely_op,
-                        &frontier_vec,
-                        &rt,
-                        is_last_op,
-                        worker_index,
-                        local_first_worker,
-                    ) && let Some(ref n) = notify
+                        &fv,
+                        &oc.rt,
+                        oc.is_last_op,
+                        oc.worker_index,
+                        oc.local_first_worker,
+                    ) && let Some(ref n) = oc.notify
                     {
                         let _ = n.send(epoch);
+                    }
+                    if frontier.frontier().is_empty() && !closed {
+                        timely_op.close(&oc.rt);
+                        closed = true;
                     }
                 }
             },
@@ -645,6 +626,20 @@ impl DataflowExecutor {
             )
             .probe_with(probe);
     }
+}
+
+// ── Operator helper types ───────────────────────────────────────────
+
+/// Bundles per-operator configuration extracted from `DataflowExecutor`
+/// to reduce the number of variables captured by the Timely closure.
+struct OperatorCfg {
+    rt: tokio::runtime::Handle,
+    worker_label: String,
+    is_last_op: bool,
+    notify: Option<flume::Sender<u64>>,
+    dlq: Option<DlqSender>,
+    worker_index: usize,
+    local_first_worker: usize,
 }
 
 // ── Operator helper functions ───────────────────────────────────────
@@ -735,6 +730,15 @@ fn try_checkpoint(
         epoch
     } else {
         None
+    }
+}
+
+/// Compute the minimum frontier timestamp, or `u64::MAX` when the frontier is empty.
+fn frontier_min_or_max(frontier: timely::progress::frontier::AntichainRef<'_, u64>) -> u64 {
+    if frontier.is_empty() {
+        u64::MAX
+    } else {
+        frontier.iter().copied().min().unwrap_or(0)
     }
 }
 
