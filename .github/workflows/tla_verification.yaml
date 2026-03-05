@@ -1,0 +1,55 @@
+name: TLA+ Verification
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "tla/**"
+  pull_request:
+    paths:
+      - "tla/**"
+
+permissions:
+  contents: read
+
+env:
+  TLA_TOOLS_VERSION: "1.8.0"
+
+jobs:
+  verify:
+    name: TLC Model Check
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        spec:
+          - name: RheiCore
+            file: RheiCore.tla
+            cfg: RheiCore.cfg
+          - name: RheiCoordination
+            file: RheiCoordination.tla
+            cfg: RheiCoordination.cfg
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Download tla2tools.jar
+        run: |
+          curl -fsSL -o tla2tools.jar \
+            "https://github.com/tlaplus/tlaplus/releases/download/v${TLA_TOOLS_VERSION}/tla2tools.jar"
+
+      - name: Run TLC on ${{ matrix.spec.name }}
+        working-directory: tla
+        run: |
+          java -XX:+UseParallelGC -Xmx4g \
+            -cp ../tla2tools.jar tlc2.TLC \
+            ${{ matrix.spec.file }} \
+            -config ${{ matrix.spec.cfg }} \
+            -workers auto \
+            -nowarning
