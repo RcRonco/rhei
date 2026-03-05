@@ -23,8 +23,19 @@ pub use rhei_runtime::controller::{PipelineController, PipelineControllerBuilder
 pub use rhei_core::connectors::print_sink::PrintSink;
 pub use rhei_core::connectors::vec_source::VecSource;
 
+// State types
+pub use rhei_core::state::list_state::ListState;
+pub use rhei_core::state::map_state::MapState;
+pub use rhei_core::state::timer_service::TimerService;
+pub use rhei_core::state::value_state::ValueState;
+
 // Operators
+pub use rhei_core::operators::count_window::{CountWindow, CountWindowOutput};
+pub use rhei_core::operators::enrich::EnrichOp;
 pub use rhei_core::operators::keyed_state::KeyedState;
+pub use rhei_core::operators::reduce::ReduceOp;
+pub use rhei_core::operators::rolling_aggregate::RollingAggregateOp;
+pub use rhei_core::operators::with_side::WithSide;
 
 /// Items used by macro-generated code. Not part of the public API.
 #[doc(hidden)]

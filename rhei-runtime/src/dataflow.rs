@@ -362,6 +362,17 @@ pub(crate) trait ErasedOperator: Send {
         watermark: u64,
         ctx: &mut StateContext,
     ) -> anyhow::Result<Vec<AnyItem>>;
+    /// Called once at operator init, before any `process`.
+    async fn open(&mut self, ctx: &mut StateContext) -> anyhow::Result<()>;
+    /// Called once at operator shutdown.
+    async fn close(&mut self) -> anyhow::Result<()>;
+    /// Called when a timer fires.
+    async fn on_timer(
+        &mut self,
+        timestamp: u64,
+        key: &str,
+        ctx: &mut StateContext,
+    ) -> anyhow::Result<Vec<AnyItem>>;
     fn clone_erased(&self) -> Box<dyn ErasedOperator>;
 }
 
@@ -401,6 +412,24 @@ where
         ctx: &mut StateContext,
     ) -> anyhow::Result<Vec<AnyItem>> {
         let results = self.0.on_watermark(watermark, ctx).await?;
+        Ok(results.into_iter().map(AnyItem::new).collect())
+    }
+
+    async fn open(&mut self, ctx: &mut StateContext) -> anyhow::Result<()> {
+        self.0.open(ctx).await
+    }
+
+    async fn close(&mut self) -> anyhow::Result<()> {
+        self.0.close().await
+    }
+
+    async fn on_timer(
+        &mut self,
+        timestamp: u64,
+        key: &str,
+        ctx: &mut StateContext,
+    ) -> anyhow::Result<Vec<AnyItem>> {
+        let results = self.0.on_timer(timestamp, key, ctx).await?;
         Ok(results.into_iter().map(AnyItem::new).collect())
     }
 
@@ -937,6 +966,70 @@ impl<
         KeyedStream::new(self.graph, node_id)
     }
 
+    /// Per-key rolling reduce. Emits the updated value on every input.
+    pub fn reduce<F, KF>(self, name: &str, key_fn: KF, reduce_fn: F) -> KeyedStream<'a, T>
+    where
+        T: Sync,
+        F: Fn(T, T) -> T + Send + Sync + Clone + 'static,
+        KF: Fn(&T) -> String + Send + Sync + Clone + 'static,
+    {
+        self.operator(
+            name,
+            rhei_core::operators::reduce::ReduceOp::new(key_fn, reduce_fn),
+        )
+    }
+
+    /// Per-key rolling aggregation. Emits the updated aggregate on every input.
+    pub fn aggregate<A, KF>(self, name: &str, key_fn: KF, agg: A) -> KeyedStream<'a, A::Output>
+    where
+        T: Sync,
+        A: rhei_core::operators::aggregator::Aggregator<Input = T> + Send + Sync + Clone + 'static,
+        A::Accumulator: serde::Serialize + serde::de::DeserializeOwned,
+        A::Output: Clone
+            + Send
+            + Sync
+            + std::fmt::Debug
+            + serde::Serialize
+            + serde::de::DeserializeOwned
+            + 'static,
+        KF: Fn(&T) -> String + Send + Sync + Clone + 'static,
+    {
+        self.operator(
+            name,
+            rhei_core::operators::rolling_aggregate::RollingAggregateOp::new(key_fn, agg),
+        )
+    }
+
+    /// Async enrichment with bounded concurrency.
+    ///
+    /// Wraps each element through the async function `f` with up to
+    /// `concurrency` parallel lookups per batch. Only on `KeyedStream` for
+    /// worker affinity.
+    pub fn enrich<F, O, Fut>(
+        self,
+        name: &str,
+        concurrency: usize,
+        timeout: std::time::Duration,
+        f: F,
+    ) -> KeyedStream<'a, O>
+    where
+        T: Sync + 'static,
+        O: Clone
+            + Send
+            + Sync
+            + std::fmt::Debug
+            + serde::Serialize
+            + serde::de::DeserializeOwned
+            + 'static,
+        Fut: std::future::Future<Output = anyhow::Result<O>> + Send + 'static,
+        F: Fn(T) -> Fut + Send + Sync + Clone + 'static,
+    {
+        self.operator(
+            name,
+            rhei_core::operators::enrich::EnrichOp::new(concurrency, timeout, f),
+        )
+    }
+
     /// Terminal: write elements to a sink.
     pub fn sink<K>(self, sink: K)
     where
@@ -946,6 +1039,88 @@ impl<
             NodeKind::Sink(Box::new(SinkWrapper(sink))),
             vec![self.node_id],
         );
+    }
+}
+
+// ── Side output split ────────────────────────────────────────────────
+
+use rhei_core::operators::with_side::WithSide;
+
+impl<
+    'a,
+    M: Clone + Send + std::fmt::Debug + serde::Serialize + serde::de::DeserializeOwned + 'static,
+    S: Clone + Send + std::fmt::Debug + serde::Serialize + serde::de::DeserializeOwned + 'static,
+> Stream<'a, WithSide<M, S>>
+{
+    /// Split a `WithSide<M, S>` stream into its main and side components.
+    ///
+    /// Adds two Transform nodes that filter and unwrap from the same upstream.
+    pub fn split_side(self) -> (Stream<'a, M>, Stream<'a, S>) {
+        let main_transform: TransformFn = Arc::new(|item: AnyItem, _ctx| {
+            let ws: WithSide<M, S> = item.downcast();
+            match ws {
+                WithSide::Main(m) => vec![AnyItem::new(m)],
+                WithSide::Side(_) => vec![],
+            }
+        });
+        let main_id = self
+            .graph
+            .add_node(NodeKind::Transform(main_transform), vec![self.node_id]);
+
+        let side_transform: TransformFn = Arc::new(|item: AnyItem, _ctx| {
+            let ws: WithSide<M, S> = item.downcast();
+            match ws {
+                WithSide::Main(_) => vec![],
+                WithSide::Side(s) => vec![AnyItem::new(s)],
+            }
+        });
+        let side_id = self
+            .graph
+            .add_node(NodeKind::Transform(side_transform), vec![self.node_id]);
+
+        (
+            Stream::new(self.graph, main_id),
+            Stream::new(self.graph, side_id),
+        )
+    }
+}
+
+impl<
+    'a,
+    M: Clone + Send + std::fmt::Debug + serde::Serialize + serde::de::DeserializeOwned + 'static,
+    S: Clone + Send + std::fmt::Debug + serde::Serialize + serde::de::DeserializeOwned + 'static,
+> KeyedStream<'a, WithSide<M, S>>
+{
+    /// Split a `WithSide<M, S>` keyed stream into main (keyed) and side (unkeyed).
+    ///
+    /// The main stream preserves key partitioning; the side stream is unkeyed.
+    pub fn split_side(self) -> (KeyedStream<'a, M>, Stream<'a, S>) {
+        let main_transform: TransformFn = Arc::new(|item: AnyItem, _ctx| {
+            let ws: WithSide<M, S> = item.downcast();
+            match ws {
+                WithSide::Main(m) => vec![AnyItem::new(m)],
+                WithSide::Side(_) => vec![],
+            }
+        });
+        let main_id = self
+            .graph
+            .add_node(NodeKind::Transform(main_transform), vec![self.node_id]);
+
+        let side_transform: TransformFn = Arc::new(|item: AnyItem, _ctx| {
+            let ws: WithSide<M, S> = item.downcast();
+            match ws {
+                WithSide::Main(_) => vec![],
+                WithSide::Side(s) => vec![AnyItem::new(s)],
+            }
+        });
+        let side_id = self
+            .graph
+            .add_node(NodeKind::Transform(side_transform), vec![self.node_id]);
+
+        (
+            KeyedStream::new(self.graph, main_id),
+            Stream::new(self.graph, side_id),
+        )
     }
 }
 

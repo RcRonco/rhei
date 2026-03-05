@@ -199,6 +199,60 @@ impl TimelyErasedOperator {
         }
     }
 
+    /// Call the operator's `open` lifecycle hook.
+    /// Also restores any persisted timer state from the backend.
+    pub fn open(&mut self, rt: &tokio::runtime::Handle) {
+        if let Err(e) = rt.block_on(self.ctx.restore_timers()) {
+            tracing::error!("timer restore failed: {e}");
+        }
+        if let Err(e) = rt.block_on(self.op.open(&mut self.ctx)) {
+            tracing::error!("operator open failed: {e}");
+        }
+    }
+
+    /// Call the operator's `close` lifecycle hook.
+    pub fn close(&mut self, rt: &tokio::runtime::Handle) {
+        if let Err(e) = rt.block_on(self.op.close()) {
+            tracing::error!("operator close failed: {e}");
+        }
+    }
+
+    /// Drain fired timers and call `on_timer` for each.
+    /// Returns any outputs produced by timer callbacks.
+    pub fn process_timers(&mut self, watermark: u64, rt: &tokio::runtime::Handle) -> Vec<AnyItem> {
+        if !self.ctx.has_timers() {
+            return vec![];
+        }
+        let fired = self.ctx.timers().drain_fired(watermark);
+        let mut outputs = Vec::new();
+        for (ts, key) in fired {
+            match rt.block_on(self.op.on_timer(ts, &key, &mut self.ctx)) {
+                Ok(results) => outputs.extend(results),
+                Err(e) => tracing::error!("on_timer failed: {e}"),
+            }
+        }
+        outputs
+    }
+
+    /// Advance the watermark and process fired timers in one call.
+    ///
+    /// If `frontier_wm > *last_watermark`, processes the watermark advancement
+    /// and then drains any fired timers. Returns all outputs combined.
+    pub fn advance_time(
+        &mut self,
+        frontier_wm: u64,
+        last_watermark: &mut u64,
+        rt: &tokio::runtime::Handle,
+    ) -> Vec<AnyItem> {
+        let mut results = Vec::new();
+        if frontier_wm > *last_watermark {
+            *last_watermark = frontier_wm;
+            results.extend(self.process_watermark(frontier_wm, rt));
+        }
+        results.extend(self.process_timers(frontier_wm, rt));
+        results
+    }
+
     /// Force a checkpoint (for final flush).
     #[allow(dead_code)]
     pub fn checkpoint(&mut self, rt: &tokio::runtime::Handle) {
