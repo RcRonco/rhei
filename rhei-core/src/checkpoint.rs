@@ -138,7 +138,7 @@ impl CheckpointManifest {
 
 /// Load operator state from a checkpoint file.
 ///
-/// Reads `{dir}/{operator_name}.checkpoint.json` (LocalBackend format),
+/// Reads `{dir}/{operator_name}.checkpoint.json` (`LocalBackend` format),
 /// strips the `{operator_name}/` prefix from keys, and returns
 /// `(user_key_string, raw_value_bytes)` pairs.
 ///

@@ -304,13 +304,12 @@ fn cmd_demo(workers: usize, addr: std::net::SocketAddr) -> anyhow::Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
 
     rt.block_on(async {
-        let handles =
-            rhei_runtime::telemetry::init(rhei_runtime::telemetry::TelemetryConfig {
-                metrics_addr: Some(addr),
-                log_filter: "info".to_string(),
-                json_logs: false,
-                tui: false,
-            })?;
+        let handles = rhei_runtime::telemetry::init(rhei_runtime::telemetry::TelemetryConfig {
+            metrics_addr: Some(addr),
+            log_filter: "info".to_string(),
+            json_logs: false,
+            tui: false,
+        })?;
 
         let health = rhei_runtime::health::HealthState::new();
 
@@ -320,20 +319,19 @@ fn cmd_demo(workers: usize, addr: std::net::SocketAddr) -> anyhow::Result<()> {
             .health(health.clone())
             .build();
 
-        let _http = rhei_runtime::http_server::start(
-            rhei_runtime::http_server::HttpServerConfig {
-                addr,
-                health,
-                prometheus: handles
-                    .prometheus_handle
-                    .expect("prometheus handle should exist"),
-                metrics_handle: handles.metrics_handle,
-                log_rx: handles.log_rx,
-                topology: executor.topology_handle(),
-                pipeline_name: Some("sensor-demo".to_string()),
-                workers,
-            },
-        );
+        let _http = rhei_runtime::http_server::start(rhei_runtime::http_server::HttpServerConfig {
+            addr,
+            health,
+            prometheus: handles
+                .prometheus_handle
+                .expect("prometheus handle should exist"),
+            metrics_handle: handles.metrics_handle,
+            log_rx: handles.log_rx,
+            topology: executor.topology_handle(),
+            pipeline_name: Some("sensor-demo".to_string()),
+            workers,
+            checkpoint_dir: None,
+        });
 
         eprintln!("Rhei demo pipeline starting on http://{addr}");
         eprintln!("Open the dashboard at http://localhost:5173 and add {addr}");

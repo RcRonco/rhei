@@ -433,9 +433,7 @@ impl PipelineController {
     /// Initializes telemetry (Prometheus + Snapshot recorders) and returns
     /// the server join handle. The handle keeps the server alive; drop it
     /// or abort it to stop the server.
-    fn maybe_start_http(
-        &self,
-    ) -> anyhow::Result<Option<tokio::task::JoinHandle<()>>> {
+    fn maybe_start_http(&self) -> anyhow::Result<Option<tokio::task::JoinHandle<()>>> {
         let Some(addr) = self.metrics_addr else {
             return Ok(None);
         };
@@ -460,6 +458,7 @@ impl PipelineController {
             topology: self.topology.clone(),
             pipeline_name: self.pipeline_name.clone(),
             workers: self.workers,
+            checkpoint_dir: Some(self.checkpoint_dir.clone()),
         });
 
         Ok(Some(http_handle))

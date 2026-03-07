@@ -25,6 +25,8 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 use tower_http::cors::CorsLayer;
 
+use rhei_core::checkpoint::{CheckpointManifest, load_operator_state};
+
 use crate::compiler::ApiTopology;
 use crate::health::{HealthState, PipelineStatus};
 use crate::metrics_snapshot::{MetricsHandle, MetricsSnapshot};
@@ -155,6 +157,8 @@ pub struct HttpServerConfig {
     pub pipeline_name: Option<String>,
     /// Number of workers for `/api/info`.
     pub workers: usize,
+    /// Checkpoint directory for state explorer endpoints.
+    pub checkpoint_dir: Option<std::path::PathBuf>,
 }
 
 // ─── App state ──────────────────────────────────────────────────────────────
@@ -171,6 +175,7 @@ struct AppState {
     pipeline_name: Option<String>,
     workers: usize,
     start_time: std::time::Instant,
+    checkpoint_dir: Option<std::path::PathBuf>,
 }
 
 /// JSON response body for health endpoints.
@@ -205,6 +210,56 @@ struct LogQuery {
 #[derive(Deserialize)]
 struct HistoryQuery {
     since: Option<u64>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct StateOperatorsResponse {
+    checkpoint_id: u64,
+    timestamp_ms: u64,
+    operators: Vec<OperatorStateInfo>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct OperatorStateInfo {
+    name: String,
+    entry_count: usize,
+}
+
+#[derive(Deserialize)]
+struct StateEntriesQuery {
+    prefix: Option<String>,
+    pattern: Option<String>,
+    limit: Option<usize>,
+    offset: Option<usize>,
+    decode: Option<String>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct StateEntriesResponse {
+    operator: String,
+    total: usize,
+    entries: Vec<StateEntryItem>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct StateEntryItem {
+    key: String,
+    value: serde_json::Value,
+    decode: String,
+    size_bytes: usize,
+}
+
+#[derive(Deserialize)]
+struct StateKeyQuery {
+    #[allow(dead_code)]
+    decode: Option<String>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct StateKeyResponse {
+    key: String,
+    size_bytes: usize,
+    decodings: std::collections::HashMap<String, serde_json::Value>,
 }
 
 // ─── Server start ───────────────────────────────────────────────────────────
@@ -255,6 +310,7 @@ pub fn start(config: HttpServerConfig) -> tokio::task::JoinHandle<()> {
         pipeline_name: config.pipeline_name,
         workers: config.workers,
         start_time: std::time::Instant::now(),
+        checkpoint_dir: config.checkpoint_dir,
     });
 
     let app = Router::new()
@@ -267,6 +323,12 @@ pub fn start(config: HttpServerConfig) -> tokio::task::JoinHandle<()> {
         .route("/api/health", get(api_health))
         .route("/api/topology", get(api_topology))
         .route("/api/info", get(api_info))
+        .route("/api/state/operators", get(api_state_operators))
+        .route("/api/state/operators/{name}", get(api_state_entries))
+        .route(
+            "/api/state/operators/{name}/keys/{*key}",
+            get(api_state_key),
+        )
         .layer(CorsLayer::permissive())
         .with_state(state);
 
@@ -389,6 +451,192 @@ async fn api_info(State(state): State<Arc<AppState>>) -> axum::Json<ApiInfoRespo
     })
 }
 
+// ─── State explorer helpers ─────────────────────────────────────────────────
+
+fn decode_value(raw: &[u8], format: &str) -> (serde_json::Value, String) {
+    match format {
+        "json" => {
+            if let Ok(v) = serde_json::from_slice::<serde_json::Value>(raw) {
+                (v, "json".to_string())
+            } else {
+                (
+                    serde_json::Value::String(hex::encode(raw)),
+                    "hex".to_string(),
+                )
+            }
+        }
+        "utf8" => match std::str::from_utf8(raw) {
+            Ok(s) => (serde_json::Value::String(s.to_string()), "utf8".to_string()),
+            Err(_) => (
+                serde_json::Value::String(hex::encode(raw)),
+                "hex".to_string(),
+            ),
+        },
+        "hex" => (
+            serde_json::Value::String(hex::encode(raw)),
+            "hex".to_string(),
+        ),
+        _ => {
+            if let Ok(v) = serde_json::from_slice::<serde_json::Value>(raw) {
+                (v, "json".to_string())
+            } else if let Ok(s) = std::str::from_utf8(raw) {
+                (serde_json::Value::String(s.to_string()), "utf8".to_string())
+            } else {
+                (
+                    serde_json::Value::String(hex::encode(raw)),
+                    "hex".to_string(),
+                )
+            }
+        }
+    }
+}
+
+// ─── State explorer handlers ────────────────────────────────────────────────
+
+/// `GET /api/state/operators` — list operators from last checkpoint.
+async fn api_state_operators(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let Some(ref dir) = state.checkpoint_dir else {
+        return (StatusCode::NOT_FOUND, axum::Json(None));
+    };
+
+    let Some(manifest) = CheckpointManifest::load(dir) else {
+        return (StatusCode::NOT_FOUND, axum::Json(None));
+    };
+
+    let operators: Vec<OperatorStateInfo> = manifest
+        .operators
+        .iter()
+        .map(|name| {
+            let entry_count = load_operator_state(dir, name)
+                .map(|entries| entries.len())
+                .unwrap_or(0);
+            OperatorStateInfo {
+                name: name.clone(),
+                entry_count,
+            }
+        })
+        .collect();
+
+    (
+        StatusCode::OK,
+        axum::Json(Some(StateOperatorsResponse {
+            checkpoint_id: manifest.checkpoint_id,
+            timestamp_ms: manifest.timestamp_ms,
+            operators,
+        })),
+    )
+}
+
+/// `GET /api/state/operators/:name` — paginated key-value entries.
+async fn api_state_entries(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(operator_name): axum::extract::Path<String>,
+    Query(query): Query<StateEntriesQuery>,
+) -> impl IntoResponse {
+    let Some(ref dir) = state.checkpoint_dir else {
+        return (StatusCode::NOT_FOUND, axum::Json(None));
+    };
+
+    let Ok(entries) = load_operator_state(dir, &operator_name) else {
+        return (StatusCode::INTERNAL_SERVER_ERROR, axum::Json(None));
+    };
+
+    let filtered: Vec<_> = entries
+        .into_iter()
+        .filter(|(key, _)| {
+            if let Some(ref prefix) = query.prefix {
+                key.starts_with(prefix)
+            } else {
+                true
+            }
+        })
+        .filter(|(key, _)| {
+            if let Some(ref pattern) = query.pattern {
+                regex::Regex::new(pattern)
+                    .map(|re| re.is_match(key))
+                    .unwrap_or(false)
+            } else {
+                true
+            }
+        })
+        .collect();
+
+    let total = filtered.len();
+    let offset = query.offset.unwrap_or(0);
+    let limit = query.limit.unwrap_or(50).min(500);
+    let decode_format = query.decode.as_deref().unwrap_or("json");
+
+    let page: Vec<StateEntryItem> = filtered
+        .into_iter()
+        .skip(offset)
+        .take(limit)
+        .map(|(key, value_bytes)| {
+            let size_bytes = value_bytes.len();
+            let (value, decode) = decode_value(&value_bytes, decode_format);
+            StateEntryItem {
+                key,
+                value,
+                decode,
+                size_bytes,
+            }
+        })
+        .collect();
+
+    (
+        StatusCode::OK,
+        axum::Json(Some(StateEntriesResponse {
+            operator: operator_name,
+            total,
+            entries: page,
+        })),
+    )
+}
+
+/// `GET /api/state/operators/:name/keys/:key` — single key with all decodings.
+async fn api_state_key(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path((operator_name, key)): axum::extract::Path<(String, String)>,
+    Query(_query): Query<StateKeyQuery>,
+) -> impl IntoResponse {
+    let Some(ref dir) = state.checkpoint_dir else {
+        return (StatusCode::NOT_FOUND, axum::Json(None));
+    };
+
+    let Ok(entries) = load_operator_state(dir, &operator_name) else {
+        return (StatusCode::INTERNAL_SERVER_ERROR, axum::Json(None));
+    };
+
+    let decoded_key = urlencoding::decode(&key).unwrap_or(std::borrow::Cow::Borrowed(&key));
+    let found = entries.into_iter().find(|(k, _)| k == decoded_key.as_ref());
+
+    let Some((found_key, value_bytes)) = found else {
+        return (StatusCode::NOT_FOUND, axum::Json(None));
+    };
+
+    let size_bytes = value_bytes.len();
+    let mut decodings = std::collections::HashMap::new();
+
+    if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&value_bytes) {
+        decodings.insert("json".to_string(), v);
+    }
+    if let Ok(s) = std::str::from_utf8(&value_bytes) {
+        decodings.insert("utf8".to_string(), serde_json::Value::String(s.to_string()));
+    }
+    decodings.insert(
+        "hex".to_string(),
+        serde_json::Value::String(hex::encode(&value_bytes)),
+    );
+
+    (
+        StatusCode::OK,
+        axum::Json(Some(StateKeyResponse {
+            key: found_key,
+            size_bytes,
+            decodings,
+        })),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -411,6 +659,7 @@ mod tests {
             pipeline_name: None,
             workers: 1,
             start_time: std::time::Instant::now(),
+            checkpoint_dir: None,
         })
     }
 
@@ -448,6 +697,7 @@ mod tests {
             pipeline_name: None,
             workers: 1,
             start_time: std::time::Instant::now(),
+            checkpoint_dir: None,
         });
         let response = readyz(State(state)).await.into_response();
         assert_eq!(response.status(), StatusCode::OK);
@@ -534,6 +784,7 @@ mod tests {
             pipeline_name: Some("test-pipeline".to_string()),
             workers: 4,
             start_time: std::time::Instant::now(),
+            checkpoint_dir: None,
         });
         let response = api_info(State(state)).await.into_response();
         assert_eq!(response.status(), StatusCode::OK);

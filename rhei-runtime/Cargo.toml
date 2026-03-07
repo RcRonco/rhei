@@ -21,6 +21,9 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 metrics.workspace = true
 metrics-exporter-prometheus.workspace = true
+hex = "0.4"
+regex = "1"
+urlencoding = "2"
 seahash = "4"
 core_affinity = "0.8"
 # rdkafka is an optional dep activated by the `kafka` feature so that
