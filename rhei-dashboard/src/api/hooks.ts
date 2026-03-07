@@ -7,6 +7,9 @@ import {
   fetchHealth,
   fetchInfo,
   fetchMetricsHistory,
+  fetchStateOperators,
+  fetchStateEntries,
+  fetchStateKey,
 } from "./client";
 import type { LogEntry, TimestampedSnapshot } from "./types";
 
@@ -91,5 +94,34 @@ export function useMetricsHistory(baseUrl: string) {
     },
     refetchInterval: 2000,
     enabled: !!baseUrl,
+  });
+}
+
+export function useStateOperators(baseUrl: string) {
+  return useQuery({
+    queryKey: ["state-operators", baseUrl],
+    queryFn: () => fetchStateOperators(baseUrl),
+    refetchInterval: 5000,
+    enabled: !!baseUrl,
+  });
+}
+
+export function useStateEntries(
+  baseUrl: string,
+  operator: string,
+  opts: { prefix?: string; pattern?: string; limit?: number; offset?: number; decode?: string } = {},
+) {
+  return useQuery({
+    queryKey: ["state-entries", baseUrl, operator, opts],
+    queryFn: () => fetchStateEntries(baseUrl, operator, opts),
+    enabled: !!baseUrl && !!operator,
+  });
+}
+
+export function useStateKey(baseUrl: string, operator: string, key: string) {
+  return useQuery({
+    queryKey: ["state-key", baseUrl, operator, key],
+    queryFn: () => fetchStateKey(baseUrl, operator, key),
+    enabled: !!baseUrl && !!operator && !!key,
   });
 }

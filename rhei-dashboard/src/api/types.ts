@@ -52,3 +52,33 @@ export interface PipelineInfo {
 }
 
 export type TimestampedSnapshot = [number, MetricsSnapshot];
+
+export interface OperatorInfo {
+  name: string;
+  entry_count: number;
+}
+
+export interface StateOperatorsResponse {
+  checkpoint_id: number;
+  timestamp_ms: number;
+  operators: OperatorInfo[];
+}
+
+export interface StateEntry {
+  key: string;
+  value: unknown;
+  decode: string;
+  size_bytes: number;
+}
+
+export interface StateEntriesResponse {
+  operator: string;
+  total: number;
+  entries: StateEntry[];
+}
+
+export interface StateKeyResponse {
+  key: string;
+  size_bytes: number;
+  decodings: Record<string, unknown>;
+}

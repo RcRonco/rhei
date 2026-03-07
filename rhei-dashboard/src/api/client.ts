@@ -5,6 +5,9 @@ import type {
   HealthResponse,
   PipelineInfo,
   TimestampedSnapshot,
+  StateOperatorsResponse,
+  StateEntriesResponse,
+  StateKeyResponse,
 } from "./types";
 
 async function fetchJson<T>(baseUrl: string, path: string): Promise<T> {
@@ -43,4 +46,34 @@ export function fetchMetricsHistory(
   sinceMs: number = 0,
 ): Promise<TimestampedSnapshot[]> {
   return fetchJson(baseUrl, `/api/metrics/history?since=${sinceMs}`);
+}
+
+export function fetchStateOperators(baseUrl: string): Promise<StateOperatorsResponse> {
+  return fetchJson(baseUrl, "/api/state/operators");
+}
+
+export function fetchStateEntries(
+  baseUrl: string,
+  operator: string,
+  opts: { prefix?: string; pattern?: string; limit?: number; offset?: number; decode?: string } = {},
+): Promise<StateEntriesResponse> {
+  const params = new URLSearchParams();
+  if (opts.prefix) params.set("prefix", opts.prefix);
+  if (opts.pattern) params.set("pattern", opts.pattern);
+  if (opts.limit) params.set("limit", String(opts.limit));
+  if (opts.offset) params.set("offset", String(opts.offset));
+  if (opts.decode) params.set("decode", opts.decode);
+  const qs = params.toString();
+  return fetchJson(baseUrl, `/api/state/operators/${encodeURIComponent(operator)}${qs ? `?${qs}` : ""}`);
+}
+
+export function fetchStateKey(
+  baseUrl: string,
+  operator: string,
+  key: string,
+): Promise<StateKeyResponse> {
+  return fetchJson(
+    baseUrl,
+    `/api/state/operators/${encodeURIComponent(operator)}/keys/${encodeURIComponent(key)}`,
+  );
 }
