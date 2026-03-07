@@ -54,6 +54,16 @@ enum Commands {
         /// Address of the running pipeline's HTTP server (e.g. `127.0.0.1:9090`)
         addr: String,
     },
+    /// Run the built-in demo pipeline with the HTTP server for the web dashboard
+    Demo {
+        /// Number of parallel Timely worker threads
+        #[arg(long, default_value = "1")]
+        workers: usize,
+
+        /// Bind address for the HTTP server (default: 0.0.0.0:9090)
+        #[arg(long, default_value = "0.0.0.0:9090")]
+        addr: std::net::SocketAddr,
+    },
 }
 
 fn main() -> anyhow::Result<()> {
@@ -98,14 +108,16 @@ fn main() -> anyhow::Result<()> {
                 None
             };
 
-            cmd_run(workers, process_id, resolved_peers)
+            cmd_run(workers, metrics_addr, process_id, resolved_peers)
         }
         Commands::Attach { addr } => cmd_attach(addr),
+        Commands::Demo { workers, addr } => cmd_demo(workers, addr),
     }
 }
 
 fn cmd_run(
     workers: usize,
+    metrics_addr: Option<std::net::SocketAddr>,
     process_id: Option<usize>,
     peers: Option<Vec<String>>,
 ) -> anyhow::Result<()> {
@@ -117,6 +129,9 @@ fn cmd_run(
     cmd.arg("run");
     cmd.env("RHEI_WORKERS", workers.to_string());
 
+    if let Some(addr) = metrics_addr {
+        cmd.env("RHEI_METRICS_ADDR", addr.to_string());
+    }
     if let Some(pid) = process_id {
         cmd.env("RHEI_PROCESS_ID", pid.to_string());
     }
@@ -285,12 +300,89 @@ fn api_log_to_log_entry(
     }
 }
 
+fn cmd_demo(workers: usize, addr: std::net::SocketAddr) -> anyhow::Result<()> {
+    let rt = tokio::runtime::Runtime::new()?;
+
+    rt.block_on(async {
+        let handles =
+            rhei_runtime::telemetry::init(rhei_runtime::telemetry::TelemetryConfig {
+                metrics_addr: Some(addr),
+                log_filter: "info".to_string(),
+                json_logs: false,
+                tui: false,
+            })?;
+
+        let health = rhei_runtime::health::HealthState::new();
+
+        let executor = rhei_runtime::executor::Executor::builder()
+            .checkpoint_dir(std::env::temp_dir().join("rhei_demo"))
+            .workers(workers)
+            .health(health.clone())
+            .build();
+
+        let _http = rhei_runtime::http_server::start(
+            rhei_runtime::http_server::HttpServerConfig {
+                addr,
+                health,
+                prometheus: handles
+                    .prometheus_handle
+                    .expect("prometheus handle should exist"),
+                metrics_handle: handles.metrics_handle,
+                log_rx: handles.log_rx,
+                topology: executor.topology_handle(),
+                pipeline_name: Some("sensor-demo".to_string()),
+                workers,
+            },
+        );
+
+        eprintln!("Rhei demo pipeline starting on http://{addr}");
+        eprintln!("Open the dashboard at http://localhost:5173 and add {addr}");
+
+        run_demo_pipeline_with(executor).await
+    })
+}
+
 /// Built-in demo pipeline for TUI mode.
 ///
 /// Simulates a real-time sensor aggregation pipeline: 5 sensors emit readings
 /// every 150 ms, aggregated into 10-second tumbling windows using the
 /// operators library.
 async fn run_demo_pipeline(workers: usize) -> anyhow::Result<()> {
+    use rhei_runtime::executor::Executor;
+
+    let dir = std::env::temp_dir().join("rhei_tui_demo");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir)?;
+
+    let executor = Executor::builder()
+        .checkpoint_dir(dir)
+        .workers(workers)
+        .from_env()
+        .build();
+
+    run_demo_with_executor(&executor).await
+}
+
+/// Run the demo pipeline with a pre-configured executor (for `rhei demo`).
+async fn run_demo_pipeline_with(
+    executor: rhei_runtime::controller::PipelineController,
+) -> anyhow::Result<()> {
+    let dir = std::env::temp_dir().join("rhei_demo");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir)?;
+
+    run_demo_with_executor(&executor).await?;
+
+    // Keep alive so the HTTP server stays up
+    loop {
+        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+    }
+}
+
+/// Shared demo pipeline logic: build graph and run on the given executor.
+async fn run_demo_with_executor(
+    executor: &rhei_runtime::controller::PipelineController,
+) -> anyhow::Result<()> {
     use std::fmt;
     use std::marker::PhantomData;
 
@@ -298,7 +390,6 @@ async fn run_demo_pipeline(workers: usize) -> anyhow::Result<()> {
     use rhei_core::operators::{Avg, TumblingWindow, WindowOutput};
     use rhei_core::traits::{Sink, Source};
     use rhei_runtime::dataflow::DataflowGraph;
-    use rhei_runtime::executor::Executor;
     use serde::{Deserialize, Serialize};
 
     #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -322,7 +413,6 @@ async fn run_demo_pipeline(workers: usize) -> anyhow::Result<()> {
             if self.tick >= self.max_ticks {
                 return None;
             }
-            // Pace the data so the TUI has something to watch
             tokio::time::sleep(std::time::Duration::from_millis(150)).await;
 
             let sensors = [
@@ -351,7 +441,7 @@ async fn run_demo_pipeline(workers: usize) -> anyhow::Result<()> {
         }
     }
 
-    /// Routes operator output into the TUI log viewer via `tracing::info!`.
+    /// Routes operator output via `tracing::info!`.
     struct LoggingSink<T>(PhantomData<fn(T)>);
 
     #[async_trait]
@@ -364,10 +454,6 @@ async fn run_demo_pipeline(workers: usize) -> anyhow::Result<()> {
         }
     }
 
-    let dir = std::env::temp_dir().join("rhei_tui_demo");
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir)?;
-
     let op = TumblingWindow::builder()
         .window_size(10)
         .key_fn(|r: &SensorReading| r.sensor_id.clone())
@@ -376,7 +462,6 @@ async fn run_demo_pipeline(workers: usize) -> anyhow::Result<()> {
         .build();
 
     let graph = DataflowGraph::new();
-    // 500 ticks × 150 ms ≈ 75 seconds of simulated sensor data
     let source = SimulatedSensorSource {
         tick: 0,
         max_ticks: 500,
@@ -389,12 +474,6 @@ async fn run_demo_pipeline(workers: usize) -> anyhow::Result<()> {
         .map(|w: WindowOutput<f64>| format!("{w}"))
         .sink(LoggingSink::<String>(PhantomData));
 
-    let executor = Executor::builder()
-        .checkpoint_dir(dir.clone())
-        .workers(workers)
-        .from_env()
-        .build();
-
     // Let the TUI render before data starts flowing
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
@@ -402,8 +481,5 @@ async fn run_demo_pipeline(workers: usize) -> anyhow::Result<()> {
     executor.run(graph).await?;
     tracing::info!("pipeline completed");
 
-    // Keep alive so TUI stays up until user quits
-    loop {
-        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
-    }
+    Ok(())
 }

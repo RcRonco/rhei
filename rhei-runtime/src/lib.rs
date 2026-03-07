@@ -35,7 +35,7 @@ pub mod bridge;
 /// Cross-process checkpoint coordination via lightweight TCP.
 pub mod checkpoint_coord;
 /// Graph compilation: logical [`DataflowGraph`](dataflow::DataflowGraph) to executable segments.
-pub(crate) mod compiler;
+pub mod compiler;
 /// Pipeline configuration, lifecycle orchestration, and checkpointing.
 pub mod controller;
 /// Dataflow graph API: [`DataflowGraph`](dataflow::DataflowGraph),

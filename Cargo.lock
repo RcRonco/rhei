@@ -2730,6 +2730,7 @@ dependencies = [
  "tempfile",
  "timely",
  "tokio",
+ "tower-http",
  "tracing",
  "tracing-subscriber",
 ]

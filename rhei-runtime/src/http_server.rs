@@ -7,6 +7,9 @@
 //! - `GET /api/metrics` — structured JSON [`MetricsSnapshot`]
 //! - `GET /api/logs?after=<seq>` — buffered log entries as JSON
 //! - `GET /api/health` — JSON health status with uptime
+//! - `GET /api/topology` — serializable pipeline DAG (nodes + edges)
+//! - `GET /api/metrics/history?since=<ms>` — ring buffer of timestamped snapshots
+//! - `GET /api/info` — pipeline identity: name, version, workers, uptime
 
 use std::collections::VecDeque;
 use std::net::SocketAddr;
@@ -20,9 +23,11 @@ use axum::routing::get;
 use metrics_exporter_prometheus::PrometheusHandle;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
+use tower_http::cors::CorsLayer;
 
+use crate::compiler::ApiTopology;
 use crate::health::{HealthState, PipelineStatus};
-use crate::metrics_snapshot::MetricsHandle;
+use crate::metrics_snapshot::{MetricsHandle, MetricsSnapshot};
 use crate::tracing_capture::LogEntry;
 
 // ─── Log buffer ─────────────────────────────────────────────────────────────
@@ -94,6 +99,39 @@ impl LogBuffer {
     }
 }
 
+// ─── Metrics history ring buffer ────────────────────────────────────────────
+
+const METRICS_HISTORY_CAPACITY: usize = 720;
+
+/// Ring buffer of timestamped [`MetricsSnapshot`] values for `/api/metrics/history`.
+#[derive(Debug)]
+struct MetricsHistory {
+    entries: VecDeque<(u64, MetricsSnapshot)>,
+}
+
+impl MetricsHistory {
+    fn new() -> Self {
+        Self {
+            entries: VecDeque::with_capacity(METRICS_HISTORY_CAPACITY),
+        }
+    }
+
+    fn push(&mut self, timestamp_ms: u64, snapshot: MetricsSnapshot) {
+        if self.entries.len() >= METRICS_HISTORY_CAPACITY {
+            self.entries.pop_front();
+        }
+        self.entries.push_back((timestamp_ms, snapshot));
+    }
+
+    fn entries_since(&self, since_ms: u64) -> Vec<(u64, MetricsSnapshot)> {
+        self.entries
+            .iter()
+            .filter(|(ts, _)| *ts >= since_ms)
+            .cloned()
+            .collect()
+    }
+}
+
 // ─── Server configuration ───────────────────────────────────────────────────
 
 /// Configuration for the HTTP server.
@@ -111,6 +149,12 @@ pub struct HttpServerConfig {
     /// Log entry receiver for the `/api/logs` ring buffer. If `None`, the
     /// endpoint returns an empty array.
     pub log_rx: Option<tokio::sync::mpsc::Receiver<LogEntry>>,
+    /// Shared topology slot, populated after graph compilation.
+    pub topology: Arc<std::sync::Mutex<Option<ApiTopology>>>,
+    /// Pipeline name for `/api/info`.
+    pub pipeline_name: Option<String>,
+    /// Number of workers for `/api/info`.
+    pub workers: usize,
 }
 
 // ─── App state ──────────────────────────────────────────────────────────────
@@ -122,6 +166,11 @@ struct AppState {
     prometheus: PrometheusHandle,
     metrics_handle: Option<MetricsHandle>,
     log_buffer: Arc<Mutex<LogBuffer>>,
+    topology: Arc<std::sync::Mutex<Option<ApiTopology>>>,
+    metrics_history: Arc<Mutex<MetricsHistory>>,
+    pipeline_name: Option<String>,
+    workers: usize,
+    start_time: std::time::Instant,
 }
 
 /// JSON response body for health endpoints.
@@ -137,10 +186,25 @@ struct ApiHealthResponse {
     uptime_secs: f64,
 }
 
+/// JSON response body for the `/api/info` endpoint.
+#[derive(Serialize, Deserialize)]
+struct ApiInfoResponse {
+    name: String,
+    version: String,
+    workers: usize,
+    uptime_secs: f64,
+}
+
 /// Query parameters for `/api/logs`.
 #[derive(Deserialize)]
 struct LogQuery {
     after: Option<u64>,
+}
+
+/// Query parameters for `/api/metrics/history`.
+#[derive(Deserialize)]
+struct HistoryQuery {
+    since: Option<u64>,
 }
 
 // ─── Server start ───────────────────────────────────────────────────────────
@@ -150,6 +214,7 @@ struct LogQuery {
 /// The server runs until the `JoinHandle` is aborted or the process exits.
 pub fn start(config: HttpServerConfig) -> tokio::task::JoinHandle<()> {
     let log_buffer = Arc::new(Mutex::new(LogBuffer::new()));
+    let metrics_history = Arc::new(Mutex::new(MetricsHistory::new()));
 
     // Spawn background task to drain log receiver into ring buffer
     if let Some(mut log_rx) = config.log_rx {
@@ -161,11 +226,35 @@ pub fn start(config: HttpServerConfig) -> tokio::task::JoinHandle<()> {
         });
     }
 
+    // Spawn background task to record metrics history every 500ms
+    if let Some(ref handle) = config.metrics_handle {
+        let handle = handle.clone();
+        let history = metrics_history.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(std::time::Duration::from_millis(500));
+            loop {
+                ticker.tick().await;
+                let snapshot = handle.snapshot();
+                #[allow(clippy::cast_possible_truncation)]
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64;
+                history.lock().await.push(now_ms, snapshot);
+            }
+        });
+    }
+
     let state = Arc::new(AppState {
         health: config.health,
         prometheus: config.prometheus,
         metrics_handle: config.metrics_handle,
         log_buffer,
+        topology: config.topology,
+        metrics_history,
+        pipeline_name: config.pipeline_name,
+        workers: config.workers,
+        start_time: std::time::Instant::now(),
     });
 
     let app = Router::new()
@@ -173,8 +262,12 @@ pub fn start(config: HttpServerConfig) -> tokio::task::JoinHandle<()> {
         .route("/readyz", get(readyz))
         .route("/metrics", get(metrics))
         .route("/api/metrics", get(api_metrics))
+        .route("/api/metrics/history", get(api_metrics_history))
         .route("/api/logs", get(api_logs))
         .route("/api/health", get(api_health))
+        .route("/api/topology", get(api_topology))
+        .route("/api/info", get(api_info))
+        .layer(CorsLayer::permissive())
         .with_state(state);
 
     let addr = config.addr;
@@ -228,7 +321,7 @@ async fn metrics(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     )
 }
 
-// ─── New API handlers ───────────────────────────────────────────────────────
+// ─── API handlers ───────────────────────────────────────────────────────────
 
 /// `GET /api/metrics` — returns the current [`MetricsSnapshot`] as JSON.
 async fn api_metrics(State(state): State<Arc<AppState>>) -> impl IntoResponse {
@@ -239,6 +332,16 @@ async fn api_metrics(State(state): State<Arc<AppState>>) -> impl IntoResponse {
         }
         None => (StatusCode::NOT_FOUND, axum::Json(None)),
     }
+}
+
+/// `GET /api/metrics/history?since=<ms>` — returns timestamped metrics snapshots.
+async fn api_metrics_history(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<HistoryQuery>,
+) -> axum::Json<Vec<(u64, MetricsSnapshot)>> {
+    let since = query.since.unwrap_or(0);
+    let history = state.metrics_history.lock().await;
+    axum::Json(history.entries_since(since))
 }
 
 /// `GET /api/logs?after=<seq>` — returns buffered log entries with `seq > after`.
@@ -263,6 +366,29 @@ async fn api_health(State(state): State<Arc<AppState>>) -> axum::Json<ApiHealthR
     })
 }
 
+/// `GET /api/topology` — returns the pipeline DAG as JSON.
+async fn api_topology(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let topo = state.topology.lock().unwrap().clone();
+    match topo {
+        Some(topology) => (StatusCode::OK, axum::Json(Some(topology))),
+        None => (StatusCode::NOT_FOUND, axum::Json(None)),
+    }
+}
+
+/// `GET /api/info` — returns pipeline identity information.
+async fn api_info(State(state): State<Arc<AppState>>) -> axum::Json<ApiInfoResponse> {
+    let uptime_secs = state.start_time.elapsed().as_secs_f64();
+    axum::Json(ApiInfoResponse {
+        name: state
+            .pipeline_name
+            .clone()
+            .unwrap_or_else(|| "unnamed".to_string()),
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        workers: state.workers,
+        uptime_secs,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -280,6 +406,11 @@ mod tests {
             prometheus: test_prometheus_handle(),
             metrics_handle: None,
             log_buffer: Arc::new(Mutex::new(LogBuffer::new())),
+            topology: Arc::new(std::sync::Mutex::new(None)),
+            metrics_history: Arc::new(Mutex::new(MetricsHistory::new())),
+            pipeline_name: None,
+            workers: 1,
+            start_time: std::time::Instant::now(),
         })
     }
 
@@ -312,6 +443,11 @@ mod tests {
             prometheus: test_prometheus_handle(),
             metrics_handle: None,
             log_buffer: Arc::new(Mutex::new(LogBuffer::new())),
+            topology: Arc::new(std::sync::Mutex::new(None)),
+            metrics_history: Arc::new(Mutex::new(MetricsHistory::new())),
+            pipeline_name: None,
+            workers: 1,
+            start_time: std::time::Instant::now(),
         });
         let response = readyz(State(state)).await.into_response();
         assert_eq!(response.status(), StatusCode::OK);
@@ -355,5 +491,78 @@ mod tests {
         assert_eq!(after_3.len(), 2);
         assert_eq!(after_3[0].seq, 4);
         assert_eq!(after_3[1].seq, 5);
+    }
+
+    #[tokio::test]
+    async fn topology_returns_404_when_not_set() {
+        let state = test_state();
+        let response = api_topology(State(state)).await.into_response();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn topology_returns_200_when_set() {
+        let state = test_state();
+        {
+            let mut topo = state.topology.lock().unwrap();
+            *topo = Some(crate::compiler::ApiTopology {
+                nodes: vec![crate::compiler::ApiTopologyNode {
+                    id: 0,
+                    kind: "source".to_string(),
+                    name: "Source_0".to_string(),
+                }],
+                edges: vec![],
+            });
+        }
+        let response = api_topology(State(state)).await.into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 4096).await.unwrap();
+        let parsed: crate::compiler::ApiTopology = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed.nodes.len(), 1);
+        assert_eq!(parsed.nodes[0].kind, "source");
+    }
+
+    #[tokio::test]
+    async fn info_returns_pipeline_info() {
+        let state = Arc::new(AppState {
+            health: HealthState::new(),
+            prometheus: test_prometheus_handle(),
+            metrics_handle: None,
+            log_buffer: Arc::new(Mutex::new(LogBuffer::new())),
+            topology: Arc::new(std::sync::Mutex::new(None)),
+            metrics_history: Arc::new(Mutex::new(MetricsHistory::new())),
+            pipeline_name: Some("test-pipeline".to_string()),
+            workers: 4,
+            start_time: std::time::Instant::now(),
+        });
+        let response = api_info(State(state)).await.into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 4096).await.unwrap();
+        let parsed: ApiInfoResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed.name, "test-pipeline");
+        assert_eq!(parsed.workers, 4);
+    }
+
+    #[tokio::test]
+    async fn metrics_history_returns_entries_since() {
+        let mut history = MetricsHistory::new();
+        history.push(1000, MetricsSnapshot::default());
+        history.push(2000, MetricsSnapshot::default());
+        history.push(3000, MetricsSnapshot::default());
+
+        let since_2000 = history.entries_since(2000);
+        assert_eq!(since_2000.len(), 2);
+        assert_eq!(since_2000[0].0, 2000);
+        assert_eq!(since_2000[1].0, 3000);
+    }
+
+    #[tokio::test]
+    async fn metrics_history_evicts_oldest() {
+        let mut history = MetricsHistory::new();
+        for i in 0..730 {
+            history.push(i, MetricsSnapshot::default());
+        }
+        assert_eq!(history.entries.len(), METRICS_HISTORY_CAPACITY);
+        assert_eq!(history.entries.front().unwrap().0, 10);
     }
 }

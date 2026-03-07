@@ -6,6 +6,8 @@
 
 use std::collections::VecDeque;
 
+use serde::{Deserialize, Serialize};
+
 use crate::dataflow::{GraphNode, NodeId, NodeKind};
 
 // ── Compiled graph ──────────────────────────────────────────────────
@@ -22,6 +24,30 @@ pub(crate) struct CompiledGraph {
     pub sink_ids: Vec<NodeId>,
     /// Sorted operator names for checkpoint manifest validation.
     pub operator_names: Vec<String>,
+    /// Serializable topology snapshot for the web dashboard API.
+    pub topology: ApiTopology,
+}
+
+// ── Serializable topology ───────────────────────────────────────────
+
+/// A node in the serializable topology.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApiTopologyNode {
+    /// Node index.
+    pub id: usize,
+    /// Node kind tag: `"source"`, `"transform"`, `"key_by"`, `"operator"`, `"merge"`, `"sink"`.
+    pub kind: String,
+    /// Human-readable name.
+    pub name: String,
+}
+
+/// Serializable DAG topology for the web dashboard.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApiTopology {
+    /// Nodes in the graph.
+    pub nodes: Vec<ApiTopologyNode>,
+    /// Directed edges as `(from_id, to_id)`.
+    pub edges: Vec<(usize, usize)>,
 }
 
 // ── DAG compilation ─────────────────────────────────────────────────
@@ -109,11 +135,47 @@ pub(crate) fn compile_graph(nodes: Vec<GraphNode>) -> anyhow::Result<CompiledGra
         .collect();
     operator_names.sort();
 
+    // Extract serializable topology before nodes are consumed by execution.
+    let topology = extract_topology(&nodes);
+
     Ok(CompiledGraph {
         nodes,
         topo_order,
         source_ids,
         sink_ids,
         operator_names,
+        topology,
     })
+}
+
+/// Extract a serializable topology from the graph nodes.
+fn extract_topology(nodes: &[GraphNode]) -> ApiTopology {
+    let mut api_nodes = Vec::with_capacity(nodes.len());
+    let mut edges = Vec::new();
+
+    for node in nodes {
+        let (kind, name) = match &node.kind {
+            NodeKind::Source(_) => ("source", format!("Source_{}", node.id.0)),
+            NodeKind::Transform(_) => ("transform", format!("Transform_{}", node.id.0)),
+            NodeKind::KeyBy(_) => ("key_by", format!("KeyBy_{}", node.id.0)),
+            NodeKind::Operator { name, .. } => ("operator", name.clone()),
+            NodeKind::Merge => ("merge", format!("Merge_{}", node.id.0)),
+            NodeKind::Sink(_) => ("sink", format!("Sink_{}", node.id.0)),
+        };
+
+        api_nodes.push(ApiTopologyNode {
+            id: node.id.0,
+            kind: kind.to_string(),
+            name,
+        });
+
+        for input in &node.inputs {
+            edges.push((input.0, node.id.0));
+        }
+    }
+
+    ApiTopology {
+        nodes: api_nodes,
+        edges,
+    }
 }

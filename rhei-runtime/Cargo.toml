@@ -16,6 +16,7 @@ serde_json.workspace = true
 timely.workspace = true
 tokio.workspace = true
 rhei-core = { path = "../rhei-core" }
+tower-http = { workspace = true }
 tracing.workspace = true
 tracing-subscriber.workspace = true
 metrics.workspace = true
