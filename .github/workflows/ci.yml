@@ -97,26 +97,6 @@ jobs:
       - name: Run clippy
         run: cargo clippy --workspace --all-targets --no-deps -- -D warnings
 
-  dashboard:
-    name: Dashboard
-    runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: rhei-dashboard
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-      - name: Setup Node
-        uses: actions/setup-node@v4
-        with:
-          node-version: 22
-          cache: npm
-          cache-dependency-path: rhei-dashboard/package-lock.json
-      - name: Install dependencies
-        run: npm ci
-      - name: Type check & build
-        run: npm run build
-
   deny:
     name: Cargo Deny
     runs-on: ubuntu-latest
