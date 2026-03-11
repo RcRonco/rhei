@@ -131,6 +131,15 @@ impl StateContext {
         self.memtable.delete(key.to_vec());
     }
 
+    /// Returns all keys in the memtable that start with the given prefix.
+    ///
+    /// **Important:** This only returns keys currently in the L1 memtable —
+    /// it does NOT scan the backend (L2/L3). For TTL cleanup this is sufficient
+    /// because all active state passes through the memtable on read.
+    pub fn keys_with_prefix(&self, prefix: &[u8]) -> Vec<Vec<u8>> {
+        self.memtable.keys_with_prefix(prefix)
+    }
+
     /// Returns a mutable reference to the timer service, creating it if needed.
     pub fn timers(&mut self) -> &mut TimerService {
         self.timer_service.get_or_insert_with(TimerService::new)
@@ -247,6 +256,25 @@ mod tests {
             ctx.get::<String>(b"b").await.unwrap().as_deref(),
             Some("hello")
         );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn keys_with_prefix_returns_matching_keys() {
+        let path = temp_path("prefix_keys");
+        let _ = std::fs::remove_file(&path);
+
+        let backend = LocalBackend::new(path.clone(), None).unwrap();
+        let mut ctx = StateContext::new(Box::new(backend));
+
+        ctx.put_raw(b"map:key1", b"val1");
+        ctx.put_raw(b"map:key2", b"val2");
+        ctx.put_raw(b"other:key3", b"val3");
+
+        let mut keys = ctx.keys_with_prefix(b"map:");
+        keys.sort();
+        assert_eq!(keys, vec![b"map:key1".to_vec(), b"map:key2".to_vec()]);
 
         let _ = std::fs::remove_file(&path);
     }

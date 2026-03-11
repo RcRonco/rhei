@@ -2,6 +2,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use rdkafka::ClientConfig;
+use rdkafka::message::{Header, OwnedHeaders};
 use rdkafka::producer::{FutureProducer, FutureRecord};
 
 use super::types::KafkaRecord;
@@ -76,6 +77,16 @@ impl KafkaSink {
             let mut fr = FutureRecord::to(&self.topic).payload(&record.payload);
             if let Some(ref key) = record.key {
                 fr = fr.key(key);
+            }
+            if !record.headers.is_empty() {
+                let mut owned = OwnedHeaders::new_with_capacity(record.headers.len());
+                for h in &record.headers {
+                    owned = owned.insert(Header {
+                        key: &h.key,
+                        value: Some(&h.value),
+                    });
+                }
+                fr = fr.headers(owned);
             }
 
             match self.producer.send(fr, self.produce_timeout).await {

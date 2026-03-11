@@ -137,6 +137,32 @@ impl MemTable {
         entries
     }
 
+    /// Returns all keys in the memtable (dirty + clean) that start with the given prefix.
+    ///
+    /// Dirty tombstones are excluded (value is `None`). Keys present in both dirty
+    /// and clean are deduplicated.
+    pub fn keys_with_prefix(&self, prefix: &[u8]) -> Vec<Vec<u8>> {
+        use std::collections::HashSet;
+
+        let mut keys = HashSet::new();
+
+        // Scan dirty entries — skip tombstones (value = None).
+        for (k, v) in &self.dirty {
+            if k.starts_with(prefix) && v.is_some() {
+                keys.insert(k.clone());
+            }
+        }
+
+        // Scan clean cache entries.
+        for (k, _v) in &self.clean {
+            if k.starts_with(prefix) && !self.dirty.contains_key(&*k) {
+                keys.insert(k.to_vec());
+            }
+        }
+
+        keys.into_iter().collect()
+    }
+
     /// Load data from the backend into the clean cache (only for keys not
     /// already present).
     pub fn merge(&mut self, key: Vec<u8>, value: Bytes) {
@@ -292,6 +318,47 @@ mod tests {
             mt.clean.entry_count() <= 2,
             "should have evicted to stay at max_entries, got {}",
             mt.clean.entry_count()
+        );
+    }
+
+    #[test]
+    fn keys_with_prefix_filters_correctly() {
+        let mut mt = MemTable::new();
+        mt.put(b"scores:alice".to_vec(), Bytes::from_static(b"100"));
+        mt.put(b"scores:bob".to_vec(), Bytes::from_static(b"200"));
+        mt.put(b"timers:t1".to_vec(), Bytes::from_static(b"999"));
+
+        let mut keys = mt.keys_with_prefix(b"scores:");
+        keys.sort();
+        assert_eq!(keys, vec![b"scores:alice".to_vec(), b"scores:bob".to_vec()]);
+    }
+
+    #[test]
+    fn keys_with_prefix_excludes_tombstones() {
+        let mut mt = MemTable::new();
+        mt.put(b"map:a".to_vec(), Bytes::from_static(b"1"));
+        mt.put(b"map:b".to_vec(), Bytes::from_static(b"2"));
+        mt.delete(b"map:b".to_vec());
+
+        let keys = mt.keys_with_prefix(b"map:");
+        assert_eq!(keys, vec![b"map:a".to_vec()]);
+    }
+
+    #[test]
+    fn keys_with_prefix_includes_clean_entries() {
+        let mut mt = MemTable::new();
+        mt.put(b"map:a".to_vec(), Bytes::from_static(b"1"));
+        mt.put(b"map:b".to_vec(), Bytes::from_static(b"2"));
+        mt.flush();
+        mt.clean.run_pending_tasks();
+
+        mt.put(b"map:c".to_vec(), Bytes::from_static(b"3"));
+
+        let mut keys = mt.keys_with_prefix(b"map:");
+        keys.sort();
+        assert_eq!(
+            keys,
+            vec![b"map:a".to_vec(), b"map:b".to_vec(), b"map:c".to_vec()]
         );
     }
 

@@ -3,10 +3,10 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use rdkafka::consumer::{Consumer, StreamConsumer};
-use rdkafka::message::Message;
+use rdkafka::message::{Headers, Message};
 use rdkafka::{ClientConfig, TopicPartitionList};
 
-use super::types::KafkaMessage;
+use super::types::{KafkaHeader, KafkaMessage};
 use crate::traits::Source;
 
 /// A Kafka consumer that implements the [`Source`] trait.
@@ -95,6 +95,49 @@ impl KafkaSource {
         }
     }
 
+    /// Create a new `KafkaSource` that subscribes to topics matching a regex pattern.
+    ///
+    /// The pattern follows librdkafka conventions: a regex that is matched against
+    /// topic names. For example, `"signals\\..*"` matches `signals.org.abc`,
+    /// `signals.pov.all`, etc.
+    ///
+    /// Internally prefixes the pattern with `^` for librdkafka regex subscription.
+    ///
+    /// # Limitations
+    ///
+    /// Pattern-based sources do not support `partition_count()` /
+    /// `create_partition_source()` and will run as a single-worker source.
+    pub fn with_topic_pattern(
+        brokers: &str,
+        group_id: &str,
+        pattern: &str,
+    ) -> anyhow::Result<Self> {
+        let consumer: StreamConsumer = ClientConfig::new()
+            .set("bootstrap.servers", brokers)
+            .set("group.id", group_id)
+            .set("enable.auto.commit", "false")
+            .set("auto.offset.reset", "earliest")
+            .create()?;
+
+        let regex_topic = format!("^{pattern}");
+        consumer.subscribe(&[&regex_topic])?;
+
+        Ok(Self {
+            consumer,
+            batch_size: 100,
+            poll_timeout: Duration::from_millis(100),
+            tracked_offsets: HashMap::new(),
+            records_since_watermark: 0,
+            watermark_interval: 1000,
+            watermark_pending: false,
+            max_timestamp: None,
+            allowed_lateness_ms: 0,
+            brokers: brokers.to_owned(),
+            group_id: group_id.to_owned(),
+            topics: Vec::new(),
+        })
+    }
+
     /// Set the maximum number of messages per batch (default: 100).
     pub fn with_batch_size(mut self, batch_size: usize) -> Self {
         self.batch_size = batch_size;
@@ -143,6 +186,21 @@ impl Source for KafkaSource {
                     let partition = msg.partition();
                     let offset = msg.offset();
 
+                    let headers = msg
+                        .headers()
+                        .map(|hs| {
+                            (0..hs.count())
+                                .map(|i| {
+                                    let h = hs.get(i);
+                                    KafkaHeader {
+                                        key: h.key.to_owned(),
+                                        value: h.value.unwrap_or_default().to_vec(),
+                                    }
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
+
                     let kafka_msg = KafkaMessage {
                         topic: topic.clone(),
                         partition,
@@ -150,6 +208,7 @@ impl Source for KafkaSource {
                         key: msg.key().map(<[u8]>::to_vec),
                         payload: msg.payload().map(<[u8]>::to_vec),
                         timestamp: msg.timestamp().to_millis(),
+                        headers,
                     };
 
                     // Track max message timestamp for watermark computation.
@@ -188,8 +247,11 @@ impl Source for KafkaSource {
     }
 
     fn current_watermark(&self) -> Option<u64> {
-        self.max_timestamp
-            .map(|ts| (ts.max(0) as u64).saturating_sub(self.allowed_lateness_ms))
+        self.max_timestamp.map(|ts| {
+            u64::try_from(ts.max(0))
+                .unwrap_or(0)
+                .saturating_sub(self.allowed_lateness_ms)
+        })
     }
 
     fn current_offsets(&self) -> HashMap<String, String> {
@@ -356,6 +418,21 @@ impl Source for KafkaPartitionSource {
                     let partition = msg.partition();
                     let offset = msg.offset();
 
+                    let headers = msg
+                        .headers()
+                        .map(|hs| {
+                            (0..hs.count())
+                                .map(|i| {
+                                    let h = hs.get(i);
+                                    KafkaHeader {
+                                        key: h.key.to_owned(),
+                                        value: h.value.unwrap_or_default().to_vec(),
+                                    }
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
+
                     let kafka_msg = KafkaMessage {
                         topic: topic.clone(),
                         partition,
@@ -363,6 +440,7 @@ impl Source for KafkaPartitionSource {
                         key: msg.key().map(<[u8]>::to_vec),
                         payload: msg.payload().map(<[u8]>::to_vec),
                         timestamp: msg.timestamp().to_millis(),
+                        headers,
                     };
 
                     // Track max message timestamp for watermark computation.
@@ -397,8 +475,11 @@ impl Source for KafkaPartitionSource {
     }
 
     fn current_watermark(&self) -> Option<u64> {
-        self.max_timestamp
-            .map(|ts| (ts.max(0) as u64).saturating_sub(self.allowed_lateness_ms))
+        self.max_timestamp.map(|ts| {
+            u64::try_from(ts.max(0))
+                .unwrap_or(0)
+                .saturating_sub(self.allowed_lateness_ms)
+        })
     }
 
     fn current_offsets(&self) -> HashMap<String, String> {

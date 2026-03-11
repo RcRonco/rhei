@@ -1,5 +1,14 @@
 use serde::{Deserialize, Serialize};
 
+/// A Kafka header key-value pair.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct KafkaHeader {
+    /// The header key.
+    pub key: String,
+    /// The header value.
+    pub value: Vec<u8>,
+}
+
 /// A message consumed from Kafka, including topic/partition/offset metadata.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KafkaMessage {
@@ -15,6 +24,8 @@ pub struct KafkaMessage {
     pub payload: Option<Vec<u8>>,
     /// The message timestamp in milliseconds, if present.
     pub timestamp: Option<i64>,
+    /// The message headers, if any.
+    pub headers: Vec<KafkaHeader>,
 }
 
 /// A record to be produced to Kafka.
@@ -24,12 +35,18 @@ pub struct KafkaRecord {
     pub key: Option<Vec<u8>>,
     /// The record payload.
     pub payload: Vec<u8>,
+    /// The record headers to attach.
+    pub headers: Vec<KafkaHeader>,
 }
 
 impl KafkaRecord {
     /// Create a new record with only a payload (no key).
     pub fn new(payload: Vec<u8>) -> Self {
-        Self { key: None, payload }
+        Self {
+            key: None,
+            payload,
+            headers: Vec::new(),
+        }
     }
 
     /// Create a new record with both a key and payload.
@@ -37,6 +54,13 @@ impl KafkaRecord {
         Self {
             key: Some(key),
             payload,
+            headers: Vec::new(),
         }
+    }
+
+    /// Attach headers to this record (builder pattern).
+    pub fn with_headers(mut self, headers: Vec<KafkaHeader>) -> Self {
+        self.headers = headers;
+        self
     }
 }
