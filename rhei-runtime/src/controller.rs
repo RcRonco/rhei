@@ -15,7 +15,7 @@ use rhei_core::state::prefixed_backend::PrefixedBackend;
 use rhei_core::state::slatedb_backend::SlateDbBackend;
 use rhei_core::state::tiered_backend::{SharedL2Cache, TieredBackendConfig};
 
-use crate::compiler::compile_graph;
+use crate::compiler::{ApiTopology, compile_graph};
 use crate::dataflow::DataflowGraph;
 use crate::health::{HealthState, PipelineStatus};
 use crate::shutdown::ShutdownHandle;
@@ -75,6 +75,13 @@ pub struct PipelineController {
     pub(crate) peers: Option<Vec<String>>,
     /// Bounded memtable configuration for L1 LRU eviction.
     pub(crate) memtable_config: MemTableConfig,
+    /// Serializable topology populated after graph compilation.
+    topology: Arc<std::sync::Mutex<Option<ApiTopology>>>,
+    /// HTTP metrics/API server bind address. If set, the HTTP server is started
+    /// automatically when `run()` is called.
+    pub(crate) metrics_addr: Option<std::net::SocketAddr>,
+    /// Human-readable pipeline name for the `/api/info` endpoint.
+    pub(crate) pipeline_name: Option<String>,
     /// S3 state configuration for distributed state backend.
     #[cfg(feature = "remote-state")]
     pub(crate) remote_state: Option<RemoteStateConfig>,
@@ -92,6 +99,8 @@ pub struct PipelineControllerBuilder {
     process_id: Option<usize>,
     peers: Option<Vec<String>>,
     memtable_config: MemTableConfig,
+    metrics_addr: Option<std::net::SocketAddr>,
+    pipeline_name: Option<String>,
     #[cfg(feature = "remote-state")]
     remote_state: Option<RemoteStateConfig>,
 }
@@ -150,6 +159,21 @@ impl PipelineControllerBuilder {
         self
     }
 
+    /// Set the HTTP server bind address for metrics, health, and dashboard APIs.
+    ///
+    /// When set, `run()` will automatically start an HTTP server on this address
+    /// with `/healthz`, `/readyz`, `/metrics`, and `/api/*` endpoints.
+    pub fn metrics_addr(mut self, addr: std::net::SocketAddr) -> Self {
+        self.metrics_addr = Some(addr);
+        self
+    }
+
+    /// Set the pipeline name (shown in `/api/info`).
+    pub fn pipeline_name(mut self, name: impl Into<String>) -> Self {
+        self.pipeline_name = Some(name.into());
+        self
+    }
+
     /// Configure remote object-store-backed distributed state.
     ///
     /// Each process independently opens `SlateDB` at the same remote path,
@@ -166,6 +190,8 @@ impl PipelineControllerBuilder {
     /// - `RHEI_WORKERS`: number of worker threads (overrides `.workers()`)
     /// - `RHEI_PROCESS_ID`: process ID for cluster mode
     /// - `RHEI_PEERS`: comma-separated peer addresses for cluster mode
+    /// - `RHEI_METRICS_ADDR`: HTTP server bind address (e.g. `0.0.0.0:9090`)
+    /// - `RHEI_PIPELINE_NAME`: human-readable pipeline name
     /// - `RHEI_REMOTE_BUCKET`, `RHEI_REMOTE_PREFIX`, `RHEI_REMOTE_ENDPOINT`,
     ///   `RHEI_REMOTE_REGION`, `RHEI_REMOTE_ALLOW_HTTP`: remote state config
     pub fn from_env(mut self) -> Self {
@@ -184,6 +210,14 @@ impl PipelineControllerBuilder {
             if !peers.is_empty() {
                 self.peers = Some(peers);
             }
+        }
+        if let Ok(val) = std::env::var("RHEI_METRICS_ADDR")
+            && let Ok(addr) = val.parse::<std::net::SocketAddr>()
+        {
+            self.metrics_addr = Some(addr);
+        }
+        if let Ok(val) = std::env::var("RHEI_PIPELINE_NAME") {
+            self.pipeline_name = Some(val);
         }
         #[cfg(feature = "remote-state")]
         if let Ok(bucket) = std::env::var("RHEI_REMOTE_BUCKET") {
@@ -223,6 +257,9 @@ impl PipelineControllerBuilder {
             process_id: self.process_id,
             peers: self.peers,
             memtable_config: self.memtable_config,
+            topology: Arc::new(std::sync::Mutex::new(None)),
+            metrics_addr: self.metrics_addr,
+            pipeline_name: self.pipeline_name,
             #[cfg(feature = "remote-state")]
             remote_state: self.remote_state,
         }
@@ -242,6 +279,8 @@ impl PipelineController {
             process_id: None,
             peers: None,
             memtable_config: MemTableConfig::default(),
+            metrics_addr: None,
+            pipeline_name: None,
             #[cfg(feature = "remote-state")]
             remote_state: None,
         }
@@ -261,6 +300,9 @@ impl PipelineController {
             process_id: None,
             peers: None,
             memtable_config: MemTableConfig::default(),
+            topology: Arc::new(std::sync::Mutex::new(None)),
+            metrics_addr: None,
+            pipeline_name: None,
             #[cfg(feature = "remote-state")]
             remote_state: None,
         }
@@ -269,6 +311,16 @@ impl PipelineController {
     /// Returns a reference to the controller's [`HealthState`].
     pub fn health(&self) -> &HealthState {
         &self.health
+    }
+
+    /// Returns the pipeline topology, if the graph has been compiled.
+    pub fn topology(&self) -> Option<ApiTopology> {
+        self.topology.lock().unwrap().clone()
+    }
+
+    /// Returns a shared handle to the topology slot for use in the HTTP server.
+    pub fn topology_handle(&self) -> Arc<std::sync::Mutex<Option<ApiTopology>>> {
+        self.topology.clone()
     }
 
     /// Set the number of parallel workers for keyed pipelines.
@@ -356,6 +408,17 @@ impl PipelineController {
         run_graph(graph, self, None).await
     }
 
+    /// Initialize telemetry, start the HTTP server (if `metrics_addr` is set),
+    /// then compile and execute the [`DataflowGraph`].
+    ///
+    /// This is the recommended entry point for `#[rhei::pipeline]` generated
+    /// code. It handles the full lifecycle: telemetry init, HTTP server start,
+    /// graph compilation, and execution.
+    pub async fn start(&self, graph: DataflowGraph) -> anyhow::Result<()> {
+        let _http_handle = self.maybe_start_http()?;
+        self.run(graph).await
+    }
+
     /// Compile and execute a [`DataflowGraph`] with graceful shutdown.
     pub async fn run_with_shutdown(
         &self,
@@ -363,6 +426,42 @@ impl PipelineController {
         shutdown: ShutdownHandle,
     ) -> anyhow::Result<()> {
         run_graph(graph, self, Some(shutdown)).await
+    }
+
+    /// Start the HTTP server if `metrics_addr` is configured.
+    ///
+    /// Initializes telemetry (Prometheus + Snapshot recorders) and returns
+    /// the server join handle. The handle keeps the server alive; drop it
+    /// or abort it to stop the server.
+    fn maybe_start_http(&self) -> anyhow::Result<Option<tokio::task::JoinHandle<()>>> {
+        let Some(addr) = self.metrics_addr else {
+            return Ok(None);
+        };
+
+        let handles = crate::telemetry::init(crate::telemetry::TelemetryConfig {
+            metrics_addr: Some(addr),
+            log_filter: std::env::var("RHEI_LOG_LEVEL").unwrap_or_else(|_| "info".to_string()),
+            json_logs: std::env::var("RHEI_JSON_LOGS")
+                .map(|v| v == "1" || v == "true")
+                .unwrap_or(false),
+            tui: false,
+        })?;
+
+        let http_handle = crate::http_server::start(crate::http_server::HttpServerConfig {
+            addr,
+            health: self.health.clone(),
+            prometheus: handles
+                .prometheus_handle
+                .expect("prometheus handle should exist when metrics_addr is set"),
+            metrics_handle: handles.metrics_handle,
+            log_rx: handles.log_rx,
+            topology: self.topology.clone(),
+            pipeline_name: self.pipeline_name.clone(),
+            workers: self.workers,
+            checkpoint_dir: Some(self.checkpoint_dir.clone()),
+        });
+
+        Ok(Some(http_handle))
     }
 
     /// Set the memtable configuration for L1 LRU eviction.
@@ -438,6 +537,9 @@ async fn run_graph(
     shutdown: Option<ShutdownHandle>,
 ) -> anyhow::Result<()> {
     let compiled = compile_graph(graph.into_nodes())?;
+
+    // Store topology for the HTTP API before nodes are consumed.
+    *controller.topology.lock().unwrap() = Some(compiled.topology.clone());
 
     let all_operator_names = &compiled.operator_names;
 

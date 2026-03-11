@@ -82,8 +82,8 @@
 - [x] Late-event policy: drop with metric and configurable `allowed_lateness` (KI-6 partial)
 - [ ] Late-event side-output routing (redirect late events to a separate stream)
 - [x] Operator-level error handling (skip or dead-letter file via `ErrorPolicy`)
-- [ ] Propagate sink send errors instead of silently dropping (KI-1)
-- [ ] Propagate DLQ write errors instead of silently dropping (KI-3)
+- [x] Propagate sink send errors instead of silently dropping (KI-1)
+- [x] Propagate DLQ write errors instead of silently dropping (KI-3)
 - [x] Propagate checkpoint failures in single-worker mode (KI-15)
 - [ ] Fix async stash ordering — pending elements can be overtaken by later L1 hits (KI-11)
 - [x] Configurable checkpoint interval via `Executor::builder().checkpoint_interval(n)` (KI-8)
@@ -97,7 +97,7 @@
 - [x] Support multiple exchanges (key_by) in a single pipeline (KI-4)
 - [x] Merge / fan-in — combine multiple streams into one (KI-9)
 - [x] Fan-out — one source feeding multiple sinks (KI-17)
-- [ ] Temporal join timeout and state eviction for unmatched events (KI-5)
+- [x] Temporal join timeout and state eviction for unmatched events (KI-5)
 - [x] Single-worker source offset tracking in checkpoint manifest (KI-12)
 
 ## Clustering

@@ -57,7 +57,7 @@ pub(crate) fn expand(item: ItemFn) -> Result<TokenStream, Error> {
                 .checkpoint_dir(&__rhei_dir)
                 .from_env()
                 .build()
-                .run(__rhei_graph)
+                .start(__rhei_graph)
                 .await?;
             Ok(())
         }

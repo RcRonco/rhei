@@ -136,6 +136,41 @@ impl CheckpointManifest {
     }
 }
 
+/// Load operator state from a checkpoint file.
+///
+/// Reads `{dir}/{operator_name}.checkpoint.json` (`LocalBackend` format),
+/// strips the `{operator_name}/` prefix from keys, and returns
+/// `(user_key_string, raw_value_bytes)` pairs.
+///
+/// Returns an empty vec if the file does not exist.
+pub fn load_operator_state(
+    dir: &Path,
+    operator_name: &str,
+) -> anyhow::Result<Vec<(String, Vec<u8>)>> {
+    let path = dir.join(format!("{operator_name}.checkpoint.json"));
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+
+    let contents = std::fs::read_to_string(&path)?;
+    let raw_entries: Vec<(Vec<u8>, Vec<u8>)> = serde_json::from_str(&contents)?;
+
+    let prefix = format!("{operator_name}/");
+    let entries = raw_entries
+        .into_iter()
+        .map(|(key_bytes, value_bytes)| {
+            let key_str = String::from_utf8_lossy(&key_bytes);
+            let user_key = key_str
+                .strip_prefix(&prefix)
+                .unwrap_or(&key_str)
+                .to_string();
+            (user_key, value_bytes)
+        })
+        .collect();
+
+    Ok(entries)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -296,5 +331,34 @@ mod tests {
                 .await
                 .is_none()
         );
+    }
+
+    #[test]
+    fn load_operator_state_parses_checkpoint_file() {
+        let dir = std::env::temp_dir().join(format!("rhei_state_load_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let entries: Vec<(Vec<u8>, Vec<u8>)> = vec![
+            (b"my_op/key1".to_vec(), b"\"value1\"".to_vec()),
+            (b"my_op/key2".to_vec(), b"\"value2\"".to_vec()),
+        ];
+        let json = serde_json::to_string(&entries).unwrap();
+        std::fs::write(dir.join("my_op.checkpoint.json"), &json).unwrap();
+
+        let result = load_operator_state(&dir, "my_op").unwrap();
+        assert_eq!(result.len(), 2);
+        assert!(result.iter().any(|(k, _)| k == "key1"));
+        assert!(result.iter().any(|(k, _)| k == "key2"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_operator_state_returns_empty_for_missing_file() {
+        let dir = std::env::temp_dir().join("rhei_state_missing");
+        let result = load_operator_state(&dir, "nonexistent");
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_empty());
     }
 }

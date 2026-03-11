@@ -1,0 +1,48 @@
+@import "tailwindcss";
+
+@layer base {
+  :root {
+    --node-source: #22c55e;
+    --node-transform: #06b6d4;
+    --node-filter: #eab308;
+    --node-keyby: #3b82f6;
+    --node-sink: #d946ef;
+    --node-operator: #06b6d4;
+    --node-merge: #a855f7;
+  }
+
+  body {
+    font-family: "Inter", system-ui, -apple-system, sans-serif;
+  }
+
+  code, .font-mono {
+    font-family: "JetBrains Mono", ui-monospace, monospace;
+  }
+}
+
+@layer components {
+  .card {
+    @apply bg-gray-900 rounded-xl ring-1 ring-gray-800 transition-shadow;
+  }
+  .card:hover {
+    @apply shadow-lg shadow-black/20;
+  }
+
+  .recharts-cartesian-grid line {
+    stroke: #1f2937;
+  }
+  .recharts-tooltip-wrapper .recharts-default-tooltip {
+    background-color: #111827 !important;
+    border: 1px solid #1f2937 !important;
+    border-radius: 0.5rem !important;
+    box-shadow: 0 10px 25px rgba(0, 0, 0, 0.4) !important;
+  }
+  .recharts-tooltip-item {
+    color: #d1d5db !important;
+    font-size: 0.75rem !important;
+  }
+  .recharts-legend-item-text {
+    color: #9ca3af !important;
+    font-size: 0.75rem !important;
+  }
+}
