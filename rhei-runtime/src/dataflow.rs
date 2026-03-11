@@ -438,6 +438,93 @@ where
     }
 }
 
+/// Internal tag used by [`DlqErasedOperator`] to distinguish main outputs
+/// from error outputs at the `AnyItem` level.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+enum DlqTag {
+    /// A successful output item (the inner `AnyItem` has the operator's output type).
+    Main(AnyItem),
+    /// An error message from a failed `process` / `process_batch` call.
+    Error(String),
+}
+
+impl std::fmt::Debug for DlqTag {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DlqTag::Main(item) => f.debug_tuple("Main").field(&item.debug_repr()).finish(),
+            DlqTag::Error(msg) => f.debug_tuple("Error").field(msg).finish(),
+        }
+    }
+}
+
+/// Wraps a `Box<dyn ErasedOperator>`, converting `Err` results into
+/// `DlqTag::Error` items instead of propagating them as pipeline failures.
+///
+/// Used by [`KeyedStream::with_dlq`] via graph rewriting.
+struct DlqErasedOperator {
+    inner: Box<dyn ErasedOperator>,
+}
+
+#[async_trait]
+impl ErasedOperator for DlqErasedOperator {
+    async fn process(
+        &mut self,
+        input: AnyItem,
+        ctx: &mut StateContext,
+    ) -> anyhow::Result<Vec<AnyItem>> {
+        match self.inner.process(input, ctx).await {
+            Ok(items) => Ok(items.into_iter().map(|i| AnyItem::new(DlqTag::Main(i))).collect()),
+            Err(e) => Ok(vec![AnyItem::new(DlqTag::Error(e.to_string()))]),
+        }
+    }
+
+    async fn process_batch(
+        &mut self,
+        inputs: Vec<AnyItem>,
+        ctx: &mut StateContext,
+    ) -> anyhow::Result<Vec<AnyItem>> {
+        match self.inner.process_batch(inputs, ctx).await {
+            Ok(items) => Ok(items.into_iter().map(|i| AnyItem::new(DlqTag::Main(i))).collect()),
+            Err(e) => Ok(vec![AnyItem::new(DlqTag::Error(e.to_string()))]),
+        }
+    }
+
+    async fn on_watermark(
+        &mut self,
+        watermark: u64,
+        ctx: &mut StateContext,
+    ) -> anyhow::Result<Vec<AnyItem>> {
+        // Watermark errors are not DLQ-able — propagate them.
+        self.inner.on_watermark(watermark, ctx).await
+    }
+
+    async fn open(&mut self, ctx: &mut StateContext) -> anyhow::Result<()> {
+        self.inner.open(ctx).await
+    }
+
+    async fn close(&mut self) -> anyhow::Result<()> {
+        self.inner.close().await
+    }
+
+    async fn on_timer(
+        &mut self,
+        timestamp: u64,
+        key: &str,
+        ctx: &mut StateContext,
+    ) -> anyhow::Result<Vec<AnyItem>> {
+        match self.inner.on_timer(timestamp, key, ctx).await {
+            Ok(items) => Ok(items.into_iter().map(|i| AnyItem::new(DlqTag::Main(i))).collect()),
+            Err(e) => Ok(vec![AnyItem::new(DlqTag::Error(e.to_string()))]),
+        }
+    }
+
+    fn clone_erased(&self) -> Box<dyn ErasedOperator> {
+        Box::new(DlqErasedOperator {
+            inner: self.inner.clone_erased(),
+        })
+    }
+}
+
 // ── Transform context ────────────────────────────────────────────────
 
 /// Runtime context available to stateless transforms.
@@ -766,6 +853,89 @@ impl<
     }
 }
 
+// ── KafkaMessage convenience methods ─────────────────────────────────
+
+#[cfg(feature = "kafka")]
+impl<'a> Stream<'a, rhei_core::connectors::kafka::types::KafkaMessage> {
+    /// Deserialize Kafka message payloads as JSON, dropping messages that
+    /// fail to parse (with a warning log).
+    ///
+    /// ```ignore
+    /// let events: Stream<MyEvent> = graph
+    ///     .source(kafka_source)
+    ///     .parse_json::<MyEvent>();
+    /// ```
+    pub fn parse_json<O>(self) -> Stream<'a, O>
+    where
+        O: Clone
+            + Send
+            + std::fmt::Debug
+            + serde::Serialize
+            + serde::de::DeserializeOwned
+            + 'static,
+    {
+        self.flat_map(|msg| {
+            let payload = msg.payload.as_deref().unwrap_or_default();
+            match serde_json::from_slice::<O>(payload) {
+                Ok(val) => vec![val],
+                Err(e) => {
+                    tracing::warn!(
+                        topic = %msg.topic,
+                        partition = msg.partition,
+                        offset = msg.offset,
+                        error = %e,
+                        "Failed to deserialize JSON payload"
+                    );
+                    vec![]
+                }
+            }
+        })
+    }
+}
+
+// ── Kafka JSON serialization helpers ─────────────────────────────────
+
+#[cfg(feature = "kafka")]
+impl<
+    'a,
+    T: Clone + Send + std::fmt::Debug + serde::Serialize + serde::de::DeserializeOwned + 'static,
+> Stream<'a, T>
+{
+    /// Serialize each element as JSON into a [`KafkaRecord`] with no key.
+    ///
+    /// ```ignore
+    /// stream.to_json().sink(kafka_sink);
+    /// ```
+    pub fn to_json(self) -> Stream<'a, rhei_core::connectors::kafka::types::KafkaRecord> {
+        self.map(|item| {
+            let payload = serde_json::to_vec(&item).expect("JSON serialization failed");
+            rhei_core::connectors::kafka::types::KafkaRecord::new(payload)
+        })
+    }
+
+    /// Serialize each element as JSON into a [`KafkaRecord`] with a key
+    /// extracted by the given closure.
+    ///
+    /// ```ignore
+    /// stream
+    ///     .to_json_keyed(|event| event.id.clone().into_bytes())
+    ///     .sink(kafka_sink);
+    /// ```
+    pub fn to_json_keyed<F>(
+        self,
+        key_fn: F,
+    ) -> Stream<'a, rhei_core::connectors::kafka::types::KafkaRecord>
+    where
+        F: Fn(&T) -> Vec<u8> + Send + Sync + 'static,
+    {
+        self.map(move |item| {
+            let key = key_fn(&item);
+            let payload = serde_json::to_vec(&item).expect("JSON serialization failed");
+            rhei_core::connectors::kafka::types::KafkaRecord::with_key(key, payload)
+        })
+    }
+}
+
 // ── KeyedStream handle ───────────────────────────────────────────────
 
 /// A stream partitioned by key. Only `KeyedStream` supports stateful operators.
@@ -951,6 +1121,75 @@ impl<
         KeyedStream::new(self.graph, node_id)
     }
 
+    /// Attach a dead-letter queue to the preceding operator.
+    ///
+    /// Rewrites the operator so that `Err(e)` results are routed to an error
+    /// stream instead of crashing the pipeline. The closure receives the error
+    /// stream (`Stream<String>`) for wiring (e.g. to a Kafka DLQ sink).
+    /// Returns the main `KeyedStream<T>` for continued chaining.
+    ///
+    /// ```ignore
+    /// stream
+    ///     .key_by(|x| x.key.clone())
+    ///     .operator("process", MyProcessor)
+    ///     .with_dlq(|errors| errors.to_json().sink(dlq_sink))
+    ///     .to_json_keyed(|e| e.key())
+    ///     .sink(output_sink);
+    /// ```
+    ///
+    /// # Panics
+    ///
+    /// Panics if the preceding node is not an `Operator`.
+    pub fn with_dlq<F>(self, f: F) -> KeyedStream<'a, T>
+    where
+        F: FnOnce(Stream<'a, String>),
+    {
+        // Rewrite the operator node to wrap it in DlqErasedOperator.
+        {
+            let mut nodes = self.graph.nodes.borrow_mut();
+            let node = &mut nodes[self.node_id.0];
+            match &mut node.kind {
+                NodeKind::Operator { op, .. } => {
+                    let temp = op.clone_erased();
+                    let inner = std::mem::replace(op, temp);
+                    *op = Box::new(DlqErasedOperator { inner });
+                }
+                other => panic!(
+                    "with_dlq called on non-operator node: {:?}",
+                    std::mem::discriminant(other)
+                ),
+            }
+        }
+
+        // The operator now emits DlqTag items. Split into main/error streams.
+        let main_transform: TransformFn = Arc::new(|item: AnyItem, _ctx| {
+            let tag: DlqTag = item.downcast();
+            match tag {
+                DlqTag::Main(inner) => vec![inner],
+                DlqTag::Error(_) => vec![],
+            }
+        });
+        let main_id = self
+            .graph
+            .add_node(NodeKind::Transform(main_transform), vec![self.node_id]);
+
+        let side_transform: TransformFn = Arc::new(|item: AnyItem, _ctx| {
+            let tag: DlqTag = item.downcast();
+            match tag {
+                DlqTag::Main(_) => vec![],
+                DlqTag::Error(msg) => vec![AnyItem::new(msg)],
+            }
+        });
+        let side_id = self
+            .graph
+            .add_node(NodeKind::Transform(side_transform), vec![self.node_id]);
+
+        // Wire the error stream via the user's closure.
+        f(Stream::new(self.graph, side_id));
+
+        KeyedStream::new(self.graph, main_id)
+    }
+
     /// Re-partition by a new key (triggers a new exchange).
     pub fn key_by<KF>(self, key_fn: KF) -> KeyedStream<'a, T>
     where
@@ -1039,6 +1278,39 @@ impl<
             NodeKind::Sink(Box::new(SinkWrapper(sink))),
             vec![self.node_id],
         );
+    }
+}
+
+// ── Kafka JSON serialization helpers (KeyedStream) ───────────────────
+
+#[cfg(feature = "kafka")]
+impl<
+    'a,
+    T: Clone + Send + std::fmt::Debug + serde::Serialize + serde::de::DeserializeOwned + 'static,
+> KeyedStream<'a, T>
+{
+    /// Serialize each element as JSON into a [`KafkaRecord`] with no key.
+    pub fn to_json(self) -> KeyedStream<'a, rhei_core::connectors::kafka::types::KafkaRecord> {
+        self.map(|item| {
+            let payload = serde_json::to_vec(&item).expect("JSON serialization failed");
+            rhei_core::connectors::kafka::types::KafkaRecord::new(payload)
+        })
+    }
+
+    /// Serialize each element as JSON into a [`KafkaRecord`] with a key
+    /// extracted by the given closure.
+    pub fn to_json_keyed<F>(
+        self,
+        key_fn: F,
+    ) -> KeyedStream<'a, rhei_core::connectors::kafka::types::KafkaRecord>
+    where
+        F: Fn(&T) -> Vec<u8> + Send + Sync + 'static,
+    {
+        self.map(move |item| {
+            let key = key_fn(&item);
+            let payload = serde_json::to_vec(&item).expect("JSON serialization failed");
+            rhei_core::connectors::kafka::types::KafkaRecord::with_key(key, payload)
+        })
     }
 }
 

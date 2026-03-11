@@ -29,6 +29,14 @@ pub use rhei_core::state::map_state::MapState;
 pub use rhei_core::state::timer_service::TimerService;
 pub use rhei_core::state::value_state::ValueState;
 
+// Kafka connectors (behind `kafka` feature)
+#[cfg(feature = "kafka")]
+pub use rhei_core::connectors::kafka::sink::KafkaSink;
+#[cfg(feature = "kafka")]
+pub use rhei_core::connectors::kafka::source::KafkaSource;
+#[cfg(feature = "kafka")]
+pub use rhei_core::connectors::kafka::types::{KafkaHeader, KafkaMessage, KafkaRecord};
+
 // Operators
 pub use rhei_core::operators::count_window::{CountWindow, CountWindowOutput};
 pub use rhei_core::operators::enrich::EnrichOp;
