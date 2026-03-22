@@ -473,7 +473,10 @@ impl ErasedOperator for DlqErasedOperator {
         ctx: &mut StateContext,
     ) -> anyhow::Result<Vec<AnyItem>> {
         match self.inner.process(input, ctx).await {
-            Ok(items) => Ok(items.into_iter().map(|i| AnyItem::new(DlqTag::Main(i))).collect()),
+            Ok(items) => Ok(items
+                .into_iter()
+                .map(|i| AnyItem::new(DlqTag::Main(i)))
+                .collect()),
             Err(e) => Ok(vec![AnyItem::new(DlqTag::Error(e.to_string()))]),
         }
     }
@@ -484,7 +487,10 @@ impl ErasedOperator for DlqErasedOperator {
         ctx: &mut StateContext,
     ) -> anyhow::Result<Vec<AnyItem>> {
         match self.inner.process_batch(inputs, ctx).await {
-            Ok(items) => Ok(items.into_iter().map(|i| AnyItem::new(DlqTag::Main(i))).collect()),
+            Ok(items) => Ok(items
+                .into_iter()
+                .map(|i| AnyItem::new(DlqTag::Main(i)))
+                .collect()),
             Err(e) => Ok(vec![AnyItem::new(DlqTag::Error(e.to_string()))]),
         }
     }
@@ -513,7 +519,10 @@ impl ErasedOperator for DlqErasedOperator {
         ctx: &mut StateContext,
     ) -> anyhow::Result<Vec<AnyItem>> {
         match self.inner.on_timer(timestamp, key, ctx).await {
-            Ok(items) => Ok(items.into_iter().map(|i| AnyItem::new(DlqTag::Main(i))).collect()),
+            Ok(items) => Ok(items
+                .into_iter()
+                .map(|i| AnyItem::new(DlqTag::Main(i)))
+                .collect()),
             Err(e) => Ok(vec![AnyItem::new(DlqTag::Error(e.to_string()))]),
         }
     }
