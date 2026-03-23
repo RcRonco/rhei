@@ -2,9 +2,9 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use object_store::path::Path;
 
 use super::backend::StateBackend;
+use slatedb::object_store::path::Path;
 
 /// L3 backend wrapping a `SlateDB` instance on object storage.
 ///

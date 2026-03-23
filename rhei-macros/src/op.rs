@@ -63,12 +63,13 @@ pub(crate) fn expand(item: ItemFn) -> Result<TokenStream, Error> {
 
     // Generate struct name from function name
     let struct_name = snake_to_pascal(&item.sig.ident.to_string());
+    let vis = &item.vis;
 
     let body = &item.block;
 
     Ok(quote! {
         #[derive(Clone, Debug)]
-        struct #struct_name;
+        #vis struct #struct_name;
 
         #[::rhei::__private::async_trait]
         impl ::rhei::StreamFunction for #struct_name {

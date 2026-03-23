@@ -3,34 +3,34 @@ members = ["rhei-core", "rhei-runtime", "rhei-cli", "rhei-macros", "rhei"]
 resolver = "3"
 
 [workspace.dependencies]
-anyhow = "1.0.101"
+anyhow = "1.0.102"
 async-trait = "0.1.89"
 bincode = "1.3"
-clap = { version = "4.5.58", features = ["derive"] }
-crossterm = { version = "0.28", features = ["event-stream"] }
-flume = "0.11"
-futures = "0.3.31"
+clap = { version = "4.6.0", features = ["derive"] }
+crossterm = { version = "0.29.0", features = ["event-stream"] }
+flume = "0.12.0"
+futures = "0.3.32"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
-timely = "0.26.1"
-tokio = { version = "1", features = ["full"] }
+timely = "0.27.0"
+tokio = { version = "1.50.0", features = ["full"] }
 foyer = "0.22.3"
-slatedb = "0.10.1"
-object_store = "0.12"
+slatedb = "0.11.2"
+object_store = "0.12.5"
 bytes = "1"
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
 metrics = "0.24"
-moka = { version = "0.12", features = ["sync"] }
-metrics-exporter-prometheus = "0.16"
-ratatui = "0.29"
+moka = { version = "0.12.15", features = ["sync"] }
+metrics-exporter-prometheus = "0.18.1"
+ratatui = "0.30.0"
 axum = "0.8"
 tower-http = { version = "0.6", features = ["cors"] }
-rdkafka = { version = "0.36", features = ["cmake-build"] }
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
-tempfile = "3"
-syn = { version = "2", features = ["full"] }
-quote = "1"
+rdkafka = { version = "0.39.0", features = ["cmake-build"] }
+reqwest = { version = "0.13.2", default-features = false, features = ["json"] }
+tempfile = "3.27.0"
+syn = { version = "2.0.117", features = ["full"] }
+quote = "1.0.45"
 proc-macro2 = "1"
 
 [workspace.lints.rust]

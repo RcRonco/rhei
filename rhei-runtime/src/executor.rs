@@ -28,6 +28,8 @@ pub use crate::controller::PipelineControllerBuilder as ExecutorBuilder;
 
 /// Type alias for a Timely worker scope parameterized by allocator.
 type Scope<'a, A> = Child<'a, Worker<A>, u64>;
+type ScopedStream<'a, A, R> = timely::dataflow::Stream<Scope<'a, A>, Vec<R>>;
+type ScopedAnyStream<'a, A> = ScopedStream<'a, A, AnyItem>;
 
 /// Special sentinel values in the `u64` timeline shared by watermarks and epochs.
 ///
@@ -240,7 +242,7 @@ impl DataflowExecutor {
         data: &mut ExecutorData,
         source_rx: &mut HashMap<NodeId, flume::Receiver<crate::bridge::SourceBatch>>,
     ) -> probe::Handle<u64> {
-        let mut streams: HashMap<NodeId, timely::dataflow::Stream<_, AnyItem>> = HashMap::new();
+        let mut streams: HashMap<NodeId, ScopedAnyStream<_>> = HashMap::new();
         let probe = probe::Handle::new();
 
         for &node_id in self.topo_order.iter() {
@@ -294,7 +296,7 @@ impl DataflowExecutor {
         node_id: NodeId,
         source_receivers: &mut HashMap<NodeId, flume::Receiver<crate::bridge::SourceBatch>>,
         source_watermarks: &mut HashMap<NodeId, Arc<AtomicU64>>,
-    ) -> timely::dataflow::Stream<Scope<'a, A>, AnyItem> {
+    ) -> ScopedAnyStream<'a, A> {
         use timely::dataflow::operators::generic::OutputBuilder;
         use timely::dataflow::operators::generic::builder_rc::OperatorBuilder;
         use timely::scheduling::Scheduler;
@@ -422,9 +424,9 @@ impl DataflowExecutor {
         &self,
         _scope: &mut Scope<'a, A>,
         node_id: NodeId,
-        input_stream: timely::dataflow::Stream<Scope<'a, A>, AnyItem>,
+        input_stream: ScopedAnyStream<'a, A>,
         transforms: &mut HashMap<NodeId, TransformFn>,
-    ) -> timely::dataflow::Stream<Scope<'a, A>, AnyItem> {
+    ) -> ScopedAnyStream<'a, A> {
         use timely::container::CapacityContainerBuilder;
         use timely::dataflow::channels::pact::Pipeline;
         use timely::dataflow::operators::generic::operator::Operator;
@@ -460,9 +462,9 @@ impl DataflowExecutor {
     /// Build a key-by exchange as an `ExchangePact` unary operator.
     fn build_key_by<'a, A: Allocate>(
         node_id: NodeId,
-        input_stream: timely::dataflow::Stream<Scope<'a, A>, AnyItem>,
+        input_stream: ScopedAnyStream<'a, A>,
         key_fns: &mut HashMap<NodeId, crate::dataflow::KeyFn>,
-    ) -> timely::dataflow::Stream<Scope<'a, A>, AnyItem> {
+    ) -> ScopedAnyStream<'a, A> {
         use timely::container::CapacityContainerBuilder;
         use timely::dataflow::channels::pact::Exchange as ExchangePact;
         use timely::dataflow::operators::generic::operator::Operator;
@@ -488,10 +490,10 @@ impl DataflowExecutor {
     fn build_operator<'a, A: Allocate>(
         &self,
         node_id: NodeId,
-        input_stream: timely::dataflow::Stream<Scope<'a, A>, AnyItem>,
+        input_stream: ScopedAnyStream<'a, A>,
         operators: &mut HashMap<NodeId, (String, Box<dyn ErasedOperator>)>,
         operator_contexts: &mut HashMap<NodeId, StateContext>,
-    ) -> timely::dataflow::Stream<Scope<'a, A>, AnyItem> {
+    ) -> ScopedAnyStream<'a, A> {
         use timely::container::CapacityContainerBuilder;
         use timely::dataflow::channels::pact::Pipeline;
         use timely::dataflow::operators::Capability;
@@ -532,7 +534,7 @@ impl DataflowExecutor {
                         }
                     };
                     input.for_each(|cap, data| {
-                        let owned_cap = cap.retain();
+                        let owned_cap = cap.retain(0);
                         let batch: Vec<AnyItem> = std::mem::take(data);
                         if batch.is_empty() {
                             return;
@@ -584,8 +586,8 @@ impl DataflowExecutor {
     fn build_merge<'a, A: Allocate>(
         scope: &mut Scope<'a, A>,
         inputs: &[NodeId],
-        streams: &HashMap<NodeId, timely::dataflow::Stream<Scope<'a, A>, AnyItem>>,
-    ) -> timely::dataflow::Stream<Scope<'a, A>, AnyItem> {
+        streams: &HashMap<NodeId, ScopedAnyStream<'a, A>>,
+    ) -> ScopedAnyStream<'a, A> {
         use timely::dataflow::operators::Concatenate;
 
         let input_streams: Vec<_> = inputs.iter().map(|id| streams[id].clone()).collect();
@@ -596,7 +598,7 @@ impl DataflowExecutor {
     fn build_sink<A: Allocate>(
         &self,
         node_id: NodeId,
-        input_stream: timely::dataflow::Stream<Scope<'_, A>, AnyItem>,
+        input_stream: ScopedAnyStream<'_, A>,
         probe: &probe::Handle<u64>,
     ) {
         use timely::container::CapacityContainerBuilder;

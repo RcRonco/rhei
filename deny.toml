@@ -6,6 +6,12 @@ ignore = [
     # Transitive dependencies we can't control
     { id = "RUSTSEC-2025-0141", reason = "bincode 1.3.3 is a transitive dep from foyer/timely, considered complete by maintainers" },
     { id = "RUSTSEC-2024-0436", reason = "paste is a transitive dep from foyer/timely" },
+    { id = "RUSTSEC-2026-0044", reason = "Rust TLS stack is used by object_store->slatedb" },
+    { id = "RUSTSEC-2026-0045", reason = "Rust TLS stack is used by object_store->slatedb" },
+    { id = "RUSTSEC-2026-0046", reason = "Rust TLS stack is used by object_store->slatedb" },
+    { id = "RUSTSEC-2026-0047", reason = "Rust TLS stack is used by object_store->slatedb" },
+    { id = "RUSTSEC-2026-0048", reason = "Rust TLS stack is used by object_store->slatedb" },
+    { id = "RUSTSEC-2026-0049", reason = "Rust TLS stack is used by object_store->slatedb" },
 ]
 
 [licenses]

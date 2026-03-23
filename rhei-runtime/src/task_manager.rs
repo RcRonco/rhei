@@ -351,7 +351,23 @@ impl TaskManager {
             })
             .map_err(|e| anyhow::anyhow!("timely execution failed: {e}"))?;
 
-            drop(guards);
+            // Timely's TCP send/recv threads panic on I/O errors during
+            // cluster teardown (broken pipe when the remote process exits
+            // first). CommsGuard::drop propagates these panics. Since all
+            // data is already processed and checkpointed by this point,
+            // treat TCP teardown panics as warnings, not fatal errors.
+            let drop_result =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(guards)));
+            if let Err(e) = drop_result {
+                let msg = e
+                    .downcast_ref::<String>()
+                    .map(String::as_str)
+                    .or_else(|| e.downcast_ref::<&str>().copied())
+                    .unwrap_or("unknown panic");
+                tracing::warn!(
+                    "timely TCP teardown panic (expected during cluster shutdown): {msg}"
+                );
+            }
             anyhow::Ok(())
         })
         .await
