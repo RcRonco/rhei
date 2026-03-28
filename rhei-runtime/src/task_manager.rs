@@ -354,22 +354,41 @@ impl TaskManager {
             })
             .map_err(|e| anyhow::anyhow!("timely execution failed: {e}"))?;
 
-            // Timely's TCP send/recv threads panic on I/O errors during
-            // cluster teardown (broken pipe when the remote process exits
-            // first). CommsGuard::drop propagates these panics. Since all
-            // data is already processed and checkpointed by this point,
-            // treat TCP teardown panics as warnings, not fatal errors.
-            let drop_result =
-                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(guards)));
-            if let Err(e) = drop_result {
-                let msg = e
-                    .downcast_ref::<String>()
-                    .map(String::as_str)
-                    .or_else(|| e.downcast_ref::<&str>().copied())
-                    .unwrap_or("unknown panic");
-                tracing::warn!(
-                    "timely TCP teardown panic (expected during cluster shutdown): {msg}"
-                );
+            // Separate the two panic sources in WorkerGuards to avoid a
+            // double-panic abort:
+            //
+            // WorkerGuards contains worker JoinHandles (guards) AND TCP
+            // send/recv JoinHandles (CommsGuard, stored in `others`).
+            // Both use .expect() in their Drop impls, so if a worker
+            // panics AND a TCP thread panics (broken pipe on cluster
+            // teardown or crash recovery), Drop hits two panics — an
+            // unrecoverable abort that catch_unwind cannot prevent.
+            //
+            // Fix: call .join() first, which drains the worker handles
+            // into Results (no panic). Then only CommsGuard remains as a
+            // drop-time panic source — a single panic that catch_unwind
+            // can handle. No leaks, no abort.
+            let join_result = std::panic::catch_unwind(
+                std::panic::AssertUnwindSafe(|| guards.join()),
+            );
+            match join_result {
+                Ok(results) => {
+                    for (i, result) in results.iter().enumerate() {
+                        if let Err(msg) = result {
+                            tracing::error!("worker {i} panicked: {msg}");
+                        }
+                    }
+                }
+                Err(e) => {
+                    let msg = e
+                        .downcast_ref::<String>()
+                        .map(String::as_str)
+                        .or_else(|| e.downcast_ref::<&str>().copied())
+                        .unwrap_or("unknown panic");
+                    tracing::warn!(
+                        "timely TCP teardown panic (expected during shutdown/recovery): {msg}"
+                    );
+                }
             }
             anyhow::Ok(())
         })
