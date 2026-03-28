@@ -17,7 +17,8 @@ use tokio::task::JoinHandle;
 
 use crate::compiler::CompiledGraph;
 use crate::controller::PipelineController;
-use crate::dataflow::{AnyItem, ErasedOperator, ErasedSource, NodeId, NodeKind, TransformFn};
+use crate::any_item::AnyItem;
+use crate::dataflow::{ErasedOperator, ErasedSource, NodeId, NodeKind, TransformFn};
 use crate::executor::NodeKindTag;
 use crate::shutdown::ShutdownHandle;
 

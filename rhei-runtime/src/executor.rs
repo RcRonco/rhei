@@ -16,7 +16,8 @@ use timely::dataflow::operators::probe;
 use timely::dataflow::scopes::Child;
 use timely::worker::Worker;
 
-use crate::dataflow::{AnyItem, ErasedOperator, NodeId, NodeKind, TransformFn};
+use crate::any_item::AnyItem;
+use crate::dataflow::{ErasedOperator, NodeId, NodeKind, TransformFn};
 use crate::task_manager::{DlqSender, ExecutorData};
 use crate::timely_operator::TimelyErasedOperator;
 
@@ -746,7 +747,7 @@ fn frontier_min_or_max(frontier: timely::progress::frontier::AntichainRef<'_, u6
 
 #[cfg(test)]
 mod tests {
-    use crate::dataflow::AnyItem;
+    use crate::any_item::AnyItem;
 
     #[test]
     fn partition_key_deterministic() {

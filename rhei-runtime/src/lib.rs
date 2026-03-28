@@ -28,6 +28,8 @@
 
 #![warn(missing_docs)]
 
+/// Cloneable, type-erased wrapper for Timely dataflow elements.
+pub(crate) mod any_item;
 /// Non-blocking async wrapper for [`StreamFunction`](rhei_core::traits::StreamFunction).
 pub mod async_operator;
 /// Async-to-sync channel bridges for Timely dataflow integration.
