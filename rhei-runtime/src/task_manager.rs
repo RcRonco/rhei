@@ -368,9 +368,8 @@ impl TaskManager {
             // into Results (no panic). Then only CommsGuard remains as a
             // drop-time panic source — a single panic that catch_unwind
             // can handle. No leaks, no abort.
-            let join_result = std::panic::catch_unwind(
-                std::panic::AssertUnwindSafe(|| guards.join()),
-            );
+            let join_result =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| guards.join()));
             match join_result {
                 Ok(results) => {
                     for (i, result) in results.iter().enumerate() {
