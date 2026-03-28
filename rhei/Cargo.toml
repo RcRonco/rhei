@@ -12,9 +12,11 @@ rhei-runtime = { path = "../rhei-runtime" }
 async-trait.workspace = true
 anyhow.workspace = true
 tokio.workspace = true
+clap = { workspace = true, features = ["derive", "env"] }
 
 [features]
 kafka = ["rhei-core/kafka", "rhei-runtime/kafka"]
+remote-state = ["rhei-runtime/remote-state"]
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full"] }

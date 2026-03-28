@@ -13,3 +13,19 @@ pub trait StateBackend: Send + Sync {
     /// Durably persists all pending writes.
     async fn checkpoint(&self) -> anyhow::Result<()>;
 }
+
+#[async_trait]
+impl<T: StateBackend> StateBackend for std::sync::Arc<T> {
+    async fn get(&self, key: &[u8]) -> anyhow::Result<Option<Bytes>> {
+        (**self).get(key).await
+    }
+    async fn put(&self, key: &[u8], value: &[u8]) -> anyhow::Result<()> {
+        (**self).put(key, value).await
+    }
+    async fn delete(&self, key: &[u8]) -> anyhow::Result<()> {
+        (**self).delete(key).await
+    }
+    async fn checkpoint(&self) -> anyhow::Result<()> {
+        (**self).checkpoint().await
+    }
+}

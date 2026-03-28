@@ -26,6 +26,12 @@ pub struct CheckpointManifest {
     /// Source-specific offset snapshot.  Key format is source-defined
     /// (e.g. `"topic/partition"` for Kafka).
     pub source_offsets: HashMap<String, String>,
+    /// Number of processes in the cluster (None for v1 manifests).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub n_processes: Option<usize>,
+    /// Workers per process (None for v1 manifests).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workers_per_process: Option<usize>,
 }
 
 const MANIFEST_FILE: &str = "manifest.json";
@@ -132,6 +138,8 @@ impl CheckpointManifest {
             timestamp_ms: max_timestamp_ms,
             operators,
             source_offsets: merged_offsets,
+            n_processes: None,
+            workers_per_process: None,
         })
     }
 }
@@ -186,6 +194,8 @@ mod tests {
             timestamp_ms: 1_700_000_000_000,
             operators: vec!["op_a".into(), "op_b".into()],
             source_offsets: HashMap::from([("t/0".into(), "99".into())]),
+            n_processes: None,
+            workers_per_process: None,
         };
 
         manifest.save(&dir).unwrap();
@@ -218,6 +228,8 @@ mod tests {
             timestamp_ms: 1_700_000_000_000,
             operators: vec!["op_a".into()],
             source_offsets: HashMap::from([("t/0".into(), "50".into())]),
+            n_processes: None,
+            workers_per_process: None,
         };
 
         manifest.save_partial(&dir, 0).unwrap();
@@ -245,6 +257,8 @@ mod tests {
                 ("topic/0".into(), "100".into()),
                 ("topic/1".into(), "200".into()),
             ]),
+            n_processes: None,
+            workers_per_process: None,
         };
         let p1 = CheckpointManifest {
             version: 1,
@@ -255,6 +269,8 @@ mod tests {
                 ("topic/2".into(), "300".into()),
                 ("topic/3".into(), "400".into()),
             ]),
+            n_processes: None,
+            workers_per_process: None,
         };
 
         p0.save_partial(&dir, 0).unwrap();
@@ -283,6 +299,8 @@ mod tests {
             timestamp_ms: 1_000,
             operators: vec![],
             source_offsets: HashMap::new(),
+            n_processes: None,
+            workers_per_process: None,
         };
         p0.save_partial(&dir, 0).unwrap();
 
@@ -306,6 +324,8 @@ mod tests {
                 ("topic/0".into(), "42".into()),
                 ("topic/1".into(), "99".into()),
             ]),
+            n_processes: None,
+            workers_per_process: None,
         };
 
         manifest.save_to_object_store(&store, &path).await.unwrap();
@@ -360,5 +380,42 @@ mod tests {
         let result = load_operator_state(&dir, "nonexistent");
         assert!(result.is_ok());
         assert!(result.unwrap().is_empty());
+    }
+
+    #[test]
+    fn v1_manifest_deserializes_with_default_topology() {
+        let json = r#"{
+        "version": 1,
+        "checkpoint_id": 5,
+        "timestamp_ms": 1000,
+        "operators": ["op_a"],
+        "source_offsets": {"t/0": "42"}
+    }"#;
+        let manifest: CheckpointManifest = serde_json::from_str(json).unwrap();
+        assert_eq!(manifest.n_processes, None);
+        assert_eq!(manifest.workers_per_process, None);
+    }
+
+    #[test]
+    fn topology_metadata_round_trips() {
+        let dir = std::env::temp_dir().join(format!("rhei_manifest_topo_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let manifest = CheckpointManifest {
+            version: 1,
+            checkpoint_id: 1,
+            timestamp_ms: 1000,
+            operators: vec!["op".into()],
+            source_offsets: HashMap::new(),
+            n_processes: Some(2),
+            workers_per_process: Some(4),
+        };
+
+        manifest.save(&dir).unwrap();
+        let loaded = CheckpointManifest::load(&dir).expect("manifest should exist");
+        assert_eq!(loaded.n_processes, Some(2));
+        assert_eq!(loaded.workers_per_process, Some(4));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

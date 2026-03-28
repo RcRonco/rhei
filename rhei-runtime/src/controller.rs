@@ -57,6 +57,31 @@ pub struct RemoteStateConfig {
     pub allow_http: bool,
 }
 
+#[cfg(feature = "remote-state")]
+impl RemoteStateConfig {
+    /// Build an `ObjectStore` from this configuration.
+    pub fn build_object_store(&self) -> anyhow::Result<Arc<dyn object_store::ObjectStore>> {
+        let mut builder = object_store::aws::AmazonS3Builder::new()
+            .with_bucket_name(&self.bucket)
+            .with_region(&self.region);
+
+        if let Some(ref endpoint) = self.endpoint {
+            builder = builder.with_endpoint(endpoint);
+        }
+        if self.allow_http {
+            builder = builder.with_allow_http(true);
+        }
+
+        // Credentials come from environment (AWS_ACCESS_KEY_ID, etc.)
+        // or instance metadata / IAM role.
+        builder = builder
+            .with_access_key_id(std::env::var("AWS_ACCESS_KEY_ID").unwrap_or_default())
+            .with_secret_access_key(std::env::var("AWS_SECRET_ACCESS_KEY").unwrap_or_default());
+
+        Ok(Arc::new(builder.build()?))
+    }
+}
+
 /// Materializes a [`DataflowGraph`] into an executable pipeline.
 ///
 /// Use [`PipelineController::builder()`] to configure execution parameters, build the
@@ -85,6 +110,15 @@ pub struct PipelineController {
     /// S3 state configuration for distributed state backend.
     #[cfg(feature = "remote-state")]
     pub(crate) remote_state: Option<RemoteStateConfig>,
+    /// Manifest path for fork mode.
+    #[cfg(feature = "remote-state")]
+    pub(crate) from_checkpoint: Option<String>,
+    /// Signed offset delta for fork mode.
+    #[allow(dead_code)] // Used only when remote-state feature is enabled
+    pub(crate) offset_delta: i64,
+    /// Remote L3 backend for fork mode (read-only). Populated during run_graph().
+    #[cfg(feature = "remote-state")]
+    pub(crate) fork_remote_l3: std::sync::Mutex<Option<Arc<SlateDbBackend>>>,
 }
 
 /// Builder for [`PipelineController`].
@@ -103,6 +137,9 @@ pub struct PipelineControllerBuilder {
     pipeline_name: Option<String>,
     #[cfg(feature = "remote-state")]
     remote_state: Option<RemoteStateConfig>,
+    #[cfg(feature = "remote-state")]
+    from_checkpoint: Option<String>,
+    offset_delta: i64,
 }
 
 impl PipelineControllerBuilder {
@@ -185,6 +222,19 @@ impl PipelineControllerBuilder {
         self
     }
 
+    /// Enable fork mode: resume from a remote checkpoint with copy-on-write state.
+    #[cfg(feature = "remote-state")]
+    pub fn from_checkpoint(mut self, path: impl Into<String>) -> Self {
+        self.from_checkpoint = Some(path.into());
+        self
+    }
+
+    /// Set the offset delta for fork mode (added to all source offsets).
+    pub fn offset_delta(mut self, delta: i64) -> Self {
+        self.offset_delta = delta;
+        self
+    }
+
     /// Read cluster configuration from environment variables.
     ///
     /// - `RHEI_WORKERS`: number of worker threads (overrides `.workers()`)
@@ -194,43 +244,66 @@ impl PipelineControllerBuilder {
     /// - `RHEI_PIPELINE_NAME`: human-readable pipeline name
     /// - `RHEI_REMOTE_BUCKET`, `RHEI_REMOTE_PREFIX`, `RHEI_REMOTE_ENDPOINT`,
     ///   `RHEI_REMOTE_REGION`, `RHEI_REMOTE_ALLOW_HTTP`: remote state config
+    /// - `RHEI_FROM_CHECKPOINT`: manifest path for fork mode
+    /// - `RHEI_OFFSET_DELTA`: signed offset delta for fork mode
     pub fn from_env(mut self) -> Self {
-        if let Ok(val) = std::env::var("RHEI_WORKERS")
+        if self.workers == 1
+            && let Ok(val) = std::env::var("RHEI_WORKERS")
             && let Ok(n) = val.parse::<usize>()
         {
             self.workers = n;
         }
-        if let Ok(val) = std::env::var("RHEI_PROCESS_ID")
+        if self.process_id.is_none()
+            && let Ok(val) = std::env::var("RHEI_PROCESS_ID")
             && let Ok(id) = val.parse::<usize>()
         {
             self.process_id = Some(id);
         }
-        if let Ok(val) = std::env::var("RHEI_PEERS") {
+        if self.peers.is_none()
+            && let Ok(val) = std::env::var("RHEI_PEERS")
+        {
             let peers: Vec<String> = val.split(',').map(|s| s.trim().to_string()).collect();
             if !peers.is_empty() {
                 self.peers = Some(peers);
             }
         }
-        if let Ok(val) = std::env::var("RHEI_METRICS_ADDR")
+        if self.metrics_addr.is_none()
+            && let Ok(val) = std::env::var("RHEI_METRICS_ADDR")
             && let Ok(addr) = val.parse::<std::net::SocketAddr>()
         {
             self.metrics_addr = Some(addr);
         }
-        if let Ok(val) = std::env::var("RHEI_PIPELINE_NAME") {
+        if self.pipeline_name.is_none()
+            && let Ok(val) = std::env::var("RHEI_PIPELINE_NAME")
+        {
             self.pipeline_name = Some(val);
         }
         #[cfg(feature = "remote-state")]
-        if let Ok(bucket) = std::env::var("RHEI_REMOTE_BUCKET") {
-            self.remote_state = Some(RemoteStateConfig {
-                bucket,
-                prefix: std::env::var("RHEI_REMOTE_PREFIX").unwrap_or_default(),
-                endpoint: std::env::var("RHEI_REMOTE_ENDPOINT").ok(),
-                region: std::env::var("RHEI_REMOTE_REGION")
-                    .unwrap_or_else(|_| "us-east-1".to_string()),
-                allow_http: std::env::var("RHEI_REMOTE_ALLOW_HTTP")
-                    .map(|v| v == "1" || v == "true")
-                    .unwrap_or(false),
-            });
+        if self.remote_state.is_none() {
+            if let Ok(bucket) = std::env::var("RHEI_REMOTE_BUCKET") {
+                self.remote_state = Some(RemoteStateConfig {
+                    bucket,
+                    prefix: std::env::var("RHEI_REMOTE_PREFIX").unwrap_or_default(),
+                    endpoint: std::env::var("RHEI_REMOTE_ENDPOINT").ok(),
+                    region: std::env::var("RHEI_REMOTE_REGION")
+                        .unwrap_or_else(|_| "us-east-1".to_string()),
+                    allow_http: std::env::var("RHEI_REMOTE_ALLOW_HTTP")
+                        .map(|v| v == "1" || v == "true")
+                        .unwrap_or(false),
+                });
+            }
+        }
+        #[cfg(feature = "remote-state")]
+        if self.from_checkpoint.is_none() {
+            if let Ok(val) = std::env::var("RHEI_FROM_CHECKPOINT") {
+                self.from_checkpoint = Some(val);
+            }
+        }
+        if self.offset_delta == 0
+            && let Ok(val) = std::env::var("RHEI_OFFSET_DELTA")
+            && let Ok(delta) = val.parse::<i64>()
+        {
+            self.offset_delta = delta;
         }
         self
     }
@@ -262,6 +335,11 @@ impl PipelineControllerBuilder {
             pipeline_name: self.pipeline_name,
             #[cfg(feature = "remote-state")]
             remote_state: self.remote_state,
+            #[cfg(feature = "remote-state")]
+            from_checkpoint: self.from_checkpoint,
+            offset_delta: self.offset_delta,
+            #[cfg(feature = "remote-state")]
+            fork_remote_l3: std::sync::Mutex::new(None),
         }
     }
 }
@@ -283,6 +361,9 @@ impl PipelineController {
             pipeline_name: None,
             #[cfg(feature = "remote-state")]
             remote_state: None,
+            #[cfg(feature = "remote-state")]
+            from_checkpoint: None,
+            offset_delta: 0,
         }
     }
 
@@ -305,6 +386,11 @@ impl PipelineController {
             pipeline_name: None,
             #[cfg(feature = "remote-state")]
             remote_state: None,
+            #[cfg(feature = "remote-state")]
+            from_checkpoint: None,
+            offset_delta: 0,
+            #[cfg(feature = "remote-state")]
+            fork_remote_l3: std::sync::Mutex::new(None),
         }
     }
 
@@ -514,23 +600,74 @@ impl PipelineController {
     /// When tiered storage is configured, produces a context backed by
     /// `PrefixedBackend(TieredBackend)`. Otherwise falls back to `LocalBackend`.
     pub fn create_context(&self, operator_name: &str) -> anyhow::Result<StateContext> {
-        let ctx = if let Some(ref tiered) = self.tiered {
-            let tiered_backend = tiered.shared_l2.create_tiered_backend(tiered.l3.clone());
-            let prefixed = PrefixedBackend::new(operator_name, Box::new(tiered_backend));
-            StateContext::new(Box::new(prefixed))
-        } else {
-            let path = self
-                .checkpoint_dir
-                .join(format!("{operator_name}.checkpoint.json"));
-            let backend = LocalBackend::new(path, None)?;
-            StateContext::new(Box::new(backend))
+        let ctx = {
+            #[cfg(feature = "remote-state")]
+            {
+                let fork_l3 = self.fork_remote_l3.lock().unwrap();
+                if let Some(ref remote_l3) = *fork_l3 {
+                    // Fork mode: PrefixedBackend wraps ForkBackend(local, remote).
+                    let local_path = self
+                        .checkpoint_dir
+                        .join(format!("{operator_name}.checkpoint.json"));
+                    let local = LocalBackend::new(local_path, None)?;
+                    let fork = rhei_core::state::fork_backend::ForkBackend::new(
+                        Box::new(local),
+                        Box::new(remote_l3.clone()),
+                    );
+                    let prefixed = PrefixedBackend::new(operator_name, Box::new(fork));
+                    StateContext::new(Box::new(prefixed))
+                } else if let Some(ref tiered) = self.tiered {
+                    let tiered_backend = tiered.shared_l2.create_tiered_backend(tiered.l3.clone());
+                    let prefixed = PrefixedBackend::new(operator_name, Box::new(tiered_backend));
+                    StateContext::new(Box::new(prefixed))
+                } else {
+                    let path = self
+                        .checkpoint_dir
+                        .join(format!("{operator_name}.checkpoint.json"));
+                    let backend = LocalBackend::new(path, None)?;
+                    StateContext::new(Box::new(backend))
+                }
+            }
+            #[cfg(not(feature = "remote-state"))]
+            {
+                if let Some(ref tiered) = self.tiered {
+                    let tiered_backend = tiered.shared_l2.create_tiered_backend(tiered.l3.clone());
+                    let prefixed = PrefixedBackend::new(operator_name, Box::new(tiered_backend));
+                    StateContext::new(Box::new(prefixed))
+                } else {
+                    let path = self
+                        .checkpoint_dir
+                        .join(format!("{operator_name}.checkpoint.json"));
+                    let backend = LocalBackend::new(path, None)?;
+                    StateContext::new(Box::new(backend))
+                }
+            }
         };
 
         Ok(ctx.with_memtable_config(self.memtable_config.clone()))
     }
 }
 
+/// Apply a signed offset delta to all source offsets.
+/// Non-numeric offsets pass through unchanged. Results are clamped to >= 0.
+#[allow(dead_code)] // Used only when remote-state feature is enabled
+pub(crate) fn apply_offset_delta(
+    offsets: &std::collections::HashMap<String, String>,
+    delta: i64,
+) -> std::collections::HashMap<String, String> {
+    offsets
+        .iter()
+        .map(|(k, v)| {
+            let adjusted = v
+                .parse::<i64>()
+                .map_or_else(|_| v.clone(), |n| (n + delta).max(0).to_string());
+            (k.clone(), adjusted)
+        })
+        .collect()
+}
+
 /// Compile and execute the dataflow graph.
+#[allow(clippy::too_many_lines)] // Complexity justified by coordinated checkpoint logic
 async fn run_graph(
     graph: DataflowGraph,
     controller: &PipelineController,
@@ -543,37 +680,127 @@ async fn run_graph(
 
     let all_operator_names = &compiled.operator_names;
 
-    // Load existing manifest and validate.
-    let (initial_checkpoint_id, restored_offsets) =
-        if let Some(manifest) = CheckpointManifest::load(&controller.checkpoint_dir) {
-            tracing::info!(
-                checkpoint_id = manifest.checkpoint_id,
-                timestamp_ms = manifest.timestamp_ms,
-                operators = ?manifest.operators,
-                source_offsets = ?manifest.source_offsets,
-                "resuming from checkpoint #{}", manifest.checkpoint_id
-            );
+    // Fork mode: load remote manifest if --from-checkpoint is set.
+    #[cfg(feature = "remote-state")]
+    let fork_data: Option<(u64, std::collections::HashMap<String, String>)> = {
+        if let Some(ref manifest_path) = controller.from_checkpoint {
+            let remote_cfg = controller.remote_state.as_ref().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "fork mode requires remote state config \
+                         (set RHEI_REMOTE_BUCKET or use .remote_state())"
+                )
+            })?;
 
-            // Validate operator names.
-            let prev: std::collections::HashSet<&str> =
-                manifest.operators.iter().map(String::as_str).collect();
-            let curr: std::collections::HashSet<&str> =
-                all_operator_names.iter().map(String::as_str).collect();
+            let object_store = remote_cfg.build_object_store()?;
+            let path = object_store::path::Path::from(manifest_path.as_str());
+            let manifest = CheckpointManifest::load_from_object_store(object_store.as_ref(), &path)
+                .await
+                .ok_or_else(|| {
+                    anyhow::anyhow!("checkpoint manifest not found at {manifest_path}")
+                })?;
 
-            let added: Vec<_> = curr.difference(&prev).collect();
-            let removed: Vec<_> = prev.difference(&curr).collect();
-            if !added.is_empty() || !removed.is_empty() {
-                tracing::warn!(
-                    ?added,
-                    ?removed,
-                    "operator topology changed since last checkpoint"
-                );
+            // Validate topology if manifest includes it.
+            if let Some(manifest_workers) = manifest.workers_per_process {
+                if manifest_workers != controller.workers {
+                    anyhow::bail!(
+                        "fork mode: manifest has {manifest_workers} workers per process, \
+                         but local pipeline has {}. Must match.",
+                        controller.workers,
+                    );
+                }
             }
 
-            (manifest.checkpoint_id, manifest.source_offsets)
+            let offsets = apply_offset_delta(&manifest.source_offsets, controller.offset_delta);
+
+            tracing::info!(
+                checkpoint_id = manifest.checkpoint_id,
+                offset_delta = controller.offset_delta,
+                adjusted_offsets = ?offsets,
+                "fork mode: resuming from remote checkpoint #{}",
+                manifest.checkpoint_id
+            );
+
+            // Open remote SlateDB read-only for ForkBackend.
+            let remote_l3 =
+                Arc::new(SlateDbBackend::open(remote_cfg.prefix.as_str(), object_store).await?);
+            *controller.fork_remote_l3.lock().unwrap() = Some(remote_l3);
+
+            Some((manifest.checkpoint_id, offsets))
         } else {
-            (0, std::collections::HashMap::new())
-        };
+            None
+        }
+    };
+
+    // Determine initial state: fork mode overrides local manifest.
+    let (initial_checkpoint_id, restored_offsets) = {
+        #[cfg(feature = "remote-state")]
+        {
+            if let Some(fork) = fork_data {
+                fork
+            } else if let Some(manifest) = CheckpointManifest::load(&controller.checkpoint_dir) {
+                tracing::info!(
+                    checkpoint_id = manifest.checkpoint_id,
+                    timestamp_ms = manifest.timestamp_ms,
+                    operators = ?manifest.operators,
+                    source_offsets = ?manifest.source_offsets,
+                    "resuming from checkpoint #{}", manifest.checkpoint_id
+                );
+
+                // Validate operator names.
+                let prev: std::collections::HashSet<&str> =
+                    manifest.operators.iter().map(String::as_str).collect();
+                let curr: std::collections::HashSet<&str> =
+                    all_operator_names.iter().map(String::as_str).collect();
+
+                let added: Vec<_> = curr.difference(&prev).collect();
+                let removed: Vec<_> = prev.difference(&curr).collect();
+                if !added.is_empty() || !removed.is_empty() {
+                    tracing::warn!(
+                        ?added,
+                        ?removed,
+                        "operator topology changed since last checkpoint"
+                    );
+                }
+
+                (manifest.checkpoint_id, manifest.source_offsets)
+            } else {
+                (0, std::collections::HashMap::new())
+            }
+        }
+
+        #[cfg(not(feature = "remote-state"))]
+        {
+            if let Some(manifest) = CheckpointManifest::load(&controller.checkpoint_dir) {
+                tracing::info!(
+                    checkpoint_id = manifest.checkpoint_id,
+                    timestamp_ms = manifest.timestamp_ms,
+                    operators = ?manifest.operators,
+                    source_offsets = ?manifest.source_offsets,
+                    "resuming from checkpoint #{}", manifest.checkpoint_id
+                );
+
+                // Validate operator names.
+                let prev: std::collections::HashSet<&str> =
+                    manifest.operators.iter().map(String::as_str).collect();
+                let curr: std::collections::HashSet<&str> =
+                    all_operator_names.iter().map(String::as_str).collect();
+
+                let added: Vec<_> = curr.difference(&prev).collect();
+                let removed: Vec<_> = prev.difference(&curr).collect();
+                if !added.is_empty() || !removed.is_empty() {
+                    tracing::warn!(
+                        ?added,
+                        ?removed,
+                        "operator topology changed since last checkpoint"
+                    );
+                }
+
+                (manifest.checkpoint_id, manifest.source_offsets)
+            } else {
+                (0, std::collections::HashMap::new())
+            }
+        }
+    };
 
     controller.health.set_status(PipelineStatus::Running);
 
@@ -608,6 +835,8 @@ async fn run_graph(
         timestamp_ms: now_millis(),
         operators: operator_names,
         source_offsets,
+        n_processes: Some(ckpt_n_processes),
+        workers_per_process: Some(controller.workers),
     };
 
     crate::task_manager::write_manifest(
@@ -1900,6 +2129,45 @@ mod tests {
         side_results.sort();
         assert_eq!(side_results, vec!["ERR:bad", "ERR:oops"]);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn apply_offset_delta_negative() {
+        let offsets = std::collections::HashMap::from([
+            ("t/0".into(), "100".into()),
+            ("t/1".into(), "200".into()),
+        ]);
+        let result = super::apply_offset_delta(&offsets, -50);
+        assert_eq!(result.get("t/0").unwrap(), "50");
+        assert_eq!(result.get("t/1").unwrap(), "150");
+    }
+
+    #[test]
+    fn apply_offset_delta_clamps_to_zero() {
+        let offsets = std::collections::HashMap::from([("t/0".into(), "10".into())]);
+        let result = super::apply_offset_delta(&offsets, -100);
+        assert_eq!(result.get("t/0").unwrap(), "0");
+    }
+
+    #[test]
+    fn apply_offset_delta_non_numeric_passthrough() {
+        let offsets = std::collections::HashMap::from([("t/0".into(), "not_a_number".into())]);
+        let result = super::apply_offset_delta(&offsets, -100);
+        assert_eq!(result.get("t/0").unwrap(), "not_a_number");
+    }
+
+    #[test]
+    fn apply_offset_delta_positive() {
+        let offsets = std::collections::HashMap::from([("t/0".into(), "100".into())]);
+        let result = super::apply_offset_delta(&offsets, 50);
+        assert_eq!(result.get("t/0").unwrap(), "150");
+    }
+
+    #[test]
+    fn apply_offset_delta_zero_identity() {
+        let offsets = std::collections::HashMap::from([("t/0".into(), "42".into())]);
+        let result = super::apply_offset_delta(&offsets, 0);
+        assert_eq!(result.get("t/0").unwrap(), "42");
     }
 
     #[tokio::test]

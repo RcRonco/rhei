@@ -50,5 +50,6 @@ pub use rhei_core::operators::with_side::WithSide;
 pub mod __private {
     pub use anyhow;
     pub use async_trait::async_trait;
+    pub use clap;
     pub use tokio;
 }
