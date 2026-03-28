@@ -18,7 +18,8 @@ use tokio::task::JoinHandle;
 use crate::compiler::CompiledGraph;
 use crate::controller::PipelineController;
 use crate::any_item::AnyItem;
-use crate::dataflow::{ErasedOperator, ErasedSource, NodeId, NodeKind, TransformFn};
+use crate::dataflow::{NodeId, NodeKind};
+use crate::erased::{ErasedOperator, ErasedSource, TransformFn};
 use crate::executor::NodeKindTag;
 use crate::shutdown::ShutdownHandle;
 
@@ -70,7 +71,7 @@ pub(crate) struct ExecutorData {
     pub source_offsets: HashMap<NodeId, Arc<std::sync::Mutex<HashMap<String, String>>>>,
     pub shutdown: Option<ShutdownHandle>,
     pub transforms: HashMap<NodeId, TransformFn>,
-    pub key_fns: HashMap<NodeId, crate::dataflow::KeyFn>,
+    pub key_fns: HashMap<NodeId, crate::erased::KeyFn>,
     pub operators: HashMap<NodeId, (String, Box<dyn ErasedOperator>)>,
     pub contexts: HashMap<NodeId, StateContext>,
     pub dlq_tx: Option<DlqSender>,
@@ -812,13 +813,13 @@ fn extract_per_worker_data(
     total_workers: usize,
 ) -> anyhow::Result<(
     Vec<Option<HashMap<NodeId, TransformFn>>>,
-    Vec<Option<HashMap<NodeId, crate::dataflow::KeyFn>>>,
+    Vec<Option<HashMap<NodeId, crate::erased::KeyFn>>>,
     Vec<Option<HashMap<NodeId, (String, Box<dyn ErasedOperator>)>>>,
     Vec<Option<HashMap<NodeId, StateContext>>>,
 )> {
     let mut all_transforms: Vec<Option<HashMap<NodeId, TransformFn>>> =
         (0..total_workers).map(|_| None).collect();
-    let mut all_key_fns: Vec<Option<HashMap<NodeId, crate::dataflow::KeyFn>>> =
+    let mut all_key_fns: Vec<Option<HashMap<NodeId, crate::erased::KeyFn>>> =
         (0..total_workers).map(|_| None).collect();
     #[allow(clippy::type_complexity)]
     let mut all_operators: Vec<Option<HashMap<NodeId, (String, Box<dyn ErasedOperator>)>>> =
@@ -851,7 +852,7 @@ fn extract_per_worker_data(
     for &nid in &transform_ids {
         orig_transforms.insert(nid, extract_transform(&mut graph.nodes[nid.0]));
     }
-    let mut orig_key_fns: HashMap<NodeId, crate::dataflow::KeyFn> = HashMap::new();
+    let mut orig_key_fns: HashMap<NodeId, crate::erased::KeyFn> = HashMap::new();
     for &nid in &key_by_ids {
         orig_key_fns.insert(nid, extract_key_fn(&mut graph.nodes[nid.0]));
     }
@@ -965,7 +966,7 @@ fn extract_source(node: &mut crate::dataflow::GraphNode) -> Box<dyn ErasedSource
 }
 
 /// Extract and compile a sink from a graph node, replacing it with a Merge placeholder.
-fn extract_sink(node: &mut crate::dataflow::GraphNode) -> Box<dyn crate::dataflow::ErasedSink> {
+fn extract_sink(node: &mut crate::dataflow::GraphNode) -> Box<dyn crate::erased::ErasedSink> {
     let kind = std::mem::replace(&mut node.kind, NodeKind::Merge);
     match kind {
         NodeKind::Sink(sink) => sink.compile(),
@@ -992,7 +993,7 @@ fn extract_transform(node: &mut crate::dataflow::GraphNode) -> TransformFn {
 }
 
 /// Extract and compile a key function from a graph node.
-fn extract_key_fn(node: &mut crate::dataflow::GraphNode) -> crate::dataflow::KeyFn {
+fn extract_key_fn(node: &mut crate::dataflow::GraphNode) -> crate::erased::KeyFn {
     let kind = std::mem::replace(&mut node.kind, NodeKind::Merge);
     match kind {
         NodeKind::KeyBy(f) => f.compile(),

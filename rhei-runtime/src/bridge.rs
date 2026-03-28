@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 use rhei_core::traits::{Sink, Source};
 
 use crate::any_item::AnyItem;
-use crate::dataflow::ErasedSource;
+use crate::erased::ErasedSource;
 use crate::shutdown::ShutdownHandle;
 
 /// Bridges an async `Source` into a `flume::Receiver` for use in Timely.

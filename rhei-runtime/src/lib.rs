@@ -32,6 +32,8 @@
 pub(crate) mod any_item;
 /// Non-blocking async wrapper for [`StreamFunction`](rhei_core::traits::StreamFunction).
 pub mod async_operator;
+/// Type-erased traits and wrappers for the Timely execution layer.
+pub(crate) mod erased;
 /// Async-to-sync channel bridges for Timely dataflow integration.
 pub mod bridge;
 /// Cross-process checkpoint coordination via lightweight TCP.

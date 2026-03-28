@@ -5,7 +5,7 @@ use rhei_core::traits::StreamFunction;
 
 use crate::async_operator::AsyncOperator;
 use crate::any_item::AnyItem;
-use crate::dataflow::ErasedOperator;
+use crate::erased::ErasedOperator;
 
 /// Wraps `AsyncOperator<F>` with Timely capability management.
 ///
