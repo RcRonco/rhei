@@ -16,7 +16,9 @@ use timely::dataflow::operators::probe;
 use timely::dataflow::scopes::Child;
 use timely::worker::Worker;
 
-use crate::dataflow::{AnyItem, ErasedOperator, NodeId, NodeKind, TransformFn};
+use crate::any_item::AnyItem;
+use crate::dataflow::{NodeId, NodeKind};
+use crate::erased::{ErasedOperator, TransformFn};
 use crate::task_manager::{DlqSender, ExecutorData};
 use crate::timely_operator::TimelyErasedOperator;
 
@@ -463,7 +465,7 @@ impl DataflowExecutor {
     fn build_key_by<'a, A: Allocate>(
         node_id: NodeId,
         input_stream: ScopedAnyStream<'a, A>,
-        key_fns: &mut HashMap<NodeId, crate::dataflow::KeyFn>,
+        key_fns: &mut HashMap<NodeId, crate::erased::KeyFn>,
     ) -> ScopedAnyStream<'a, A> {
         use timely::container::CapacityContainerBuilder;
         use timely::dataflow::channels::pact::Exchange as ExchangePact;
@@ -746,7 +748,7 @@ fn frontier_min_or_max(frontier: timely::progress::frontier::AntichainRef<'_, u6
 
 #[cfg(test)]
 mod tests {
-    use crate::dataflow::AnyItem;
+    use crate::any_item::AnyItem;
 
     #[test]
     fn partition_key_deterministic() {

@@ -15,9 +15,11 @@ use rhei_core::dlq::ErrorPolicy;
 use rhei_core::state::context::StateContext;
 use tokio::task::JoinHandle;
 
+use crate::any_item::AnyItem;
 use crate::compiler::CompiledGraph;
 use crate::controller::PipelineController;
-use crate::dataflow::{AnyItem, ErasedOperator, ErasedSource, NodeId, NodeKind, TransformFn};
+use crate::dataflow::{NodeId, NodeKind};
+use crate::erased::{ErasedOperator, ErasedSource, TransformFn};
 use crate::executor::NodeKindTag;
 use crate::shutdown::ShutdownHandle;
 
@@ -69,7 +71,7 @@ pub(crate) struct ExecutorData {
     pub source_offsets: HashMap<NodeId, Arc<std::sync::Mutex<HashMap<String, String>>>>,
     pub shutdown: Option<ShutdownHandle>,
     pub transforms: HashMap<NodeId, TransformFn>,
-    pub key_fns: HashMap<NodeId, crate::dataflow::KeyFn>,
+    pub key_fns: HashMap<NodeId, crate::erased::KeyFn>,
     pub operators: HashMap<NodeId, (String, Box<dyn ErasedOperator>)>,
     pub contexts: HashMap<NodeId, StateContext>,
     pub dlq_tx: Option<DlqSender>,
@@ -352,22 +354,40 @@ impl TaskManager {
             })
             .map_err(|e| anyhow::anyhow!("timely execution failed: {e}"))?;
 
-            // Timely's TCP send/recv threads panic on I/O errors during
-            // cluster teardown (broken pipe when the remote process exits
-            // first). CommsGuard::drop propagates these panics. Since all
-            // data is already processed and checkpointed by this point,
-            // treat TCP teardown panics as warnings, not fatal errors.
-            let drop_result =
-                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(guards)));
-            if let Err(e) = drop_result {
-                let msg = e
-                    .downcast_ref::<String>()
-                    .map(String::as_str)
-                    .or_else(|| e.downcast_ref::<&str>().copied())
-                    .unwrap_or("unknown panic");
-                tracing::warn!(
-                    "timely TCP teardown panic (expected during cluster shutdown): {msg}"
-                );
+            // Separate the two panic sources in WorkerGuards to avoid a
+            // double-panic abort:
+            //
+            // WorkerGuards contains worker JoinHandles (guards) AND TCP
+            // send/recv JoinHandles (CommsGuard, stored in `others`).
+            // Both use .expect() in their Drop impls, so if a worker
+            // panics AND a TCP thread panics (broken pipe on cluster
+            // teardown or crash recovery), Drop hits two panics — an
+            // unrecoverable abort that catch_unwind cannot prevent.
+            //
+            // Fix: call .join() first, which drains the worker handles
+            // into Results (no panic). Then only CommsGuard remains as a
+            // drop-time panic source — a single panic that catch_unwind
+            // can handle. No leaks, no abort.
+            let join_result =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| guards.join()));
+            match join_result {
+                Ok(results) => {
+                    for (i, result) in results.iter().enumerate() {
+                        if let Err(msg) = result {
+                            tracing::error!("worker {i} panicked: {msg}");
+                        }
+                    }
+                }
+                Err(e) => {
+                    let msg = e
+                        .downcast_ref::<String>()
+                        .map(String::as_str)
+                        .or_else(|| e.downcast_ref::<&str>().copied())
+                        .unwrap_or("unknown panic");
+                    tracing::warn!(
+                        "timely TCP teardown panic (expected during shutdown/recovery): {msg}"
+                    );
+                }
             }
             anyhow::Ok(())
         })
@@ -811,13 +831,13 @@ fn extract_per_worker_data(
     total_workers: usize,
 ) -> anyhow::Result<(
     Vec<Option<HashMap<NodeId, TransformFn>>>,
-    Vec<Option<HashMap<NodeId, crate::dataflow::KeyFn>>>,
+    Vec<Option<HashMap<NodeId, crate::erased::KeyFn>>>,
     Vec<Option<HashMap<NodeId, (String, Box<dyn ErasedOperator>)>>>,
     Vec<Option<HashMap<NodeId, StateContext>>>,
 )> {
     let mut all_transforms: Vec<Option<HashMap<NodeId, TransformFn>>> =
         (0..total_workers).map(|_| None).collect();
-    let mut all_key_fns: Vec<Option<HashMap<NodeId, crate::dataflow::KeyFn>>> =
+    let mut all_key_fns: Vec<Option<HashMap<NodeId, crate::erased::KeyFn>>> =
         (0..total_workers).map(|_| None).collect();
     #[allow(clippy::type_complexity)]
     let mut all_operators: Vec<Option<HashMap<NodeId, (String, Box<dyn ErasedOperator>)>>> =
@@ -850,7 +870,7 @@ fn extract_per_worker_data(
     for &nid in &transform_ids {
         orig_transforms.insert(nid, extract_transform(&mut graph.nodes[nid.0]));
     }
-    let mut orig_key_fns: HashMap<NodeId, crate::dataflow::KeyFn> = HashMap::new();
+    let mut orig_key_fns: HashMap<NodeId, crate::erased::KeyFn> = HashMap::new();
     for &nid in &key_by_ids {
         orig_key_fns.insert(nid, extract_key_fn(&mut graph.nodes[nid.0]));
     }
@@ -954,47 +974,47 @@ pub(crate) fn merge_source_offsets(
 
 // ── Node extraction helpers ─────────────────────────────────────────
 
-/// Extract a source from a graph node, replacing it with a Merge placeholder.
+/// Extract and compile a source from a graph node, replacing it with a Merge placeholder.
 fn extract_source(node: &mut crate::dataflow::GraphNode) -> Box<dyn ErasedSource> {
     let kind = std::mem::replace(&mut node.kind, NodeKind::Merge);
     match kind {
-        NodeKind::Source(src) => src,
+        NodeKind::Source(src) => src.compile(),
         _ => panic!("expected Source node at {:?}", node.id),
     }
 }
 
-/// Extract a sink from a graph node, replacing it with a Merge placeholder.
-fn extract_sink(node: &mut crate::dataflow::GraphNode) -> Box<dyn crate::dataflow::ErasedSink> {
+/// Extract and compile a sink from a graph node, replacing it with a Merge placeholder.
+fn extract_sink(node: &mut crate::dataflow::GraphNode) -> Box<dyn crate::erased::ErasedSink> {
     let kind = std::mem::replace(&mut node.kind, NodeKind::Merge);
     match kind {
-        NodeKind::Sink(sink) => sink,
+        NodeKind::Sink(sink) => sink.compile(),
         _ => panic!("expected Sink node at {:?}", node.id),
     }
 }
 
-/// Extract an operator from a graph node, replacing it with a Merge placeholder.
+/// Extract and compile an operator from a graph node, replacing it with a Merge placeholder.
 fn extract_operator(node: &mut crate::dataflow::GraphNode) -> (String, Box<dyn ErasedOperator>) {
     let kind = std::mem::replace(&mut node.kind, NodeKind::Merge);
     match kind {
-        NodeKind::Operator { name, op } => (name, op),
+        NodeKind::Operator { name, op } => (name, op.compile()),
         _ => panic!("expected Operator node at {:?}", node.id),
     }
 }
 
-/// Extract a transform function from a graph node.
+/// Extract and compile a transform function from a graph node.
 fn extract_transform(node: &mut crate::dataflow::GraphNode) -> TransformFn {
     let kind = std::mem::replace(&mut node.kind, NodeKind::Merge);
     match kind {
-        NodeKind::Transform(f) => f,
+        NodeKind::Transform(f) => f.compile(),
         _ => panic!("expected Transform node at {:?}", node.id),
     }
 }
 
-/// Extract a key function from a graph node.
-fn extract_key_fn(node: &mut crate::dataflow::GraphNode) -> crate::dataflow::KeyFn {
+/// Extract and compile a key function from a graph node.
+fn extract_key_fn(node: &mut crate::dataflow::GraphNode) -> crate::erased::KeyFn {
     let kind = std::mem::replace(&mut node.kind, NodeKind::Merge);
     match kind {
-        NodeKind::KeyBy(f) => f,
+        NodeKind::KeyBy(f) => f.compile(),
         _ => panic!("expected KeyBy node at {:?}", node.id),
     }
 }
