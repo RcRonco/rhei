@@ -92,6 +92,14 @@ where
 /// genuine (not a panic stub), enabling future use of Timely's `Exchange` pact.
 pub(crate) struct AnyItem(Box<dyn CloneAnySend>);
 
+impl std::fmt::Debug for AnyItem {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("AnyItem")
+            .field(&self.0.debug_repr())
+            .finish()
+    }
+}
+
 impl Clone for AnyItem {
     fn clone(&self) -> Self {
         AnyItem(self.0.clone_box())

@@ -44,6 +44,7 @@ pub(crate) struct NodeId(pub(crate) usize);
 
 /// Type-erased source: produces batches of [`AnyItem`].
 #[async_trait]
+#[allow(dead_code)]
 pub(crate) trait ErasedSource: Send {
     async fn next_batch(&mut self) -> Option<Vec<AnyItem>>;
     async fn on_checkpoint_complete(&mut self) -> anyhow::Result<()>;
@@ -291,19 +292,22 @@ where
 }
 
 /// Internal tag used by [`DlqErasedOperator`] to distinguish main outputs
-/// from error outputs at the `AnyItem` level.
+/// from error outputs.
+///
+/// Generic over `T` so it can be used at both the typed and erased level.
+/// At the Timely boundary the concrete type is `DlqTag<AnyItem>`.
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
-enum DlqTag {
-    /// A successful output item (the inner `AnyItem` has the operator's output type).
-    Main(AnyItem),
+enum DlqTag<T> {
+    /// A successful output item.
+    Main(T),
     /// An error message from a failed `process` / `process_batch` call.
     Error(String),
 }
 
-impl std::fmt::Debug for DlqTag {
+impl<T: std::fmt::Debug> std::fmt::Debug for DlqTag<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            DlqTag::Main(item) => f.debug_tuple("Main").field(&item.debug_repr()).finish(),
+            DlqTag::Main(item) => f.debug_tuple("Main").field(item).finish(),
             DlqTag::Error(msg) => f.debug_tuple("Error").field(msg).finish(),
         }
     }
@@ -327,9 +331,9 @@ impl ErasedOperator for DlqErasedOperator {
         match self.inner.process(input, ctx).await {
             Ok(items) => Ok(items
                 .into_iter()
-                .map(|i| AnyItem::new(DlqTag::Main(i)))
+                .map(|i| AnyItem::new(DlqTag::<AnyItem>::Main(i)))
                 .collect()),
-            Err(e) => Ok(vec![AnyItem::new(DlqTag::Error(e.to_string()))]),
+            Err(e) => Ok(vec![AnyItem::new(DlqTag::<AnyItem>::Error(e.to_string()))]),
         }
     }
 
@@ -341,9 +345,9 @@ impl ErasedOperator for DlqErasedOperator {
         match self.inner.process_batch(inputs, ctx).await {
             Ok(items) => Ok(items
                 .into_iter()
-                .map(|i| AnyItem::new(DlqTag::Main(i)))
+                .map(|i| AnyItem::new(DlqTag::<AnyItem>::Main(i)))
                 .collect()),
-            Err(e) => Ok(vec![AnyItem::new(DlqTag::Error(e.to_string()))]),
+            Err(e) => Ok(vec![AnyItem::new(DlqTag::<AnyItem>::Error(e.to_string()))]),
         }
     }
 
@@ -373,9 +377,9 @@ impl ErasedOperator for DlqErasedOperator {
         match self.inner.on_timer(timestamp, key, ctx).await {
             Ok(items) => Ok(items
                 .into_iter()
-                .map(|i| AnyItem::new(DlqTag::Main(i)))
+                .map(|i| AnyItem::new(DlqTag::<AnyItem>::Main(i)))
                 .collect()),
-            Err(e) => Ok(vec![AnyItem::new(DlqTag::Error(e.to_string()))]),
+            Err(e) => Ok(vec![AnyItem::new(DlqTag::<AnyItem>::Error(e.to_string()))]),
         }
     }
 
@@ -1167,7 +1171,7 @@ impl<
         // The operator now emits DlqTag items. Split into main/error streams.
         let main_node = LazyTransformNode(Box::new(|| {
             Arc::new(|item: AnyItem, _ctx: &TransformContext| {
-                let tag: DlqTag = item.downcast();
+                let tag: DlqTag<AnyItem> = item.downcast();
                 match tag {
                     DlqTag::Main(inner) => vec![inner],
                     DlqTag::Error(_) => vec![],
@@ -1181,7 +1185,7 @@ impl<
 
         let side_node = LazyTransformNode(Box::new(|| {
             Arc::new(|item: AnyItem, _ctx: &TransformContext| {
-                let tag: DlqTag = item.downcast();
+                let tag: DlqTag<AnyItem> = item.downcast();
                 match tag {
                     DlqTag::Main(_) => vec![],
                     DlqTag::Error(msg) => vec![AnyItem::new(msg)],
