@@ -234,8 +234,7 @@ impl DataflowGraph {
             + serde::de::DeserializeOwned
             + 'static,
     {
-        let id =
-            self.add_node(NodeKind::Source(Box::new(TypedSourceNode(source))), vec![]);
+        let id = self.add_node(NodeKind::Source(Box::new(TypedSourceNode(source))), vec![]);
         Stream::new(self, id)
     }
 
@@ -809,10 +808,9 @@ impl<
                 }
             })
         }));
-        let main_id = self.graph.add_node(
-            NodeKind::Transform(Box::new(main_node)),
-            vec![self.node_id],
-        );
+        let main_id = self
+            .graph
+            .add_node(NodeKind::Transform(Box::new(main_node)), vec![self.node_id]);
 
         let side_node = LazyTransformNode(Box::new(|| {
             Arc::new(|item: AnyItem, _ctx: &TransformContext| {
@@ -823,10 +821,9 @@ impl<
                 }
             })
         }));
-        let side_id = self.graph.add_node(
-            NodeKind::Transform(Box::new(side_node)),
-            vec![self.node_id],
-        );
+        let side_id = self
+            .graph
+            .add_node(NodeKind::Transform(Box::new(side_node)), vec![self.node_id]);
 
         // Wire the error stream via the user's closure.
         f(Stream::new(self.graph, side_id));
@@ -983,10 +980,9 @@ impl<
                 }
             })
         }));
-        let main_id = self.graph.add_node(
-            NodeKind::Transform(Box::new(main_node)),
-            vec![self.node_id],
-        );
+        let main_id = self
+            .graph
+            .add_node(NodeKind::Transform(Box::new(main_node)), vec![self.node_id]);
 
         let side_node = LazyTransformNode(Box::new(|| {
             Arc::new(|item: AnyItem, _ctx: &TransformContext| {
@@ -997,10 +993,9 @@ impl<
                 }
             })
         }));
-        let side_id = self.graph.add_node(
-            NodeKind::Transform(Box::new(side_node)),
-            vec![self.node_id],
-        );
+        let side_id = self
+            .graph
+            .add_node(NodeKind::Transform(Box::new(side_node)), vec![self.node_id]);
 
         (
             Stream::new(self.graph, main_id),
@@ -1028,10 +1023,9 @@ impl<
                 }
             })
         }));
-        let main_id = self.graph.add_node(
-            NodeKind::Transform(Box::new(main_node)),
-            vec![self.node_id],
-        );
+        let main_id = self
+            .graph
+            .add_node(NodeKind::Transform(Box::new(main_node)), vec![self.node_id]);
 
         let side_node = LazyTransformNode(Box::new(|| {
             Arc::new(|item: AnyItem, _ctx: &TransformContext| {
@@ -1042,10 +1036,9 @@ impl<
                 }
             })
         }));
-        let side_id = self.graph.add_node(
-            NodeKind::Transform(Box::new(side_node)),
-            vec![self.node_id],
-        );
+        let side_id = self
+            .graph
+            .add_node(NodeKind::Transform(Box::new(side_node)), vec![self.node_id]);
 
         (
             KeyedStream::new(self.graph, main_id),
@@ -1057,8 +1050,8 @@ impl<
 #[cfg(test)]
 mod tests {
     use super::*;
-    use async_trait::async_trait;
     use crate::erased::SourceWrapper;
+    use async_trait::async_trait;
     use rhei_core::state::context::StateContext;
 
     #[test]

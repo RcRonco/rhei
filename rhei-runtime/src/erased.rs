@@ -10,7 +10,7 @@ use async_trait::async_trait;
 use rhei_core::state::context::StateContext;
 use rhei_core::traits::{Sink, Source, StreamFunction};
 
-use crate::any_item::{register_type, AnyItem};
+use crate::any_item::{AnyItem, register_type};
 
 // ── Type-erased source ──────────────────────────────────────────────
 
@@ -382,8 +382,7 @@ pub struct TransformContext {
 
 /// Stateless transform: one [`AnyItem`] in, zero or more out.
 /// `Arc` for sharing across workers without cloning the closure.
-pub(crate) type TransformFn =
-    Arc<dyn Fn(AnyItem, &TransformContext) -> Vec<AnyItem> + Send + Sync>;
+pub(crate) type TransformFn = Arc<dyn Fn(AnyItem, &TransformContext) -> Vec<AnyItem> + Send + Sync>;
 
 /// Key extraction function.
 pub(crate) type KeyFn = Arc<dyn Fn(&AnyItem) -> String + Send + Sync>;

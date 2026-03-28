@@ -15,9 +15,9 @@ use rhei_core::dlq::ErrorPolicy;
 use rhei_core::state::context::StateContext;
 use tokio::task::JoinHandle;
 
+use crate::any_item::AnyItem;
 use crate::compiler::CompiledGraph;
 use crate::controller::PipelineController;
-use crate::any_item::AnyItem;
 use crate::dataflow::{NodeId, NodeKind};
 use crate::erased::{ErasedOperator, ErasedSource, TransformFn};
 use crate::executor::NodeKindTag;

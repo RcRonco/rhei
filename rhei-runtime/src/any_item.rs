@@ -75,8 +75,7 @@ where
         let mut reg = TYPE_REGISTRY.write().unwrap();
         reg.entry(type_hash).or_insert_with(|| {
             Box::new(|bytes: &[u8]| {
-                let value: T =
-                    bincode::deserialize(bytes).expect("AnyItem deserialization failed");
+                let value: T = bincode::deserialize(bytes).expect("AnyItem deserialization failed");
                 AnyItem(Box::new(value))
             })
         });

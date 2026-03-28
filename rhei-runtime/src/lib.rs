@@ -32,8 +32,6 @@
 pub(crate) mod any_item;
 /// Non-blocking async wrapper for [`StreamFunction`](rhei_core::traits::StreamFunction).
 pub mod async_operator;
-/// Type-erased traits and wrappers for the Timely execution layer.
-pub(crate) mod erased;
 /// Async-to-sync channel bridges for Timely dataflow integration.
 pub mod bridge;
 /// Cross-process checkpoint coordination via lightweight TCP.
@@ -45,6 +43,8 @@ pub mod controller;
 /// Dataflow graph API: [`DataflowGraph`](dataflow::DataflowGraph),
 /// [`Stream<T>`](dataflow::Stream), [`KeyedStream<T>`](dataflow::KeyedStream).
 pub mod dataflow;
+/// Type-erased traits and wrappers for the Timely execution layer.
+pub(crate) mod erased;
 /// Pure Timely DAG construction and execution.
 pub mod executor;
 /// Fan-out recorder delegating to Prometheus and Snapshot recorders.

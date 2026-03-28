@@ -3,8 +3,8 @@ use std::collections::HashMap;
 use rhei_core::state::context::StateContext;
 use rhei_core::traits::StreamFunction;
 
-use crate::async_operator::AsyncOperator;
 use crate::any_item::AnyItem;
+use crate::async_operator::AsyncOperator;
 use crate::erased::ErasedOperator;
 
 /// Wraps `AsyncOperator<F>` with Timely capability management.
