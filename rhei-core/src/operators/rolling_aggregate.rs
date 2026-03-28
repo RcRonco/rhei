@@ -71,7 +71,7 @@ where
 
         let mut acc: A::Accumulator = ctx.get(key_bytes).await?.unwrap_or_default();
         self.aggregator.accumulate(&mut acc, &input);
-        ctx.put(key_bytes, &acc);
+        ctx.put(key_bytes, &acc)?;
 
         Ok(vec![self.aggregator.finish(&acc)])
     }

@@ -47,14 +47,14 @@ where
         Some(self.num_partitions)
     }
 
-    fn create_partition_source(&self, assigned: &[usize]) -> Box<dyn Source<Output = T>> {
+    fn create_partition_source(&self, assigned: &[usize]) -> Option<Box<dyn Source<Output = T>>> {
         let mut items = Vec::new();
         for (i, item) in self.items.iter().enumerate() {
             if assigned.contains(&(i % self.num_partitions)) {
                 items.push(item.clone());
             }
         }
-        Box::new(VecSource::new(items))
+        Some(Box::new(VecSource::new(items)))
     }
 }
 
@@ -80,7 +80,7 @@ mod tests {
         let src = PartitionedVecSource::new(vec![0, 1, 2, 3, 4, 5], 3);
 
         // Partition 0 gets items at indices 0, 3
-        let mut p0 = src.create_partition_source(&[0]);
+        let mut p0 = src.create_partition_source(&[0]).unwrap();
         let mut all = Vec::new();
         while let Some(batch) = p0.next_batch().await {
             all.extend(batch);
@@ -88,7 +88,7 @@ mod tests {
         assert_eq!(all, vec![0, 3]);
 
         // Partition 1 gets items at indices 1, 4
-        let mut p1 = src.create_partition_source(&[1]);
+        let mut p1 = src.create_partition_source(&[1]).unwrap();
         let mut all = Vec::new();
         while let Some(batch) = p1.next_batch().await {
             all.extend(batch);
@@ -96,7 +96,7 @@ mod tests {
         assert_eq!(all, vec![1, 4]);
 
         // Partition 2 gets items at indices 2, 5
-        let mut p2 = src.create_partition_source(&[2]);
+        let mut p2 = src.create_partition_source(&[2]).unwrap();
         let mut all = Vec::new();
         while let Some(batch) = p2.next_batch().await {
             all.extend(batch);
@@ -109,7 +109,7 @@ mod tests {
         let src = PartitionedVecSource::new(vec![0, 1, 2, 3, 4, 5], 3);
 
         // Worker gets partitions 0 and 2
-        let mut p = src.create_partition_source(&[0, 2]);
+        let mut p = src.create_partition_source(&[0, 2]).unwrap();
         let mut all = Vec::new();
         while let Some(batch) = p.next_batch().await {
             all.extend(batch);

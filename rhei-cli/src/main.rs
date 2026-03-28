@@ -319,7 +319,7 @@ fn cmd_demo(workers: usize, addr: std::net::SocketAddr) -> anyhow::Result<()> {
             .checkpoint_dir(std::env::temp_dir().join("rhei_demo"))
             .workers(workers)
             .health(health.clone())
-            .build();
+            .build()?;
 
         let _http = rhei_runtime::http_server::start(rhei_runtime::http_server::HttpServerConfig {
             addr,
@@ -358,7 +358,7 @@ async fn run_demo_pipeline(workers: usize) -> anyhow::Result<()> {
         .checkpoint_dir(dir)
         .workers(workers)
         .from_env()
-        .build();
+        .build()?;
 
     run_demo_with_executor(&executor).await
 }

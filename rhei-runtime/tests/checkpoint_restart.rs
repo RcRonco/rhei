@@ -45,7 +45,7 @@ impl StreamFunction for WordCounter {
         let word = input.trim();
         let key = word.as_bytes();
         let count = ctx.get::<u64>(key).await?.unwrap_or(0) + 1;
-        ctx.put(key, &count);
+        ctx.put(key, &count)?;
         Ok(vec![format!("{word}:{count}")])
     }
 }
@@ -244,16 +244,19 @@ impl Source for OffsetPartitionedSource {
         Some(self.partitions.len())
     }
 
-    fn create_partition_source(&self, assigned: &[usize]) -> Box<dyn Source<Output = String>> {
+    fn create_partition_source(
+        &self,
+        assigned: &[usize],
+    ) -> Option<Box<dyn Source<Output = String>>> {
         let partition_data: Vec<(usize, Vec<String>)> = assigned
             .iter()
             .map(|&idx| (idx, self.partitions[idx].clone()))
             .collect();
-        Box::new(OffsetPartitionReader {
+        Some(Box::new(OffsetPartitionReader {
             partitions: partition_data,
             positions: HashMap::new(),
             current_partition: 0,
-        })
+        }))
     }
 }
 
@@ -330,7 +333,11 @@ async fn multi_worker_checkpoint_restart() {
                 collected: collected.clone(),
             });
 
-        let executor = Executor::builder().checkpoint_dir(&dir).workers(2).build();
+        let executor = Executor::builder()
+            .checkpoint_dir(&dir)
+            .workers(2)
+            .build()
+            .unwrap();
         executor.run(graph).await.unwrap();
 
         let results = collected.lock().unwrap().clone();
@@ -357,7 +364,11 @@ async fn multi_worker_checkpoint_restart() {
                 collected: collected.clone(),
             });
 
-        let executor = Executor::builder().checkpoint_dir(&dir).workers(2).build();
+        let executor = Executor::builder()
+            .checkpoint_dir(&dir)
+            .workers(2)
+            .build()
+            .unwrap();
         executor.run(graph).await.unwrap();
 
         let results = collected.lock().unwrap().clone();
@@ -419,7 +430,11 @@ async fn partitioned_source_checkpoint_restart() {
                 collected: collected.clone(),
             });
 
-        let executor = Executor::builder().checkpoint_dir(&dir).workers(2).build();
+        let executor = Executor::builder()
+            .checkpoint_dir(&dir)
+            .workers(2)
+            .build()
+            .unwrap();
         executor.run(graph).await.unwrap();
 
         let results = collected.lock().unwrap().clone();
@@ -447,7 +462,11 @@ async fn partitioned_source_checkpoint_restart() {
                 collected: collected.clone(),
             });
 
-        let executor = Executor::builder().checkpoint_dir(&dir).workers(2).build();
+        let executor = Executor::builder()
+            .checkpoint_dir(&dir)
+            .workers(2)
+            .build()
+            .unwrap();
         executor.run(graph).await.unwrap();
 
         let results = collected.lock().unwrap().clone();
@@ -504,7 +523,11 @@ async fn partitioned_source_offset_merge() {
             collected: collected.clone(),
         });
 
-    let executor = Executor::builder().checkpoint_dir(&dir).workers(2).build();
+    let executor = Executor::builder()
+        .checkpoint_dir(&dir)
+        .workers(2)
+        .build()
+        .unwrap();
     executor.run(graph).await.unwrap();
 
     let results = collected.lock().unwrap().clone();
@@ -567,7 +590,11 @@ async fn partitioned_source_offset_restore() {
                 collected: collected.clone(),
             });
 
-        let executor = Executor::builder().checkpoint_dir(&dir).workers(2).build();
+        let executor = Executor::builder()
+            .checkpoint_dir(&dir)
+            .workers(2)
+            .build()
+            .unwrap();
         executor.run(graph).await.unwrap();
 
         let results = collected.lock().unwrap().clone();
@@ -625,7 +652,11 @@ async fn partitioned_source_offset_restore() {
                 collected: collected.clone(),
             });
 
-        let executor = Executor::builder().checkpoint_dir(&dir).workers(2).build();
+        let executor = Executor::builder()
+            .checkpoint_dir(&dir)
+            .workers(2)
+            .build()
+            .unwrap();
         executor.run(graph).await.unwrap();
 
         let results = collected.lock().unwrap().clone();
@@ -703,7 +734,11 @@ async fn partitioned_source_changed_worker_count() {
                 collected: collected.clone(),
             });
 
-        let executor = Executor::builder().checkpoint_dir(&dir).workers(2).build();
+        let executor = Executor::builder()
+            .checkpoint_dir(&dir)
+            .workers(2)
+            .build()
+            .unwrap();
         executor.run(graph).await.unwrap();
 
         let results = collected.lock().unwrap().clone();
@@ -759,7 +794,11 @@ async fn partitioned_source_changed_worker_count() {
 
         // Changed from 2 workers to 4 workers — partition distribution changes
         // but per-partition offsets should still restore correctly.
-        let executor = Executor::builder().checkpoint_dir(&dir).workers(4).build();
+        let executor = Executor::builder()
+            .checkpoint_dir(&dir)
+            .workers(4)
+            .build()
+            .unwrap();
         executor.run(graph).await.unwrap();
 
         let results = collected.lock().unwrap().clone();

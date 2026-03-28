@@ -187,7 +187,7 @@ where
             ctx.delete(key_bytes);
             Ok(vec![output])
         } else {
-            ctx.put(key_bytes, &state);
+            ctx.put(key_bytes, &state)?;
             Ok(vec![])
         }
     }

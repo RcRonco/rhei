@@ -293,7 +293,7 @@ where
         // Store updated session state
         {
             let mut state = KeyedState::<String, SessionState<A::Accumulator>>::new(ctx, "session");
-            state.put(&key, &new_session);
+            state.put(&key, &new_session)?;
         }
 
         Ok(outputs)
@@ -327,7 +327,7 @@ where
                 });
                 let mut state =
                     KeyedState::<String, SessionState<A::Accumulator>>::new(ctx, "session");
-                state.delete(key);
+                state.delete(key)?;
                 closed_keys.push(key.clone());
             }
         }

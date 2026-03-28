@@ -47,8 +47,8 @@ where
     }
 
     /// Stores a value.
-    pub fn set(&mut self, value: &V) {
-        self.ctx.put(&self.key, value);
+    pub fn set(&mut self, value: &V) -> anyhow::Result<()> {
+        self.ctx.put(&self.key, value)
     }
 
     /// Removes the stored value.
@@ -75,7 +75,7 @@ mod tests {
         let mut ctx = test_ctx("roundtrip");
         {
             let mut vs = ValueState::<u64>::new(&mut ctx, "counter");
-            vs.set(&42);
+            vs.set(&42).unwrap();
             assert_eq!(vs.get().await.unwrap(), Some(42));
         }
     }
@@ -92,7 +92,7 @@ mod tests {
         let mut ctx = test_ctx("clear");
         {
             let mut vs = ValueState::<u64>::new(&mut ctx, "val");
-            vs.set(&100);
+            vs.set(&100).unwrap();
             assert_eq!(vs.get().await.unwrap(), Some(100));
             vs.clear();
             assert_eq!(vs.get().await.unwrap(), None);
@@ -108,7 +108,7 @@ mod tests {
             let backend = LocalBackend::new(path.clone(), None).unwrap();
             let mut ctx = StateContext::new(Box::new(backend));
             let mut vs = ValueState::<String>::new(&mut ctx, "name");
-            vs.set(&"hello".to_string());
+            vs.set(&"hello".to_string()).unwrap();
             drop(vs);
             ctx.checkpoint().await.unwrap();
         }

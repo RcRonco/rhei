@@ -143,7 +143,11 @@ async fn timer_fires_on_watermark_advance() {
             collected: collected.clone(),
         });
 
-    let executor = Executor::builder().checkpoint_dir(&dir).workers(1).build();
+    let executor = Executor::builder()
+        .checkpoint_dir(&dir)
+        .workers(1)
+        .build()
+        .unwrap();
     executor.run(graph).await.unwrap();
 
     let results = collected.lock().unwrap().clone();

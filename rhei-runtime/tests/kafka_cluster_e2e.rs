@@ -505,7 +505,8 @@ async fn worker_main() {
     let executor = Executor::builder()
         .checkpoint_dir(&proc_checkpoint_dir)
         .from_env()
-        .build();
+        .build()
+        .unwrap();
 
     eprintln!(
         "worker process {process_id}: cluster={}, total_workers={}, local_range={:?}",

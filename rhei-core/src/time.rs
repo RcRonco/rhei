@@ -31,7 +31,7 @@ impl TimeProvider for WallClockProvider {
         {
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
-                .expect("system clock before UNIX epoch")
+                .unwrap_or_else(|e| panic!("system clock before UNIX epoch: {e}"))
                 .as_millis() as u64
         }
     }
@@ -72,6 +72,7 @@ impl TimeProvider for FixedClockProvider {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 

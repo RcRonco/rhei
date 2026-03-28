@@ -56,8 +56,8 @@ pub fn shutdown_signal() -> ShutdownHandle {
         #[cfg(unix)]
         {
             use tokio::signal::unix::{SignalKind, signal};
-            let mut sigterm =
-                signal(SignalKind::terminate()).expect("failed to install SIGTERM handler");
+            let mut sigterm = signal(SignalKind::terminate())
+                .unwrap_or_else(|e| panic!("failed to install SIGTERM handler: {e}"));
 
             tokio::select! {
                 _ = ctrl_c => {},

@@ -59,14 +59,13 @@ impl SharedL2Cache {
     }
 
     /// Build a memory-only shared cache (for tests).
-    pub async fn memory_only() -> Self {
+    pub async fn memory_only() -> anyhow::Result<Self> {
         let cache = HybridCacheBuilder::new()
             .memory(1024 * 1024)
             .storage()
             .build()
-            .await
-            .expect("failed to build memory-only HybridCache");
-        Self { cache }
+            .await?;
+        Ok(Self { cache })
     }
 
     /// Create a `TieredBackend` using this shared cache.
@@ -187,6 +186,7 @@ impl StateBackend for TieredBackend {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
     use bytes::Bytes;
@@ -278,7 +278,7 @@ mod tests {
         let store = Arc::new(InMemory::new());
         let l3 = Arc::new(SlateDbBackend::open("test_shared_l2", store).await.unwrap());
 
-        let shared = SharedL2Cache::memory_only().await;
+        let shared = SharedL2Cache::memory_only().await.unwrap();
 
         // Two operators sharing the same L2 cache (namespaced via PrefixedBackend).
         let backend_a = shared.create_tiered_backend(l3.clone());

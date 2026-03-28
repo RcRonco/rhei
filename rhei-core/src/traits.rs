@@ -128,7 +128,10 @@ pub trait Source: Send + Sync {
     ///
     /// Called by the executor when `partition_count()` returns `Some`.
     /// Takes `&self` because multiple partition readers are created from one factory.
-    fn create_partition_source(&self, _assigned: &[usize]) -> Box<dyn Source<Output = Self::Output>>
+    fn create_partition_source(
+        &self,
+        _assigned: &[usize],
+    ) -> Option<Box<dyn Source<Output = Self::Output>>>
     where
         Self: Sized,
     {

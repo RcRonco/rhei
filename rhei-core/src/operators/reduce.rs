@@ -73,7 +73,7 @@ where
             Some(prev) => (self.reduce_fn)(prev, input),
             None => input,
         };
-        ctx.put(key_bytes, &result);
+        ctx.put(key_bytes, &result)?;
         Ok(vec![result])
     }
 }

@@ -159,7 +159,8 @@ async fn s3_tiered_storage_e2e() {
             l3.clone(),
             foyer_config,
         )
-        .await;
+        .await
+        .unwrap();
 
     // ── 3. Build pipeline ──────────────────────────────────────────
     let words = generate_words();

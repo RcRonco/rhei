@@ -298,7 +298,8 @@ async fn kafka_join_window_e2e() {
     let executor = Executor::builder()
         .checkpoint_dir(checkpoint_dir.path())
         .workers(2)
-        .build();
+        .build()
+        .unwrap();
 
     executor.run_with_shutdown(graph, handle).await.unwrap();
 
@@ -486,7 +487,8 @@ async fn kafka_multi_partition_e2e() {
     let executor = Executor::builder()
         .checkpoint_dir(checkpoint_dir.path())
         .workers(4)
-        .build();
+        .build()
+        .unwrap();
 
     executor.run_with_shutdown(graph, handle).await.unwrap();
 
