@@ -411,6 +411,128 @@ pub(crate) type TransformFn = Arc<dyn Fn(AnyItem, &TransformContext) -> Vec<AnyI
 /// Key extraction function.
 pub(crate) type KeyFn = Arc<dyn Fn(&AnyItem) -> String + Send + Sync>;
 
+// ── Graph-node compile traits ────────────────────────────────────────
+//
+// These traits represent dataflow nodes at the *graph construction* level.
+// Each trait's `compile()` method bridges to the AnyItem-based execution
+// layer used by the Timely executor. This keeps AnyItem out of the
+// user-facing graph API — conversion is deferred to compilation time.
+
+/// A source node that produces data batches. Compiles to [`ErasedSource`].
+#[allow(dead_code)]
+pub(crate) trait SourceNode: Send {
+    fn compile(self: Box<Self>) -> Box<dyn ErasedSource>;
+}
+
+/// A stateless transform node (`map`/`filter`/`flat_map`). Compiles to [`TransformFn`].
+#[allow(dead_code)]
+pub(crate) trait TransformNode: Send {
+    fn compile(self: Box<Self>) -> TransformFn;
+}
+
+/// A key-extraction node for partitioning. Compiles to [`KeyFn`].
+#[allow(dead_code)]
+pub(crate) trait KeyByNode: Send {
+    fn compile(self: Box<Self>) -> KeyFn;
+}
+
+/// A stateful operator node. Compiles to [`ErasedOperator`].
+#[allow(dead_code)]
+pub(crate) trait OperatorNode: Send {
+    fn compile(self: Box<Self>) -> Box<dyn ErasedOperator>;
+}
+
+/// A terminal sink node. Compiles to [`ErasedSink`].
+#[allow(dead_code)]
+pub(crate) trait SinkNode: Send {
+    fn compile(self: Box<Self>) -> Box<dyn ErasedSink>;
+}
+
+// ── Typed node wrappers ─────────────────────────────────────────────
+
+/// Wraps a typed [`Source`] for deferred compilation.
+#[allow(dead_code)]
+pub(crate) struct TypedSourceNode<S: Source>(pub(crate) S);
+
+impl<S> SourceNode for TypedSourceNode<S>
+where
+    S: Source + Send + 'static,
+    S::Output: Clone
+        + Send
+        + Sync
+        + std::fmt::Debug
+        + serde::Serialize
+        + serde::de::DeserializeOwned
+        + 'static,
+{
+    fn compile(self: Box<Self>) -> Box<dyn ErasedSource> {
+        Box::new(SourceWrapper(self.0))
+    }
+}
+
+/// Deferred transform: stores a factory that produces the AnyItem-based closure
+/// at compile time rather than at graph construction time.
+#[allow(dead_code)]
+pub(crate) struct LazyTransformNode(pub(crate) Box<dyn FnOnce() -> TransformFn + Send>);
+
+impl TransformNode for LazyTransformNode {
+    fn compile(self: Box<Self>) -> TransformFn {
+        (self.0)()
+    }
+}
+
+/// Deferred key function: stores a factory that produces the AnyItem-based key fn.
+#[allow(dead_code)]
+pub(crate) struct LazyKeyByNode(pub(crate) Box<dyn FnOnce() -> KeyFn + Send>);
+
+impl KeyByNode for LazyKeyByNode {
+    fn compile(self: Box<Self>) -> KeyFn {
+        (self.0)()
+    }
+}
+
+/// Wraps a typed [`StreamFunction`] for deferred compilation.
+#[allow(dead_code)]
+pub(crate) struct TypedOperatorNode<F: StreamFunction>(pub(crate) F);
+
+impl<F> OperatorNode for TypedOperatorNode<F>
+where
+    F: StreamFunction + Clone + Send + 'static,
+    F::Input: serde::Serialize + serde::de::DeserializeOwned + 'static,
+    F::Output: serde::Serialize + serde::de::DeserializeOwned + 'static,
+{
+    fn compile(self: Box<Self>) -> Box<dyn ErasedOperator> {
+        Box::new(OperatorWrapper(self.0))
+    }
+}
+
+/// Wraps an [`OperatorNode`] with dead-letter-queue error routing.
+///
+/// Compiles the inner operator first, then wraps it in [`DlqErasedOperator`].
+#[allow(dead_code)]
+pub(crate) struct DlqOperatorNode(pub(crate) Box<dyn OperatorNode>);
+
+impl OperatorNode for DlqOperatorNode {
+    fn compile(self: Box<Self>) -> Box<dyn ErasedOperator> {
+        let inner = self.0.compile();
+        Box::new(DlqErasedOperator { inner })
+    }
+}
+
+/// Wraps a typed [`Sink`] for deferred compilation.
+#[allow(dead_code)]
+pub(crate) struct TypedSinkNode<K: Sink>(pub(crate) K);
+
+impl<K> SinkNode for TypedSinkNode<K>
+where
+    K: Sink + Send + 'static,
+    K::Input: 'static,
+{
+    fn compile(self: Box<Self>) -> Box<dyn ErasedSink> {
+        Box::new(SinkWrapper(self.0))
+    }
+}
+
 // ── Graph nodes ──────────────────────────────────────────────────────
 
 /// The kind of processing a graph node performs.
@@ -1276,5 +1398,76 @@ mod tests {
         let bytes = bincode::serialize(&item).unwrap();
         let restored: AnyItem = bincode::deserialize(&bytes).unwrap();
         assert_eq!(restored.downcast::<u16>(), 42);
+    }
+
+    #[test]
+    fn typed_source_node_compiles_to_erased_source() {
+        let source = rhei_core::connectors::vec_source::VecSource::new(vec![1u16, 2, 3]);
+        let node: Box<dyn SourceNode> = Box::new(TypedSourceNode(source));
+        let erased = node.compile();
+        // register_output_type should work on the compiled source.
+        erased.register_output_type();
+        let item = AnyItem::new(99u16);
+        let bytes = bincode::serialize(&item).unwrap();
+        let restored: AnyItem = bincode::deserialize(&bytes).unwrap();
+        assert_eq!(restored.downcast::<u16>(), 99);
+    }
+
+    #[test]
+    fn lazy_transform_node_compiles_and_executes() {
+        let node: Box<dyn TransformNode> = Box::new(LazyTransformNode(Box::new(|| {
+            Arc::new(|item: AnyItem, _ctx: &TransformContext| {
+                let val: i32 = item.downcast();
+                vec![AnyItem::new(val * 2)]
+            })
+        })));
+        let transform = node.compile();
+        let ctx = TransformContext {
+            worker_index: 0,
+            num_workers: 1,
+        };
+        let result = transform(AnyItem::new(5i32), &ctx);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].clone().downcast::<i32>(), 10);
+    }
+
+    #[test]
+    fn lazy_key_by_node_compiles_and_extracts() {
+        let node: Box<dyn KeyByNode> = Box::new(LazyKeyByNode(Box::new(|| {
+            Arc::new(|item: &AnyItem| {
+                let val = item.downcast_ref::<i32>();
+                format!("key-{val}")
+            })
+        })));
+        let key_fn = node.compile();
+        let item = AnyItem::new(42i32);
+        assert_eq!(key_fn(&item), "key-42");
+    }
+
+    #[test]
+    fn dlq_operator_node_wraps_inner() {
+        // Verify DlqOperatorNode compiles by wrapping a typed operator.
+        // Use a simple identity-like StreamFunction.
+        #[derive(Clone)]
+        struct IdentityOp;
+
+        #[async_trait]
+        impl StreamFunction for IdentityOp {
+            type Input = i32;
+            type Output = i32;
+
+            async fn process(
+                &mut self,
+                input: i32,
+                _ctx: &mut StateContext,
+            ) -> anyhow::Result<Vec<i32>> {
+                Ok(vec![input])
+            }
+        }
+
+        let inner: Box<dyn OperatorNode> = Box::new(TypedOperatorNode(IdentityOp));
+        let dlq_node: Box<dyn OperatorNode> = Box::new(DlqOperatorNode(inner));
+        // Compile should succeed — produces a DlqErasedOperator wrapping OperatorWrapper.
+        let _erased = dlq_node.compile();
     }
 }
