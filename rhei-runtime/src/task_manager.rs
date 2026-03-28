@@ -308,6 +308,7 @@ impl TaskManager {
             checkpoint_dir: self.checkpoint_dir.clone(),
             process_id: self.process_id,
             n_processes: self.n_processes,
+            workers_per_process: controller.workers,
         };
 
         // Create a shutdown barrier for coordinated process teardown.
@@ -412,6 +413,7 @@ struct CheckpointTaskConfig {
     checkpoint_dir: PathBuf,
     process_id: Option<usize>,
     n_processes: usize,
+    workers_per_process: usize,
 }
 
 /// Set up cross-process checkpoint coordination for cluster mode.
@@ -532,6 +534,8 @@ async fn run_checkpoint_task(
             timestamp_ms: crate::controller::now_millis(),
             operators: config.operator_names.clone(),
             source_offsets: offsets,
+            n_processes: Some(config.n_processes),
+            workers_per_process: Some(config.workers_per_process),
         };
 
         if let Err(e) = write_manifest(

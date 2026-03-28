@@ -14,6 +14,12 @@
 - [ ] Hot-reload operator logic without full pipeline restart
 - [x] `rhei run --attach <url>` — connect to a running pipeline and stream health/metrics/logs to TUI
 - [ ] `rhei-cli` improvements: deploy, inspect running pipelines, replay from checkpoint
+- [x] `#[rhei::main]` pipeline binary macro — generates clap CLI with `--workers`, `--from-checkpoint`, `--offset-delta`, `--metrics-addr`, `--process-id`, `--peers` (replaces env-var-based `from_env()`)
+- [x] Checkpoint fork mode — `--from-checkpoint <s3-url> --offset-delta=<N>` to reproduce production locally
+  - [x] `ForkBackend` — copy-on-write `StateBackend` (local writes, read-only remote fallback)
+  - [x] Offset delta — adjust manifest source offsets for local Kafka with re-indexed data
+  - [x] Topology validation — require matching worker count between manifest and local run
+  - [x] Manifest v2 — add topology metadata (process count, workers per process)
 
 ## Integrations
 

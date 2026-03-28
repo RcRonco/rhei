@@ -2,6 +2,8 @@
 pub mod backend;
 /// Operator-scoped [`StateContext`](context::StateContext) (memtable + backend).
 pub mod context;
+/// Copy-on-write backend for checkpoint fork mode.
+pub mod fork_backend;
 /// List-valued typed state wrapper.
 pub mod list_state;
 /// JSON-file-backed local state backend.
