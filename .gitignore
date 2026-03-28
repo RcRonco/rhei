@@ -21,6 +21,9 @@ target
 #.idea/
 
 
+# Git worktrees
+.worktrees/
+
 # Added by cargo
 
 /target
