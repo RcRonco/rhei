@@ -1,4 +1,5 @@
 #![cfg(feature = "remote-state")]
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 
 //! End-to-end S3 tiered storage test.
 //!

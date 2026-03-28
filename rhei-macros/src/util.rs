@@ -64,6 +64,7 @@ pub(crate) fn extract_result_vec_inner(ty: &Type) -> Option<&Type> {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 

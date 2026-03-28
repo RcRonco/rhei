@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 //! Cross-process checkpoint coordination E2E test.
 //!
 //! Validates that coordinated checkpointing works across 2 OS processes, each

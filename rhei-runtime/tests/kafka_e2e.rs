@@ -1,5 +1,6 @@
 #![cfg(feature = "kafka")]
 #![allow(clippy::struct_field_names)]
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 
 //! End-to-end Kafka integration test.
 //!

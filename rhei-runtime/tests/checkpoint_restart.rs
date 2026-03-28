@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 //! End-to-end tests for checkpoint restart with manifest persistence.
 
 use std::collections::HashMap;

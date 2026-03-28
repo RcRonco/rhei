@@ -50,7 +50,14 @@ pub struct ForkBackend {
 impl std::fmt::Debug for ForkBackend {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ForkBackend")
-            .field("tombstone_count", &self.tombstones.lock().unwrap().len())
+            .field(
+                "tombstone_count",
+                &self
+                    .tombstones
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .len(),
+            )
             .finish_non_exhaustive()
     }
 }
@@ -73,7 +80,12 @@ impl ForkBackend {
 impl StateBackend for ForkBackend {
     async fn get(&self, key: &[u8]) -> anyhow::Result<Option<Bytes>> {
         // 1. Tombstone check — deleted keys must not resurface from remote.
-        if self.tombstones.lock().unwrap().contains(key) {
+        if self
+            .tombstones
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(key)
+        {
             return Ok(None);
         }
 
@@ -90,14 +102,20 @@ impl StateBackend for ForkBackend {
         // Clear tombstone first: a put resurrects a previously deleted key.
         // The tombstone must be removed before the local write so that a
         // concurrent reader does not see the tombstone after the value lands.
-        self.tombstones.lock().unwrap().remove(key);
+        self.tombstones
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(key);
         self.local.put(key, value).await
     }
 
     async fn delete(&self, key: &[u8]) -> anyhow::Result<()> {
         // Record tombstone before local delete to prevent a concurrent read
         // from falling through to the remote backend during the delete.
-        self.tombstones.lock().unwrap().insert(key.to_vec());
+        self.tombstones
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(key.to_vec());
         self.local.delete(key).await
     }
 
@@ -108,6 +126,7 @@ impl StateBackend for ForkBackend {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
     use crate::state::local_backend::LocalBackend;

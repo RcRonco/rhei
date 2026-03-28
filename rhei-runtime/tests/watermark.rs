@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 //! Integration tests for watermark propagation through the pipeline.
 
 use std::sync::{Arc, Mutex};

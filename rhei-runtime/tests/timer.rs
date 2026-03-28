@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 //! Integration test for timer firing on watermark advance.
 
 use std::sync::{Arc, Mutex};
