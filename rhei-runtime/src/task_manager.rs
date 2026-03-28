@@ -955,47 +955,47 @@ pub(crate) fn merge_source_offsets(
 
 // ── Node extraction helpers ─────────────────────────────────────────
 
-/// Extract a source from a graph node, replacing it with a Merge placeholder.
+/// Extract and compile a source from a graph node, replacing it with a Merge placeholder.
 fn extract_source(node: &mut crate::dataflow::GraphNode) -> Box<dyn ErasedSource> {
     let kind = std::mem::replace(&mut node.kind, NodeKind::Merge);
     match kind {
-        NodeKind::Source(src) => src,
+        NodeKind::Source(src) => src.compile(),
         _ => panic!("expected Source node at {:?}", node.id),
     }
 }
 
-/// Extract a sink from a graph node, replacing it with a Merge placeholder.
+/// Extract and compile a sink from a graph node, replacing it with a Merge placeholder.
 fn extract_sink(node: &mut crate::dataflow::GraphNode) -> Box<dyn crate::dataflow::ErasedSink> {
     let kind = std::mem::replace(&mut node.kind, NodeKind::Merge);
     match kind {
-        NodeKind::Sink(sink) => sink,
+        NodeKind::Sink(sink) => sink.compile(),
         _ => panic!("expected Sink node at {:?}", node.id),
     }
 }
 
-/// Extract an operator from a graph node, replacing it with a Merge placeholder.
+/// Extract and compile an operator from a graph node, replacing it with a Merge placeholder.
 fn extract_operator(node: &mut crate::dataflow::GraphNode) -> (String, Box<dyn ErasedOperator>) {
     let kind = std::mem::replace(&mut node.kind, NodeKind::Merge);
     match kind {
-        NodeKind::Operator { name, op } => (name, op),
+        NodeKind::Operator { name, op } => (name, op.compile()),
         _ => panic!("expected Operator node at {:?}", node.id),
     }
 }
 
-/// Extract a transform function from a graph node.
+/// Extract and compile a transform function from a graph node.
 fn extract_transform(node: &mut crate::dataflow::GraphNode) -> TransformFn {
     let kind = std::mem::replace(&mut node.kind, NodeKind::Merge);
     match kind {
-        NodeKind::Transform(f) => f,
+        NodeKind::Transform(f) => f.compile(),
         _ => panic!("expected Transform node at {:?}", node.id),
     }
 }
 
-/// Extract a key function from a graph node.
+/// Extract and compile a key function from a graph node.
 fn extract_key_fn(node: &mut crate::dataflow::GraphNode) -> crate::dataflow::KeyFn {
     let kind = std::mem::replace(&mut node.kind, NodeKind::Merge);
     match kind {
-        NodeKind::KeyBy(f) => f,
+        NodeKind::KeyBy(f) => f.compile(),
         _ => panic!("expected KeyBy node at {:?}", node.id),
     }
 }

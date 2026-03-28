@@ -44,7 +44,6 @@ pub(crate) struct NodeId(pub(crate) usize);
 
 /// Type-erased source: produces batches of [`AnyItem`].
 #[async_trait]
-#[allow(dead_code)]
 pub(crate) trait ErasedSource: Send {
     async fn next_batch(&mut self) -> Option<Vec<AnyItem>>;
     async fn on_checkpoint_complete(&mut self) -> anyhow::Result<()>;
@@ -419,31 +418,26 @@ pub(crate) type KeyFn = Arc<dyn Fn(&AnyItem) -> String + Send + Sync>;
 // user-facing graph API — conversion is deferred to compilation time.
 
 /// A source node that produces data batches. Compiles to [`ErasedSource`].
-#[allow(dead_code)]
 pub(crate) trait SourceNode: Send {
     fn compile(self: Box<Self>) -> Box<dyn ErasedSource>;
 }
 
 /// A stateless transform node (`map`/`filter`/`flat_map`). Compiles to [`TransformFn`].
-#[allow(dead_code)]
 pub(crate) trait TransformNode: Send {
     fn compile(self: Box<Self>) -> TransformFn;
 }
 
 /// A key-extraction node for partitioning. Compiles to [`KeyFn`].
-#[allow(dead_code)]
 pub(crate) trait KeyByNode: Send {
     fn compile(self: Box<Self>) -> KeyFn;
 }
 
 /// A stateful operator node. Compiles to [`ErasedOperator`].
-#[allow(dead_code)]
 pub(crate) trait OperatorNode: Send {
     fn compile(self: Box<Self>) -> Box<dyn ErasedOperator>;
 }
 
 /// A terminal sink node. Compiles to [`ErasedSink`].
-#[allow(dead_code)]
 pub(crate) trait SinkNode: Send {
     fn compile(self: Box<Self>) -> Box<dyn ErasedSink>;
 }
@@ -451,7 +445,6 @@ pub(crate) trait SinkNode: Send {
 // ── Typed node wrappers ─────────────────────────────────────────────
 
 /// Wraps a typed [`Source`] for deferred compilation.
-#[allow(dead_code)]
 pub(crate) struct TypedSourceNode<S: Source>(pub(crate) S);
 
 impl<S> SourceNode for TypedSourceNode<S>
@@ -472,7 +465,6 @@ where
 
 /// Deferred transform: stores a factory that produces the AnyItem-based closure
 /// at compile time rather than at graph construction time.
-#[allow(dead_code)]
 pub(crate) struct LazyTransformNode(pub(crate) Box<dyn FnOnce() -> TransformFn + Send>);
 
 impl TransformNode for LazyTransformNode {
@@ -482,7 +474,6 @@ impl TransformNode for LazyTransformNode {
 }
 
 /// Deferred key function: stores a factory that produces the AnyItem-based key fn.
-#[allow(dead_code)]
 pub(crate) struct LazyKeyByNode(pub(crate) Box<dyn FnOnce() -> KeyFn + Send>);
 
 impl KeyByNode for LazyKeyByNode {
@@ -492,7 +483,6 @@ impl KeyByNode for LazyKeyByNode {
 }
 
 /// Wraps a typed [`StreamFunction`] for deferred compilation.
-#[allow(dead_code)]
 pub(crate) struct TypedOperatorNode<F: StreamFunction>(pub(crate) F);
 
 impl<F> OperatorNode for TypedOperatorNode<F>
@@ -509,7 +499,6 @@ where
 /// Wraps an [`OperatorNode`] with dead-letter-queue error routing.
 ///
 /// Compiles the inner operator first, then wraps it in [`DlqErasedOperator`].
-#[allow(dead_code)]
 pub(crate) struct DlqOperatorNode(pub(crate) Box<dyn OperatorNode>);
 
 impl OperatorNode for DlqOperatorNode {
@@ -520,7 +509,6 @@ impl OperatorNode for DlqOperatorNode {
 }
 
 /// Wraps a typed [`Sink`] for deferred compilation.
-#[allow(dead_code)]
 pub(crate) struct TypedSinkNode<K: Sink>(pub(crate) K);
 
 impl<K> SinkNode for TypedSinkNode<K>
@@ -536,24 +524,28 @@ where
 // ── Graph nodes ──────────────────────────────────────────────────────
 
 /// The kind of processing a graph node performs.
+///
+/// Each variant stores a graph-level compile trait rather than an
+/// AnyItem-based erased form. Call the corresponding `compile()` method
+/// to produce the execution-layer form needed by the Timely executor.
 pub(crate) enum NodeKind {
     /// A data source.
-    Source(Box<dyn ErasedSource>),
+    Source(Box<dyn SourceNode>),
     /// A stateless transform (map/filter/`flat_map`).
-    Transform(TransformFn),
+    Transform(Box<dyn TransformNode>),
     /// A key-based exchange point.
-    KeyBy(KeyFn),
+    KeyBy(Box<dyn KeyByNode>),
     /// A stateful operator.
     Operator {
         /// Human-readable operator name (used for `StateContext` namespacing).
         name: String,
-        /// The type-erased operator instance.
-        op: Box<dyn ErasedOperator>,
+        /// The typed operator node.
+        op: Box<dyn OperatorNode>,
     },
     /// Merges two input streams (placeholder for future use).
     Merge,
     /// A data sink (terminal node).
-    Sink(Box<dyn ErasedSink>),
+    Sink(Box<dyn SinkNode>),
 }
 
 /// A node in the dataflow graph.
@@ -598,7 +590,7 @@ impl DataflowGraph {
     /// Add a data source to the dataflow. Returns a [`Stream`] handle.
     pub fn source<S>(&self, source: S) -> Stream<'_, S::Output>
     where
-        S: Source + 'static,
+        S: Source + Send + 'static,
         S::Output: Clone
             + Send
             + Sync
@@ -607,7 +599,8 @@ impl DataflowGraph {
             + serde::de::DeserializeOwned
             + 'static,
     {
-        let id = self.add_node(NodeKind::Source(Box::new(SourceWrapper(source))), vec![]);
+        let id =
+            self.add_node(NodeKind::Source(Box::new(TypedSourceNode(source))), vec![]);
         Stream::new(self, id)
     }
 
@@ -686,13 +679,15 @@ impl<
             + serde::de::DeserializeOwned
             + 'static,
     {
-        let transform: TransformFn = Arc::new(move |item: AnyItem, _ctx| {
-            let typed: T = item.downcast();
-            vec![AnyItem::new(f(typed))]
-        });
+        let node = LazyTransformNode(Box::new(move || {
+            Arc::new(move |item: AnyItem, _ctx: &TransformContext| {
+                let typed: T = item.downcast();
+                vec![AnyItem::new(f(typed))]
+            })
+        }));
         let node_id = self
             .graph
-            .add_node(NodeKind::Transform(transform), vec![self.node_id]);
+            .add_node(NodeKind::Transform(Box::new(node)), vec![self.node_id]);
         Stream::new(self.graph, node_id)
     }
 
@@ -707,13 +702,15 @@ impl<
             + serde::de::DeserializeOwned
             + 'static,
     {
-        let transform: TransformFn = Arc::new(move |item: AnyItem, ctx| {
-            let typed: T = item.downcast();
-            vec![AnyItem::new(f(typed, ctx))]
-        });
+        let node = LazyTransformNode(Box::new(move || {
+            Arc::new(move |item: AnyItem, ctx: &TransformContext| {
+                let typed: T = item.downcast();
+                vec![AnyItem::new(f(typed, ctx))]
+            })
+        }));
         let node_id = self
             .graph
-            .add_node(NodeKind::Transform(transform), vec![self.node_id]);
+            .add_node(NodeKind::Transform(Box::new(node)), vec![self.node_id]);
         Stream::new(self.graph, node_id)
     }
 
@@ -722,17 +719,19 @@ impl<
     where
         F: Fn(&T) -> bool + Send + Sync + 'static,
     {
-        let transform: TransformFn = Arc::new(move |item: AnyItem, _ctx| {
-            let typed: T = item.downcast();
-            if f(&typed) {
-                vec![AnyItem::new(typed)]
-            } else {
-                vec![]
-            }
-        });
+        let node = LazyTransformNode(Box::new(move || {
+            Arc::new(move |item: AnyItem, _ctx: &TransformContext| {
+                let typed: T = item.downcast();
+                if f(&typed) {
+                    vec![AnyItem::new(typed)]
+                } else {
+                    vec![]
+                }
+            })
+        }));
         let node_id = self
             .graph
-            .add_node(NodeKind::Transform(transform), vec![self.node_id]);
+            .add_node(NodeKind::Transform(Box::new(node)), vec![self.node_id]);
         Stream::new(self.graph, node_id)
     }
 
@@ -742,17 +741,19 @@ impl<
     where
         F: Fn(&T, &TransformContext) -> bool + Send + Sync + 'static,
     {
-        let transform: TransformFn = Arc::new(move |item: AnyItem, ctx| {
-            let typed: T = item.downcast();
-            if f(&typed, ctx) {
-                vec![AnyItem::new(typed)]
-            } else {
-                vec![]
-            }
-        });
+        let node = LazyTransformNode(Box::new(move || {
+            Arc::new(move |item: AnyItem, ctx: &TransformContext| {
+                let typed: T = item.downcast();
+                if f(&typed, ctx) {
+                    vec![AnyItem::new(typed)]
+                } else {
+                    vec![]
+                }
+            })
+        }));
         let node_id = self
             .graph
-            .add_node(NodeKind::Transform(transform), vec![self.node_id]);
+            .add_node(NodeKind::Transform(Box::new(node)), vec![self.node_id]);
         Stream::new(self.graph, node_id)
     }
 
@@ -767,13 +768,15 @@ impl<
             + serde::de::DeserializeOwned
             + 'static,
     {
-        let transform: TransformFn = Arc::new(move |item: AnyItem, _ctx| {
-            let typed: T = item.downcast();
-            f(typed).into_iter().map(AnyItem::new).collect()
-        });
+        let node = LazyTransformNode(Box::new(move || {
+            Arc::new(move |item: AnyItem, _ctx: &TransformContext| {
+                let typed: T = item.downcast();
+                f(typed).into_iter().map(AnyItem::new).collect()
+            })
+        }));
         let node_id = self
             .graph
-            .add_node(NodeKind::Transform(transform), vec![self.node_id]);
+            .add_node(NodeKind::Transform(Box::new(node)), vec![self.node_id]);
         Stream::new(self.graph, node_id)
     }
 
@@ -788,13 +791,15 @@ impl<
             + serde::de::DeserializeOwned
             + 'static,
     {
-        let transform: TransformFn = Arc::new(move |item: AnyItem, ctx| {
-            let typed: T = item.downcast();
-            f(typed, ctx).into_iter().map(AnyItem::new).collect()
-        });
+        let node = LazyTransformNode(Box::new(move || {
+            Arc::new(move |item: AnyItem, ctx: &TransformContext| {
+                let typed: T = item.downcast();
+                f(typed, ctx).into_iter().map(AnyItem::new).collect()
+            })
+        }));
         let node_id = self
             .graph
-            .add_node(NodeKind::Transform(transform), vec![self.node_id]);
+            .add_node(NodeKind::Transform(Box::new(node)), vec![self.node_id]);
         Stream::new(self.graph, node_id)
     }
 
@@ -807,13 +812,15 @@ impl<
     where
         KF: Fn(&T) -> String + Send + Sync + 'static,
     {
-        let erased_key_fn: KeyFn = Arc::new(move |item: &AnyItem| {
-            let typed = item.downcast_ref::<T>();
-            key_fn(typed)
-        });
+        let node = LazyKeyByNode(Box::new(move || {
+            Arc::new(move |item: &AnyItem| {
+                let typed = item.downcast_ref::<T>();
+                key_fn(typed)
+            })
+        }));
         let node_id = self
             .graph
-            .add_node(NodeKind::KeyBy(erased_key_fn), vec![self.node_id]);
+            .add_node(NodeKind::KeyBy(Box::new(node)), vec![self.node_id]);
         KeyedStream::new(self.graph, node_id)
     }
 
@@ -828,10 +835,10 @@ impl<
     /// Terminal: write elements to a sink.
     pub fn sink<K>(self, sink: K)
     where
-        K: Sink<Input = T> + 'static,
+        K: Sink<Input = T> + Send + 'static,
     {
         self.graph.add_node(
-            NodeKind::Sink(Box::new(SinkWrapper(sink))),
+            NodeKind::Sink(Box::new(TypedSinkNode(sink))),
             vec![self.node_id],
         );
     }
@@ -972,13 +979,15 @@ impl<
             + serde::de::DeserializeOwned
             + 'static,
     {
-        let transform: TransformFn = Arc::new(move |item: AnyItem, _ctx| {
-            let typed: T = item.downcast();
-            vec![AnyItem::new(f(typed))]
-        });
+        let node = LazyTransformNode(Box::new(move || {
+            Arc::new(move |item: AnyItem, _ctx: &TransformContext| {
+                let typed: T = item.downcast();
+                vec![AnyItem::new(f(typed))]
+            })
+        }));
         let node_id = self
             .graph
-            .add_node(NodeKind::Transform(transform), vec![self.node_id]);
+            .add_node(NodeKind::Transform(Box::new(node)), vec![self.node_id]);
         KeyedStream::new(self.graph, node_id)
     }
 
@@ -994,13 +1003,15 @@ impl<
             + serde::de::DeserializeOwned
             + 'static,
     {
-        let transform: TransformFn = Arc::new(move |item: AnyItem, ctx| {
-            let typed: T = item.downcast();
-            vec![AnyItem::new(f(typed, ctx))]
-        });
+        let node = LazyTransformNode(Box::new(move || {
+            Arc::new(move |item: AnyItem, ctx: &TransformContext| {
+                let typed: T = item.downcast();
+                vec![AnyItem::new(f(typed, ctx))]
+            })
+        }));
         let node_id = self
             .graph
-            .add_node(NodeKind::Transform(transform), vec![self.node_id]);
+            .add_node(NodeKind::Transform(Box::new(node)), vec![self.node_id]);
         KeyedStream::new(self.graph, node_id)
     }
 
@@ -1009,17 +1020,19 @@ impl<
     where
         F: Fn(&T) -> bool + Send + Sync + 'static,
     {
-        let transform: TransformFn = Arc::new(move |item: AnyItem, _ctx| {
-            let typed: T = item.downcast();
-            if f(&typed) {
-                vec![AnyItem::new(typed)]
-            } else {
-                vec![]
-            }
-        });
+        let node = LazyTransformNode(Box::new(move || {
+            Arc::new(move |item: AnyItem, _ctx: &TransformContext| {
+                let typed: T = item.downcast();
+                if f(&typed) {
+                    vec![AnyItem::new(typed)]
+                } else {
+                    vec![]
+                }
+            })
+        }));
         let node_id = self
             .graph
-            .add_node(NodeKind::Transform(transform), vec![self.node_id]);
+            .add_node(NodeKind::Transform(Box::new(node)), vec![self.node_id]);
         KeyedStream::new(self.graph, node_id)
     }
 
@@ -1029,17 +1042,19 @@ impl<
     where
         F: Fn(&T, &TransformContext) -> bool + Send + Sync + 'static,
     {
-        let transform: TransformFn = Arc::new(move |item: AnyItem, ctx| {
-            let typed: T = item.downcast();
-            if f(&typed, ctx) {
-                vec![AnyItem::new(typed)]
-            } else {
-                vec![]
-            }
-        });
+        let node = LazyTransformNode(Box::new(move || {
+            Arc::new(move |item: AnyItem, ctx: &TransformContext| {
+                let typed: T = item.downcast();
+                if f(&typed, ctx) {
+                    vec![AnyItem::new(typed)]
+                } else {
+                    vec![]
+                }
+            })
+        }));
         let node_id = self
             .graph
-            .add_node(NodeKind::Transform(transform), vec![self.node_id]);
+            .add_node(NodeKind::Transform(Box::new(node)), vec![self.node_id]);
         KeyedStream::new(self.graph, node_id)
     }
 
@@ -1054,13 +1069,15 @@ impl<
             + serde::de::DeserializeOwned
             + 'static,
     {
-        let transform: TransformFn = Arc::new(move |item: AnyItem, _ctx| {
-            let typed: T = item.downcast();
-            f(typed).into_iter().map(AnyItem::new).collect()
-        });
+        let node = LazyTransformNode(Box::new(move || {
+            Arc::new(move |item: AnyItem, _ctx: &TransformContext| {
+                let typed: T = item.downcast();
+                f(typed).into_iter().map(AnyItem::new).collect()
+            })
+        }));
         let node_id = self
             .graph
-            .add_node(NodeKind::Transform(transform), vec![self.node_id]);
+            .add_node(NodeKind::Transform(Box::new(node)), vec![self.node_id]);
         KeyedStream::new(self.graph, node_id)
     }
 
@@ -1076,13 +1093,15 @@ impl<
             + serde::de::DeserializeOwned
             + 'static,
     {
-        let transform: TransformFn = Arc::new(move |item: AnyItem, ctx| {
-            let typed: T = item.downcast();
-            f(typed, ctx).into_iter().map(AnyItem::new).collect()
-        });
+        let node = LazyTransformNode(Box::new(move || {
+            Arc::new(move |item: AnyItem, ctx: &TransformContext| {
+                let typed: T = item.downcast();
+                f(typed, ctx).into_iter().map(AnyItem::new).collect()
+            })
+        }));
         let node_id = self
             .graph
-            .add_node(NodeKind::Transform(transform), vec![self.node_id]);
+            .add_node(NodeKind::Transform(Box::new(node)), vec![self.node_id]);
         KeyedStream::new(self.graph, node_id)
     }
 
@@ -1092,13 +1111,13 @@ impl<
     /// Only available on `KeyedStream` — this is enforced at compile time.
     pub fn operator<Func>(self, name: &str, func: Func) -> KeyedStream<'a, Func::Output>
     where
-        Func: StreamFunction<Input = T> + Clone + 'static,
+        Func: StreamFunction<Input = T> + Clone + Send + 'static,
         Func::Output: serde::Serialize + serde::de::DeserializeOwned + 'static,
     {
         let node_id = self.graph.add_node(
             NodeKind::Operator {
                 name: name.to_string(),
-                op: Box::new(OperatorWrapper(func)),
+                op: Box::new(TypedOperatorNode(func)),
             },
             vec![self.node_id],
         );
@@ -1128,45 +1147,51 @@ impl<
     where
         F: FnOnce(Stream<'a, String>),
     {
-        // Rewrite the operator node to wrap it in DlqErasedOperator.
+        // Rewrite the operator node to wrap it in DlqOperatorNode.
         {
             let mut nodes = self.graph.nodes.borrow_mut();
             let node = &mut nodes[self.node_id.0];
-            match &mut node.kind {
-                NodeKind::Operator { op, .. } => {
-                    let temp = op.clone_erased();
-                    let inner = std::mem::replace(op, temp);
-                    *op = Box::new(DlqErasedOperator { inner });
+            // Swap NodeKind out temporarily, wrap operator, swap back.
+            let old_kind = std::mem::replace(&mut node.kind, NodeKind::Merge);
+            match old_kind {
+                NodeKind::Operator { name, op } => {
+                    node.kind = NodeKind::Operator {
+                        name,
+                        op: Box::new(DlqOperatorNode(op)),
+                    };
                 }
-                other => panic!(
-                    "with_dlq called on non-operator node: {:?}",
-                    std::mem::discriminant(other)
-                ),
+                _ => panic!("with_dlq called on non-operator node"),
             }
         }
 
         // The operator now emits DlqTag items. Split into main/error streams.
-        let main_transform: TransformFn = Arc::new(|item: AnyItem, _ctx| {
-            let tag: DlqTag = item.downcast();
-            match tag {
-                DlqTag::Main(inner) => vec![inner],
-                DlqTag::Error(_) => vec![],
-            }
-        });
-        let main_id = self
-            .graph
-            .add_node(NodeKind::Transform(main_transform), vec![self.node_id]);
+        let main_node = LazyTransformNode(Box::new(|| {
+            Arc::new(|item: AnyItem, _ctx: &TransformContext| {
+                let tag: DlqTag = item.downcast();
+                match tag {
+                    DlqTag::Main(inner) => vec![inner],
+                    DlqTag::Error(_) => vec![],
+                }
+            })
+        }));
+        let main_id = self.graph.add_node(
+            NodeKind::Transform(Box::new(main_node)),
+            vec![self.node_id],
+        );
 
-        let side_transform: TransformFn = Arc::new(|item: AnyItem, _ctx| {
-            let tag: DlqTag = item.downcast();
-            match tag {
-                DlqTag::Main(_) => vec![],
-                DlqTag::Error(msg) => vec![AnyItem::new(msg)],
-            }
-        });
-        let side_id = self
-            .graph
-            .add_node(NodeKind::Transform(side_transform), vec![self.node_id]);
+        let side_node = LazyTransformNode(Box::new(|| {
+            Arc::new(|item: AnyItem, _ctx: &TransformContext| {
+                let tag: DlqTag = item.downcast();
+                match tag {
+                    DlqTag::Main(_) => vec![],
+                    DlqTag::Error(msg) => vec![AnyItem::new(msg)],
+                }
+            })
+        }));
+        let side_id = self.graph.add_node(
+            NodeKind::Transform(Box::new(side_node)),
+            vec![self.node_id],
+        );
 
         // Wire the error stream via the user's closure.
         f(Stream::new(self.graph, side_id));
@@ -1179,13 +1204,15 @@ impl<
     where
         KF: Fn(&T) -> String + Send + Sync + 'static,
     {
-        let erased_key_fn: KeyFn = Arc::new(move |item: &AnyItem| {
-            let typed = item.downcast_ref::<T>();
-            key_fn(typed)
-        });
+        let node = LazyKeyByNode(Box::new(move || {
+            Arc::new(move |item: &AnyItem| {
+                let typed = item.downcast_ref::<T>();
+                key_fn(typed)
+            })
+        }));
         let node_id = self
             .graph
-            .add_node(NodeKind::KeyBy(erased_key_fn), vec![self.node_id]);
+            .add_node(NodeKind::KeyBy(Box::new(node)), vec![self.node_id]);
         KeyedStream::new(self.graph, node_id)
     }
 
@@ -1256,10 +1283,10 @@ impl<
     /// Terminal: write elements to a sink.
     pub fn sink<K>(self, sink: K)
     where
-        K: Sink<Input = T> + 'static,
+        K: Sink<Input = T> + Send + 'static,
     {
         self.graph.add_node(
-            NodeKind::Sink(Box::new(SinkWrapper(sink))),
+            NodeKind::Sink(Box::new(TypedSinkNode(sink))),
             vec![self.node_id],
         );
     }
@@ -1312,27 +1339,33 @@ impl<
     ///
     /// Adds two Transform nodes that filter and unwrap from the same upstream.
     pub fn split_side(self) -> (Stream<'a, M>, Stream<'a, S>) {
-        let main_transform: TransformFn = Arc::new(|item: AnyItem, _ctx| {
-            let ws: WithSide<M, S> = item.downcast();
-            match ws {
-                WithSide::Main(m) => vec![AnyItem::new(m)],
-                WithSide::Side(_) => vec![],
-            }
-        });
-        let main_id = self
-            .graph
-            .add_node(NodeKind::Transform(main_transform), vec![self.node_id]);
+        let main_node = LazyTransformNode(Box::new(|| {
+            Arc::new(|item: AnyItem, _ctx: &TransformContext| {
+                let ws: WithSide<M, S> = item.downcast();
+                match ws {
+                    WithSide::Main(m) => vec![AnyItem::new(m)],
+                    WithSide::Side(_) => vec![],
+                }
+            })
+        }));
+        let main_id = self.graph.add_node(
+            NodeKind::Transform(Box::new(main_node)),
+            vec![self.node_id],
+        );
 
-        let side_transform: TransformFn = Arc::new(|item: AnyItem, _ctx| {
-            let ws: WithSide<M, S> = item.downcast();
-            match ws {
-                WithSide::Main(_) => vec![],
-                WithSide::Side(s) => vec![AnyItem::new(s)],
-            }
-        });
-        let side_id = self
-            .graph
-            .add_node(NodeKind::Transform(side_transform), vec![self.node_id]);
+        let side_node = LazyTransformNode(Box::new(|| {
+            Arc::new(|item: AnyItem, _ctx: &TransformContext| {
+                let ws: WithSide<M, S> = item.downcast();
+                match ws {
+                    WithSide::Main(_) => vec![],
+                    WithSide::Side(s) => vec![AnyItem::new(s)],
+                }
+            })
+        }));
+        let side_id = self.graph.add_node(
+            NodeKind::Transform(Box::new(side_node)),
+            vec![self.node_id],
+        );
 
         (
             Stream::new(self.graph, main_id),
@@ -1351,27 +1384,33 @@ impl<
     ///
     /// The main stream preserves key partitioning; the side stream is unkeyed.
     pub fn split_side(self) -> (KeyedStream<'a, M>, Stream<'a, S>) {
-        let main_transform: TransformFn = Arc::new(|item: AnyItem, _ctx| {
-            let ws: WithSide<M, S> = item.downcast();
-            match ws {
-                WithSide::Main(m) => vec![AnyItem::new(m)],
-                WithSide::Side(_) => vec![],
-            }
-        });
-        let main_id = self
-            .graph
-            .add_node(NodeKind::Transform(main_transform), vec![self.node_id]);
+        let main_node = LazyTransformNode(Box::new(|| {
+            Arc::new(|item: AnyItem, _ctx: &TransformContext| {
+                let ws: WithSide<M, S> = item.downcast();
+                match ws {
+                    WithSide::Main(m) => vec![AnyItem::new(m)],
+                    WithSide::Side(_) => vec![],
+                }
+            })
+        }));
+        let main_id = self.graph.add_node(
+            NodeKind::Transform(Box::new(main_node)),
+            vec![self.node_id],
+        );
 
-        let side_transform: TransformFn = Arc::new(|item: AnyItem, _ctx| {
-            let ws: WithSide<M, S> = item.downcast();
-            match ws {
-                WithSide::Main(_) => vec![],
-                WithSide::Side(s) => vec![AnyItem::new(s)],
-            }
-        });
-        let side_id = self
-            .graph
-            .add_node(NodeKind::Transform(side_transform), vec![self.node_id]);
+        let side_node = LazyTransformNode(Box::new(|| {
+            Arc::new(|item: AnyItem, _ctx: &TransformContext| {
+                let ws: WithSide<M, S> = item.downcast();
+                match ws {
+                    WithSide::Main(_) => vec![],
+                    WithSide::Side(s) => vec![AnyItem::new(s)],
+                }
+            })
+        }));
+        let side_id = self.graph.add_node(
+            NodeKind::Transform(Box::new(side_node)),
+            vec![self.node_id],
+        );
 
         (
             KeyedStream::new(self.graph, main_id),
