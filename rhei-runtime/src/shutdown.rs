@@ -56,8 +56,10 @@ pub fn shutdown_signal() -> ShutdownHandle {
         #[cfg(unix)]
         {
             use tokio::signal::unix::{SignalKind, signal};
-            let mut sigterm = signal(SignalKind::terminate())
-                .unwrap_or_else(|e| panic!("failed to install SIGTERM handler: {e}"));
+            #[allow(clippy::expect_used)]
+            // invariant: SIGTERM handler can always be installed on unix
+            let mut sigterm =
+                signal(SignalKind::terminate()).expect("failed to install SIGTERM handler");
 
             tokio::select! {
                 _ = ctrl_c => {},

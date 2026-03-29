@@ -533,6 +533,7 @@ impl<
     /// ```
     pub fn to_json(self) -> Stream<'a, rhei_core::connectors::kafka::types::KafkaRecord> {
         self.map(|item| {
+            #[allow(clippy::expect_used)] // invariant: T: Serialize, so JSON encoding cannot fail
             let payload = serde_json::to_vec(&item).expect("JSON serialization failed");
             rhei_core::connectors::kafka::types::KafkaRecord::new(payload)
         })
@@ -555,6 +556,7 @@ impl<
     {
         self.map(move |item| {
             let key = key_fn(&item);
+            #[allow(clippy::expect_used)] // invariant: T: Serialize, so JSON encoding cannot fail
             let payload = serde_json::to_vec(&item).expect("JSON serialization failed");
             rhei_core::connectors::kafka::types::KafkaRecord::with_key(key, payload)
         })
@@ -935,6 +937,7 @@ impl<
     /// Serialize each element as JSON into a [`KafkaRecord`] with no key.
     pub fn to_json(self) -> KeyedStream<'a, rhei_core::connectors::kafka::types::KafkaRecord> {
         self.map(|item| {
+            #[allow(clippy::expect_used)] // invariant: T: Serialize, so JSON encoding cannot fail
             let payload = serde_json::to_vec(&item).expect("JSON serialization failed");
             rhei_core::connectors::kafka::types::KafkaRecord::new(payload)
         })
@@ -951,6 +954,7 @@ impl<
     {
         self.map(move |item| {
             let key = key_fn(&item);
+            #[allow(clippy::expect_used)] // invariant: T: Serialize, so JSON encoding cannot fail
             let payload = serde_json::to_vec(&item).expect("JSON serialization failed");
             rhei_core::connectors::kafka::types::KafkaRecord::with_key(key, payload)
         })
@@ -1048,6 +1052,7 @@ impl<
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
     use crate::erased::SourceWrapper;

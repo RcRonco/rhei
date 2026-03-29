@@ -28,10 +28,11 @@ pub struct WallClockProvider;
 impl TimeProvider for WallClockProvider {
     fn current_time(&self) -> u64 {
         #[allow(clippy::cast_possible_truncation)] // millis won't overflow u64 until year 584M+
+        #[allow(clippy::expect_used)] // invariant: system clock is always after UNIX epoch
         {
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
-                .unwrap_or_else(|e| panic!("system clock before UNIX epoch: {e}"))
+                .expect("system clock before UNIX epoch")
                 .as_millis() as u64
         }
     }
