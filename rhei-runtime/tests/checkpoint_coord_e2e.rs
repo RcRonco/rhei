@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 //! Cross-process checkpoint coordination E2E test.
 //!
 //! Validates that coordinated checkpointing works across 2 OS processes, each
@@ -228,7 +229,7 @@ impl rhei_core::traits::StreamFunction for CharCounter {
     ) -> anyhow::Result<Vec<String>> {
         let key = input.as_bytes();
         let count = ctx.get::<u64>(key).await?.unwrap_or(0) + 1;
-        ctx.put(key, &count);
+        ctx.put(key, &count)?;
         Ok(vec![format!("{input}:{count}")])
     }
 }
@@ -280,7 +281,8 @@ async fn worker_main() {
     let executor = Executor::builder()
         .checkpoint_dir(&checkpoint_dir)
         .from_env()
-        .build();
+        .build()
+        .unwrap();
 
     eprintln!(
         "coord worker process {process_id}: cluster={}, total_workers={}, local_range={:?}",

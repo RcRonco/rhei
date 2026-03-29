@@ -196,7 +196,7 @@ where
                     let mut state = KeyedState::<String, Stamped<R>>::new(ctx, "right");
                     let val = state.get(&key).await.unwrap_or(None);
                     if val.is_some() {
-                        state.delete(&key);
+                        state.delete(&key)?;
                     }
                     val.map(|s| s.value)
                 };
@@ -213,7 +213,7 @@ where
                             value: l,
                             watermark_at_buffer: self.last_watermark,
                         },
-                    );
+                    )?;
                     self.active_keys.insert(key);
                     Ok(vec![])
                 }
@@ -224,7 +224,7 @@ where
                     let mut state = KeyedState::<String, Stamped<L>>::new(ctx, "left");
                     let val = state.get(&key).await.unwrap_or(None);
                     if val.is_some() {
-                        state.delete(&key);
+                        state.delete(&key)?;
                     }
                     val.map(|s| s.value)
                 };
@@ -241,7 +241,7 @@ where
                             value: r,
                             watermark_at_buffer: self.last_watermark,
                         },
-                    );
+                    )?;
                     self.active_keys.insert(key);
                     Ok(vec![])
                 }
@@ -269,7 +269,7 @@ where
                 if let Some(stamped) = state.get(key).await.unwrap_or(None)
                     && watermark >= stamped.watermark_at_buffer + timeout
                 {
-                    state.delete(key);
+                    state.delete(key)?;
                     did_evict = true;
                 }
             }
@@ -280,7 +280,7 @@ where
                 if let Some(stamped) = state.get(key).await.unwrap_or(None)
                     && watermark >= stamped.watermark_at_buffer + timeout
                 {
-                    state.delete(key);
+                    state.delete(key)?;
                     did_evict = true;
                 }
             }
@@ -300,6 +300,7 @@ where
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
     use crate::state::context::StateContext;

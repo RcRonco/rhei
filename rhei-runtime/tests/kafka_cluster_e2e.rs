@@ -1,5 +1,6 @@
 #![cfg(feature = "kafka")]
 #![allow(clippy::struct_field_names)]
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 
 //! Multi-process cluster E2E test with Kafka.
 //!
@@ -504,7 +505,8 @@ async fn worker_main() {
     let executor = Executor::builder()
         .checkpoint_dir(&proc_checkpoint_dir)
         .from_env()
-        .build();
+        .build()
+        .unwrap();
 
     eprintln!(
         "worker process {process_id}: cluster={}, total_workers={}, local_range={:?}",

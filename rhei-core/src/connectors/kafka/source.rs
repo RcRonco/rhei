@@ -330,12 +330,15 @@ impl Source for KafkaSource {
     fn create_partition_source(
         &self,
         assigned: &[usize],
-    ) -> Box<dyn Source<Output = KafkaMessage>> {
+    ) -> Option<Box<dyn Source<Output = KafkaMessage>>> {
         // Fetch metadata to map global partition indices to (topic, partition) pairs
-        let metadata = self
-            .consumer
-            .fetch_metadata(None, Duration::from_secs(10))
-            .expect("metadata fetch failed");
+        let metadata = match self.consumer.fetch_metadata(None, Duration::from_secs(10)) {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::error!(error = %e, "metadata fetch failed");
+                return None;
+            }
+        };
 
         let mut all_partitions: Vec<(String, i32)> = Vec::new();
         for t in metadata.topics() {
@@ -347,13 +350,19 @@ impl Source for KafkaSource {
         }
 
         // Create a new consumer with manual assignment (no group rebalance)
-        let consumer: StreamConsumer = ClientConfig::new()
+        let consumer: StreamConsumer = match ClientConfig::new()
             .set("bootstrap.servers", &self.brokers)
             .set("group.id", &self.group_id)
             .set("enable.auto.commit", "false")
             .set("auto.offset.reset", "earliest")
             .create()
-            .expect("failed to create partition consumer");
+        {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::error!(error = %e, "failed to create partition consumer");
+                return None;
+            }
+        };
 
         let mut tpl = TopicPartitionList::new();
         let assigned_pairs: Vec<(String, i32)> = assigned
@@ -361,12 +370,18 @@ impl Source for KafkaSource {
             .map(|&idx| all_partitions[idx].clone())
             .collect();
         for (topic, partition) in &assigned_pairs {
-            tpl.add_partition_offset(topic, *partition, rdkafka::Offset::Beginning)
-                .expect("failed to add partition offset");
+            if let Err(e) = tpl.add_partition_offset(topic, *partition, rdkafka::Offset::Beginning)
+            {
+                tracing::error!(error = %e, "failed to add partition offset");
+                return None;
+            }
         }
-        consumer.assign(&tpl).expect("failed to assign partitions");
+        if let Err(e) = consumer.assign(&tpl) {
+            tracing::error!(error = %e, "failed to assign partitions");
+            return None;
+        }
 
-        Box::new(KafkaPartitionSource {
+        Some(Box::new(KafkaPartitionSource {
             consumer,
             batch_size: self.batch_size,
             poll_timeout: self.poll_timeout,
@@ -377,7 +392,7 @@ impl Source for KafkaSource {
             max_timestamp: None,
             allowed_lateness_ms: self.allowed_lateness_ms,
             assigned_partitions: assigned_pairs,
-        })
+        }))
     }
 }
 

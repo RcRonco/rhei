@@ -61,15 +61,17 @@ where
     }
 
     /// Stores a key-value pair.
-    pub fn put(&mut self, key: &K, value: &V) {
-        let encoded_key = format!("{}:{}", self.prefix, serde_json::to_string(key).unwrap());
-        let encoded_value = serde_json::to_vec(value).unwrap();
+    pub fn put(&mut self, key: &K, value: &V) -> anyhow::Result<()> {
+        let encoded_key = format!("{}:{}", self.prefix, serde_json::to_string(key)?);
+        let encoded_value = serde_json::to_vec(value)?;
         self.ctx.put_raw(encoded_key.as_bytes(), &encoded_value);
+        Ok(())
     }
 
     /// Deletes the given key.
-    pub fn delete(&mut self, key: &K) {
-        let encoded_key = format!("{}:{}", self.prefix, serde_json::to_string(key).unwrap());
+    pub fn delete(&mut self, key: &K) -> anyhow::Result<()> {
+        let encoded_key = format!("{}:{}", self.prefix, serde_json::to_string(key)?);
         self.ctx.delete(encoded_key.as_bytes());
+        Ok(())
     }
 }

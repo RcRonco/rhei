@@ -12,7 +12,7 @@ async fn word_counter(input: String, ctx: &mut StateContext) -> anyhow::Result<V
         let count = {
             let mut state = KeyedState::<String, u64>::new(ctx, "count");
             let count = state.get(&key).await.unwrap_or(None).unwrap_or(0) + 1;
-            state.put(&key, &count);
+            state.put(&key, &count)?;
             count
         };
         outputs.push(format!("{word}: {count}"));

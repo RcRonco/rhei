@@ -175,6 +175,7 @@ impl DataflowExecutor {
             }
         }
 
+        #[allow(clippy::expect_used)] // invariant: run() is called exactly once
         let mut data = self.data.take().expect("executor data already taken");
 
         // Bridge sources on the shared Tokio runtime. Source bridges run
@@ -223,7 +224,10 @@ impl DataflowExecutor {
                 let _ = n.send(Sentinel::Shutdown as u64);
             }
             if let Some(ref barrier) = self.shutdown_barrier
-                && let Some(rx) = barrier.lock().unwrap().take()
+                && let Some(rx) = barrier
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take()
             {
                 tracing::debug!("worker {} waiting on shutdown barrier", self.worker_index);
                 let _ = rx.recv();
@@ -292,6 +296,7 @@ impl DataflowExecutor {
     }
 
     /// Build a source operator with reschedule, capability management, and metrics.
+    #[allow(clippy::too_many_lines)]
     fn build_source<'a, A: Allocate>(
         &self,
         scope: &mut Scope<'a, A>,
@@ -316,7 +321,12 @@ impl DataflowExecutor {
         let per_source_wm = source_watermarks.remove(&node_id);
 
         source_builder.build_reschedule(move |mut capabilities| {
-            let mut cap = Some(capabilities.pop().unwrap());
+            #[allow(clippy::expect_used)] // invariant: Timely always provides an initial capability
+            let mut cap = Some(
+                capabilities
+                    .pop()
+                    .expect("source operator should have initial capability"),
+            );
             let mut epoch: u64 = 0;
             let mut rx = source_rx;
             let mut draining = false;
@@ -433,7 +443,10 @@ impl DataflowExecutor {
         use timely::dataflow::channels::pact::Pipeline;
         use timely::dataflow::operators::generic::operator::Operator;
 
-        let f = transforms.remove(&node_id).expect("missing transform");
+        #[allow(clippy::expect_used)] // invariant: graph compilation guarantees transform exists
+        let f = transforms
+            .remove(&node_id)
+            .expect("missing transform for node");
         let name = format!("Transform_{}", node_id.0);
         let worker_index = self.worker_index;
         let num_workers = self.num_workers;
@@ -471,7 +484,8 @@ impl DataflowExecutor {
         use timely::dataflow::channels::pact::Exchange as ExchangePact;
         use timely::dataflow::operators::generic::operator::Operator;
 
-        let key_fn = key_fns.remove(&node_id).expect("missing key_fn");
+        #[allow(clippy::expect_used)] // invariant: graph compilation guarantees key_fn exists
+        let key_fn = key_fns.remove(&node_id).expect("missing key_fn for node");
         input_stream.unary::<CapacityContainerBuilder<Vec<AnyItem>>, _, _, _>(
             ExchangePact::new(move |item: &AnyItem| seahash::hash(key_fn(item).as_bytes())),
             &format!("Exchange_{}", node_id.0),
@@ -501,10 +515,14 @@ impl DataflowExecutor {
         use timely::dataflow::operators::Capability;
         use timely::dataflow::operators::generic::operator::Operator;
 
-        let (op_name, op) = operators.remove(&node_id).expect("missing operator");
+        #[allow(clippy::expect_used)] // invariant: graph compilation guarantees operator exists
+        let (op_name, op) = operators
+            .remove(&node_id)
+            .expect("missing operator for node");
+        #[allow(clippy::expect_used)] // invariant: graph compilation guarantees operator ctx exists
         let ctx = operator_contexts
             .remove(&node_id)
-            .expect("missing operator ctx");
+            .expect("missing operator ctx for node");
         let oc = OperatorCfg {
             rt: self.rt.clone(),
             worker_label: self.worker_index.to_string(),
@@ -747,6 +765,7 @@ fn frontier_min_or_max(frontier: timely::progress::frontier::AntichainRef<'_, u6
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use crate::any_item::AnyItem;
 

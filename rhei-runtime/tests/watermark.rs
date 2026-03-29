@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 //! Integration tests for watermark propagation through the pipeline.
 
 use std::sync::{Arc, Mutex};
@@ -119,7 +120,11 @@ async fn test_watermark_propagation_closes_window() {
             collected: collected.clone(),
         });
 
-    let executor = Executor::builder().checkpoint_dir(&dir).workers(1).build();
+    let executor = Executor::builder()
+        .checkpoint_dir(&dir)
+        .workers(1)
+        .build()
+        .unwrap();
     executor.run(graph).await.unwrap();
 
     let results = collected.lock().unwrap().clone();

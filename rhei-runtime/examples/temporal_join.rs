@@ -106,7 +106,7 @@ async fn main() -> anyhow::Result<()> {
         .operator("temporal_join", op)
         .sink(PrintSink::<String>::new().with_prefix("output"));
 
-    let executor = Executor::builder().checkpoint_dir(&dir).build();
+    let executor = Executor::builder().checkpoint_dir(&dir).build()?;
     executor.run(graph).await?;
 
     let _ = std::fs::remove_dir_all(&dir);

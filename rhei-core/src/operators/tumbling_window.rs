@@ -297,7 +297,7 @@ where
             // Delete old accumulator
             {
                 let mut state = KeyedState::<String, A::Accumulator>::new(ctx, "acc");
-                state.delete(&acc_key);
+                state.delete(&acc_key)?;
             }
         }
 
@@ -318,13 +318,13 @@ where
         // Store updated accumulator
         {
             let mut state = KeyedState::<String, A::Accumulator>::new(ctx, "acc");
-            state.put(&acc_key, &acc);
+            state.put(&acc_key, &acc)?;
         }
 
         // Update active window tracker
         {
             let mut state = KeyedState::<String, u64>::new(ctx, "win");
-            state.put(&key, &window_start);
+            state.put(&key, &window_start)?;
         }
 
         Ok(outputs)
@@ -365,11 +365,11 @@ where
                 // Clean up state.
                 {
                     let mut state = KeyedState::<String, A::Accumulator>::new(ctx, "acc");
-                    state.delete(&acc_key);
+                    state.delete(&acc_key)?;
                 }
                 {
                     let mut state = KeyedState::<String, u64>::new(ctx, "win");
-                    state.delete(key);
+                    state.delete(key)?;
                 }
                 closed_keys.push(key.clone());
             }
@@ -384,6 +384,7 @@ where
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use std::sync::Arc;
 

@@ -73,12 +73,13 @@ where
             Some(prev) => (self.reduce_fn)(prev, input),
             None => input,
         };
-        ctx.put(key_bytes, &result);
+        ctx.put(key_bytes, &result)?;
         Ok(vec![result])
     }
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
     use crate::state::local_backend::LocalBackend;

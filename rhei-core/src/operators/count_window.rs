@@ -187,13 +187,14 @@ where
             ctx.delete(key_bytes);
             Ok(vec![output])
         } else {
-            ctx.put(key_bytes, &state);
+            ctx.put(key_bytes, &state)?;
             Ok(vec![])
         }
     }
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
     use crate::operators::aggregator::Count;

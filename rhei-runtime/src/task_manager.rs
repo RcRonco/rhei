@@ -81,10 +81,13 @@ impl TaskManager {
     /// Take per-executor data for the given worker index (one-time handoff).
     ///
     /// Panics if the data for this worker was already taken or was never populated.
+    #[allow(clippy::expect_used)] // invariant: each worker takes data exactly once
     pub(crate) fn take_executor_data(&self, idx: usize) -> ExecutorData {
-        self.per_executor.lock().unwrap()[idx]
+        self.per_executor
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)[idx]
             .take()
-            .expect("executor data already taken")
+            .expect("executor data already taken for worker")
     }
 
     /// Build a `TaskManager` from a compiled graph and controller configuration.
@@ -238,10 +241,11 @@ impl TaskManager {
     /// Take the checkpoint notification receiver for the mid-execution checkpoint task.
     ///
     /// Returns the receiver. Can only be called once.
+    #[allow(clippy::expect_used)] // invariant: checkpoint_rx is taken exactly once
     pub(crate) fn take_checkpoint_rx(&self) -> flume::Receiver<u64> {
         self.checkpoint_notify_rx
             .lock()
-            .unwrap()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take()
             .expect("checkpoint_rx already taken")
     }
@@ -258,7 +262,11 @@ impl TaskManager {
     /// Drops the sender so the checkpoint task's `recv()` returns `None`
     /// and the task exits gracefully after processing queued notifications.
     pub(crate) fn close_checkpoint_channel(&self) {
-        let _ = self.checkpoint_notify_tx.lock().unwrap().take();
+        let _ = self
+            .checkpoint_notify_tx
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
     }
 
     /// Create a [`DataflowExecutor`](crate::executor::DataflowExecutor) for the given worker index.
@@ -326,11 +334,16 @@ impl TaskManager {
             run_checkpoint_task(checkpoint_rx, ckpt_config, coordination, barrier_tx).await
         });
 
-        let timely_config = controller.timely_config();
+        let timely_config = controller.timely_config()?;
         let local_first_worker = controller.local_worker_range().start;
         let rt = tokio::runtime::Handle::current();
 
-        let checkpoint_notify_tx = self.checkpoint_notify_tx.lock().unwrap().as_ref().cloned();
+        let checkpoint_notify_tx = self
+            .checkpoint_notify_tx
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .cloned();
 
         // Wrap the barrier receiver so only the first local worker can take it.
         let shutdown_barrier: Option<Arc<std::sync::Mutex<Option<std::sync::mpsc::Receiver<()>>>>> =
@@ -451,8 +464,13 @@ async fn setup_coordination(
         return Ok((None, None));
     }
 
-    let peers = controller.peers.as_ref().unwrap();
-    let pid = controller.process_id().unwrap();
+    let peers = controller
+        .peers
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("peers should be set in cluster mode"))?;
+    let pid = controller
+        .process_id()
+        .ok_or_else(|| anyhow::anyhow!("process_id should be set in cluster mode"))?;
     let n_processes = peers.len();
     let coord_port = crate::checkpoint_coord::coordination_port(peers);
     let coord_addr = format!("127.0.0.1:{coord_port}");
@@ -493,7 +511,9 @@ async fn setup_coordination(
             }
         }
         Ok((
-            Some(CheckpointCoordination::Remote(participant.unwrap())),
+            Some(CheckpointCoordination::Remote(participant.unwrap_or_else(
+                || panic!("participant should be connected after retries"),
+            ))),
             None,
         ))
     }
@@ -745,9 +765,11 @@ async fn prepare_sources(
                 if parts.is_empty() || !local_range.contains(&worker_idx) {
                     continue;
                 }
-                let mut psrc = source
-                    .create_partition_source(&parts)
-                    .expect("partitioned source failed to create reader");
+                let mut psrc = source.create_partition_source(&parts).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "partitioned source failed to create reader for partitions {parts:?}"
+                    )
+                })?;
                 if !restored_offsets.is_empty() {
                     psrc.restore_offsets(restored_offsets).await?;
                 }
@@ -967,7 +989,12 @@ pub(crate) fn merge_source_offsets(
 ) -> HashMap<String, String> {
     let mut combined = HashMap::new();
     for offsets in all {
-        combined.extend(offsets.lock().unwrap().clone());
+        combined.extend(
+            offsets
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone(),
+        );
     }
     combined
 }

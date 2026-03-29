@@ -54,9 +54,9 @@ impl TimerService {
     }
 
     /// Serialize the timer set to bytes.
-    pub fn serialize(&self) -> Vec<u8> {
+    pub fn serialize(&self) -> anyhow::Result<Vec<u8>> {
         let entries: Vec<(u64, String)> = self.timers.iter().cloned().collect();
-        bincode::serialize(&entries).expect("timer serialization failed")
+        Ok(bincode::serialize(&entries)?)
     }
 
     /// Restore the timer set from bytes.
@@ -78,6 +78,7 @@ impl TimerService {
 pub const TIMER_STATE_KEY: &[u8] = b"__timers__";
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 
@@ -134,7 +135,7 @@ mod tests {
         ts.register(100, "a".into());
         ts.register(200, "b".into());
 
-        let bytes = ts.serialize();
+        let bytes = ts.serialize().unwrap();
         let restored = TimerService::restore(&bytes).unwrap();
 
         assert_eq!(restored.timers.len(), 2);
