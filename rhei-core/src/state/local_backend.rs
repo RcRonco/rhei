@@ -51,27 +51,39 @@ impl LocalBackend {
 impl StateBackend for LocalBackend {
     async fn get(&self, key: &[u8]) -> anyhow::Result<Option<Bytes>> {
         self.maybe_sleep().await;
-        let data = self.data.lock().unwrap();
+        let data = self
+            .data
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         Ok(data.get(key).map(|v| Bytes::from(v.clone())))
     }
 
     async fn put(&self, key: &[u8], value: &[u8]) -> anyhow::Result<()> {
         self.maybe_sleep().await;
-        let mut data = self.data.lock().unwrap();
+        let mut data = self
+            .data
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         data.insert(key.to_vec(), value.to_vec());
         Ok(())
     }
 
     async fn delete(&self, key: &[u8]) -> anyhow::Result<()> {
         self.maybe_sleep().await;
-        let mut data = self.data.lock().unwrap();
+        let mut data = self
+            .data
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         data.remove(key);
         Ok(())
     }
 
     async fn checkpoint(&self) -> anyhow::Result<()> {
         let snapshot: Vec<(Vec<u8>, Vec<u8>)> = {
-            let data = self.data.lock().unwrap();
+            let data = self
+                .data
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             data.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
         };
         let json = serde_json::to_string(&snapshot)?;
@@ -84,6 +96,7 @@ impl StateBackend for LocalBackend {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
     use bytes::Bytes;

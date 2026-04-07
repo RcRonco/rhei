@@ -50,7 +50,7 @@ where
     pub async fn append(&mut self, value: &V) -> anyhow::Result<()> {
         let mut list = self.get().await?;
         list.push(bincode::deserialize(&bincode::serialize(value)?)?);
-        self.ctx.put(&self.key, &list);
+        self.ctx.put(&self.key, &list)?;
         Ok(())
     }
 
@@ -61,7 +61,7 @@ where
     {
         let mut list = self.get().await?;
         list.extend(values.iter().cloned());
-        self.ctx.put(&self.key, &list);
+        self.ctx.put(&self.key, &list)?;
         Ok(())
     }
 
@@ -72,6 +72,7 @@ where
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
     use crate::state::local_backend::LocalBackend;

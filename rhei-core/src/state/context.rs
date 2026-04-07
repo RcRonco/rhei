@@ -60,9 +60,10 @@ impl StateContext {
     }
 
     /// Put a typed value — serializes via bincode.
-    pub fn put<V: Serialize>(&mut self, key: &[u8], value: &V) {
-        let encoded = bincode::serialize(value).expect("bincode serialization failed");
+    pub fn put<V: Serialize>(&mut self, key: &[u8], value: &V) -> anyhow::Result<()> {
+        let encoded = bincode::serialize(value)?;
         self.put_raw(key, &encoded);
+        Ok(())
     }
 
     /// Get raw bytes — checks memtable first, then falls back to backend.
@@ -179,7 +180,7 @@ impl StateContext {
         if let Some(ref mut ts) = self.timer_service
             && ts.is_dirty()
         {
-            let timer_bytes = ts.serialize();
+            let timer_bytes = ts.serialize()?;
             self.backend
                 .put(super::timer_service::TIMER_STATE_KEY, &timer_bytes)
                 .await?;
@@ -196,6 +197,7 @@ impl StateContext {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
     use crate::state::local_backend::LocalBackend;
@@ -213,7 +215,7 @@ mod tests {
         let backend = LocalBackend::new(path.clone(), None).unwrap();
         let mut ctx = StateContext::new(Box::new(backend));
 
-        ctx.put(b"count", &42u64);
+        ctx.put(b"count", &42u64).unwrap();
         let val: Option<u64> = ctx.get(b"count").await.unwrap();
         assert_eq!(val, Some(42));
 
@@ -243,8 +245,8 @@ mod tests {
         {
             let backend = LocalBackend::new(path.clone(), None).unwrap();
             let mut ctx = StateContext::new(Box::new(backend));
-            ctx.put(b"a", &100u64);
-            ctx.put(b"b", &"hello".to_string());
+            ctx.put(b"a", &100u64).unwrap();
+            ctx.put(b"b", &"hello".to_string()).unwrap();
             ctx.checkpoint().await.unwrap();
         }
 

@@ -37,7 +37,7 @@ impl StreamFunction for WordCounter {
             let count = {
                 let mut state = KeyedState::<String, u64>::new(ctx, "count");
                 let count = state.get(&key).await.unwrap_or(None).unwrap_or(0) + 1;
-                state.put(&key, &count);
+                state.put(&key, &count)?;
                 count
             };
             outputs.push(format!("{word}: {count}"));
@@ -75,7 +75,7 @@ async fn main() -> anyhow::Result<()> {
 
         let executor = Executor::builder()
             .checkpoint_dir(dir.join("single"))
-            .build();
+            .build()?;
         executor.run(graph).await?;
     }
 
@@ -96,7 +96,7 @@ async fn main() -> anyhow::Result<()> {
         let executor = Executor::builder()
             .checkpoint_dir(dir.join("multi"))
             .workers(3)
-            .build();
+            .build()?;
         executor.run(graph).await?;
     }
 

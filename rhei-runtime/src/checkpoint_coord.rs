@@ -32,13 +32,13 @@ pub enum CoordMessage {
 
 /// Encode a message as length-prefixed bincode.
 #[allow(clippy::cast_possible_truncation)]
-pub fn encode_message(msg: &CoordMessage) -> Vec<u8> {
-    let payload = bincode::serialize(msg).expect("bincode serialize");
+pub fn encode_message(msg: &CoordMessage) -> anyhow::Result<Vec<u8>> {
+    let payload = bincode::serialize(msg)?;
     let len = payload.len() as u32;
     let mut buf = Vec::with_capacity(4 + payload.len());
     buf.extend_from_slice(&len.to_be_bytes());
     buf.extend_from_slice(&payload);
-    buf
+    Ok(buf)
 }
 
 /// Decode a length-prefixed bincode message from a stream.
@@ -148,14 +148,18 @@ impl CheckpointCoordinator {
                 process_epochs.insert(process_id, epoch);
 
                 if process_epochs.len() >= n {
-                    let committed_epoch = *process_epochs.values().max().unwrap();
+                    #[allow(clippy::expect_used)] // invariant: we just checked len >= n > 0
+                    let committed_epoch = *process_epochs
+                        .values()
+                        .max()
+                        .expect("process_epochs should not be empty");
                     tracing::info!(committed_epoch, "all {} processes ready — committing", n);
                     process_epochs.clear();
 
                     // Broadcast Committed to remote participants.
                     let committed = encode_message(&CoordMessage::Committed {
                         epoch: committed_epoch,
-                    });
+                    })?;
                     for stream in &mut streams {
                         if let Err(e) = stream.write_all(&committed).await {
                             tracing::warn!(error = %e, "failed to send Committed");
@@ -236,7 +240,7 @@ impl CheckpointParticipant {
             process_id: self.process_id,
             epoch,
         };
-        let bytes = encode_message(&msg);
+        let bytes = encode_message(&msg)?;
         self.stream.write_all(&bytes).await?;
         Ok(())
     }
@@ -317,6 +321,7 @@ pub async fn setup_coordinator_full(
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 
@@ -329,7 +334,7 @@ mod tests {
         let committed = CoordMessage::Committed { epoch: 100 };
 
         for msg in [&ready, &committed] {
-            let bytes = encode_message(msg);
+            let bytes = encode_message(msg).unwrap();
             assert!(bytes.len() > 4); // length prefix + payload
 
             // Verify length prefix.

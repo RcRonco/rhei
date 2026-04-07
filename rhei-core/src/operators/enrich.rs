@@ -99,7 +99,8 @@ where
                 let sem = sem.clone();
                 let f = f.clone();
                 tokio::spawn(async move {
-                    let _permit = sem.acquire().await.unwrap();
+                    #[allow(clippy::expect_used)] // invariant: semaphore is never closed
+                    let _permit = sem.acquire().await.expect("semaphore closed");
                     tokio::time::timeout(timeout, f(input)).await
                 })
             })
@@ -121,6 +122,7 @@ where
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
     use crate::state::local_backend::LocalBackend;

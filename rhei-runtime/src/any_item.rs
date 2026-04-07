@@ -26,7 +26,7 @@ pub(crate) trait CloneAnySend: Any + Send {
     /// Stable hash of the concrete type name, used as a serialization tag.
     fn stable_type_id(&self) -> u64;
     /// Serialize the value to bytes via bincode.
-    fn serialize_bytes(&self) -> Vec<u8>;
+    fn serialize_bytes(&self) -> Result<Vec<u8>, bincode::Error>;
 }
 
 impl<T: Clone + Any + Send + std::fmt::Debug + serde::Serialize> CloneAnySend for T {
@@ -50,14 +50,14 @@ impl<T: Clone + Any + Send + std::fmt::Debug + serde::Serialize> CloneAnySend fo
         seahash::hash(std::any::type_name::<T>().as_bytes())
     }
 
-    fn serialize_bytes(&self) -> Vec<u8> {
-        bincode::serialize(self).expect("AnyItem serialization failed")
+    fn serialize_bytes(&self) -> Result<Vec<u8>, bincode::Error> {
+        bincode::serialize(self)
     }
 }
 
 // ── Global type registry for AnyItem deserialization ────────────────
 
-type DeserFn = Box<dyn Fn(&[u8]) -> AnyItem + Send + Sync>;
+type DeserFn = Box<dyn Fn(&[u8]) -> Result<AnyItem, bincode::Error> + Send + Sync>;
 
 static TYPE_REGISTRY: LazyLock<RwLock<std::collections::HashMap<u64, DeserFn>>> =
     LazyLock::new(|| RwLock::new(std::collections::HashMap::new()));
@@ -68,15 +68,19 @@ where
 {
     let type_hash = seahash::hash(std::any::type_name::<T>().as_bytes());
     let needs_insert = {
-        let reg = TYPE_REGISTRY.read().unwrap();
+        let reg = TYPE_REGISTRY
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         !reg.contains_key(&type_hash)
     };
     if needs_insert {
-        let mut reg = TYPE_REGISTRY.write().unwrap();
+        let mut reg = TYPE_REGISTRY
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         reg.entry(type_hash).or_insert_with(|| {
             Box::new(|bytes: &[u8]| {
-                let value: T = bincode::deserialize(bytes).expect("AnyItem deserialization failed");
-                AnyItem(Box::new(value))
+                let value: T = bincode::deserialize(bytes)?;
+                Ok(AnyItem(Box::new(value)))
             })
         });
     }
@@ -147,9 +151,13 @@ impl AnyItem {
 impl serde::Serialize for AnyItem {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeTuple;
+        let bytes = self
+            .0
+            .serialize_bytes()
+            .map_err(serde::ser::Error::custom)?;
         let mut tup = serializer.serialize_tuple(2)?;
         tup.serialize_element(&self.0.stable_type_id())?;
-        tup.serialize_element(&self.0.serialize_bytes())?;
+        tup.serialize_element(&bytes)?;
         tup.end()
     }
 }
@@ -157,15 +165,18 @@ impl serde::Serialize for AnyItem {
 impl<'de> serde::Deserialize<'de> for AnyItem {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let (type_hash, bytes): (u64, Vec<u8>) = serde::Deserialize::deserialize(deserializer)?;
-        let reg = TYPE_REGISTRY.read().unwrap();
+        let reg = TYPE_REGISTRY
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let deser_fn = reg.get(&type_hash).ok_or_else(|| {
             serde::de::Error::custom(format!("unknown AnyItem type hash: {type_hash}"))
         })?;
-        Ok(deser_fn(&bytes))
+        deser_fn(&bytes).map_err(serde::de::Error::custom)
     }
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 

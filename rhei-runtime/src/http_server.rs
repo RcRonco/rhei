@@ -430,7 +430,11 @@ async fn api_health(State(state): State<Arc<AppState>>) -> axum::Json<ApiHealthR
 
 /// `GET /api/topology` — returns the pipeline DAG as JSON.
 async fn api_topology(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let topo = state.topology.lock().unwrap().clone();
+    let topo = state
+        .topology
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
     match topo {
         Some(topology) => (StatusCode::OK, axum::Json(Some(topology))),
         None => (StatusCode::NOT_FOUND, axum::Json(None)),
@@ -638,6 +642,7 @@ async fn api_state_key(
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
     use axum::body::to_bytes;

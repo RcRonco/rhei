@@ -162,8 +162,10 @@ fn cmd_run_tui(log_level: String, workers: usize) -> anyhow::Result<()> {
 
         let metrics_rx = handles
             .metrics_rx
-            .expect("TUI mode should provide metrics_rx");
-        let log_rx = handles.log_rx.expect("TUI mode should provide log_rx");
+            .ok_or_else(|| anyhow::anyhow!("TUI mode should provide metrics_rx"))?;
+        let log_rx = handles
+            .log_rx
+            .ok_or_else(|| anyhow::anyhow!("TUI mode should provide log_rx"))?;
 
         // Build the logical plan for the demo pipeline
         let plan = rhei_core::graph::StreamGraph::new()
@@ -317,14 +319,14 @@ fn cmd_demo(workers: usize, addr: std::net::SocketAddr) -> anyhow::Result<()> {
             .checkpoint_dir(std::env::temp_dir().join("rhei_demo"))
             .workers(workers)
             .health(health.clone())
-            .build();
+            .build()?;
 
         let _http = rhei_runtime::http_server::start(rhei_runtime::http_server::HttpServerConfig {
             addr,
             health,
             prometheus: handles
                 .prometheus_handle
-                .expect("prometheus handle should exist"),
+                .ok_or_else(|| anyhow::anyhow!("prometheus handle should exist"))?,
             metrics_handle: handles.metrics_handle,
             log_rx: handles.log_rx,
             topology: executor.topology_handle(),
@@ -356,7 +358,7 @@ async fn run_demo_pipeline(workers: usize) -> anyhow::Result<()> {
         .checkpoint_dir(dir)
         .workers(workers)
         .from_env()
-        .build();
+        .build()?;
 
     run_demo_with_executor(&executor).await
 }

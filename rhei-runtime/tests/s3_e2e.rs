@@ -1,4 +1,5 @@
 #![cfg(feature = "remote-state")]
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 
 //! End-to-end S3 tiered storage test.
 //!
@@ -158,7 +159,8 @@ async fn s3_tiered_storage_e2e() {
             l3.clone(),
             foyer_config,
         )
-        .await;
+        .await
+        .unwrap();
 
     // ── 3. Build pipeline ──────────────────────────────────────────
     let words = generate_words();

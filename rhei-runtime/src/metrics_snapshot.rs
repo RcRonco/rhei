@@ -126,8 +126,16 @@ pub struct MetricsHandle {
 impl MetricsHandle {
     /// Produce a current snapshot by reading all counters and gauges.
     pub fn snapshot(&self) -> MetricsSnapshot {
-        let counters = self.inner.counters.lock().unwrap();
-        let gauges = self.inner.gauges.lock().unwrap();
+        let counters = self
+            .inner
+            .counters
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let gauges = self
+            .inner
+            .gauges
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
 
         let get = |map: &HashMap<String, Arc<AtomicU64>>, key: &str| -> u64 {
             map.get(key).map_or(0, |v| v.load(Ordering::Relaxed))
@@ -210,14 +218,22 @@ impl SnapshotRecorder {
     }
 
     fn counter_arc(&self, key: &Key) -> Arc<AtomicU64> {
-        let mut map = self.inner.counters.lock().unwrap();
+        let mut map = self
+            .inner
+            .counters
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         map.entry(key.name().to_string())
             .or_insert_with(|| Arc::new(AtomicU64::new(0)))
             .clone()
     }
 
     fn gauge_arc(&self, key: &Key) -> Arc<AtomicU64> {
-        let mut map = self.inner.gauges.lock().unwrap();
+        let mut map = self
+            .inner
+            .gauges
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         map.entry(key.name().to_string())
             .or_insert_with(|| Arc::new(AtomicU64::new(0)))
             .clone()
@@ -318,6 +334,7 @@ pub fn start_snapshot_publisher(
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 

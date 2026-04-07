@@ -28,6 +28,7 @@ pub struct WallClockProvider;
 impl TimeProvider for WallClockProvider {
     fn current_time(&self) -> u64 {
         #[allow(clippy::cast_possible_truncation)] // millis won't overflow u64 until year 584M+
+        #[allow(clippy::expect_used)] // invariant: system clock is always after UNIX epoch
         {
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -72,6 +73,7 @@ impl TimeProvider for FixedClockProvider {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 

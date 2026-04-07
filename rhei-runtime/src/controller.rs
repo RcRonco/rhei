@@ -309,18 +309,21 @@ impl PipelineControllerBuilder {
     }
 
     /// Build the controller.
-    pub fn build(self) -> PipelineController {
+    ///
+    /// # Errors
+    /// Returns an error if `peers` is set but `process_id` is missing or out of range.
+    pub fn build(self) -> anyhow::Result<PipelineController> {
         if let Some(ref peers) = self.peers {
             let pid = self
                 .process_id
-                .expect("process_id is required when peers are set");
-            assert!(
+                .ok_or_else(|| anyhow::anyhow!("process_id is required when peers are set"))?;
+            anyhow::ensure!(
                 pid < peers.len(),
                 "process_id ({pid}) must be less than number of peers ({})",
                 peers.len()
             );
         }
-        PipelineController {
+        Ok(PipelineController {
             checkpoint_dir: self.checkpoint_dir,
             tiered: self.tiered,
             workers: self.workers,
@@ -340,7 +343,7 @@ impl PipelineControllerBuilder {
             offset_delta: self.offset_delta,
             #[cfg(feature = "remote-state")]
             fork_remote_l3: std::sync::Mutex::new(None),
-        }
+        })
     }
 }
 
@@ -401,7 +404,10 @@ impl PipelineController {
 
     /// Returns the pipeline topology, if the graph has been compiled.
     pub fn topology(&self) -> Option<ApiTopology> {
-        self.topology.lock().unwrap().clone()
+        self.topology
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     /// Returns a shared handle to the topology slot for use in the HTTP server.
@@ -467,10 +473,15 @@ impl PipelineController {
     }
 
     /// Construct a Timely config appropriate for the execution mode.
-    pub(crate) fn timely_config(&self) -> timely::execute::Config {
+    ///
+    /// # Errors
+    /// Returns an error if in cluster mode but `process_id` is not set.
+    pub(crate) fn timely_config(&self) -> anyhow::Result<timely::execute::Config> {
         if let Some(ref peers) = self.peers {
-            let pid = self.process_id.expect("process_id required for cluster");
-            timely::execute::Config {
+            let pid = self
+                .process_id
+                .ok_or_else(|| anyhow::anyhow!("process_id required for cluster"))?;
+            Ok(timely::execute::Config {
                 communication: timely::CommunicationConfig::Cluster {
                     threads: self.workers,
                     process: pid,
@@ -480,9 +491,9 @@ impl PipelineController {
                     log_fn: Arc::new(|_| None),
                 },
                 worker: timely::WorkerConfig::default(),
-            }
+            })
         } else {
-            timely::execute::Config::process(self.workers)
+            Ok(timely::execute::Config::process(self.workers))
         }
     }
 
@@ -536,9 +547,9 @@ impl PipelineController {
         let http_handle = crate::http_server::start(crate::http_server::HttpServerConfig {
             addr,
             health: self.health.clone(),
-            prometheus: handles
-                .prometheus_handle
-                .expect("prometheus handle should exist when metrics_addr is set"),
+            prometheus: handles.prometheus_handle.ok_or_else(|| {
+                anyhow::anyhow!("prometheus handle should exist when metrics_addr is set")
+            })?,
             metrics_handle: handles.metrics_handle,
             log_rx: handles.log_rx,
             topology: self.topology.clone(),
@@ -567,13 +578,11 @@ impl PipelineController {
         checkpoint_dir: std::path::PathBuf,
         l3: Arc<SlateDbBackend>,
         foyer_config: TieredBackendConfig,
-    ) -> Self {
+    ) -> anyhow::Result<Self> {
         self.checkpoint_dir = checkpoint_dir;
-        let shared_l2 = SharedL2Cache::open(&foyer_config)
-            .await
-            .expect("failed to build shared L2 cache");
+        let shared_l2 = SharedL2Cache::open(&foyer_config).await?;
         self.tiered = Some(TieredStorageConfig { l3, shared_l2 });
-        self
+        Ok(self)
     }
 
     /// Create a per-worker `StateContext` for the given operator.
@@ -603,7 +612,10 @@ impl PipelineController {
         let ctx = {
             #[cfg(feature = "remote-state")]
             {
-                let fork_l3 = self.fork_remote_l3.lock().unwrap();
+                let fork_l3 = self
+                    .fork_remote_l3
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 if let Some(ref remote_l3) = *fork_l3 {
                     // Fork mode: PrefixedBackend wraps ForkBackend(local, remote).
                     let local_path = self
@@ -676,7 +688,10 @@ async fn run_graph(
     let compiled = compile_graph(graph.into_nodes())?;
 
     // Store topology for the HTTP API before nodes are consumed.
-    *controller.topology.lock().unwrap() = Some(compiled.topology.clone());
+    *controller
+        .topology
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(compiled.topology.clone());
 
     let all_operator_names = &compiled.operator_names;
 
@@ -723,7 +738,10 @@ async fn run_graph(
             // Open remote SlateDB read-only for ForkBackend.
             let remote_l3 =
                 Arc::new(SlateDbBackend::open(remote_cfg.prefix.as_str(), object_store).await?);
-            *controller.fork_remote_l3.lock().unwrap() = Some(remote_l3);
+            *controller
+                .fork_remote_l3
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = Some(remote_l3);
 
             Some((manifest.checkpoint_id, offsets))
         } else {
@@ -822,10 +840,10 @@ async fn run_graph(
     let ckpt_process_id = controller.process_id();
     let ckpt_n_processes = controller.peers.as_ref().map_or(1, Vec::len);
 
-    Arc::try_unwrap(task_manager)
-        .unwrap_or_else(|_| panic!("TaskManager Arc still shared after run"))
-        .drain()
-        .await?;
+    // invariant: all workers have finished, no other Arc holders
+    let task_manager = Arc::try_unwrap(task_manager)
+        .unwrap_or_else(|_| panic!("TaskManager Arc still shared after run() completed"));
+    task_manager.drain().await?;
 
     // Final manifest (includes all accumulated checkpoint progress).
     let checkpoint_id = last_checkpoint_id + 1;
@@ -851,6 +869,7 @@ async fn run_graph(
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use std::sync::{Arc, Mutex};
 
@@ -989,7 +1008,7 @@ mod tests {
             for word in input.split_whitespace() {
                 let key = word.as_bytes();
                 let count = ctx.get::<u64>(key).await.unwrap_or(None).unwrap_or(0) + 1;
-                ctx.put(key, &count);
+                ctx.put(key, &count)?;
                 outputs.push(format!("{word}: {count}"));
             }
             Ok(outputs)
@@ -1048,7 +1067,8 @@ mod tests {
         let controller = super::PipelineController::builder()
             .checkpoint_dir(&dir)
             .workers(2)
-            .build();
+            .build()
+            .unwrap();
         controller.run(graph).await.unwrap();
         let mut results = collected.lock().unwrap().clone();
         results.sort_unstable();
@@ -1083,7 +1103,8 @@ mod tests {
         let controller = super::PipelineController::builder()
             .checkpoint_dir(&dir)
             .workers(2)
-            .build();
+            .build()
+            .unwrap();
         controller.run(graph).await.unwrap();
         let mut results = collected.lock().unwrap().clone();
         results.sort_unstable();
@@ -1109,7 +1130,8 @@ mod tests {
         let controller = super::PipelineController::builder()
             .checkpoint_dir(&dir)
             .workers(1)
-            .build();
+            .build()
+            .unwrap();
         controller.run(graph).await.unwrap();
         assert_eq!(*collected.lock().unwrap(), vec![11, 21, 31]);
         let _ = std::fs::remove_dir_all(&dir);
@@ -1149,7 +1171,8 @@ mod tests {
         let controller = super::PipelineController::builder()
             .checkpoint_dir(&dir)
             .workers(4)
-            .build();
+            .build()
+            .unwrap();
         controller.run(graph).await.unwrap();
         let results = collected.lock().unwrap().clone();
         assert_eq!(results.len(), 8);
@@ -1237,7 +1260,8 @@ mod tests {
         let controller = super::PipelineController::builder()
             .checkpoint_dir(&dir)
             .workers(2)
-            .build();
+            .build()
+            .unwrap();
         controller.run(graph).await.unwrap();
         let mut results = collected.lock().unwrap().clone();
         results.sort_unstable();
@@ -1278,7 +1302,8 @@ mod tests {
         let controller = super::PipelineController::builder()
             .checkpoint_dir(&dir)
             .workers(4)
-            .build();
+            .build()
+            .unwrap();
         controller.run(graph).await.unwrap();
         let results = collected.lock().unwrap().clone();
         assert_eq!(results.len(), 6);
@@ -1312,7 +1337,8 @@ mod tests {
         let controller = super::PipelineController::builder()
             .checkpoint_dir(&dir)
             .workers(1)
-            .build();
+            .build()
+            .unwrap();
         controller.run(graph).await.unwrap();
         let mut results = collected.lock().unwrap().clone();
         results.sort_unstable();
@@ -1347,7 +1373,8 @@ mod tests {
         let controller = super::PipelineController::builder()
             .checkpoint_dir(&dir)
             .workers(4)
-            .build();
+            .build()
+            .unwrap();
         controller.run(graph).await.unwrap();
         let mut results = collected.lock().unwrap().clone();
         results.sort_unstable();
@@ -1376,7 +1403,8 @@ mod tests {
         let controller = super::PipelineController::builder()
             .checkpoint_dir(&dir)
             .workers(2)
-            .build();
+            .build()
+            .unwrap();
         controller.run(graph).await.unwrap();
         let results = collected.lock().unwrap().clone();
         assert_eq!(results.len(), 6);
@@ -1447,7 +1475,8 @@ mod tests {
         let controller = super::PipelineController::builder()
             .checkpoint_dir(&dir)
             .workers(2)
-            .build();
+            .build()
+            .unwrap();
         controller.run(graph).await.unwrap();
 
         // All 150 items should have been processed.
@@ -1569,7 +1598,8 @@ mod tests {
         let controller = super::PipelineController::builder()
             .checkpoint_dir(&dir)
             .workers(2)
-            .build();
+            .build()
+            .unwrap();
         controller.run(graph).await.unwrap();
         let results = collected.lock().unwrap().clone();
         assert_eq!(results.len(), 4);
@@ -1608,7 +1638,8 @@ mod tests {
         let controller = super::PipelineController::builder()
             .checkpoint_dir(&dir)
             .workers(4)
-            .build();
+            .build()
+            .unwrap();
         controller.run(graph).await.unwrap();
         let mut results = collected.lock().unwrap().clone();
         results.sort_unstable();
@@ -1641,7 +1672,8 @@ mod tests {
         let controller = super::PipelineController::builder()
             .checkpoint_dir(&dir)
             .workers(2)
-            .build();
+            .build()
+            .unwrap();
         controller.run(graph).await.unwrap();
         let mut results = collected.lock().unwrap().clone();
         results.sort_unstable();
@@ -1675,7 +1707,8 @@ mod tests {
         let controller = super::PipelineController::builder()
             .checkpoint_dir(&dir)
             .workers(2)
-            .build();
+            .build()
+            .unwrap();
         controller.run(graph).await.unwrap();
         let mut results = collected.lock().unwrap().clone();
         results.sort_unstable();
@@ -1711,7 +1744,8 @@ mod tests {
         let controller = super::PipelineController::builder()
             .checkpoint_dir(&dir)
             .workers(2)
-            .build();
+            .build()
+            .unwrap();
         controller.run(graph).await.unwrap();
 
         let mut doubled_results = collected_doubled.lock().unwrap().clone();
@@ -1733,7 +1767,8 @@ mod tests {
             .workers(4)
             .process_id(0)
             .peers(vec!["h0:2101".into(), "h1:2101".into()])
-            .build();
+            .build()
+            .unwrap();
         assert_eq!(ctrl.total_workers(), 8); // 4 workers * 2 peers
         assert!(ctrl.is_cluster());
     }
@@ -1743,7 +1778,8 @@ mod tests {
         let ctrl = super::PipelineController::builder()
             .checkpoint_dir("/tmp/test")
             .workers(4)
-            .build();
+            .build()
+            .unwrap();
         assert_eq!(ctrl.total_workers(), 4);
         assert!(!ctrl.is_cluster());
     }
@@ -1756,7 +1792,8 @@ mod tests {
             .workers(4)
             .process_id(0)
             .peers(vec!["h0:2101".into(), "h1:2101".into()])
-            .build();
+            .build()
+            .unwrap();
         assert_eq!(ctrl0.local_worker_range(), 0..4);
 
         // Process 1 of 2, 4 workers each
@@ -1765,7 +1802,8 @@ mod tests {
             .workers(4)
             .process_id(1)
             .peers(vec!["h0:2101".into(), "h1:2101".into()])
-            .build();
+            .build()
+            .unwrap();
         assert_eq!(ctrl1.local_worker_range(), 4..8);
     }
 
@@ -1774,7 +1812,8 @@ mod tests {
         let ctrl = super::PipelineController::builder()
             .checkpoint_dir("/tmp/test")
             .workers(3)
-            .build();
+            .build()
+            .unwrap();
         assert_eq!(ctrl.local_worker_range(), 0..3);
     }
 
@@ -1785,8 +1824,9 @@ mod tests {
             .workers(2)
             .process_id(0)
             .peers(vec!["h0:2101".into(), "h1:2101".into()])
-            .build();
-        let config = ctrl.timely_config();
+            .build()
+            .unwrap();
+        let config = ctrl.timely_config().unwrap();
         assert!(
             matches!(
                 config.communication,
@@ -1801,8 +1841,9 @@ mod tests {
         let ctrl = super::PipelineController::builder()
             .checkpoint_dir("/tmp/test")
             .workers(2)
-            .build();
-        let config = ctrl.timely_config();
+            .build()
+            .unwrap();
+        let config = ctrl.timely_config().unwrap();
         assert!(
             matches!(
                 config.communication,
@@ -1819,7 +1860,8 @@ mod tests {
             .workers(2)
             .process_id(1)
             .peers(vec!["h0:2101".into(), "h1:2101".into()])
-            .build();
+            .build()
+            .unwrap();
 
         let ctx = ctrl.create_context_for_worker("my_op", 3).unwrap();
         // The context should have been created with prefix "p1_w3_my_op"
@@ -1842,22 +1884,32 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "process_id is required when peers are set")]
     fn cluster_requires_process_id() {
-        super::PipelineController::builder()
+        let err = super::PipelineController::builder()
             .checkpoint_dir("/tmp/test")
             .peers(vec!["h0:2101".into()])
-            .build();
+            .build()
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("process_id is required when peers are set"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
-    #[should_panic(expected = "process_id (2) must be less than number of peers (2)")]
     fn cluster_process_id_out_of_range() {
-        super::PipelineController::builder()
+        let err = super::PipelineController::builder()
             .checkpoint_dir("/tmp/test")
             .process_id(2)
             .peers(vec!["h0:2101".into(), "h1:2101".into()])
-            .build();
+            .build()
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("process_id (2) must be less than number of peers (2)"),
+            "unexpected error: {err}"
+        );
     }
 
     // ── Flink-inspired feature integration tests ─────────────────────

@@ -30,14 +30,14 @@ impl<K, V> fmt::Debug for MapState<'_, K, V> {
 }
 
 /// Encode a key to a hex string of its bincode serialization.
-fn key_to_hex<K: Serialize>(key: &K) -> String {
-    let bytes = bincode::serialize(key).expect("map state key serialization failed");
+fn key_to_hex<K: Serialize>(key: &K) -> anyhow::Result<String> {
+    let bytes = bincode::serialize(key)?;
     let mut hex = String::with_capacity(bytes.len() * 2);
     for b in &bytes {
         use std::fmt::Write;
-        write!(hex, "{b:02x}").unwrap();
+        write!(hex, "{b:02x}")?;
     }
-    hex
+    Ok(hex)
 }
 
 impl<'a, K, V> MapState<'a, K, V>
@@ -55,30 +55,32 @@ where
     }
 
     /// Build the full state key for a map entry.
-    fn state_key(&self, key: &K) -> Vec<u8> {
-        format!("{}:{}", self.prefix, key_to_hex(key)).into_bytes()
+    fn state_key(&self, key: &K) -> anyhow::Result<Vec<u8>> {
+        Ok(format!("{}:{}", self.prefix, key_to_hex(key)?).into_bytes())
     }
 
     /// Retrieves the value for the given key, or `None` if absent.
     pub async fn get(&mut self, key: &K) -> anyhow::Result<Option<V>> {
-        let sk = self.state_key(key);
+        let sk = self.state_key(key)?;
         self.ctx.get(&sk).await
     }
 
     /// Stores a key-value pair.
-    pub fn put(&mut self, key: &K, value: &V) {
-        let sk = self.state_key(key);
-        self.ctx.put(&sk, value);
+    pub fn put(&mut self, key: &K, value: &V) -> anyhow::Result<()> {
+        let sk = self.state_key(key)?;
+        self.ctx.put(&sk, value)
     }
 
     /// Removes the given key.
-    pub fn remove(&mut self, key: &K) {
-        let sk = self.state_key(key);
+    pub fn remove(&mut self, key: &K) -> anyhow::Result<()> {
+        let sk = self.state_key(key)?;
         self.ctx.delete(&sk);
+        Ok(())
     }
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
     use crate::state::local_backend::LocalBackend;
@@ -95,8 +97,8 @@ mod tests {
         let mut ctx = test_ctx("roundtrip");
         {
             let mut ms = MapState::<String, u64>::new(&mut ctx, "scores");
-            ms.put(&"alice".to_string(), &100);
-            ms.put(&"bob".to_string(), &200);
+            ms.put(&"alice".to_string(), &100).unwrap();
+            ms.put(&"bob".to_string(), &200).unwrap();
             assert_eq!(ms.get(&"alice".to_string()).await.unwrap(), Some(100));
             assert_eq!(ms.get(&"bob".to_string()).await.unwrap(), Some(200));
         }
@@ -114,9 +116,9 @@ mod tests {
         let mut ctx = test_ctx("remove");
         {
             let mut ms = MapState::<String, u64>::new(&mut ctx, "m");
-            ms.put(&"key".to_string(), &42);
+            ms.put(&"key".to_string(), &42).unwrap();
             assert_eq!(ms.get(&"key".to_string()).await.unwrap(), Some(42));
-            ms.remove(&"key".to_string());
+            ms.remove(&"key".to_string()).unwrap();
             assert_eq!(ms.get(&"key".to_string()).await.unwrap(), None);
         }
     }
@@ -130,8 +132,8 @@ mod tests {
             let backend = LocalBackend::new(path.clone(), None).unwrap();
             let mut ctx = StateContext::new(Box::new(backend));
             let mut ms = MapState::<String, u64>::new(&mut ctx, "m");
-            ms.put(&"a".to_string(), &1);
-            ms.put(&"b".to_string(), &2);
+            ms.put(&"a".to_string(), &1).unwrap();
+            ms.put(&"b".to_string(), &2).unwrap();
             drop(ms);
             ctx.checkpoint().await.unwrap();
         }

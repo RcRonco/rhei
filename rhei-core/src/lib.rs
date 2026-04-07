@@ -33,6 +33,7 @@ pub mod time;
 pub mod traits;
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod compile_tests {
     use async_trait::async_trait;
 

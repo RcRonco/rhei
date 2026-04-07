@@ -72,7 +72,7 @@ where
 
     fn create_partition_source(&self, assigned: &[usize]) -> Option<Box<dyn ErasedSource>> {
         self.0.partition_count()?;
-        let partition_source = self.0.create_partition_source(assigned);
+        let partition_source = self.0.create_partition_source(assigned)?;
         Some(Box::new(DynSourceWrapper(partition_source)))
     }
 

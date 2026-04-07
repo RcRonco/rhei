@@ -124,7 +124,7 @@ pub(crate) fn expand(item: ItemFn) -> Result<TokenStream, Error> {
             // because it has 5 sub-fields better handled by from_env).
             __builder = __builder.from_env();
 
-            __builder.build().start(__rhei_graph).await?;
+            __builder.build()?.start(__rhei_graph).await?;
             Ok(())
         }
     })

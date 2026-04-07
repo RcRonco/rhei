@@ -85,7 +85,9 @@ pub(crate) async fn local_source_bridge(
         // Snapshot offsets after reading each batch.
         let offsets = source.current_offsets();
         if !offsets.is_empty() {
-            *offsets_writer.lock().unwrap() = offsets;
+            *offsets_writer
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = offsets;
         }
 
         // Capture watermark to send alongside the batch data. The Timely
@@ -112,6 +114,7 @@ pub(crate) async fn local_source_bridge(
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
     use crate::executor::Sentinel;

@@ -99,7 +99,7 @@ async fn main() -> anyhow::Result<()> {
         .operator("tumbling_window", op)
         .sink(PrintSink::<WindowOutput<f64>>::new().with_prefix("output"));
 
-    let executor = Executor::builder().checkpoint_dir(&dir).build();
+    let executor = Executor::builder().checkpoint_dir(&dir).build()?;
     executor.run(graph).await?;
 
     let _ = std::fs::remove_dir_all(&dir);

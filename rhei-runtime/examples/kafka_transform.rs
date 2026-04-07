@@ -62,7 +62,7 @@ async fn main() -> anyhow::Result<()> {
         .operator("uppercase", Uppercase)
         .sink(sink);
 
-    let executor = Executor::builder().checkpoint_dir(dir.clone()).build();
+    let executor = Executor::builder().checkpoint_dir(dir.clone()).build()?;
 
     tracing::info!("starting kafka transform pipeline");
     executor.run(graph).await?;

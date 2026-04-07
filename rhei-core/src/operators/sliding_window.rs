@@ -333,7 +333,7 @@ where
                 }
                 // Clean up accumulator
                 let mut state = KeyedState::<String, A::Accumulator>::new(ctx, "sw_acc");
-                state.delete(&acc_key);
+                state.delete(&acc_key)?;
             } else {
                 still_active.push(win_start);
             }
@@ -359,7 +359,7 @@ where
 
             {
                 let mut state = KeyedState::<String, A::Accumulator>::new(ctx, "sw_acc");
-                state.put(&acc_key, &acc);
+                state.put(&acc_key, &acc)?;
             }
 
             // Track this window as active if not already
@@ -372,7 +372,7 @@ where
         active.starts.sort_unstable();
         {
             let mut state = KeyedState::<String, ActiveWindows>::new(ctx, "sw_active");
-            state.put(&key, &active);
+            state.put(&key, &active)?;
         }
 
         Ok(outputs)
@@ -411,7 +411,7 @@ where
                         });
                     }
                     let mut state = KeyedState::<String, A::Accumulator>::new(ctx, "sw_acc");
-                    state.delete(&acc_key);
+                    state.delete(&acc_key)?;
                 } else {
                     still_active.push(win_start);
                 }
@@ -420,12 +420,12 @@ where
             active.starts = still_active;
             if active.starts.is_empty() {
                 let mut state = KeyedState::<String, ActiveWindows>::new(ctx, "sw_active");
-                state.delete(key);
+                state.delete(key)?;
                 keys_to_remove.push(key.clone());
             } else {
                 active.starts.sort_unstable();
                 let mut state = KeyedState::<String, ActiveWindows>::new(ctx, "sw_active");
-                state.put(key, &active);
+                state.put(key, &active)?;
             }
         }
 
@@ -438,6 +438,7 @@ where
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use std::sync::Arc;
 
