@@ -111,9 +111,7 @@ impl<T> CollectSink<T> {
 
     /// Returns a snapshot of all collected items.
     ///
-    /// # Panics
-    ///
-    /// Panics if the internal mutex is poisoned.
+    /// Recovers from a poisoned mutex by accessing the inner data.
     pub fn items(&self) -> Vec<T>
     where
         T: Clone,
