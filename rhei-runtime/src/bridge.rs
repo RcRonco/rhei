@@ -16,7 +16,7 @@ use crate::shutdown::ShutdownHandle;
 /// backpressure but may cause the source to stall more frequently.
 ///
 /// Used by [`source_bridge`], [`sink_bridge`], and [`local_source_bridge`].
-/// The executor and task_manager also use this for their internal channels.
+/// The executor and `task_manager` also use this for their internal channels.
 pub const DEFAULT_CHANNEL_SIZE: usize = 16;
 
 /// Bridges an async `Source` into a `flume::Receiver` for use in Timely.
@@ -92,7 +92,7 @@ pub(crate) type SourceBatch = (Vec<AnyItem>, Option<u64>);
 /// `offsets_writer` is read from synchronous Timely worker threads in
 /// `task_manager.rs` (via `merge_source_offsets`). A `tokio::sync::Mutex`
 /// requires `.await` to lock, which is not available in the sync Timely
-/// context. The lock is held only for a brief HashMap swap, so contention
+/// context. The lock is held only for a brief `HashMap` swap, so contention
 /// is negligible and the async executor is never blocked for meaningful
 /// duration.
 pub(crate) async fn local_source_bridge(

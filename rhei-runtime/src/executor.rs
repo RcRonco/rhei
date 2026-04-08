@@ -506,6 +506,7 @@ impl DataflowExecutor {
     }
 
     /// Build a stateful operator with DLQ, watermark, timer, and checkpoint support.
+    #[allow(clippy::too_many_lines)]
     fn build_operator<'a, A: Allocate>(
         &self,
         node_id: NodeId,
