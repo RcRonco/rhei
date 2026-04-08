@@ -218,6 +218,17 @@ fn ts_add(ts: u64, offset: i64) -> u64 {
     }
 }
 
+/// Opportunistically evict stale events from a buffer.
+///
+/// Retains only events where `watermark <= ts_add(ev.timestamp, bound)`.
+/// Returns the number of evicted events.
+fn evict_stale<V>(buf: &mut EventBuffer<V>, watermark: u64, bound: i64) -> usize {
+    let before = buf.events.len();
+    buf.events
+        .retain(|ev| watermark <= ts_add(ev.timestamp, bound));
+    before - buf.events.len()
+}
+
 #[async_trait]
 impl<L, R, O, KF, JF> StreamFunction for IntervalJoin<L, R, KF, JF>
 where
@@ -241,7 +252,7 @@ where
         match input {
             IntervalSide::Left(l, l_ts) => {
                 // Probe right buffer: match where l_ts + lower <= r_ts <= l_ts + upper
-                let right_buf: EventBuffer<R> = {
+                let mut right_buf: EventBuffer<R> = {
                     let mut state = KeyedState::<String, EventBuffer<R>>::new(ctx, "ij_right");
                     state.get(&key).await.unwrap_or(None).unwrap_or_default()
                 };
@@ -256,7 +267,18 @@ where
                     }
                 }
 
-                // Buffer the left event
+                // Opportunistic eviction of stale right events.
+                if self.last_watermark > 0 {
+                    let evicted = evict_stale(&mut right_buf, self.last_watermark, -self.lower_bound);
+                    if evicted > 0 {
+                        metrics::counter!("interval_join_right_evicted_total")
+                            .increment(u64::try_from(evicted).unwrap_or(u64::MAX));
+                    }
+                    let mut state = KeyedState::<String, EventBuffer<R>>::new(ctx, "ij_right");
+                    state.put(&key, &right_buf)?;
+                }
+
+                // Buffer the left event.
                 let mut left_buf: EventBuffer<L> = {
                     let mut state = KeyedState::<String, EventBuffer<L>>::new(ctx, "ij_left");
                     state.get(&key).await.unwrap_or(None).unwrap_or_default()
@@ -268,6 +290,16 @@ where
                     timestamp: l_ts,
                     seq,
                 });
+
+                // Opportunistic eviction of stale left events.
+                if self.last_watermark > 0 {
+                    let evicted = evict_stale(&mut left_buf, self.last_watermark, self.upper_bound);
+                    if evicted > 0 {
+                        metrics::counter!("interval_join_left_evicted_total")
+                            .increment(u64::try_from(evicted).unwrap_or(u64::MAX));
+                    }
+                }
+
                 {
                     let mut state = KeyedState::<String, EventBuffer<L>>::new(ctx, "ij_left");
                     state.put(&key, &left_buf)?;
@@ -278,7 +310,7 @@ where
             IntervalSide::Right(r, r_ts) => {
                 // Probe left buffer: match where l_ts + lower <= r_ts <= l_ts + upper
                 // Rearranged: r_ts - upper <= l_ts <= r_ts - lower
-                let left_buf: EventBuffer<L> = {
+                let mut left_buf: EventBuffer<L> = {
                     let mut state = KeyedState::<String, EventBuffer<L>>::new(ctx, "ij_left");
                     state.get(&key).await.unwrap_or(None).unwrap_or_default()
                 };
@@ -293,7 +325,18 @@ where
                     }
                 }
 
-                // Buffer the right event
+                // Opportunistic eviction of stale left events.
+                if self.last_watermark > 0 {
+                    let evicted = evict_stale(&mut left_buf, self.last_watermark, self.upper_bound);
+                    if evicted > 0 {
+                        metrics::counter!("interval_join_left_evicted_total")
+                            .increment(u64::try_from(evicted).unwrap_or(u64::MAX));
+                    }
+                    let mut state = KeyedState::<String, EventBuffer<L>>::new(ctx, "ij_left");
+                    state.put(&key, &left_buf)?;
+                }
+
+                // Buffer the right event.
                 let mut right_buf: EventBuffer<R> = {
                     let mut state = KeyedState::<String, EventBuffer<R>>::new(ctx, "ij_right");
                     state.get(&key).await.unwrap_or(None).unwrap_or_default()
@@ -305,6 +348,16 @@ where
                     timestamp: r_ts,
                     seq,
                 });
+
+                // Opportunistic eviction of stale right events.
+                if self.last_watermark > 0 {
+                    let evicted = evict_stale(&mut right_buf, self.last_watermark, -self.lower_bound);
+                    if evicted > 0 {
+                        metrics::counter!("interval_join_right_evicted_total")
+                            .increment(u64::try_from(evicted).unwrap_or(u64::MAX));
+                    }
+                }
+
                 {
                     let mut state = KeyedState::<String, EventBuffer<R>>::new(ctx, "ij_right");
                     state.put(&key, &right_buf)?;
@@ -328,20 +381,14 @@ where
             let mut modified = false;
 
             // Evict left events that can no longer match any future right event.
-            // A left event at l_ts can match right events with r_ts <= l_ts + upper_bound.
-            // If watermark > l_ts + upper_bound, no future right event can match.
             {
                 let mut left_buf: EventBuffer<L> = {
                     let mut state = KeyedState::<String, EventBuffer<L>>::new(ctx, "ij_left");
                     state.get(key).await.unwrap_or(None).unwrap_or_default()
                 };
-                let before = left_buf.events.len();
-                left_buf
-                    .events
-                    .retain(|ev| watermark <= ts_add(ev.timestamp, self.upper_bound));
-                if left_buf.events.len() != before {
+                let evicted = evict_stale(&mut left_buf, watermark, self.upper_bound);
+                if evicted > 0 {
                     modified = true;
-                    let evicted = before - left_buf.events.len();
                     metrics::counter!("interval_join_left_evicted_total")
                         .increment(u64::try_from(evicted).unwrap_or(u64::MAX));
                     let mut state = KeyedState::<String, EventBuffer<L>>::new(ctx, "ij_left");
@@ -354,21 +401,14 @@ where
             }
 
             // Evict right events that can no longer match any future left event.
-            // A right event at r_ts can match left events where l_ts + lower_bound <= r_ts,
-            // i.e., l_ts <= r_ts - lower_bound. If watermark > r_ts - lower_bound,
-            // no future left event can match.
             {
                 let mut right_buf: EventBuffer<R> = {
                     let mut state = KeyedState::<String, EventBuffer<R>>::new(ctx, "ij_right");
                     state.get(key).await.unwrap_or(None).unwrap_or_default()
                 };
-                let before = right_buf.events.len();
-                right_buf
-                    .events
-                    .retain(|ev| watermark <= ts_add(ev.timestamp, -self.lower_bound));
-                if right_buf.events.len() != before {
+                let evicted = evict_stale(&mut right_buf, watermark, -self.lower_bound);
+                if evicted > 0 {
                     modified = true;
-                    let evicted = before - right_buf.events.len();
                     metrics::counter!("interval_join_right_evicted_total")
                         .increment(u64::try_from(evicted).unwrap_or(u64::MAX));
                     let mut state = KeyedState::<String, EventBuffer<R>>::new(ctx, "ij_right");
