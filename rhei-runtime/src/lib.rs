@@ -42,6 +42,10 @@ pub mod compiler;
 pub mod controller;
 /// Dataflow graph API: [`DataflowGraph`](dataflow::DataflowGraph),
 /// [`Stream<T>`](dataflow::Stream), [`KeyedStream<T>`](dataflow::KeyedStream).
+// Transform closures use AnyItem::downcast (now deprecated in favor of
+// try_downcast). The type is guaranteed by construction in these closures,
+// so the panicking downcast is acceptable until a full migration.
+#[allow(deprecated)]
 pub mod dataflow;
 /// Type-erased traits and wrappers for the Timely execution layer.
 pub(crate) mod erased;

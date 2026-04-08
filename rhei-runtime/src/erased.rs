@@ -159,7 +159,7 @@ where
     K::Input: 'static,
 {
     async fn write(&mut self, item: AnyItem) -> anyhow::Result<()> {
-        let typed: K::Input = item.downcast();
+        let typed: K::Input = item.try_downcast().map_err(|e| anyhow::anyhow!("{e}"))?;
         self.0.write(typed).await
     }
 
@@ -220,7 +220,7 @@ where
         input: AnyItem,
         ctx: &mut StateContext,
     ) -> anyhow::Result<Vec<AnyItem>> {
-        let typed: F::Input = input.downcast();
+        let typed: F::Input = input.try_downcast().map_err(|e| anyhow::anyhow!("{e}"))?;
         let results = self.0.process(typed, ctx).await?;
         Ok(results.into_iter().map(AnyItem::new).collect())
     }
@@ -230,7 +230,10 @@ where
         inputs: Vec<AnyItem>,
         ctx: &mut StateContext,
     ) -> anyhow::Result<Vec<AnyItem>> {
-        let typed: Vec<F::Input> = inputs.into_iter().map(AnyItem::downcast).collect();
+        let typed: Vec<F::Input> = inputs
+            .into_iter()
+            .map(|item| item.try_downcast().map_err(|e| anyhow::anyhow!("{e}")))
+            .collect::<Result<Vec<_>, _>>()?;
         let results = self.0.process_batch(typed, ctx).await?;
         Ok(results.into_iter().map(AnyItem::new).collect())
     }

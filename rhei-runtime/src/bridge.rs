@@ -114,7 +114,7 @@ pub(crate) async fn local_source_bridge(
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used, deprecated)]
 mod tests {
     use super::*;
     use crate::executor::Sentinel;

@@ -5,7 +5,29 @@
 //! serialization via bincode.
 
 use std::any::Any;
+use std::fmt;
 use std::sync::{LazyLock, RwLock};
+
+// ── DowncastError ──────────────────────────────────────────────────
+
+/// Error returned when an [`AnyItem`] downcast fails due to a type mismatch.
+///
+/// Contains the expected type name for diagnostic purposes. The original
+/// `AnyItem` is consumed and cannot be recovered (use `try_downcast_ref`
+/// for a non-consuming alternative).
+#[derive(Debug, Clone)]
+pub(crate) struct DowncastError {
+    /// The expected concrete type name (from `std::any::type_name::<T>()`).
+    pub expected: &'static str,
+}
+
+impl fmt::Display for DowncastError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "AnyItem downcast failed: expected {}", self.expected)
+    }
+}
+
+impl std::error::Error for DowncastError {}
 
 // ── Cloneable type-erased wrapper ────────────────────────────────────
 
@@ -124,7 +146,34 @@ impl AnyItem {
         AnyItem(Box::new(value))
     }
 
+    /// Consume and downcast to concrete type `T`.
+    ///
+    /// Returns `Err(DowncastError)` if the contained value is not of type `T`.
+    pub(crate) fn try_downcast<T: 'static>(self) -> Result<T, DowncastError> {
+        self.0
+            .into_any()
+            .downcast::<T>()
+            .map(|b| *b)
+            .map_err(|_| DowncastError {
+                expected: std::any::type_name::<T>(),
+            })
+    }
+
+    /// Borrow and downcast to `&T`.
+    ///
+    /// Returns `Err(DowncastError)` if the contained value is not of type `T`.
+    #[allow(dead_code)]
+    pub(crate) fn try_downcast_ref<T: 'static>(&self) -> Result<&T, DowncastError> {
+        self.0
+            .as_any_ref()
+            .downcast_ref::<T>()
+            .ok_or(DowncastError {
+                expected: std::any::type_name::<T>(),
+            })
+    }
+
     /// Consume and downcast to concrete type `T`. Panics on type mismatch.
+    #[deprecated(note = "use try_downcast() which returns Result instead of panicking")]
     pub(crate) fn downcast<T: 'static>(self) -> T {
         *self
             .0
@@ -134,6 +183,7 @@ impl AnyItem {
     }
 
     /// Borrow and downcast to `&T`. Panics on type mismatch.
+    #[deprecated(note = "use try_downcast_ref() which returns Result instead of panicking")]
     pub(crate) fn downcast_ref<T: 'static>(&self) -> &T {
         self.0
             .as_any_ref()
@@ -188,7 +238,7 @@ mod tests {
         let bytes = bincode::serialize(&item).unwrap();
 
         let restored: AnyItem = bincode::deserialize(&bytes).unwrap();
-        assert_eq!(restored.downcast::<String>(), "hello");
+        assert_eq!(restored.try_downcast::<String>().unwrap(), "hello");
     }
 
     #[test]
@@ -199,6 +249,39 @@ mod tests {
         let item = AnyItem::new(42u32);
         let bytes = bincode::serialize(&item).unwrap();
         let restored: AnyItem = bincode::deserialize(&bytes).unwrap();
-        assert_eq!(restored.downcast::<u32>(), 42);
+        assert_eq!(restored.try_downcast::<u32>().unwrap(), 42);
+    }
+
+    #[test]
+    fn try_downcast_success() {
+        let item = AnyItem::new(42i32);
+        assert_eq!(item.try_downcast::<i32>().unwrap(), 42);
+    }
+
+    #[test]
+    fn try_downcast_wrong_type_returns_error() {
+        let item = AnyItem::new(42i32);
+        let err = item.try_downcast::<String>().unwrap_err();
+        assert!(
+            err.to_string().contains("String"),
+            "error should mention expected type, got: {err}"
+        );
+    }
+
+    #[test]
+    fn try_downcast_ref_success() {
+        let item = AnyItem::new("hello".to_string());
+        let val = item.try_downcast_ref::<String>().unwrap();
+        assert_eq!(val, "hello");
+    }
+
+    #[test]
+    fn try_downcast_ref_wrong_type_returns_error() {
+        let item = AnyItem::new(42i32);
+        let err = item.try_downcast_ref::<String>().unwrap_err();
+        assert!(
+            err.to_string().contains("String"),
+            "error should mention expected type, got: {err}"
+        );
     }
 }

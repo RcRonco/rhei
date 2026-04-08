@@ -765,7 +765,7 @@ fn frontier_min_or_max(frontier: timely::progress::frontier::AntichainRef<'_, u6
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used, deprecated)]
 mod tests {
     use crate::any_item::AnyItem;
 
