@@ -130,12 +130,18 @@ impl MetricsHandle {
             .inner
             .counters
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .unwrap_or_else(|e| {
+                tracing::warn!("mutex poisoned in metrics counters lock, recovering inner data");
+                e.into_inner()
+            });
         let gauges = self
             .inner
             .gauges
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .unwrap_or_else(|e| {
+                tracing::warn!("mutex poisoned in metrics gauges lock, recovering inner data");
+                e.into_inner()
+            });
 
         let get = |map: &HashMap<String, Arc<AtomicU64>>, key: &str| -> u64 {
             map.get(key).map_or(0, |v| v.load(Ordering::Relaxed))
@@ -222,7 +228,12 @@ impl SnapshotRecorder {
             .inner
             .counters
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .unwrap_or_else(|e| {
+                tracing::warn!(
+                    "mutex poisoned in recorder counters lock, recovering inner data"
+                );
+                e.into_inner()
+            });
         map.entry(key.name().to_string())
             .or_insert_with(|| Arc::new(AtomicU64::new(0)))
             .clone()
@@ -233,7 +244,10 @@ impl SnapshotRecorder {
             .inner
             .gauges
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .unwrap_or_else(|e| {
+                tracing::warn!("mutex poisoned in recorder gauges lock, recovering inner data");
+                e.into_inner()
+            });
         map.entry(key.name().to_string())
             .or_insert_with(|| Arc::new(AtomicU64::new(0)))
             .clone()

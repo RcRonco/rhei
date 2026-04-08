@@ -85,7 +85,10 @@ impl TaskManager {
     pub(crate) fn take_executor_data(&self, idx: usize) -> ExecutorData {
         self.per_executor
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)[idx]
+            .unwrap_or_else(|e| {
+                tracing::warn!("mutex poisoned in per_executor lock, recovering inner data");
+                e.into_inner()
+            })[idx]
             .take()
             .expect("executor data already taken for worker")
     }
@@ -245,7 +248,10 @@ impl TaskManager {
     pub(crate) fn take_checkpoint_rx(&self) -> flume::Receiver<u64> {
         self.checkpoint_notify_rx
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .unwrap_or_else(|e| {
+                tracing::warn!("mutex poisoned in checkpoint_notify_rx lock, recovering inner data");
+                e.into_inner()
+            })
             .take()
             .expect("checkpoint_rx already taken")
     }
@@ -265,7 +271,12 @@ impl TaskManager {
         let _ = self
             .checkpoint_notify_tx
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .unwrap_or_else(|e| {
+                tracing::warn!(
+                    "mutex poisoned in checkpoint_notify_tx lock (close), recovering inner data"
+                );
+                e.into_inner()
+            })
             .take();
     }
 
@@ -341,7 +352,12 @@ impl TaskManager {
         let checkpoint_notify_tx = self
             .checkpoint_notify_tx
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .unwrap_or_else(|e| {
+                tracing::warn!(
+                    "mutex poisoned in checkpoint_notify_tx lock (run), recovering inner data"
+                );
+                e.into_inner()
+            })
             .as_ref()
             .cloned();
 
@@ -992,7 +1008,12 @@ pub(crate) fn merge_source_offsets(
         combined.extend(
             offsets
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .unwrap_or_else(|e| {
+                    tracing::warn!(
+                        "mutex poisoned in source_offsets merge lock, recovering inner data"
+                    );
+                    e.into_inner()
+                })
                 .clone(),
         );
     }

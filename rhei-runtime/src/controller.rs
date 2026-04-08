@@ -406,7 +406,10 @@ impl PipelineController {
     pub fn topology(&self) -> Option<ApiTopology> {
         self.topology
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .unwrap_or_else(|e| {
+                tracing::warn!("mutex poisoned in topology lock, recovering inner data");
+                e.into_inner()
+            })
             .clone()
     }
 
@@ -615,7 +618,12 @@ impl PipelineController {
                 let fork_l3 = self
                     .fork_remote_l3
                     .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    .unwrap_or_else(|e| {
+                        tracing::warn!(
+                            "mutex poisoned in fork_remote_l3 lock, recovering inner data"
+                        );
+                        e.into_inner()
+                    });
                 if let Some(ref remote_l3) = *fork_l3 {
                     // Fork mode: PrefixedBackend wraps ForkBackend(local, remote).
                     let local_path = self
@@ -691,7 +699,10 @@ async fn run_graph(
     *controller
         .topology
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(compiled.topology.clone());
+        .unwrap_or_else(|e| {
+            tracing::warn!("mutex poisoned in topology lock (run_graph), recovering inner data");
+            e.into_inner()
+        }) = Some(compiled.topology.clone());
 
     let all_operator_names = &compiled.operator_names;
 
@@ -741,7 +752,12 @@ async fn run_graph(
             *controller
                 .fork_remote_l3
                 .lock()
-                .unwrap_or_else(|e| e.into_inner()) = Some(remote_l3);
+                .unwrap_or_else(|e| {
+                    tracing::warn!(
+                        "mutex poisoned in fork_remote_l3 lock (run_graph), recovering inner data"
+                    );
+                    e.into_inner()
+                }) = Some(remote_l3);
 
             Some((manifest.checkpoint_id, offsets))
         } else {

@@ -433,7 +433,10 @@ async fn api_topology(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let topo = state
         .topology
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .unwrap_or_else(|e| {
+            tracing::warn!("mutex poisoned in topology lock (api_topology), recovering inner data");
+            e.into_inner()
+        })
         .clone();
     match topo {
         Some(topology) => (StatusCode::OK, axum::Json(Some(topology))),
