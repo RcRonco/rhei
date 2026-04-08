@@ -189,38 +189,49 @@ impl PipelineConfig {
     /// Environment variables take precedence over TOML values.
     /// Call this after [`load()`](Self::load) to allow deployment-time
     /// overrides without modifying the config file.
-    pub fn apply_env(mut self) -> Self {
-        if let Ok(val) = std::env::var("RHEI_PIPELINE_NAME") {
+    pub fn apply_env(self) -> Self {
+        self.apply_env_with(|key| std::env::var(key))
+    }
+
+    /// Internal: apply overrides using a custom env-lookup function.
+    ///
+    /// This lets tests supply a mock environment without requiring
+    /// `unsafe` calls to `std::env::set_var`.
+    fn apply_env_with<F>(mut self, env: F) -> Self
+    where
+        F: Fn(&str) -> Result<String, std::env::VarError>,
+    {
+        if let Ok(val) = env("RHEI_PIPELINE_NAME") {
             self.pipeline.name = Some(val);
         }
-        if let Ok(val) = std::env::var("RHEI_WORKERS")
+        if let Ok(val) = env("RHEI_WORKERS")
             && let Ok(n) = val.parse::<usize>()
         {
             self.pipeline.workers = n;
         }
-        if let Ok(val) = std::env::var("RHEI_CHECKPOINT_DIR") {
+        if let Ok(val) = env("RHEI_CHECKPOINT_DIR") {
             self.pipeline.checkpoint_dir = val;
         }
-        if let Ok(val) = std::env::var("RHEI_CHECKPOINT_INTERVAL")
+        if let Ok(val) = env("RHEI_CHECKPOINT_INTERVAL")
             && let Ok(n) = val.parse::<u64>()
         {
             self.pipeline.checkpoint_interval = n;
         }
-        if let Ok(val) = std::env::var("RHEI_METRICS_ADDR") {
+        if let Ok(val) = env("RHEI_METRICS_ADDR") {
             self.metrics.addr = Some(val);
         }
-        if let Ok(val) = std::env::var("RHEI_LOG_LEVEL") {
+        if let Ok(val) = env("RHEI_LOG_LEVEL") {
             self.metrics.log_level = val;
         }
-        if let Ok(val) = std::env::var("RHEI_JSON_LOGS") {
+        if let Ok(val) = env("RHEI_JSON_LOGS") {
             self.metrics.json_logs = val == "1" || val == "true";
         }
-        if let Ok(val) = std::env::var("RHEI_PROCESS_ID")
+        if let Ok(val) = env("RHEI_PROCESS_ID")
             && let Ok(id) = val.parse::<usize>()
         {
             self.cluster.process_id = Some(id);
         }
-        if let Ok(val) = std::env::var("RHEI_PEERS") {
+        if let Ok(val) = env("RHEI_PEERS") {
             let peers: Vec<String> = val.split(',').map(|s| s.trim().to_string()).collect();
             if !peers.is_empty() {
                 self.cluster.peers = Some(peers);
@@ -343,5 +354,78 @@ addr = "0.0.0.0:9090"
         assert!(config.pipeline.name.is_none());
         assert_eq!(config.metrics.log_level, "info");
         assert!(!config.metrics.json_logs);
+    }
+
+    /// Build a mock env-lookup function from key-value pairs.
+    fn mock_env(
+        vars: &[(&str, &str)],
+    ) -> impl Fn(&str) -> Result<String, std::env::VarError> {
+        let map: std::collections::HashMap<String, String> = vars
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect();
+        move |key: &str| {
+            map.get(key)
+                .cloned()
+                .ok_or(std::env::VarError::NotPresent)
+        }
+    }
+
+    #[test]
+    fn apply_env_numeric_workers_override() {
+        let env = mock_env(&[("RHEI_WORKERS", "16")]);
+        let config = PipelineConfig::default().apply_env_with(env);
+        assert_eq!(config.pipeline.workers, 16);
+    }
+
+    #[test]
+    fn apply_env_non_numeric_workers_silently_skipped() {
+        let env = mock_env(&[("RHEI_WORKERS", "not-a-number")]);
+        let config = PipelineConfig::default().apply_env_with(env);
+        // Should keep the default value since the env var is not a valid number
+        assert_eq!(config.pipeline.workers, 1);
+    }
+
+    #[test]
+    fn apply_env_json_logs_boolean() {
+        let env = mock_env(&[("RHEI_JSON_LOGS", "true")]);
+        let config = PipelineConfig::default().apply_env_with(env);
+        assert!(config.metrics.json_logs);
+
+        // Also test "1"
+        let env = mock_env(&[("RHEI_JSON_LOGS", "1")]);
+        let config = PipelineConfig::default().apply_env_with(env);
+        assert!(config.metrics.json_logs);
+
+        // "false" or any other value should set json_logs to false
+        let env = mock_env(&[("RHEI_JSON_LOGS", "false")]);
+        let config = PipelineConfig::default().apply_env_with(env);
+        assert!(!config.metrics.json_logs);
+    }
+
+    #[test]
+    fn apply_env_comma_separated_peers() {
+        let env = mock_env(&[("RHEI_PEERS", "host1:2101, host2:2101, host3:2101")]);
+        let config = PipelineConfig::default().apply_env_with(env);
+        let peers = config.cluster.peers.unwrap();
+        assert_eq!(
+            peers,
+            vec![
+                "host1:2101".to_string(),
+                "host2:2101".to_string(),
+                "host3:2101".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn apply_env_checkpoint_dir_and_interval() {
+        let env = mock_env(&[
+            ("RHEI_CHECKPOINT_DIR", "/tmp/my-checkpoints"),
+            ("RHEI_CHECKPOINT_INTERVAL", "500"),
+        ]);
+        let config = PipelineConfig::default().apply_env_with(env);
+        assert_eq!(config.pipeline.checkpoint_dir, "/tmp/my-checkpoints");
+        assert_eq!(config.pipeline.checkpoint_interval, 500);
     }
 }
