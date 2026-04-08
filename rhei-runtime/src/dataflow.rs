@@ -890,19 +890,48 @@ impl<
         KeyedStream::new(self.graph, node_id)
     }
 
-    /// Attach a dead-letter queue to the preceding operator.
+    /// Route operator errors to a dead-letter queue sink.
     ///
-    /// Rewrites the operator so that `Err(e)` results are routed to an error
-    /// stream instead of crashing the pipeline. The closure receives the error
-    /// stream (`Stream<String>`) for wiring (e.g. to a Kafka DLQ sink).
-    /// Returns the main `KeyedStream<T>` for continued chaining.
+    /// The simplest way to add DLQ handling: pass any `Sink<Input = String>`
+    /// and errors are automatically routed there. The main stream continues
+    /// with successful results only.
     ///
     /// ```ignore
     /// stream
     ///     .key_by(|x| x.key.clone())
     ///     .operator("process", MyProcessor)
-    ///     .with_dlq(|errors| errors.to_json().sink(dlq_sink))
-    ///     .to_json_keyed(|e| e.key())
+    ///     .dlq(PrintSink::new().with_prefix("DLQ"))
+    ///     .sink(output_sink);
+    /// ```
+    ///
+    /// For more control over the error stream (e.g. transforms before
+    /// sinking), use [`with_dlq()`](Self::with_dlq) instead.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the preceding node is not an `Operator`.
+    pub fn dlq<K>(self, sink: K) -> KeyedStream<'a, T>
+    where
+        K: Sink<Input = String> + Send + 'static,
+    {
+        self.with_dlq(|errors| errors.sink(sink))
+    }
+
+    /// Attach a dead-letter queue to the preceding operator (advanced).
+    ///
+    /// Rewrites the operator so that `Err(e)` results are routed to an error
+    /// stream instead of crashing the pipeline. The closure receives the error
+    /// stream (`Stream<String>`) for wiring (e.g. to transform before sinking).
+    /// Returns the main `KeyedStream<T>` for continued chaining.
+    ///
+    /// For the simple case, prefer [`dlq(sink)`](Self::dlq) which takes a
+    /// sink directly.
+    ///
+    /// ```ignore
+    /// stream
+    ///     .key_by(|x| x.key.clone())
+    ///     .operator("process", MyProcessor)
+    ///     .with_dlq(|errors| errors.map(enrich_error).sink(dlq_sink))
     ///     .sink(output_sink);
     /// ```
     ///
