@@ -59,7 +59,7 @@ impl StateBackend for SlateDbBackend {
         Ok(())
     }
 
-    /// Atomic batch write using SlateDB's native `WriteBatch`.
+    /// Atomic batch write using `SlateDB`'s native `WriteBatch`.
     ///
     /// All operations in the batch are applied atomically — either all
     /// succeed or none are visible. This is critical for checkpoint

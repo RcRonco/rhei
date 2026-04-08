@@ -33,7 +33,7 @@ pub trait StateBackend: Send + Sync {
     /// Atomically writes a batch of put/delete operations.
     ///
     /// The default implementation applies operations sequentially. Backends
-    /// that support native atomic batches (e.g. SlateDB `WriteBatch`) should
+    /// that support native atomic batches (e.g. `SlateDB` `WriteBatch`) should
     /// override this for atomicity and better performance.
     ///
     /// # Invariant
