@@ -19,6 +19,13 @@ pub struct TieredBackendConfig {
     pub foyer_memory_capacity: usize,
     /// On-disk capacity for the Foyer cache (bytes). Default: 256 MiB.
     pub foyer_disk_capacity: usize,
+    /// Block size for Foyer's on-disk block engine (bytes). Default: 256 KiB.
+    ///
+    /// Smaller blocks reduce read amplification for point lookups (typical
+    /// in state backends) at the cost of higher metadata overhead. 256 KiB
+    /// is a reasonable balance; bump to 1-4 MiB only if values are large
+    /// or sequential scan throughput matters more than lookup latency.
+    pub foyer_block_size: usize,
 }
 
 impl Default for TieredBackendConfig {
@@ -27,6 +34,7 @@ impl Default for TieredBackendConfig {
             foyer_dir: PathBuf::from(format!("/tmp/rhei-foyer-{}", std::process::id())),
             foyer_memory_capacity: 64 * 1024 * 1024,
             foyer_disk_capacity: 256 * 1024 * 1024,
+            foyer_block_size: 256 * 1024,
         }
     }
 }
@@ -52,7 +60,7 @@ impl SharedL2Cache {
             .memory(config.foyer_memory_capacity)
             .storage()
             .with_engine_config(
-                foyer::BlockEngineConfig::new(device).with_block_size(4 * 1024 * 1024),
+                foyer::BlockEngineConfig::new(device).with_block_size(config.foyer_block_size),
             )
             .build()
             .await?;
@@ -115,7 +123,7 @@ impl TieredBackend {
             .memory(config.foyer_memory_capacity)
             .storage()
             .with_engine_config(
-                foyer::BlockEngineConfig::new(device).with_block_size(4 * 1024 * 1024), // 4 MiB blocks
+                foyer::BlockEngineConfig::new(device).with_block_size(config.foyer_block_size),
             )
             .build()
             .await?;
