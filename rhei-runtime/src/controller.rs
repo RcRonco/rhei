@@ -145,17 +145,19 @@ pub struct PipelineControllerBuilder {
 impl PipelineControllerBuilder {
     /// Apply settings from a [`PipelineConfig`](rhei_core::config::PipelineConfig).
     ///
-    /// Values from the config are applied as defaults — any settings
-    /// already set via builder methods take precedence. Call this early
-    /// in the builder chain to allow subsequent method calls to override.
+    /// Core fields (`checkpoint_dir`, `workers`, `checkpoint_interval`) are
+    /// set unconditionally from the config. Optional fields (`pipeline_name`,
+    /// `metrics_addr`, `process_id`, `peers`) are only set when present in
+    /// the config. Call this early in the builder chain so that subsequent
+    /// builder methods can override the values.
     ///
     /// # Example
     ///
     /// ```ignore
     /// let config = PipelineConfig::load("pipeline.toml")?.apply_env();
     /// let executor = Executor::builder()
-    ///     .apply_config(&config)
-    ///     .workers(8)  // overrides config value
+    ///     .apply_config(&config)  // sets all core fields from config
+    ///     .workers(8)             // overrides the config value
     ///     .build()?;
     /// ```
     pub fn apply_config(mut self, config: &rhei_core::config::PipelineConfig) -> Self {
