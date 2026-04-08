@@ -2,7 +2,7 @@ use bytes::Bytes;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
-use super::backend::StateBackend;
+use super::backend::{BatchOp, StateBackend};
 use super::memtable::MemTable;
 use super::timer_service::TimerService;
 
@@ -160,6 +160,19 @@ impl StateContext {
     }
 
     /// Flush dirty entries from memtable to backend, then trigger backend checkpoint.
+    ///
+    /// Dirty keys are collected into a single `put_batch` call so that backends
+    /// with native atomic batches (e.g. SlateDB `WriteBatch`) can apply them
+    /// atomically. This prevents partial flushes from leaving the backend in
+    /// an inconsistent state on crash.
+    ///
+    /// # Invariants
+    ///
+    /// - After a successful checkpoint, all dirty entries are persisted to the
+    ///   backend and the memtable's dirty set is empty.
+    /// - Timer state is included in the same batch when dirty.
+    /// - The backend's `checkpoint()` is called after the batch write to ensure
+    ///   durability (no-op for SlateDB which is WAL-durable by default).
     pub async fn checkpoint(&mut self) -> anyhow::Result<()> {
         let start = std::time::Instant::now();
         let dirty = self.memtable.flush();
@@ -169,22 +182,32 @@ impl StateContext {
         #[allow(clippy::cast_precision_loss)]
         metrics::gauge!("state_checkpoint_dirty_keys").set(dirty_count as f64);
 
+        // Collect all dirty entries into batch operations.
+        let mut ops: Vec<BatchOp> = Vec::with_capacity(dirty_count + 1);
         for (key, value) in dirty {
             match value {
-                Some(v) => self.backend.put(&key, &v).await?,
-                None => self.backend.delete(&key).await?,
+                Some(v) => ops.push(BatchOp::Put {
+                    key,
+                    value: v.to_vec(),
+                }),
+                None => ops.push(BatchOp::Delete { key }),
             }
         }
 
-        // Persist timer state if dirty.
+        // Include timer state in the same batch if dirty.
         if let Some(ref mut ts) = self.timer_service
             && ts.is_dirty()
         {
             let timer_bytes = ts.serialize()?;
-            self.backend
-                .put(super::timer_service::TIMER_STATE_KEY, &timer_bytes)
-                .await?;
+            ops.push(BatchOp::Put {
+                key: super::timer_service::TIMER_STATE_KEY.to_vec(),
+                value: timer_bytes,
+            });
             ts.clear_dirty();
+        }
+
+        if !ops.is_empty() {
+            self.backend.put_batch(ops).await?;
         }
 
         self.backend.checkpoint().await?;

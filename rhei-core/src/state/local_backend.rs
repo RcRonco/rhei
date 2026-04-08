@@ -6,7 +6,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use bytes::Bytes;
 
-use super::backend::StateBackend;
+use super::backend::{BatchOp, StateBackend};
 
 /// A local file-backed state backend.
 ///
@@ -91,6 +91,25 @@ impl StateBackend for LocalBackend {
             std::fs::create_dir_all(parent)?;
         }
         std::fs::write(&self.path, json)?;
+        Ok(())
+    }
+
+    async fn put_batch(&self, ops: Vec<BatchOp>) -> anyhow::Result<()> {
+        self.maybe_sleep().await;
+        let mut data = self
+            .data
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for op in ops {
+            match op {
+                BatchOp::Put { key, value } => {
+                    data.insert(key, value);
+                }
+                BatchOp::Delete { key } => {
+                    data.remove(&key);
+                }
+            }
+        }
         Ok(())
     }
 }

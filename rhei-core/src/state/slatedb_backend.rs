@@ -3,7 +3,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use bytes::Bytes;
 
-use super::backend::StateBackend;
+use super::backend::{BatchOp, StateBackend};
 use slatedb::object_store::path::Path;
 
 /// L3 backend wrapping a `SlateDB` instance on object storage.
@@ -58,6 +58,27 @@ impl StateBackend for SlateDbBackend {
         // SlateDB is durable by default — no explicit checkpoint needed.
         Ok(())
     }
+
+    /// Atomic batch write using SlateDB's native `WriteBatch`.
+    ///
+    /// All operations in the batch are applied atomically — either all
+    /// succeed or none are visible. This is critical for checkpoint
+    /// correctness: a partial flush must not leave the backend in an
+    /// inconsistent state.
+    async fn put_batch(&self, ops: Vec<BatchOp>) -> anyhow::Result<()> {
+        if ops.is_empty() {
+            return Ok(());
+        }
+        let mut batch = slatedb::WriteBatch::new();
+        for op in ops {
+            match op {
+                BatchOp::Put { key, value } => batch.put(&key, &value),
+                BatchOp::Delete { key } => batch.delete(&key),
+            }
+        }
+        self.db.write(batch).await?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -104,6 +125,48 @@ mod tests {
 
         let val = backend.get(b"key").await.unwrap();
         assert_eq!(val, None);
+
+        backend.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn put_batch_atomic_roundtrip() {
+        let store = Arc::new(InMemory::new());
+        let backend = open_test_db(store, "test_batch").await;
+
+        let ops = vec![
+            BatchOp::Put {
+                key: b"k1".to_vec(),
+                value: b"v1".to_vec(),
+            },
+            BatchOp::Put {
+                key: b"k2".to_vec(),
+                value: b"v2".to_vec(),
+            },
+            BatchOp::Delete {
+                key: b"k1".to_vec(),
+            },
+        ];
+
+        backend.put_batch(ops).await.unwrap();
+
+        // k1 was put then deleted in the same batch — should be gone.
+        assert_eq!(backend.get(b"k1").await.unwrap(), None);
+        // k2 should be present.
+        assert_eq!(
+            backend.get(b"k2").await.unwrap(),
+            Some(Bytes::from_static(b"v2"))
+        );
+
+        backend.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn put_batch_empty_is_noop() {
+        let store = Arc::new(InMemory::new());
+        let backend = open_test_db(store, "test_batch_empty").await;
+
+        backend.put_batch(vec![]).await.unwrap();
 
         backend.close().await.unwrap();
     }
