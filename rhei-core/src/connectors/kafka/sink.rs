@@ -3,7 +3,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use rdkafka::ClientConfig;
 use rdkafka::message::{Header, OwnedHeaders};
-use rdkafka::producer::{FutureProducer, FutureRecord};
+use rdkafka::producer::{FutureProducer, FutureRecord, Producer};
 
 use super::types::KafkaRecord;
 use crate::traits::Sink;
@@ -277,10 +277,14 @@ impl KafkaSinkBuilder {
 
     /// Build a [`TransactionalKafkaSink`].
     ///
+    /// This calls `init_transactions()` on the producer, which is required by
+    /// the Kafka transactional protocol before the first `begin_transaction()`.
+    /// The call may block while coordinating with the Kafka broker.
+    ///
     /// # Errors
     ///
-    /// Returns an error if `transactional_id` was not set or if the producer
-    /// fails to initialize transactions.
+    /// Returns an error if `transactional_id` was not set, if the producer
+    /// cannot be created, or if `init_transactions()` fails.
     pub fn build_transactional(self) -> anyhow::Result<TransactionalKafkaSink> {
         anyhow::ensure!(
             self.transactional_id.is_some(),
@@ -288,6 +292,10 @@ impl KafkaSinkBuilder {
         );
 
         let producer: FutureProducer = self.build_client_config().create()?;
+
+        // The Kafka transactional protocol requires init_transactions() to be
+        // called exactly once before the first begin_transaction().
+        producer.init_transactions(self.produce_timeout)?;
 
         Ok(TransactionalKafkaSink {
             producer,
