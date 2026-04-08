@@ -310,10 +310,10 @@ mod tests {
 
         // Two operators sharing the same L2 cache (namespaced via PrefixedBackend).
         let backend_a = shared.create_tiered_backend(l3.clone());
-        let op_a = PrefixedBackend::new("op_a", Box::new(backend_a));
+        let op_a = PrefixedBackend::new("op_a", Box::new(backend_a)).unwrap();
 
         let backend_b = shared.create_tiered_backend(l3.clone());
-        let op_b = PrefixedBackend::new("op_b", Box::new(backend_b));
+        let op_b = PrefixedBackend::new("op_b", Box::new(backend_b)).unwrap();
 
         // Write via op_a, read via op_a — should work.
         op_a.put(b"key", b"val_a").await.unwrap();
