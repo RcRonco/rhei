@@ -134,9 +134,24 @@ impl StateContext {
 
     /// Returns all keys in the memtable that start with the given prefix.
     ///
-    /// **Important:** This only returns keys currently in the L1 memtable —
-    /// it does NOT scan the backend (L2/L3). For TTL cleanup this is sufficient
-    /// because all active state passes through the memtable on read.
+    /// # L1-only limitation
+    ///
+    /// This **only** returns keys currently in the L1 memtable (dirty +
+    /// clean cache). It does **not** scan L2 (Foyer) or L3 (`SlateDB`).
+    ///
+    /// Keys that were persisted to L2/L3 but have since been evicted from
+    /// the L1 clean cache will not be returned. After a restart, the L1
+    /// memtable is empty, so this method returns nothing until keys are
+    /// re-read from the backend or written by the operator.
+    ///
+    /// This is acceptable for:
+    /// - **TTL cleanup** — active state passes through the memtable on read,
+    ///   so recently-accessed keys are always present.
+    /// - **Window state enumeration** — window operators keep all active
+    ///   keys in the memtable during processing.
+    ///
+    /// Callers that need a complete key listing across all tiers should
+    /// implement a backend-level scan (e.g. `SlateDB` range scan).
     pub fn keys_with_prefix(&self, prefix: &[u8]) -> Vec<Vec<u8>> {
         self.memtable.keys_with_prefix(prefix)
     }
