@@ -826,7 +826,7 @@ fn bridge_sinks(
 
     for &sink_id in &graph.sink_ids {
         let sink = extract_sink(&mut graph.nodes[sink_id.0]);
-        let (tx, rx) = flume::bounded::<AnyItem>(16);
+        let (tx, rx) = flume::bounded::<AnyItem>(crate::bridge::DEFAULT_CHANNEL_SIZE);
         sink_senders.insert(sink_id, tx);
         sink_handles.push(tokio::spawn(async move {
             let mut sink = sink;

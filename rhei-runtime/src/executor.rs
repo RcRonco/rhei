@@ -193,7 +193,7 @@ impl DataflowExecutor {
         let mut source_rx: HashMap<NodeId, flume::Receiver<crate::bridge::SourceBatch>> =
             HashMap::new();
         for (node_id, source) in data.sources.drain() {
-            let (tx, rx) = flume::bounded(16);
+            let (tx, rx) = flume::bounded(crate::bridge::DEFAULT_CHANNEL_SIZE);
             let offsets = data
                 .source_offsets
                 .remove(&node_id)

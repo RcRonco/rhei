@@ -8,6 +8,17 @@ use crate::any_item::AnyItem;
 use crate::erased::ErasedSource;
 use crate::shutdown::ShutdownHandle;
 
+/// Default bounded channel capacity for source and sink bridges.
+///
+/// This controls backpressure between async source/sink tasks and the
+/// synchronous Timely worker thread. A higher value increases throughput
+/// at the cost of memory and latency; a lower value provides tighter
+/// backpressure but may cause the source to stall more frequently.
+///
+/// Used by [`source_bridge`], [`sink_bridge`], and [`local_source_bridge`].
+/// The executor and task_manager also use this for their internal channels.
+pub const DEFAULT_CHANNEL_SIZE: usize = 16;
+
 /// Bridges an async `Source` into a `flume::Receiver` for use in Timely.
 ///
 /// Spawns a Tokio task that calls `source.next_batch().await` in a loop,
@@ -20,7 +31,7 @@ pub fn source_bridge<S>(
 where
     S: Source + 'static,
 {
-    let (tx, rx) = flume::bounded(16);
+    let (tx, rx) = flume::bounded(DEFAULT_CHANNEL_SIZE);
     rt.spawn(async move {
         while let Some(batch) = source.next_batch().await {
             if tx.send_async(batch).await.is_err() {
@@ -43,7 +54,7 @@ pub fn sink_bridge<K>(mut sink: K, rt: &tokio::runtime::Handle) -> flume::Sender
 where
     K: Sink + 'static,
 {
-    let (tx, rx) = flume::bounded::<K::Input>(16);
+    let (tx, rx) = flume::bounded::<K::Input>(DEFAULT_CHANNEL_SIZE);
     rt.spawn(async move {
         while let Ok(item) = rx.recv_async().await {
             if let Err(e) = sink.write(item).await {
