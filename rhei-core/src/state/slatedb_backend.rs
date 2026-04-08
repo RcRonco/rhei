@@ -19,19 +19,11 @@ pub use slatedb::config::Settings as SlateDbSettings;
 /// - SST block size
 ///
 /// Use `Default::default()` for `SlateDB`'s built-in defaults.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct SlateDbConfig {
     /// The underlying `SlateDB` settings. All fields are public via the
     /// re-exported [`SlateDbSettings`] type.
     pub settings: SlateDbSettings,
-}
-
-impl Default for SlateDbConfig {
-    fn default() -> Self {
-        Self {
-            settings: SlateDbSettings::default(),
-        }
-    }
 }
 
 /// L3 backend wrapping a `SlateDB` instance on object storage.
