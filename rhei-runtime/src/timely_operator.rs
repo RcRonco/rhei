@@ -164,10 +164,11 @@ impl TimelyErasedOperator {
 
     /// Checkpoint state when frontier advances past last checkpoint epoch.
     ///
-    /// Returns `Ok(Some(epoch))` if a checkpoint was performed,
-    /// `Ok(None)` if no checkpoint was needed, or `Err` if the checkpoint
-    /// failed. On error, the checkpoint epoch is NOT advanced so it will
-    /// be retried on the next frontier change.
+    /// Returns `Ok(Some(epoch))` if a checkpoint was performed at a specific
+    /// epoch, `Ok(None)` if no checkpoint was needed **or** if the frontier
+    /// is empty (computation complete — final flush, no meaningful epoch),
+    /// or `Err` if the checkpoint failed. On error, the checkpoint epoch is
+    /// NOT advanced so it will be retried on the next frontier change.
     pub fn maybe_checkpoint(
         &mut self,
         frontier: &[u64],
@@ -186,7 +187,7 @@ impl TimelyErasedOperator {
             metrics::gauge!("executor_checkpoint_duration_seconds")
                 .set(ckpt_start.elapsed().as_secs_f64());
             self.last_checkpoint_epoch = min_frontier;
-            Ok(Some(min_frontier.unwrap_or(0)))
+            Ok(min_frontier)
         } else {
             Ok(None)
         }
