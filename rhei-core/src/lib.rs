@@ -14,6 +14,8 @@
 
 /// Checkpoint manifest for recording pipeline checkpoint metadata.
 pub mod checkpoint;
+/// TOML-based pipeline configuration with environment variable overrides.
+pub mod config;
 /// Built-in source and sink connectors.
 pub mod connectors;
 /// Dead-letter queue types.

@@ -20,6 +20,7 @@ tracing.workspace = true
 metrics.workspace = true
 moka.workspace = true
 hex = "0.4"
+toml.workspace = true
 rdkafka = { workspace = true, optional = true }
 
 [features]

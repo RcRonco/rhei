@@ -143,6 +143,40 @@ pub struct PipelineControllerBuilder {
 }
 
 impl PipelineControllerBuilder {
+    /// Apply settings from a [`PipelineConfig`](rhei_core::config::PipelineConfig).
+    ///
+    /// Values from the config are applied as defaults — any settings
+    /// already set via builder methods take precedence. Call this early
+    /// in the builder chain to allow subsequent method calls to override.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let config = PipelineConfig::load("pipeline.toml")?.apply_env();
+    /// let executor = Executor::builder()
+    ///     .apply_config(&config)
+    ///     .workers(8)  // overrides config value
+    ///     .build()?;
+    /// ```
+    pub fn apply_config(mut self, config: &rhei_core::config::PipelineConfig) -> Self {
+        self.checkpoint_dir = std::path::PathBuf::from(&config.pipeline.checkpoint_dir);
+        self.workers = config.pipeline.workers;
+        self.checkpoint_interval = config.pipeline.checkpoint_interval;
+        if let Some(ref name) = config.pipeline.name {
+            self.pipeline_name = Some(name.clone());
+        }
+        if let Some(addr) = config.metrics_addr() {
+            self.metrics_addr = Some(addr);
+        }
+        if let Some(pid) = config.cluster.process_id {
+            self.process_id = Some(pid);
+        }
+        if let Some(ref peers) = config.cluster.peers {
+            self.peers = Some(peers.clone());
+        }
+        self
+    }
+
     /// Set the checkpoint directory.
     pub fn checkpoint_dir(mut self, dir: impl Into<std::path::PathBuf>) -> Self {
         self.checkpoint_dir = dir.into();
