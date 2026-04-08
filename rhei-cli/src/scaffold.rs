@@ -113,14 +113,15 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-rhei = {{ version = "0.1", features = [] }}
+rhei-core = {{ version = "0.1", features = [] }}
+rhei-runtime = "0.1"
 anyhow = "1"
 async-trait = "0.1"
 serde = {{ version = "1", features = ["derive"] }}
 tokio = {{ version = "1", features = ["full"] }}
 
 # Uncomment for Kafka connectors:
-# [dependencies.rhei]
+# [dependencies.rhei-core]
 # version = "0.1"
 # features = ["kafka"]
 "#
@@ -144,15 +145,18 @@ log_level = "info"
     )
 }
 
-const MAIN_RS: &str = r#"use rhei::{PrintSink, VecSource};
+const MAIN_RS: &str = r#"use rhei_core::connectors::print_sink::PrintSink;
+use rhei_core::connectors::vec_source::VecSource;
+use rhei_runtime::dataflow::DataflowGraph;
+use rhei_runtime::Executor;
 
 /// A minimal Rhei streaming pipeline.
 ///
 /// This example reads strings from an in-memory source, transforms them,
 /// and prints the results. Replace `VecSource` with `KafkaSource` for
 /// production use.
-#[rhei::pipeline]
-fn main(graph: &DataflowGraph) {
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
     let events = vec![
         "sensor-1:23.5".to_string(),
         "sensor-2:18.0".to_string(),
@@ -160,6 +164,7 @@ fn main(graph: &DataflowGraph) {
         "sensor-2:17.8".to_string(),
     ];
 
+    let graph = DataflowGraph::new();
     graph
         .source(VecSource::new(events))
         // Parse each line into a structured format
@@ -170,6 +175,13 @@ fn main(graph: &DataflowGraph) {
             format!("[{sensor}] reading = {value}")
         })
         .sink(PrintSink::<String>::new());
+
+    let executor = Executor::builder()
+        .checkpoint_dir("./checkpoints")
+        .build()?;
+
+    executor.run(graph).await?;
+    Ok(())
 }
 "#;
 
