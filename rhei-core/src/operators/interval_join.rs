@@ -212,7 +212,7 @@ where
 /// Helper: add a signed offset to a u64 timestamp, clamping to 0.
 fn ts_add(ts: u64, offset: i64) -> u64 {
     if offset >= 0 {
-        ts.saturating_add(offset as u64)
+        ts.saturating_add(offset.unsigned_abs())
     } else {
         ts.saturating_sub(offset.unsigned_abs())
     }

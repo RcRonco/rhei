@@ -202,12 +202,11 @@ where
                 let mut state = KeyedState::<String, Stamped<B>>::new(ctx, "broadcast");
                 let entry = state.get(&key).await.unwrap_or(None);
 
-                match entry {
-                    Some(stamped) => Ok(vec![(self.join_fn)(s, &stamped.value)]),
-                    None => {
-                        metrics::counter!("broadcast_join_misses_total").increment(1);
-                        Ok(vec![])
-                    }
+                if let Some(stamped) = entry {
+                    Ok(vec![(self.join_fn)(s, &stamped.value)])
+                } else {
+                    metrics::counter!("broadcast_join_misses_total").increment(1);
+                    Ok(vec![])
                 }
             }
         }

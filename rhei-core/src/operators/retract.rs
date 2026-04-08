@@ -214,7 +214,7 @@ mod tests {
         assert_eq!(original, deserialized);
     }
 
-    /// Minimal pass-through operator for testing RetractOp.
+    /// Minimal pass-through operator for testing `RetractOp`.
     struct DoubleOp;
 
     #[async_trait]
@@ -270,24 +270,25 @@ mod tests {
         assert_eq!(r[2], Retract::Insert(12));
     }
 
+    /// Operator that always produces empty output.
+    struct EmptyOp;
+
+    #[async_trait]
+    impl StreamFunction for EmptyOp {
+        type Input = i32;
+        type Output = i32;
+        async fn process(
+            &mut self,
+            _input: i32,
+            _ctx: &mut StateContext,
+        ) -> anyhow::Result<Vec<i32>> {
+            Ok(vec![])
+        }
+    }
+
     #[tokio::test]
     async fn retract_op_empty_output() {
         let mut ctx = test_ctx("retract_empty");
-
-        struct EmptyOp;
-        #[async_trait]
-        impl StreamFunction for EmptyOp {
-            type Input = i32;
-            type Output = i32;
-            async fn process(
-                &mut self,
-                _input: i32,
-                _ctx: &mut StateContext,
-            ) -> anyhow::Result<Vec<i32>> {
-                Ok(vec![])
-            }
-        }
-
         let mut op = RetractOp::new(EmptyOp);
         let r = op.process(42, &mut ctx).await.unwrap();
         assert!(r.is_empty());
