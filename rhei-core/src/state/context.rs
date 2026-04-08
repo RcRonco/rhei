@@ -162,7 +162,7 @@ impl StateContext {
     /// Flush dirty entries from memtable to backend, then trigger backend checkpoint.
     ///
     /// Dirty keys are collected into a single `put_batch` call so that backends
-    /// with native atomic batches (e.g. SlateDB `WriteBatch`) can apply them
+    /// with native atomic batches (e.g. `SlateDB` `WriteBatch`) can apply them
     /// atomically. This prevents partial flushes from leaving the backend in
     /// an inconsistent state on crash.
     ///
@@ -172,7 +172,7 @@ impl StateContext {
     ///   backend and the memtable's dirty set is empty.
     /// - Timer state is included in the same batch when dirty.
     /// - The backend's `checkpoint()` is called after the batch write to ensure
-    ///   durability (no-op for SlateDB which is WAL-durable by default).
+    ///   durability (no-op for `SlateDB` which is WAL-durable by default).
     pub async fn checkpoint(&mut self) -> anyhow::Result<()> {
         let start = std::time::Instant::now();
         let dirty = self.memtable.flush();
