@@ -19,6 +19,7 @@ bytes.workspace = true
 tracing.workspace = true
 metrics.workspace = true
 moka.workspace = true
+hex = "0.4"
 rdkafka = { workspace = true, optional = true }
 
 [features]

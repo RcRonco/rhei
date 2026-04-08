@@ -30,7 +30,7 @@ pub use aggregator::{Aggregator, Avg, Count, Sum};
 pub use count_window::{CountWindow, CountWindowOutput};
 pub use enrich::EnrichOp;
 pub use filter::FilterOp;
-pub use keyed_state::KeyedState;
+pub use keyed_state::{BincodeEncoder, JsonEncoder, KeyEncoder, KeyedState};
 pub use map::{FlatMapOp, MapOp};
 pub use reduce::ReduceOp;
 pub use rolling_aggregate::RollingAggregateOp;
