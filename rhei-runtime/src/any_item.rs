@@ -90,15 +90,17 @@ where
 {
     let type_hash = seahash::hash(std::any::type_name::<T>().as_bytes());
     let needs_insert = {
-        let reg = TYPE_REGISTRY
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let reg = TYPE_REGISTRY.read().unwrap_or_else(|e| {
+            tracing::warn!("TYPE_REGISTRY read lock poisoned, recovering: {e}");
+            e.into_inner()
+        });
         !reg.contains_key(&type_hash)
     };
     if needs_insert {
-        let mut reg = TYPE_REGISTRY
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut reg = TYPE_REGISTRY.write().unwrap_or_else(|e| {
+            tracing::warn!("TYPE_REGISTRY write lock poisoned, recovering: {e}");
+            e.into_inner()
+        });
         reg.entry(type_hash).or_insert_with(|| {
             Box::new(|bytes: &[u8]| {
                 let value: T = bincode::deserialize(bytes)?;
@@ -215,9 +217,10 @@ impl serde::Serialize for AnyItem {
 impl<'de> serde::Deserialize<'de> for AnyItem {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let (type_hash, bytes): (u64, Vec<u8>) = serde::Deserialize::deserialize(deserializer)?;
-        let reg = TYPE_REGISTRY
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let reg = TYPE_REGISTRY.read().unwrap_or_else(|e| {
+            tracing::warn!("TYPE_REGISTRY read lock poisoned during deserialize, recovering: {e}");
+            e.into_inner()
+        });
         let deser_fn = reg.get(&type_hash).ok_or_else(|| {
             serde::de::Error::custom(format!("unknown AnyItem type hash: {type_hash}"))
         })?;

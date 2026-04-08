@@ -226,7 +226,10 @@ impl DataflowExecutor {
             if let Some(ref barrier) = self.shutdown_barrier
                 && let Some(rx) = barrier
                     .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .unwrap_or_else(|e| {
+                        tracing::warn!("shutdown barrier mutex poisoned, recovering: {e}");
+                        e.into_inner()
+                    })
                     .take()
             {
                 tracing::debug!("worker {} waiting on shutdown barrier", self.worker_index);
