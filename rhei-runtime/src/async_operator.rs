@@ -158,7 +158,19 @@ impl<F: StreamFunction + 'static> AsyncOperator<F> {
                 Poll::Pending => {
                     // Cold path: the future needs async I/O (state miss).
                     // Drive it to completion via the Tokio runtime.
+                    //
+                    // block_in_place panics on a current_thread runtime.
+                    // The runtime must be multi-threaded for the cold path
+                    // to work. Assert this in debug builds to catch
+                    // misconfiguration early.
                     if let Some(ref rt) = self.rt {
+                        debug_assert!(
+                            rt.runtime_flavor() != tokio::runtime::RuntimeFlavor::CurrentThread,
+                            "block_in_place requires a multi-threaded Tokio \
+                             runtime, but a current_thread runtime was provided. \
+                             Ensure the executor is configured with a \
+                             multi-threaded runtime for async state backends."
+                        );
                         match tokio::task::block_in_place(|| rt.block_on(fut)) {
                             Ok(results) => output.extend(results),
                             Err(e) => errors.push(e),

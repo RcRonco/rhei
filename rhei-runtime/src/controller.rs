@@ -406,7 +406,10 @@ impl PipelineController {
     pub fn topology(&self) -> Option<ApiTopology> {
         self.topology
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .unwrap_or_else(|e| {
+                tracing::warn!("mutex poisoned in topology lock, recovering inner data");
+                e.into_inner()
+            })
             .clone()
     }
 
@@ -612,10 +615,10 @@ impl PipelineController {
         let ctx = {
             #[cfg(feature = "remote-state")]
             {
-                let fork_l3 = self
-                    .fork_remote_l3
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let fork_l3 = self.fork_remote_l3.lock().unwrap_or_else(|e| {
+                    tracing::warn!("mutex poisoned in fork_remote_l3 lock, recovering inner data");
+                    e.into_inner()
+                });
                 if let Some(ref remote_l3) = *fork_l3 {
                     // Fork mode: PrefixedBackend wraps ForkBackend(local, remote).
                     let local_path = self
@@ -688,10 +691,10 @@ async fn run_graph(
     let compiled = compile_graph(graph.into_nodes())?;
 
     // Store topology for the HTTP API before nodes are consumed.
-    *controller
-        .topology
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(compiled.topology.clone());
+    *controller.topology.lock().unwrap_or_else(|e| {
+        tracing::warn!("mutex poisoned in topology lock (run_graph), recovering inner data");
+        e.into_inner()
+    }) = Some(compiled.topology.clone());
 
     let all_operator_names = &compiled.operator_names;
 
@@ -738,10 +741,12 @@ async fn run_graph(
             // Open remote SlateDB read-only for ForkBackend.
             let remote_l3 =
                 Arc::new(SlateDbBackend::open(remote_cfg.prefix.as_str(), object_store).await?);
-            *controller
-                .fork_remote_l3
-                .lock()
-                .unwrap_or_else(|e| e.into_inner()) = Some(remote_l3);
+            *controller.fork_remote_l3.lock().unwrap_or_else(|e| {
+                tracing::warn!(
+                    "mutex poisoned in fork_remote_l3 lock (run_graph), recovering inner data"
+                );
+                e.into_inner()
+            }) = Some(remote_l3);
 
             Some((manifest.checkpoint_id, offsets))
         } else {
