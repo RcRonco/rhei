@@ -43,6 +43,15 @@ struct WindowState<Acc> {
     version: u64,
 }
 
+/// Tracks active window start timestamps for a given key.
+///
+/// Stored in state so `on_watermark` can iterate known windows instead of
+/// scanning a heuristic range.
+#[derive(Serialize, Deserialize, Default)]
+struct ActiveWindows {
+    starts: Vec<u64>,
+}
+
 /// A tumbling window operator that re-emits updated results on late arrivals.
 ///
 /// # Type Parameters
@@ -271,6 +280,26 @@ where
             state.put(&state_key, &ws)?;
         }
 
+        // Track this window start in the per-key active windows list.
+        {
+            let mut active: ActiveWindows = {
+                let mut state =
+                    KeyedState::<String, ActiveWindows>::new(ctx, "lew_active");
+                state
+                    .get(&key)
+                    .await
+                    .unwrap_or(None)
+                    .unwrap_or_default()
+            };
+            if !active.starts.contains(&window_start) {
+                active.starts.push(window_start);
+                active.starts.sort_unstable();
+                let mut state =
+                    KeyedState::<String, ActiveWindows>::new(ctx, "lew_active");
+                state.put(&key, &active)?;
+            }
+        }
+
         Ok(outputs)
     }
 
@@ -283,42 +312,20 @@ where
         let mut outputs = Vec::new();
         let mut keys_to_remove = Vec::new();
 
-        // We need to track which window each key is in. We iterate active keys
-        // and check their windows. We use a simple scan approach: for each key,
-        // check if there are windows ready to close.
-        //
-        // Note: In this simplified implementation, we track one active window per
-        // key. A production implementation would use a window index.
         for key in &self.active_keys {
-            // Look for unclosed windows for this key by checking the current
-            // window based on the watermark.
-            // We need to find windows that should close. Since we don't track
-            // all window starts per key, we scan a reasonable range.
-            // For simplicity, check windows that could close at this watermark.
+            // Load the tracked active windows for this key from state.
+            let mut active: ActiveWindows = {
+                let mut state =
+                    KeyedState::<String, ActiveWindows>::new(ctx, "lew_active");
+                state.get(key).await.unwrap_or(None).unwrap_or_default()
+            };
 
-            // Find all windows ending at or before the watermark.
-            // We check the window that ends at the latest slide before watermark.
-            let mut any_remaining = false;
+            let mut still_active = Vec::new();
 
-            // Check windows ending in the range [0, watermark]
-            // We only need to check windows that could have data.
-            // Use a scan approach: check windows starting from 0 up to watermark.
-            // In practice, we'd have an index. Here we check the window
-            // corresponding to watermark - window_size.
-            let candidate_start = watermark.saturating_sub(self.window_size);
-            // Check a range of recent windows (current and a few past).
-            let num_check = (self.late_deadline / self.window_size)
-                .saturating_add(2)
-                .min(20);
-            for i in 0..num_check {
-                let ws_start = if candidate_start >= i * self.window_size {
-                    candidate_start - i * self.window_size
-                } else {
-                    break;
-                };
-                // Align to window boundary.
-                let aligned_start = ws_start - (ws_start % self.window_size);
-                let state_key = format!("{key}:{aligned_start}");
+            for &win_start in &active.starts {
+                let win_end = win_start + self.window_size;
+                let state_key = format!("{key}:{win_start}");
+
                 let ws_opt: Option<WindowState<A::Accumulator>> = {
                     let mut state =
                         KeyedState::<String, WindowState<A::Accumulator>>::new(ctx, "lew");
@@ -326,13 +333,12 @@ where
                 };
 
                 if let Some(mut ws) = ws_opt {
-                    let win_end = aligned_start + self.window_size;
                     if win_end <= watermark && !ws.closed {
                         // Close and emit.
                         ws.closed = true;
                         outputs.push(WindowOutput {
                             key: key.clone(),
-                            window_start: aligned_start,
+                            window_start: win_start,
                             window_end: win_end,
                             value: self.aggregator.finish(&ws.accumulator),
                         });
@@ -347,13 +353,25 @@ where
                             KeyedState::<String, WindowState<A::Accumulator>>::new(ctx, "lew");
                         state.delete(&state_key)?;
                     } else {
-                        any_remaining = true;
+                        still_active.push(win_start);
                     }
                 }
+                // If ws_opt is None, the window state was already cleaned up;
+                // do not keep it in still_active.
             }
 
-            if !any_remaining {
+            active.starts = still_active;
+
+            if active.starts.is_empty() {
+                // No windows remain for this key — clean up.
+                let mut state =
+                    KeyedState::<String, ActiveWindows>::new(ctx, "lew_active");
+                state.delete(key)?;
                 keys_to_remove.push(key.clone());
+            } else {
+                let mut state =
+                    KeyedState::<String, ActiveWindows>::new(ctx, "lew_active");
+                state.put(key, &active)?;
             }
         }
 
