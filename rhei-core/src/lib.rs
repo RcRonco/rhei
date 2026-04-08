@@ -30,6 +30,8 @@ pub mod graph;
 pub mod operators;
 /// Tiered state management (memtable, local, Foyer, `SlateDB`).
 pub mod state;
+/// Test harness: in-memory sources, collecting sinks, and assertion helpers.
+pub mod testing;
 /// Time providers for processing-time windowing and deterministic replay.
 pub mod time;
 /// Core stream processing traits ([`StreamFunction`](traits::StreamFunction),
