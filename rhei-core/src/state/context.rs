@@ -135,6 +135,10 @@ impl StateContext {
                 // Check TTL — lazily expire on read.
                 if self.is_expired(key) {
                     metrics::counter!("state_ttl_expired_total").increment(1);
+                    // Mark as deleted (tombstone) in the memtable so the next
+                    // checkpoint flushes a backend delete. This prevents the
+                    // expired key from being re-fetched from the backend after
+                    // the tombstone is evicted from L1.
                     self.memtable.delete(key.to_vec());
                     self.write_times.remove(key);
                     Ok(None)
@@ -156,11 +160,23 @@ impl StateContext {
                 } else {
                     metrics::counter!("state_l1_misses_total").increment(1);
                 }
-                // Cache miss — fetch from backend
+                // Cache miss — fetch from backend.
+                //
+                // Known limitation: keys loaded from the backend after a
+                // restart (or L1 eviction + checkpoint) receive a fresh
+                // `Instant::now()` write timestamp, effectively resetting
+                // their TTL. This is unavoidable because `Instant` is not
+                // persisted. The checkpoint sweep (see `checkpoint()`)
+                // mitigates this by deleting expired keys from the backend
+                // before they can be re-fetched. After recovery, all
+                // backend keys are treated as freshly written.
                 let result = self.backend.get(key).await?;
                 if let Some(ref v) = result {
                     self.memtable.merge(key.to_vec(), v.clone());
                     // Track write time for backend-loaded keys so TTL applies.
+                    // Uses `or_insert_with` to avoid overwriting an existing
+                    // timestamp if the key was already tracked (should not
+                    // happen on a true L1 miss, but is defensive).
                     if self.ttl.is_some() {
                         self.write_times
                             .entry(key.to_vec())
@@ -258,6 +274,31 @@ impl StateContext {
     ///   durability (no-op for `SlateDB` which is WAL-durable by default).
     pub async fn checkpoint(&mut self) -> anyhow::Result<()> {
         let start = std::time::Instant::now();
+
+        // Sweep expired keys before flushing. This converts any remaining
+        // expired entries into memtable deletes (tombstones) so that the
+        // subsequent flush will propagate backend deletes, preventing
+        // unbounded growth of expired-but-never-read keys in the backend.
+        if let Some(ttl) = self.ttl {
+            let expired_keys: Vec<Vec<u8>> = self
+                .write_times
+                .iter()
+                .filter(|(_, write_time)| write_time.elapsed() > ttl)
+                .map(|(key, _)| key.clone())
+                .collect();
+
+            let expired_count = expired_keys.len();
+            if expired_count > 0 {
+                tracing::debug!(expired_count, "sweeping expired TTL keys at checkpoint");
+                metrics::counter!("state_ttl_swept_total").increment(expired_count as u64);
+            }
+
+            for key in expired_keys {
+                self.memtable.delete(key.clone());
+                self.write_times.remove(&key);
+            }
+        }
+
         let dirty = self.memtable.flush();
         let dirty_count = dirty.len();
 
@@ -439,6 +480,63 @@ mod tests {
         // Still readable after any delay (no TTL).
         let val = ctx.get_raw(b"key").await.unwrap();
         assert_eq!(val.as_deref(), Some(b"value".as_slice()));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn ttl_checkpoint_sweeps_expired_keys() {
+        let path = temp_path("ttl_sweep");
+        let _ = std::fs::remove_file(&path);
+
+        let backend = LocalBackend::new(path.clone(), None).unwrap();
+        let mut ctx = StateContext::new(Box::new(backend)).with_ttl(Duration::from_millis(50));
+
+        ctx.put_raw(b"key1", b"val1");
+        ctx.put_raw(b"key2", b"val2");
+
+        // Wait for TTL to expire.
+        tokio::time::sleep(Duration::from_millis(60)).await;
+
+        // Checkpoint should sweep expired keys — they become backend deletes.
+        ctx.checkpoint().await.unwrap();
+
+        // After sweep + checkpoint, expired keys should not be in the backend.
+        // Re-open with a fresh context to verify.
+        let backend = LocalBackend::new(path.clone(), None).unwrap();
+        let mut ctx = StateContext::new(Box::new(backend));
+        assert_eq!(ctx.get_raw(b"key1").await.unwrap(), None);
+        assert_eq!(ctx.get_raw(b"key2").await.unwrap(), None);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn ttl_checkpoint_preserves_live_keys() {
+        let path = temp_path("ttl_preserve");
+        let _ = std::fs::remove_file(&path);
+
+        let backend = LocalBackend::new(path.clone(), None).unwrap();
+        let mut ctx =
+            StateContext::new(Box::new(backend)).with_ttl(Duration::from_millis(500));
+
+        ctx.put_raw(b"live", b"value");
+        ctx.put_raw(b"also_live", b"value2");
+
+        // Checkpoint before TTL expires.
+        ctx.checkpoint().await.unwrap();
+
+        // Re-open and verify keys are persisted.
+        let backend = LocalBackend::new(path.clone(), None).unwrap();
+        let mut ctx = StateContext::new(Box::new(backend));
+        assert_eq!(
+            ctx.get_raw(b"live").await.unwrap().as_deref(),
+            Some(b"value".as_slice())
+        );
+        assert_eq!(
+            ctx.get_raw(b"also_live").await.unwrap().as_deref(),
+            Some(b"value2".as_slice())
+        );
 
         let _ = std::fs::remove_file(&path);
     }
