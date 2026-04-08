@@ -357,18 +357,12 @@ addr = "0.0.0.0:9090"
     }
 
     /// Build a mock env-lookup function from key-value pairs.
-    fn mock_env(
-        vars: &[(&str, &str)],
-    ) -> impl Fn(&str) -> Result<String, std::env::VarError> {
+    fn mock_env(vars: &[(&str, &str)]) -> impl Fn(&str) -> Result<String, std::env::VarError> {
         let map: std::collections::HashMap<String, String> = vars
             .iter()
             .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
             .collect();
-        move |key: &str| {
-            map.get(key)
-                .cloned()
-                .ok_or(std::env::VarError::NotPresent)
-        }
+        move |key: &str| map.get(key).cloned().ok_or(std::env::VarError::NotPresent)
     }
 
     #[test]
