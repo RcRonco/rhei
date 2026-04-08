@@ -8,11 +8,12 @@
 //! - **Aggregation:** [`Aggregator`] trait with built-in [`Count`], [`Sum`], [`Avg`]
 //! - **Rolling aggregation:** [`ReduceOp`], [`RollingAggregateOp`] — per-key stateful emit-on-every-input
 //! - **Windowing:** [`TumblingWindow`], [`SlidingWindow`], [`SessionWindow`], [`CountWindow`]
-//! - **Joins:** [`TemporalJoin`] with [`JoinSide`]
+//! - **Joins:** [`TemporalJoin`] with [`JoinSide`], [`BroadcastJoin`] with [`BroadcastSide`]
 //! - **Side outputs:** [`WithSide`] — split operator output into main and side channels
 //! - **Async enrichment:** [`EnrichOp`] — bounded-concurrency async lookup
 
 pub mod aggregator;
+pub mod broadcast_join;
 pub mod count_window;
 pub mod enrich;
 pub mod filter;
@@ -27,6 +28,7 @@ pub mod tumbling_window;
 pub mod with_side;
 
 pub use aggregator::{Aggregator, Avg, Count, Sum};
+pub use broadcast_join::{BroadcastJoin, BroadcastSide};
 pub use count_window::{CountWindow, CountWindowOutput};
 pub use enrich::EnrichOp;
 pub use filter::FilterOp;
