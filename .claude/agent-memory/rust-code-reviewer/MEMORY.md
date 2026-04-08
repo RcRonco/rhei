@@ -1,2 +1,0 @@
-- [Ron - project owner](user_ron.md) -- Senior engineer building Rhei stream processing framework
-- [GPG signing fallback](feedback_gpg_signing.md) -- 1Password signing fails in worktrees, use -c commit.gpgsign=false
