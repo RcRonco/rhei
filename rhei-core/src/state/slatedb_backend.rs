@@ -6,6 +6,34 @@ use bytes::Bytes;
 use super::backend::{BatchOp, StateBackend};
 use slatedb::object_store::path::Path;
 
+/// Re-export `SlateDB` settings for direct configuration.
+pub use slatedb::config::Settings as SlateDbSettings;
+
+/// Configuration for the `SlateDB` L3 backend.
+///
+/// Wraps [`slatedb::config::Settings`] to expose tunables such as:
+/// - Write buffer size
+/// - Compaction options
+/// - Garbage collection intervals
+/// - Compression codec
+/// - SST block size
+///
+/// Use `Default::default()` for `SlateDB`'s built-in defaults.
+#[derive(Debug, Clone)]
+pub struct SlateDbConfig {
+    /// The underlying `SlateDB` settings. All fields are public via the
+    /// re-exported [`SlateDbSettings`] type.
+    pub settings: SlateDbSettings,
+}
+
+impl Default for SlateDbConfig {
+    fn default() -> Self {
+        Self {
+            settings: SlateDbSettings::default(),
+        }
+    }
+}
+
 /// L3 backend wrapping a `SlateDB` instance on object storage.
 ///
 /// `SlateDB` is durable by default (writes go to a WAL backed by the object store),
@@ -21,12 +49,29 @@ impl std::fmt::Debug for SlateDbBackend {
 }
 
 impl SlateDbBackend {
-    /// Open (or create) a `SlateDB` database at the given object-store path.
+    /// Open (or create) a `SlateDB` database at the given object-store path
+    /// with default settings.
     pub async fn open(
         path: impl Into<Path>,
         object_store: Arc<dyn object_store::ObjectStore>,
     ) -> anyhow::Result<Self> {
         let db = slatedb::Db::open(path, object_store).await?;
+        Ok(Self { db })
+    }
+
+    /// Open (or create) a `SlateDB` database with custom configuration.
+    ///
+    /// Use this when you need to tune write buffer size, compaction, or
+    /// other `SlateDB` internals.
+    pub async fn open_with_config(
+        path: impl Into<Path>,
+        object_store: Arc<dyn object_store::ObjectStore>,
+        config: SlateDbConfig,
+    ) -> anyhow::Result<Self> {
+        let db = slatedb::Db::builder(path, object_store)
+            .with_settings(config.settings)
+            .build()
+            .await?;
         Ok(Self { db })
     }
 
