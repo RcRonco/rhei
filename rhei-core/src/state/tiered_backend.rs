@@ -12,6 +12,8 @@ use super::slatedb_backend::SlateDbBackend;
 #[derive(Debug)]
 pub struct TieredBackendConfig {
     /// Directory for Foyer's on-disk cache files.
+    /// Default: `/tmp/rhei-foyer-{pid}` (PID-scoped to avoid collisions
+    /// between concurrent processes sharing the same host).
     pub foyer_dir: PathBuf,
     /// In-memory capacity for the Foyer cache (bytes). Default: 64 MiB.
     pub foyer_memory_capacity: usize,
@@ -22,7 +24,7 @@ pub struct TieredBackendConfig {
 impl Default for TieredBackendConfig {
     fn default() -> Self {
         Self {
-            foyer_dir: PathBuf::from("/tmp/rhei-foyer"),
+            foyer_dir: PathBuf::from(format!("/tmp/rhei-foyer-{}", std::process::id())),
             foyer_memory_capacity: 64 * 1024 * 1024,
             foyer_disk_capacity: 256 * 1024 * 1024,
         }
