@@ -19,6 +19,23 @@ use super::context::StateContext;
 /// Using raw bincode bytes instead of hex encoding halves the key size,
 /// reducing memtable memory usage and backend I/O. The keys are opaque
 /// byte slices to the storage layer, so binary content is safe.
+///
+/// # Breaking change: key encoding format
+///
+/// Prior versions encoded sub-keys as `"{prefix}:" ++ hex(bincode(K))`.
+/// The current encoding uses raw bincode bytes directly:
+/// `"{prefix}:" ++ bincode(K)`. This means **existing persisted state from
+/// the hex-encoding era is inaccessible** after upgrading -- reads for
+/// old keys will miss, and writes will create new keys under the binary
+/// encoding. There is no automatic migration.
+///
+/// **Migration options:**
+/// - **Reprocess from source:** If the stream can be replayed (e.g. Kafka
+///   with sufficient retention), drop the old state and reprocess.
+/// - **Offline migration script:** Read all keys with the old hex encoding,
+///   decode them, re-encode with raw bincode, and write them back.
+/// - **Dual-read fallback:** Not currently implemented. If needed, a
+///   wrapper could try the binary key first and fall back to hex on miss.
 pub struct MapState<'a, K, V> {
     ctx: &'a mut StateContext,
     /// Pre-computed prefix bytes: `b"{name}:"`.
