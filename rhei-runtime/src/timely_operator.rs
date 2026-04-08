@@ -84,7 +84,15 @@ impl<F: StreamFunction + 'static> TimelyAsyncOperator<F> {
     }
 
     /// Checkpoint state when frontier advances past last checkpoint epoch.
-    pub fn maybe_checkpoint(&mut self, frontier: &[u64], rt: &tokio::runtime::Handle) {
+    ///
+    /// Returns `Ok(())` on success or if no checkpoint was needed. Returns
+    /// `Err` if the checkpoint operation fails; the epoch is NOT advanced
+    /// on failure so the checkpoint will be retried.
+    pub fn maybe_checkpoint(
+        &mut self,
+        frontier: &[u64],
+        rt: &tokio::runtime::Handle,
+    ) -> anyhow::Result<()> {
         let min_frontier = frontier.iter().copied().min();
 
         let should_checkpoint = match (min_frontier, self.last_checkpoint_epoch) {
@@ -94,11 +102,10 @@ impl<F: StreamFunction + 'static> TimelyAsyncOperator<F> {
 
         if should_checkpoint && !self.inner.has_pending() {
             let ctx = self.inner.context_mut();
-            if let Err(e) = rt.block_on(ctx.checkpoint()) {
-                tracing::error!("checkpoint failed: {e}");
-            }
+            rt.block_on(ctx.checkpoint())?;
             self.last_checkpoint_epoch = min_frontier;
         }
+        Ok(())
     }
 
     /// Get mutable reference to the state context (for final checkpoint).
@@ -157,12 +164,15 @@ impl TimelyErasedOperator {
 
     /// Checkpoint state when frontier advances past last checkpoint epoch.
     ///
-    /// Returns `Some(epoch)` if a checkpoint was performed, `None` otherwise.
+    /// Returns `Ok(Some(epoch))` if a checkpoint was performed,
+    /// `Ok(None)` if no checkpoint was needed, or `Err` if the checkpoint
+    /// failed. On error, the checkpoint epoch is NOT advanced so it will
+    /// be retried on the next frontier change.
     pub fn maybe_checkpoint(
         &mut self,
         frontier: &[u64],
         rt: &tokio::runtime::Handle,
-    ) -> Option<u64> {
+    ) -> anyhow::Result<Option<u64>> {
         let min_frontier = frontier.iter().copied().min();
 
         let should_checkpoint = match (min_frontier, self.last_checkpoint_epoch) {
@@ -172,15 +182,13 @@ impl TimelyErasedOperator {
 
         if should_checkpoint {
             let ckpt_start = std::time::Instant::now();
-            if let Err(e) = rt.block_on(self.ctx.checkpoint()) {
-                tracing::error!("checkpoint failed: {e}");
-            }
+            rt.block_on(self.ctx.checkpoint())?;
             metrics::gauge!("executor_checkpoint_duration_seconds")
                 .set(ckpt_start.elapsed().as_secs_f64());
             self.last_checkpoint_epoch = min_frontier;
-            Some(min_frontier.unwrap_or(0))
+            Ok(Some(min_frontier.unwrap_or(0)))
         } else {
-            None
+            Ok(None)
         }
     }
 
@@ -202,20 +210,25 @@ impl TimelyErasedOperator {
 
     /// Call the operator's `open` lifecycle hook.
     /// Also restores any persisted timer state from the backend.
-    pub fn open(&mut self, rt: &tokio::runtime::Handle) {
-        if let Err(e) = rt.block_on(self.ctx.restore_timers()) {
-            tracing::error!("timer restore failed: {e}");
-        }
-        if let Err(e) = rt.block_on(self.op.open(&mut self.ctx)) {
-            tracing::error!("operator open failed: {e}");
-        }
+    ///
+    /// Returns an error if timer restoration or the operator's `open` hook
+    /// fails. Callers should log and handle the error appropriately — in
+    /// Timely closures, errors cannot propagate further but should be
+    /// counted via metrics.
+    pub fn open(&mut self, rt: &tokio::runtime::Handle) -> anyhow::Result<()> {
+        rt.block_on(self.ctx.restore_timers())
+            .map_err(|e| anyhow::anyhow!("timer restore failed: {e}"))?;
+        rt.block_on(self.op.open(&mut self.ctx))
+            .map_err(|e| anyhow::anyhow!("operator open failed: {e}"))?;
+        Ok(())
     }
 
     /// Call the operator's `close` lifecycle hook.
-    pub fn close(&mut self, rt: &tokio::runtime::Handle) {
-        if let Err(e) = rt.block_on(self.op.close()) {
-            tracing::error!("operator close failed: {e}");
-        }
+    ///
+    /// Returns an error if the operator's `close` hook fails.
+    pub fn close(&mut self, rt: &tokio::runtime::Handle) -> anyhow::Result<()> {
+        rt.block_on(self.op.close())
+            .map_err(|e| anyhow::anyhow!("operator close failed: {e}"))
     }
 
     /// Drain fired timers and call `on_timer` for each.
@@ -256,12 +269,11 @@ impl TimelyErasedOperator {
 
     /// Force a checkpoint (for final flush).
     #[allow(dead_code)]
-    pub fn checkpoint(&mut self, rt: &tokio::runtime::Handle) {
+    pub fn checkpoint(&mut self, rt: &tokio::runtime::Handle) -> anyhow::Result<()> {
         let ckpt_start = std::time::Instant::now();
-        if let Err(e) = rt.block_on(self.ctx.checkpoint()) {
-            tracing::error!("final checkpoint failed: {e}");
-        }
+        rt.block_on(self.ctx.checkpoint())?;
         metrics::gauge!("executor_checkpoint_duration_seconds")
             .set(ckpt_start.elapsed().as_secs_f64());
+        Ok(())
     }
 }

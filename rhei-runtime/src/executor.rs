@@ -538,7 +538,18 @@ impl DataflowExecutor {
             &format!("Op_{}", node_id.0),
             move |_init_cap, _info| {
                 let mut timely_op = TimelyErasedOperator::new(op, ctx);
-                timely_op.open(&oc.rt);
+                if let Err(e) = timely_op.open(&oc.rt) {
+                    tracing::error!(
+                        error = %e,
+                        operator = %op_name,
+                        "operator open failed"
+                    );
+                    metrics::counter!(
+                        "operator_lifecycle_errors_total",
+                        "phase" => "open"
+                    )
+                    .increment(1);
+                }
                 let mut last_watermark: u64 = 0;
                 let mut retained_cap: Option<Capability<u64>> = None;
                 let mut closed = false;
@@ -594,7 +605,18 @@ impl DataflowExecutor {
                         let _ = n.send(epoch);
                     }
                     if frontier.frontier().is_empty() && !closed {
-                        timely_op.close(&oc.rt);
+                        if let Err(e) = timely_op.close(&oc.rt) {
+                            tracing::error!(
+                                error = %e,
+                                operator = %op_name,
+                                "operator close failed"
+                            );
+                            metrics::counter!(
+                                "operator_lifecycle_errors_total",
+                                "phase" => "close"
+                            )
+                            .increment(1);
+                        }
                         closed = true;
                     }
                 }
@@ -747,7 +769,18 @@ fn try_checkpoint(
     worker_index: usize,
     local_first_worker: usize,
 ) -> Option<u64> {
-    let epoch = timely_op.maybe_checkpoint(frontier_vec, rt);
+    let epoch = match timely_op.maybe_checkpoint(frontier_vec, rt) {
+        Ok(epoch) => epoch,
+        Err(e) => {
+            tracing::error!(error = %e, "checkpoint failed");
+            metrics::counter!(
+                "operator_lifecycle_errors_total",
+                "phase" => "checkpoint"
+            )
+            .increment(1);
+            None
+        }
+    };
     if is_last_op && worker_index == local_first_worker {
         epoch
     } else {
