@@ -3124,6 +3124,7 @@ dependencies = [
  "bytes",
  "foyer 0.22.3",
  "futures",
+ "hex",
  "metrics",
  "moka",
  "object_store",
