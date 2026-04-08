@@ -517,8 +517,7 @@ mod tests {
         let _ = std::fs::remove_file(&path);
 
         let backend = LocalBackend::new(path.clone(), None).unwrap();
-        let mut ctx =
-            StateContext::new(Box::new(backend)).with_ttl(Duration::from_millis(500));
+        let mut ctx = StateContext::new(Box::new(backend)).with_ttl(Duration::from_millis(500));
 
         ctx.put_raw(b"live", b"value");
         ctx.put_raw(b"also_live", b"value2");

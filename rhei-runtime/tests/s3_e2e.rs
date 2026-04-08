@@ -151,6 +151,7 @@ async fn s3_tiered_storage_e2e() {
         foyer_dir: foyer_dir.path().to_path_buf(),
         foyer_memory_capacity: 4 * 1024 * 1024,
         foyer_disk_capacity: 16 * 1024 * 1024,
+        foyer_block_size: 256 * 1024,
     };
 
     let executor = Executor::new(checkpoint_dir.path().to_path_buf())
