@@ -83,12 +83,10 @@ impl TaskManager {
     /// Panics if the data for this worker was already taken or was never populated.
     #[allow(clippy::expect_used)] // invariant: each worker takes data exactly once
     pub(crate) fn take_executor_data(&self, idx: usize) -> ExecutorData {
-        self.per_executor
-            .lock()
-            .unwrap_or_else(|e| {
-                tracing::warn!("mutex poisoned in per_executor lock, recovering inner data");
-                e.into_inner()
-            })[idx]
+        self.per_executor.lock().unwrap_or_else(|e| {
+            tracing::warn!("mutex poisoned in per_executor lock, recovering inner data");
+            e.into_inner()
+        })[idx]
             .take()
             .expect("executor data already taken for worker")
     }
@@ -249,7 +247,9 @@ impl TaskManager {
         self.checkpoint_notify_rx
             .lock()
             .unwrap_or_else(|e| {
-                tracing::warn!("mutex poisoned in checkpoint_notify_rx lock, recovering inner data");
+                tracing::warn!(
+                    "mutex poisoned in checkpoint_notify_rx lock, recovering inner data"
+                );
                 e.into_inner()
             })
             .take()
