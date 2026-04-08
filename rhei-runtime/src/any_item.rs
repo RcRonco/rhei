@@ -183,6 +183,7 @@ impl AnyItem {
 
     /// Consume and downcast to concrete type `T`. Panics on type mismatch.
     #[deprecated(note = "use try_downcast() which returns Result instead of panicking")]
+    #[allow(dead_code)]
     pub(crate) fn downcast<T: 'static>(self) -> T {
         *self
             .0
@@ -193,6 +194,7 @@ impl AnyItem {
 
     /// Borrow and downcast to `&T`. Panics on type mismatch.
     #[deprecated(note = "use try_downcast_ref() which returns Result instead of panicking")]
+    #[allow(dead_code)]
     pub(crate) fn downcast_ref<T: 'static>(&self) -> &T {
         self.0
             .as_any_ref()
