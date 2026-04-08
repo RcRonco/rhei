@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use foyer::{DeviceBuilder, FsDeviceBuilder, HybridCache, HybridCacheBuilder};
 
-use super::backend::StateBackend;
+use super::backend::{BatchOp, StateBackend};
 use super::slatedb_backend::SlateDbBackend;
 
 /// Configuration for the L2 Foyer disk cache layer.
@@ -182,6 +182,34 @@ impl StateBackend for TieredBackend {
     async fn checkpoint(&self) -> anyhow::Result<()> {
         // Delegate to L3 (no-op for SlateDB, but respects the trait contract)
         self.l3.checkpoint().await
+    }
+
+    async fn put_batch(&self, ops: Vec<BatchOp>) -> anyhow::Result<()> {
+        // Write-through: atomic batch to L3, then update L2 cache.
+        // L2 updates are best-effort cache population — not critical for
+        // correctness since L2 is a read cache that can be repopulated.
+        let l2_ops: Vec<(Vec<u8>, Option<Bytes>)> = ops
+            .iter()
+            .map(|op| match op {
+                BatchOp::Put { key, value } => (key.clone(), Some(Bytes::from(value.clone()))),
+                BatchOp::Delete { key } => (key.clone(), None),
+            })
+            .collect();
+
+        self.l3.put_batch(ops).await?;
+
+        // Update L2 cache to reflect the batch writes.
+        for (key, value) in l2_ops {
+            match value {
+                Some(v) => {
+                    self.l2.insert(key, v);
+                }
+                None => {
+                    self.l2.remove(&key);
+                }
+            }
+        }
+        Ok(())
     }
 }
 

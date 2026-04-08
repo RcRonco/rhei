@@ -4,7 +4,7 @@ use std::sync::Mutex;
 use async_trait::async_trait;
 use bytes::Bytes;
 
-use super::backend::StateBackend;
+use super::backend::{BatchOp, StateBackend};
 
 /// Copy-on-write state backend for checkpoint fork mode.
 ///
@@ -122,6 +122,27 @@ impl StateBackend for ForkBackend {
     async fn checkpoint(&self) -> anyhow::Result<()> {
         // Only checkpoint the local backend. The remote is immutable.
         self.local.checkpoint().await
+    }
+
+    async fn put_batch(&self, ops: Vec<BatchOp>) -> anyhow::Result<()> {
+        // Update tombstones before delegating to local backend.
+        {
+            let mut tombstones = self
+                .tombstones
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            for op in &ops {
+                match op {
+                    BatchOp::Put { key, .. } => {
+                        tombstones.remove(key.as_slice());
+                    }
+                    BatchOp::Delete { key } => {
+                        tombstones.insert(key.clone());
+                    }
+                }
+            }
+        }
+        self.local.put_batch(ops).await
     }
 }
 

@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use bytes::Bytes;
 
-use super::backend::StateBackend;
+use super::backend::{BatchOp, StateBackend};
 
 /// A key-namespacing wrapper that prepends a prefix to every key.
 ///
@@ -56,6 +56,22 @@ impl StateBackend for PrefixedBackend {
 
     async fn checkpoint(&self) -> anyhow::Result<()> {
         self.inner.checkpoint().await
+    }
+
+    async fn put_batch(&self, ops: Vec<BatchOp>) -> anyhow::Result<()> {
+        let prefixed_ops = ops
+            .into_iter()
+            .map(|op| match op {
+                BatchOp::Put { key, value } => BatchOp::Put {
+                    key: self.prefixed_key(&key),
+                    value,
+                },
+                BatchOp::Delete { key } => BatchOp::Delete {
+                    key: self.prefixed_key(&key),
+                },
+            })
+            .collect();
+        self.inner.put_batch(prefixed_ops).await
     }
 }
 
@@ -147,6 +163,9 @@ mod tests {
         }
         async fn checkpoint(&self) -> anyhow::Result<()> {
             self.0.checkpoint().await
+        }
+        async fn put_batch(&self, ops: Vec<BatchOp>) -> anyhow::Result<()> {
+            self.0.put_batch(ops).await
         }
     }
 }
