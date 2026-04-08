@@ -33,6 +33,22 @@ use super::backend::{BatchOp, StateBackend};
 /// A `put` to a tombstoned key clears the tombstone (resurrection),
 /// ensuring the new value is visible on the next read.
 ///
+/// # Tombstone memory usage
+///
+/// Tombstones are **load-bearing for correctness**: evicting a tombstone
+/// would allow a deleted key to resurface from the remote backend. The
+/// set is therefore never pruned during the lifetime of this backend.
+///
+/// The `tombstone_warning_threshold` (default: 100,000) triggers a
+/// `tracing::warn` and increments `state_fork_tombstone_overflow_total`
+/// when exceeded, alerting operators to potential memory pressure. If
+/// your workload deletes many distinct keys between checkpoints,
+/// consider increasing the threshold or restructuring to avoid
+/// fork-from-checkpoint mode for high-churn operators.
+///
+/// Tombstones are discarded when the `ForkBackend` itself is dropped
+/// (typically after a new checkpoint replaces the fork with fresh state).
+///
 /// # Checkpoint
 ///
 /// Only the local backend is checkpointed. The remote backend is
@@ -45,6 +61,11 @@ pub struct ForkBackend {
     /// Invariant: if `tombstones` contains a key, then `get` for that key
     /// must return `None` regardless of what the remote backend holds.
     tombstones: Mutex<HashSet<Vec<u8>>>,
+    /// Emit a warning when tombstone count exceeds this threshold.
+    tombstone_warning_threshold: usize,
+    /// Whether the threshold warning has already been emitted for this
+    /// instance (avoids log spam).
+    warning_emitted: Mutex<bool>,
 }
 
 impl std::fmt::Debug for ForkBackend {
@@ -58,9 +79,16 @@ impl std::fmt::Debug for ForkBackend {
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .len(),
             )
+            .field(
+                "tombstone_warning_threshold",
+                &self.tombstone_warning_threshold,
+            )
             .finish_non_exhaustive()
     }
 }
+
+/// Default tombstone warning threshold (100,000 entries).
+const DEFAULT_TOMBSTONE_WARNING_THRESHOLD: usize = 100_000;
 
 impl ForkBackend {
     /// Creates a new `ForkBackend` with the given local and remote backends.
@@ -72,6 +100,45 @@ impl ForkBackend {
             local,
             remote,
             tombstones: Mutex::new(HashSet::new()),
+            tombstone_warning_threshold: DEFAULT_TOMBSTONE_WARNING_THRESHOLD,
+            warning_emitted: Mutex::new(false),
+        }
+    }
+
+    /// Set a custom tombstone warning threshold.
+    ///
+    /// A `tracing::warn` is emitted once when the tombstone count exceeds
+    /// this value. The default is 100,000.
+    pub fn with_tombstone_warning_threshold(mut self, threshold: usize) -> Self {
+        self.tombstone_warning_threshold = threshold;
+        self
+    }
+
+    /// Returns the current number of tombstones.
+    pub fn tombstone_count(&self) -> usize {
+        self.tombstones
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len()
+    }
+
+    /// Check tombstone count and emit a warning if threshold is exceeded.
+    fn check_tombstone_threshold(&self, count: usize) {
+        if count > self.tombstone_warning_threshold {
+            let mut emitted = self
+                .warning_emitted
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if !*emitted {
+                tracing::warn!(
+                    tombstone_count = count,
+                    threshold = self.tombstone_warning_threshold,
+                    "ForkBackend tombstone count exceeds warning threshold; \
+                     this may indicate high key churn between checkpoints"
+                );
+                metrics::counter!("state_fork_tombstone_overflow_total").increment(1);
+                *emitted = true;
+            }
         }
     }
 }
@@ -112,10 +179,17 @@ impl StateBackend for ForkBackend {
     async fn delete(&self, key: &[u8]) -> anyhow::Result<()> {
         // Record tombstone before local delete to prevent a concurrent read
         // from falling through to the remote backend during the delete.
-        self.tombstones
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(key.to_vec());
+        let count = {
+            let mut ts = self
+                .tombstones
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            ts.insert(key.to_vec());
+            ts.len()
+        };
+        #[allow(clippy::cast_precision_loss)]
+        metrics::gauge!("state_fork_tombstone_count").set(count as f64);
+        self.check_tombstone_threshold(count);
         self.local.delete(key).await
     }
 
@@ -126,7 +200,7 @@ impl StateBackend for ForkBackend {
 
     async fn put_batch(&self, ops: Vec<BatchOp>) -> anyhow::Result<()> {
         // Update tombstones before delegating to local backend.
-        {
+        let count = {
             let mut tombstones = self
                 .tombstones
                 .lock()
@@ -141,7 +215,11 @@ impl StateBackend for ForkBackend {
                     }
                 }
             }
-        }
+            tombstones.len()
+        };
+        #[allow(clippy::cast_precision_loss)]
+        metrics::gauge!("state_fork_tombstone_count").set(count as f64);
+        self.check_tombstone_threshold(count);
         self.local.put_batch(ops).await
     }
 }
@@ -256,6 +334,34 @@ mod tests {
             None,
             "tombstone must prevent remote fallthrough after delete",
         );
+
+        let _ = std::fs::remove_file(&local_path);
+        let _ = std::fs::remove_file(&remote_path);
+    }
+
+    #[tokio::test]
+    async fn tombstone_count_tracks_deletes() {
+        let (local_path, local) = fresh_local("tombstone_count_local");
+        let (remote_path, remote) = fresh_local("tombstone_count_remote");
+
+        let fork =
+            ForkBackend::new(Box::new(local), Box::new(remote)).with_tombstone_warning_threshold(3);
+
+        assert_eq!(fork.tombstone_count(), 0);
+
+        fork.delete(b"a").await.unwrap();
+        fork.delete(b"b").await.unwrap();
+        assert_eq!(fork.tombstone_count(), 2);
+
+        // Put clears a tombstone.
+        fork.put(b"a", b"val").await.unwrap();
+        assert_eq!(fork.tombstone_count(), 1);
+
+        // Delete more to exceed threshold (1 existing + 3 new = 4 > 3).
+        fork.delete(b"c").await.unwrap();
+        fork.delete(b"d").await.unwrap();
+        fork.delete(b"e").await.unwrap();
+        assert_eq!(fork.tombstone_count(), 4);
 
         let _ = std::fs::remove_file(&local_path);
         let _ = std::fs::remove_file(&remote_path);
