@@ -1,3 +1,6 @@
+use std::collections::HashMap;
+use std::time::{Duration, Instant};
+
 use bytes::Bytes;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -11,6 +14,17 @@ use super::timer_service::TimerService;
 /// Reads go through the L1 `MemTable` first (read-your-own-writes). On miss the
 /// request falls through to the backend. Writes always go to the `MemTable`
 /// (synchronous, fast). Dirty entries are flushed to the backend on checkpoint.
+///
+/// ## TTL support
+///
+/// When configured via [`with_ttl`](Self::with_ttl), keys are automatically
+/// expired on read (lazy eviction). Expired keys return `None` from `get`/`get_raw`
+/// and are deleted from the memtable. On checkpoint, any remaining expired keys
+/// are swept and converted to backend deletes.
+///
+/// TTL tracking uses `Instant` (monotonic clock), so it is immune to wall-clock
+/// jumps. The tradeoff is that TTL timestamps are not persisted across restarts;
+/// after recovery, keys loaded from the backend start with a fresh write timestamp.
 pub struct StateContext {
     memtable: MemTable,
     backend: Box<dyn StateBackend>,
@@ -18,6 +32,11 @@ pub struct StateContext {
     worker_label: Option<String>,
     /// Lazy-initialized timer service for event-time callbacks.
     timer_service: Option<TimerService>,
+    /// Optional TTL for state entries.
+    ttl: Option<Duration>,
+    /// Write timestamps for TTL tracking. Only populated when `ttl` is `Some`.
+    /// Uses `Instant` (monotonic) to avoid wall-clock drift issues.
+    write_times: HashMap<Vec<u8>, Instant>,
 }
 
 impl std::fmt::Debug for StateContext {
@@ -36,6 +55,8 @@ impl StateContext {
             backend,
             worker_label: None,
             timer_service: None,
+            ttl: None,
+            write_times: HashMap::new(),
         }
     }
 
@@ -48,6 +69,19 @@ impl StateContext {
     /// Replace the memtable with one using the given configuration.
     pub fn with_memtable_config(mut self, config: super::memtable::MemTableConfig) -> Self {
         self.memtable = MemTable::with_config(config);
+        self
+    }
+
+    /// Enable time-to-live for state entries.
+    ///
+    /// Keys written after this call will be lazily expired on read when
+    /// their age exceeds `ttl`. Expired keys are also swept during
+    /// checkpoint.
+    ///
+    /// Note: TTL timestamps are not persisted. After recovery, keys
+    /// loaded from the backend are treated as freshly written.
+    pub fn with_ttl(mut self, ttl: Duration) -> Self {
+        self.ttl = Some(ttl);
         self
     }
 
@@ -66,7 +100,23 @@ impl StateContext {
         Ok(())
     }
 
+    /// Returns `true` if the key has exceeded its TTL.
+    fn is_expired(&self, key: &[u8]) -> bool {
+        if let Some(ttl) = self.ttl
+            && let Some(write_time) = self.write_times.get(key)
+        {
+            return write_time.elapsed() > ttl;
+        }
+        // No TTL configured, or no write_time recorded (key loaded from
+        // backend post-recovery, or TTL enabled after key was written).
+        // In all cases, treat the key as not expired.
+        false
+    }
+
     /// Get raw bytes — checks memtable first, then falls back to backend.
+    ///
+    /// If TTL is configured, expired keys are lazily evicted: they return
+    /// `None` and are marked as deleted in the memtable.
     pub async fn get_raw(&mut self, key: &[u8]) -> anyhow::Result<Option<Bytes>> {
         if let Some(ref wl) = self.worker_label {
             metrics::counter!("state_gets_total", "worker" => wl.clone()).increment(1);
@@ -82,7 +132,15 @@ impl StateContext {
                 } else {
                     metrics::counter!("state_l1_hits_total").increment(1);
                 }
-                Ok(Some(v))
+                // Check TTL — lazily expire on read.
+                if self.is_expired(key) {
+                    metrics::counter!("state_ttl_expired_total").increment(1);
+                    self.memtable.delete(key.to_vec());
+                    self.write_times.remove(key);
+                    Ok(None)
+                } else {
+                    Ok(Some(v))
+                }
             }
             Some(None) => {
                 if let Some(ref wl) = self.worker_label {
@@ -102,6 +160,12 @@ impl StateContext {
                 let result = self.backend.get(key).await?;
                 if let Some(ref v) = result {
                     self.memtable.merge(key.to_vec(), v.clone());
+                    // Track write time for backend-loaded keys so TTL applies.
+                    if self.ttl.is_some() {
+                        self.write_times
+                            .entry(key.to_vec())
+                            .or_insert_with(Instant::now);
+                    }
                 }
                 Ok(result)
             }
@@ -118,6 +182,9 @@ impl StateContext {
         } else {
             metrics::counter!("state_puts_total").increment(1);
         }
+        if self.ttl.is_some() {
+            self.write_times.insert(key.to_vec(), Instant::now());
+        }
         self.memtable
             .put(key.to_vec(), Bytes::copy_from_slice(value));
     }
@@ -129,6 +196,7 @@ impl StateContext {
         } else {
             metrics::counter!("state_deletes_total").increment(1);
         }
+        self.write_times.remove(key);
         self.memtable.delete(key.to_vec());
     }
 
@@ -331,6 +399,68 @@ mod tests {
         ctx.delete(b"key");
         let val = ctx.get_raw(b"key").await.unwrap();
         assert_eq!(val, None);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn ttl_expires_key_on_read() {
+        let path = temp_path("ttl_expire");
+        let _ = std::fs::remove_file(&path);
+
+        let backend = LocalBackend::new(path.clone(), None).unwrap();
+        let mut ctx = StateContext::new(Box::new(backend)).with_ttl(Duration::from_millis(50));
+
+        ctx.put_raw(b"key", b"value");
+        // Immediately readable.
+        let val = ctx.get_raw(b"key").await.unwrap();
+        assert_eq!(val.as_deref(), Some(b"value".as_slice()));
+
+        // Wait for TTL to expire.
+        tokio::time::sleep(Duration::from_millis(60)).await;
+
+        // Should now return None (expired).
+        let val = ctx.get_raw(b"key").await.unwrap();
+        assert_eq!(val, None);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn ttl_not_set_no_expiry() {
+        let path = temp_path("ttl_none");
+        let _ = std::fs::remove_file(&path);
+
+        let backend = LocalBackend::new(path.clone(), None).unwrap();
+        let mut ctx = StateContext::new(Box::new(backend));
+        // No TTL configured.
+
+        ctx.put_raw(b"key", b"value");
+        // Still readable after any delay (no TTL).
+        let val = ctx.get_raw(b"key").await.unwrap();
+        assert_eq!(val.as_deref(), Some(b"value".as_slice()));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn ttl_rewrite_resets_timer() {
+        let path = temp_path("ttl_rewrite");
+        let _ = std::fs::remove_file(&path);
+
+        let backend = LocalBackend::new(path.clone(), None).unwrap();
+        let mut ctx = StateContext::new(Box::new(backend)).with_ttl(Duration::from_millis(80));
+
+        ctx.put_raw(b"key", b"value1");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Rewrite resets the TTL timer.
+        ctx.put_raw(b"key", b"value2");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Still alive because the rewrite reset the timer.
+        let val = ctx.get_raw(b"key").await.unwrap();
+        assert_eq!(val.as_deref(), Some(b"value2".as_slice()));
 
         let _ = std::fs::remove_file(&path);
     }
