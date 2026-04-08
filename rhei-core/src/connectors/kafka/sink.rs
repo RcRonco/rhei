@@ -373,8 +373,7 @@ impl TransactionalKafkaSink {
             return Ok(());
         }
 
-        let records: Vec<KafkaRecord> = self.buffer.drain(..).collect();
-        let batch_size = records.len();
+        let batch_size = self.buffer.len();
 
         // Begin transaction if not already in one.
         if !self.in_transaction {
@@ -382,9 +381,12 @@ impl TransactionalKafkaSink {
             self.in_transaction = true;
         }
 
-        let mut first_error: Option<anyhow::Error> = None;
+        // Produce all buffered records. On the first error, break immediately
+        // and abort the transaction. Records remain in self.buffer so they can
+        // be retried on the next flush attempt.
+        let mut produce_error: Option<anyhow::Error> = None;
 
-        for record in records {
+        for record in &self.buffer {
             let mut fr = FutureRecord::to(&self.topic).payload(&record.payload);
             if let Some(ref key) = record.key {
                 fr = fr.key(key);
@@ -407,16 +409,16 @@ impl TransactionalKafkaSink {
                 Err((e, _)) => {
                     metrics::counter!("kafka_tx_produce_errors_total").increment(1);
                     tracing::error!(error = %e, "transactional kafka produce error");
-                    if first_error.is_none() {
-                        first_error =
-                            Some(anyhow::anyhow!("transactional kafka produce error: {e}"));
-                    }
+                    produce_error =
+                        Some(anyhow::anyhow!("transactional kafka produce error: {e}"));
+                    break;
                 }
             }
         }
 
-        if let Some(e) = first_error {
-            // Abort the transaction on failure.
+        if let Some(e) = produce_error {
+            // Abort the transaction on failure. Records stay in self.buffer
+            // for retry on the next flush attempt.
             if let Err(abort_err) = self.producer.abort_transaction(self.produce_timeout) {
                 tracing::error!(error = %abort_err, "failed to abort kafka transaction");
             }
@@ -429,8 +431,11 @@ impl TransactionalKafkaSink {
         self.producer.commit_transaction(self.produce_timeout)?;
         self.in_transaction = false;
 
+        // Only clear the buffer after a successful commit.
+        self.buffer.clear();
+
         metrics::counter!("kafka_tx_committed_total").increment(1);
-        metrics::counter!("kafka_tx_batch_size")
+        metrics::counter!("kafka_tx_records_committed_total")
             .increment(u64::try_from(batch_size).unwrap_or(u64::MAX));
 
         Ok(())
