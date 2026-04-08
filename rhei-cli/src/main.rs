@@ -1,9 +1,10 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, UNIX_EPOCH};
 
 use clap::{Parser, Subcommand};
 
+mod scaffold;
 mod tui;
 
 #[derive(Parser)]
@@ -57,6 +58,15 @@ enum Commands {
     Attach {
         /// Address of the running pipeline's HTTP server (e.g. `127.0.0.1:9090`)
         addr: String,
+    },
+    /// Create a new Rhei pipeline project
+    New {
+        /// Project name (used as directory name and Cargo package name)
+        name: String,
+
+        /// Parent directory for the project (defaults to current directory)
+        #[arg(long)]
+        path: Option<PathBuf>,
     },
     /// Run the built-in demo pipeline with the HTTP server for the web dashboard
     Demo {
@@ -150,6 +160,7 @@ fn main() -> anyhow::Result<()> {
                 resolved_peers,
             )
         }
+        Commands::New { name, path } => scaffold::create_project(&name, path.as_deref()),
         Commands::Attach { addr } => cmd_attach(addr),
         Commands::Demo { workers, addr } => cmd_demo(workers, addr),
     }
