@@ -312,11 +312,17 @@ where
             state.get(&key).await.unwrap_or(None).unwrap_or_default()
         };
 
-        // Close any windows whose end <= timestamp (the element has advanced past them)
+        // Evict windows that are closed: either the element's timestamp has advanced
+        // past the window end, or the watermark (plus allowed lateness) has passed it.
+        // This prevents unbounded growth of the active window list between watermark
+        // ticks.
         let mut still_active = Vec::new();
         for &win_start in &active.starts {
             let win_end = win_start + self.window_size;
-            if win_end <= timestamp {
+            let past_timestamp = win_end <= timestamp;
+            let past_watermark =
+                win_start + self.window_size + self.allowed_lateness <= self.last_watermark;
+            if past_timestamp || past_watermark {
                 // Window closed — emit its aggregate
                 let acc_key = format!("{key}:{win_start}");
                 let acc: Option<A::Accumulator> = {
@@ -368,9 +374,13 @@ where
             }
         }
 
-        // Store updated active windows
+        // Store updated active windows, or clean up if none remain.
         active.starts.sort_unstable();
-        {
+        if active.starts.is_empty() {
+            let mut state = KeyedState::<String, ActiveWindows>::new(ctx, "sw_active");
+            state.delete(&key)?;
+            self.active_keys.remove(&key);
+        } else {
             let mut state = KeyedState::<String, ActiveWindows>::new(ctx, "sw_active");
             state.put(&key, &active)?;
         }
@@ -573,6 +583,64 @@ mod tests {
         assert_eq!(r[0].window_start, 0);
         assert_eq!(r[0].window_end, 10);
         assert_eq!(r[0].value, 1);
+    }
+
+    #[tokio::test]
+    async fn sliding_watermark_evicts_during_process() {
+        let mut ctx = test_ctx("wm_evict_proc");
+        let mut win = make_sliding();
+
+        // Element at ts=3 → windows [0,10)
+        win.process(("a".into(), 3), &mut ctx).await.unwrap();
+
+        // Advance watermark past window [0,10): 0+10+0 <= 12
+        let r = win.on_watermark(12, &mut ctx).await.unwrap();
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].window_start, 0);
+
+        // Key "a" should have been removed from active_keys since no windows remain
+        assert!(!win.active_keys.contains("a"));
+    }
+
+    #[tokio::test]
+    async fn sliding_process_evicts_watermark_expired_windows() {
+        let mut ctx = test_ctx("proc_evict_wm");
+        let mut win = make_sliding();
+
+        // Element at ts=3 → windows [0,10)
+        win.process(("a".into(), 3), &mut ctx).await.unwrap();
+
+        // Advance watermark past [0,10) without triggering on_watermark for key "a"
+        // by just setting last_watermark directly
+        win.last_watermark = 12;
+
+        // Next process call for this key should evict the expired window [0,10)
+        // during the eviction pass (0 + 10 + 0 <= 12).
+        // Element at ts=3 would be late (all candidate windows expired), so use ts=20.
+        let r = win.process(("a".into(), 20), &mut ctx).await.unwrap();
+        // Should have emitted the closed [0,10) window
+        assert!(r.iter().any(|w| w.window_start == 0 && w.window_end == 10));
+    }
+
+    #[tokio::test]
+    async fn sliding_active_keys_cleaned_up_when_all_windows_evicted() {
+        let mut ctx = test_ctx("active_cleanup");
+        let mut win = make_sliding();
+
+        // Element at ts=3 for key "a"
+        win.process(("a".into(), 3), &mut ctx).await.unwrap();
+        assert!(win.active_keys.contains("a"));
+
+        // Watermark evicts all windows for "a"
+        win.on_watermark(12, &mut ctx).await.unwrap();
+        // Key should be removed from active_keys
+        assert!(!win.active_keys.contains("a"));
+
+        // Element at ts=100 for key "b"
+        win.process(("b".into(), 100), &mut ctx).await.unwrap();
+        assert!(win.active_keys.contains("b"));
+        // "a" should still be absent
+        assert!(!win.active_keys.contains("a"));
     }
 
     #[tokio::test]
