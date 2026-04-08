@@ -18,6 +18,8 @@ pub mod checkpoint;
 pub mod connectors;
 /// Dead-letter queue types.
 pub mod dlq;
+/// Classified pipeline errors for structured error handling and DLQ routing.
+pub mod error;
 /// Event serialization and the [`Event`](event::Event) marker trait.
 pub mod event;
 /// Logical execution plan builder ([`StreamGraph`](graph::StreamGraph)).
