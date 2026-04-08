@@ -199,28 +199,47 @@ impl StateBackend for ForkBackend {
     }
 
     async fn put_batch(&self, ops: Vec<BatchOp>) -> anyhow::Result<()> {
-        // Update tombstones before delegating to local backend.
+        // Collect tombstone mutations from the batch before forwarding
+        // to the local backend, but only apply them after the batch
+        // succeeds. This avoids tombstone/local desync on partial
+        // failure: if we updated tombstones first and put_batch failed,
+        // tombstones would reference keys never actually deleted from
+        // local (or clear tombstones for puts that never landed).
+        //
+        // Trade-off: during the put_batch call, concurrent readers
+        // see stale tombstone state. This is acceptable because
+        // put_batch is called from checkpoint(), which runs under
+        // exclusive (&mut) access to StateContext. No concurrent
+        // reads can occur within the same operator.
+        let mut puts: Vec<Vec<u8>> = Vec::new();
+        let mut deletes: Vec<Vec<u8>> = Vec::new();
+        for op in &ops {
+            match op {
+                BatchOp::Put { key, .. } => puts.push(key.clone()),
+                BatchOp::Delete { key } => deletes.push(key.clone()),
+            }
+        }
+
+        self.local.put_batch(ops).await?;
+
+        // Batch succeeded — now update tombstones to match.
         let count = {
             let mut tombstones = self
                 .tombstones
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            for op in &ops {
-                match op {
-                    BatchOp::Put { key, .. } => {
-                        tombstones.remove(key.as_slice());
-                    }
-                    BatchOp::Delete { key } => {
-                        tombstones.insert(key.clone());
-                    }
-                }
+            for key in &puts {
+                tombstones.remove(key.as_slice());
+            }
+            for key in deletes {
+                tombstones.insert(key);
             }
             tombstones.len()
         };
         #[allow(clippy::cast_precision_loss)]
         metrics::gauge!("state_fork_tombstone_count").set(count as f64);
         self.check_tombstone_threshold(count);
-        self.local.put_batch(ops).await
+        Ok(())
     }
 }
 
