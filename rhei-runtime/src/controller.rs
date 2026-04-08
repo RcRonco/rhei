@@ -501,7 +501,11 @@ impl PipelineController {
     ///
     /// Build the graph first with [`DataflowGraph::source()`], stream
     /// transforms, and sinks, then pass it here for execution.
+    ///
+    /// Validates the graph structure before compilation. Returns a clear
+    /// error if any streams do not terminate at a sink.
     pub async fn run(&self, graph: DataflowGraph) -> anyhow::Result<()> {
+        graph.validate().map_err(|e| anyhow::anyhow!("{e}"))?;
         run_graph(graph, self, None).await
     }
 
@@ -510,18 +514,23 @@ impl PipelineController {
     ///
     /// This is the recommended entry point for `#[rhei::pipeline]` generated
     /// code. It handles the full lifecycle: telemetry init, HTTP server start,
-    /// graph compilation, and execution.
+    /// graph validation, compilation, and execution.
     pub async fn start(&self, graph: DataflowGraph) -> anyhow::Result<()> {
+        graph.validate().map_err(|e| anyhow::anyhow!("{e}"))?;
         let _http_handle = self.maybe_start_http()?;
-        self.run(graph).await
+        run_graph(graph, self, None).await
     }
 
     /// Compile and execute a [`DataflowGraph`] with graceful shutdown.
+    ///
+    /// Validates the graph structure before compilation. Returns a clear
+    /// error if any streams do not terminate at a sink.
     pub async fn run_with_shutdown(
         &self,
         graph: DataflowGraph,
         shutdown: ShutdownHandle,
     ) -> anyhow::Result<()> {
+        graph.validate().map_err(|e| anyhow::anyhow!("{e}"))?;
         run_graph(graph, self, Some(shutdown)).await
     }
 

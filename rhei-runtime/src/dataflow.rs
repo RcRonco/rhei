@@ -258,6 +258,136 @@ impl Default for DataflowGraph {
     }
 }
 
+// ── Graph validation ────────────────────────────────────────────────
+
+/// Errors produced by [`DataflowGraph::validate()`].
+#[derive(Debug, Clone)]
+pub enum ValidationError {
+    /// The graph has no nodes at all.
+    EmptyGraph,
+    /// The graph has no source nodes.
+    NoSources,
+    /// The graph has no sink nodes.
+    NoSinks,
+    /// One or more streams do not terminate at a sink.
+    ///
+    /// Each entry is `(node_index, node_kind_label)` for the dangling
+    /// leaf node.
+    DanglingStreams(Vec<(usize, String)>),
+}
+
+impl std::fmt::Display for ValidationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::EmptyGraph => write!(f, "dataflow graph is empty — add at least one source"),
+            Self::NoSources => write!(
+                f,
+                "dataflow graph has no sources — call graph.source(...) to add one"
+            ),
+            Self::NoSinks => write!(
+                f,
+                "dataflow graph has no sinks — every stream must end with .sink(...)"
+            ),
+            Self::DanglingStreams(nodes) => {
+                writeln!(
+                    f,
+                    "the following streams do not reach a sink (call .sink(...) on each):"
+                )?;
+                for (idx, kind) in nodes {
+                    writeln!(f, "  - node {idx} ({kind})")?;
+                }
+                write!(
+                    f,
+                    "hint: every path from a source must terminate at a .sink()"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for ValidationError {}
+
+impl DataflowGraph {
+    /// Validate the graph structure before execution.
+    ///
+    /// Checks:
+    /// - The graph is not empty
+    /// - At least one source exists
+    /// - At least one sink exists
+    /// - Every non-sink leaf node can reach a sink (no dangling streams)
+    ///
+    /// Call this before passing the graph to
+    /// [`Executor::run()`](crate::executor::Executor::run) to get clear,
+    /// actionable error messages instead of runtime failures.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let graph = DataflowGraph::new();
+    /// graph.source(my_source)
+    ///     .map(|x| x * 2);
+    ///     // Oops — forgot .sink(...)
+    ///
+    /// if let Err(e) = graph.validate() {
+    ///     eprintln!("Graph error: {e}");
+    ///     // "the following streams do not reach a sink..."
+    /// }
+    /// ```
+    pub fn validate(&self) -> Result<(), ValidationError> {
+        let nodes = self.nodes.borrow();
+
+        if nodes.is_empty() {
+            return Err(ValidationError::EmptyGraph);
+        }
+
+        let has_sources = nodes.iter().any(|n| matches!(n.kind, NodeKind::Source(_)));
+        if !has_sources {
+            return Err(ValidationError::NoSources);
+        }
+
+        let has_sinks = nodes.iter().any(|n| matches!(n.kind, NodeKind::Sink(_)));
+        if !has_sinks {
+            return Err(ValidationError::NoSinks);
+        }
+
+        // Build successor adjacency list to find dangling leaves.
+        let n = nodes.len();
+        let mut successors: Vec<Vec<usize>> = vec![vec![]; n];
+        for node in nodes.iter() {
+            for &input_id in &node.inputs {
+                successors[input_id.0].push(node.id.0);
+            }
+        }
+
+        // Find leaf nodes (no successors) that are NOT sinks.
+        let dangling: Vec<(usize, String)> = nodes
+            .iter()
+            .filter(|node| {
+                successors[node.id.0].is_empty() && !matches!(node.kind, NodeKind::Sink(_))
+            })
+            .map(|node| {
+                let kind_label = match &node.kind {
+                    NodeKind::Source(_) => "source".to_string(),
+                    NodeKind::Transform(_) => "transform".to_string(),
+                    NodeKind::KeyBy(_) => "key_by".to_string(),
+                    NodeKind::Operator { name, .. } => {
+                        format!("operator \"{name}\"")
+                    }
+                    NodeKind::Merge => "merge".to_string(),
+                    NodeKind::Sink(_) => unreachable!(),
+                };
+                (node.id.0, kind_label)
+            })
+            .collect();
+
+        if !dangling.is_empty() {
+            return Err(ValidationError::DanglingStreams(dangling));
+        }
+
+        Ok(())
+    }
+}
+
 // ── Stream handle ────────────────────────────────────────────────────
 
 /// A lightweight, copyable handle representing a point in the dataflow graph.
@@ -1058,6 +1188,75 @@ mod tests {
     use crate::erased::SourceWrapper;
     use async_trait::async_trait;
     use rhei_core::state::context::StateContext;
+
+    // ── Validation tests ────────────────────────────────────────────
+
+    #[test]
+    fn validate_empty_graph() {
+        let graph = DataflowGraph::new();
+        let err = graph.validate().unwrap_err();
+        assert!(matches!(err, ValidationError::EmptyGraph));
+        assert!(err.to_string().contains("empty"));
+    }
+
+    #[test]
+    fn validate_no_sinks() {
+        let graph = DataflowGraph::new();
+        let source = rhei_core::connectors::vec_source::VecSource::new(vec![1i32, 2, 3]);
+        graph.source(source).map(|x: i32| x * 2);
+        // No .sink() call -- the NoSinks check fires before DanglingStreams
+        let err = graph.validate().unwrap_err();
+        assert!(matches!(err, ValidationError::NoSinks));
+        assert!(
+            err.to_string().contains("no sinks"),
+            "error should mention no sinks: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_valid_graph() {
+        let graph = DataflowGraph::new();
+        let source = rhei_core::connectors::vec_source::VecSource::new(vec![1i32, 2, 3]);
+        graph
+            .source(source)
+            .map(|x: i32| x * 2)
+            .sink(rhei_core::connectors::print_sink::PrintSink::<i32>::new());
+        assert!(graph.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_fan_out_one_dangling() {
+        let graph = DataflowGraph::new();
+        let source = rhei_core::connectors::vec_source::VecSource::new(vec![1i32, 2, 3]);
+        let stream = graph.source(source);
+        let mapped = stream.map(|x: i32| x * 2);
+        // One branch has a sink, the other dangles
+        mapped.sink(rhei_core::connectors::print_sink::PrintSink::<i32>::new());
+        stream.map(|x: i32| x + 1); // dangling!
+
+        let err = graph.validate().unwrap_err();
+        match err {
+            ValidationError::DanglingStreams(nodes) => {
+                assert_eq!(nodes.len(), 1);
+                assert_eq!(nodes[0].1, "transform");
+            }
+            other => panic!("expected DanglingStreams, got: {other}"),
+        }
+    }
+
+    #[test]
+    fn validate_fan_out_both_sunk() {
+        let graph = DataflowGraph::new();
+        let source = rhei_core::connectors::vec_source::VecSource::new(vec![1i32, 2, 3]);
+        let stream = graph.source(source);
+        stream
+            .map(|x: i32| x * 2)
+            .sink(rhei_core::connectors::print_sink::PrintSink::<i32>::new());
+        stream
+            .map(|x: i32| x + 1)
+            .sink(rhei_core::connectors::print_sink::PrintSink::<i32>::new());
+        assert!(graph.validate().is_ok());
+    }
 
     #[test]
     fn source_wrapper_registers_output_type() {
