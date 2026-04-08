@@ -555,7 +555,9 @@ impl DataflowExecutor {
                 }
                 let mut last_watermark: u64 = 0;
                 let mut retained_cap: Option<Capability<u64>> = None;
+                let mut cap_retained_since: Option<std::time::Instant> = None;
                 let mut closed = false;
+                let cap_worker_label = oc.worker_label.clone();
                 move |(input, frontier), output| {
                     let mut emit = |items: Vec<AnyItem>, cap: &Option<Capability<u64>>| {
                         if let Some(c) = cap
@@ -585,6 +587,9 @@ impl DataflowExecutor {
                             );
                         }
                         emit(results, &Some(owned_cap.clone()));
+                        if retained_cap.is_none() {
+                            cap_retained_since = Some(std::time::Instant::now());
+                        }
                         retained_cap = Some(owned_cap);
                     });
                     let wm = frontier_min_or_max(frontier.frontier());
@@ -593,6 +598,22 @@ impl DataflowExecutor {
                     if let Some(ref cap) = retained_cap
                         && !frontier.less_equal(cap.time())
                     {
+                        if let Some(since) = cap_retained_since.take() {
+                            let held_secs = since.elapsed().as_secs_f64();
+                            metrics::gauge!(
+                                "capability_held_duration_seconds",
+                                "worker" => cap_worker_label.clone()
+                            )
+                            .set(held_secs);
+                            if held_secs > 30.0 {
+                                tracing::warn!(
+                                    held_seconds = held_secs,
+                                    epoch = cap.time(),
+                                    "capability held for over 30s — \
+                                     possible stall in operator processing"
+                                );
+                            }
+                        }
                         retained_cap = None;
                     }
                     let fv: Vec<u64> = frontier.frontier().iter().copied().collect();
