@@ -74,6 +74,16 @@ pub(crate) type SourceBatch = (Vec<AnyItem>, Option<u64>);
 ///
 /// The only direct atomic write is the `SourceExhausted` sentinel when the
 /// source is naturally exhausted (returns `None`).
+///
+/// # Design note: `std::sync::Mutex` for `offsets_writer`
+///
+/// We intentionally use `std::sync::Mutex` (not `tokio::sync::Mutex`) because
+/// `offsets_writer` is read from synchronous Timely worker threads in
+/// `task_manager.rs` (via `merge_source_offsets`). A `tokio::sync::Mutex`
+/// requires `.await` to lock, which is not available in the sync Timely
+/// context. The lock is held only for a brief HashMap swap, so contention
+/// is negligible and the async executor is never blocked for meaningful
+/// duration.
 pub(crate) async fn local_source_bridge(
     mut source: Box<dyn ErasedSource>,
     tx: flume::Sender<SourceBatch>,
@@ -85,9 +95,10 @@ pub(crate) async fn local_source_bridge(
         // Snapshot offsets after reading each batch.
         let offsets = source.current_offsets();
         if !offsets.is_empty() {
-            *offsets_writer
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) = offsets;
+            *offsets_writer.lock().unwrap_or_else(|e| {
+                tracing::warn!("offsets_writer mutex poisoned, recovering: {e}");
+                e.into_inner()
+            }) = offsets;
         }
 
         // Capture watermark to send alongside the batch data. The Timely
