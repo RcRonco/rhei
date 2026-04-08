@@ -269,7 +269,8 @@ where
 
                 // Opportunistic eviction of stale right events.
                 if self.last_watermark > 0 {
-                    let evicted = evict_stale(&mut right_buf, self.last_watermark, -self.lower_bound);
+                    let evicted =
+                        evict_stale(&mut right_buf, self.last_watermark, -self.lower_bound);
                     if evicted > 0 {
                         metrics::counter!("interval_join_right_evicted_total")
                             .increment(u64::try_from(evicted).unwrap_or(u64::MAX));
@@ -351,7 +352,8 @@ where
 
                 // Opportunistic eviction of stale right events.
                 if self.last_watermark > 0 {
-                    let evicted = evict_stale(&mut right_buf, self.last_watermark, -self.lower_bound);
+                    let evicted =
+                        evict_stale(&mut right_buf, self.last_watermark, -self.lower_bound);
                     if evicted > 0 {
                         metrics::counter!("interval_join_right_evicted_total")
                             .increment(u64::try_from(evicted).unwrap_or(u64::MAX));

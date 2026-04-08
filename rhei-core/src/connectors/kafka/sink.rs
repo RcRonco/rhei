@@ -409,8 +409,7 @@ impl TransactionalKafkaSink {
                 Err((e, _)) => {
                     metrics::counter!("kafka_tx_produce_errors_total").increment(1);
                     tracing::error!(error = %e, "transactional kafka produce error");
-                    produce_error =
-                        Some(anyhow::anyhow!("transactional kafka produce error: {e}"));
+                    produce_error = Some(anyhow::anyhow!("transactional kafka produce error: {e}"));
                     break;
                 }
             }

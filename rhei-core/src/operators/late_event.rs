@@ -283,19 +283,13 @@ where
         // Track this window start in the per-key active windows list.
         {
             let mut active: ActiveWindows = {
-                let mut state =
-                    KeyedState::<String, ActiveWindows>::new(ctx, "lew_active");
-                state
-                    .get(&key)
-                    .await
-                    .unwrap_or(None)
-                    .unwrap_or_default()
+                let mut state = KeyedState::<String, ActiveWindows>::new(ctx, "lew_active");
+                state.get(&key).await.unwrap_or(None).unwrap_or_default()
             };
             if !active.starts.contains(&window_start) {
                 active.starts.push(window_start);
                 active.starts.sort_unstable();
-                let mut state =
-                    KeyedState::<String, ActiveWindows>::new(ctx, "lew_active");
+                let mut state = KeyedState::<String, ActiveWindows>::new(ctx, "lew_active");
                 state.put(&key, &active)?;
             }
         }
@@ -315,8 +309,7 @@ where
         for key in &self.active_keys {
             // Load the tracked active windows for this key from state.
             let mut active: ActiveWindows = {
-                let mut state =
-                    KeyedState::<String, ActiveWindows>::new(ctx, "lew_active");
+                let mut state = KeyedState::<String, ActiveWindows>::new(ctx, "lew_active");
                 state.get(key).await.unwrap_or(None).unwrap_or_default()
             };
 
@@ -364,13 +357,11 @@ where
 
             if active.starts.is_empty() {
                 // No windows remain for this key — clean up.
-                let mut state =
-                    KeyedState::<String, ActiveWindows>::new(ctx, "lew_active");
+                let mut state = KeyedState::<String, ActiveWindows>::new(ctx, "lew_active");
                 state.delete(key)?;
                 keys_to_remove.push(key.clone());
             } else {
-                let mut state =
-                    KeyedState::<String, ActiveWindows>::new(ctx, "lew_active");
+                let mut state = KeyedState::<String, ActiveWindows>::new(ctx, "lew_active");
                 state.put(key, &active)?;
             }
         }
