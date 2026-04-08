@@ -180,7 +180,7 @@ impl PipelineError {
 ///   "operator": "json_parser",
 ///   "error": "expected value at line 1 column 1",
 ///   "input_repr": "{invalid json",
-///   "timestamp": "2024-03-15T10:30:00Z",
+///   "timestamp": "1710499800",
 ///   "pipeline": "clickstream-ingest",
 ///   "worker_index": 2
 /// }
@@ -195,7 +195,7 @@ pub struct StructuredError {
     pub error: String,
     /// Best-effort debug representation of the failed input.
     pub input_repr: String,
-    /// ISO-8601 timestamp of when the error occurred.
+    /// Unix epoch seconds (as a string) of when the error occurred.
     pub timestamp: String,
     /// Optional pipeline name for multi-pipeline environments.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -219,7 +219,7 @@ impl StructuredError {
             let d = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default();
-            // Simple ISO-ish timestamp from unix seconds
+            // Unix epoch seconds as a string (no chrono dependency)
             format!("{}", d.as_secs())
         };
         Self {
