@@ -626,11 +626,11 @@ impl PipelineController {
                         Box::new(local),
                         Box::new(remote_l3.clone()),
                     );
-                    let prefixed = PrefixedBackend::new(operator_name, Box::new(fork));
+                    let prefixed = PrefixedBackend::new(operator_name, Box::new(fork))?;
                     StateContext::new(Box::new(prefixed))
                 } else if let Some(ref tiered) = self.tiered {
                     let tiered_backend = tiered.shared_l2.create_tiered_backend(tiered.l3.clone());
-                    let prefixed = PrefixedBackend::new(operator_name, Box::new(tiered_backend));
+                    let prefixed = PrefixedBackend::new(operator_name, Box::new(tiered_backend))?;
                     StateContext::new(Box::new(prefixed))
                 } else {
                     let path = self
@@ -644,7 +644,7 @@ impl PipelineController {
             {
                 if let Some(ref tiered) = self.tiered {
                     let tiered_backend = tiered.shared_l2.create_tiered_backend(tiered.l3.clone());
-                    let prefixed = PrefixedBackend::new(operator_name, Box::new(tiered_backend));
+                    let prefixed = PrefixedBackend::new(operator_name, Box::new(tiered_backend))?;
                     StateContext::new(Box::new(prefixed))
                 } else {
                     let path = self

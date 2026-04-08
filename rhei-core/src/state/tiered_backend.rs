@@ -5,26 +5,36 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use foyer::{DeviceBuilder, FsDeviceBuilder, HybridCache, HybridCacheBuilder};
 
-use super::backend::StateBackend;
+use super::backend::{BatchOp, StateBackend};
 use super::slatedb_backend::SlateDbBackend;
 
 /// Configuration for the L2 Foyer disk cache layer.
 #[derive(Debug)]
 pub struct TieredBackendConfig {
     /// Directory for Foyer's on-disk cache files.
+    /// Default: `/tmp/rhei-foyer-{pid}` (PID-scoped to avoid collisions
+    /// between concurrent processes sharing the same host).
     pub foyer_dir: PathBuf,
     /// In-memory capacity for the Foyer cache (bytes). Default: 64 MiB.
     pub foyer_memory_capacity: usize,
     /// On-disk capacity for the Foyer cache (bytes). Default: 256 MiB.
     pub foyer_disk_capacity: usize,
+    /// Block size for Foyer's on-disk block engine (bytes). Default: 256 KiB.
+    ///
+    /// Smaller blocks reduce read amplification for point lookups (typical
+    /// in state backends) at the cost of higher metadata overhead. 256 KiB
+    /// is a reasonable balance; bump to 1-4 MiB only if values are large
+    /// or sequential scan throughput matters more than lookup latency.
+    pub foyer_block_size: usize,
 }
 
 impl Default for TieredBackendConfig {
     fn default() -> Self {
         Self {
-            foyer_dir: PathBuf::from("/tmp/rhei-foyer"),
+            foyer_dir: PathBuf::from(format!("/tmp/rhei-foyer-{}", std::process::id())),
             foyer_memory_capacity: 64 * 1024 * 1024,
             foyer_disk_capacity: 256 * 1024 * 1024,
+            foyer_block_size: 256 * 1024,
         }
     }
 }
@@ -50,7 +60,7 @@ impl SharedL2Cache {
             .memory(config.foyer_memory_capacity)
             .storage()
             .with_engine_config(
-                foyer::BlockEngineConfig::new(device).with_block_size(4 * 1024 * 1024),
+                foyer::BlockEngineConfig::new(device).with_block_size(config.foyer_block_size),
             )
             .build()
             .await?;
@@ -113,7 +123,7 @@ impl TieredBackend {
             .memory(config.foyer_memory_capacity)
             .storage()
             .with_engine_config(
-                foyer::BlockEngineConfig::new(device).with_block_size(4 * 1024 * 1024), // 4 MiB blocks
+                foyer::BlockEngineConfig::new(device).with_block_size(config.foyer_block_size),
             )
             .build()
             .await?;
@@ -182,6 +192,34 @@ impl StateBackend for TieredBackend {
     async fn checkpoint(&self) -> anyhow::Result<()> {
         // Delegate to L3 (no-op for SlateDB, but respects the trait contract)
         self.l3.checkpoint().await
+    }
+
+    async fn put_batch(&self, ops: Vec<BatchOp>) -> anyhow::Result<()> {
+        // Write-through: atomic batch to L3, then update L2 cache.
+        // L2 updates are best-effort cache population — not critical for
+        // correctness since L2 is a read cache that can be repopulated.
+        let l2_ops: Vec<(Vec<u8>, Option<Bytes>)> = ops
+            .iter()
+            .map(|op| match op {
+                BatchOp::Put { key, value } => (key.clone(), Some(Bytes::from(value.clone()))),
+                BatchOp::Delete { key } => (key.clone(), None),
+            })
+            .collect();
+
+        self.l3.put_batch(ops).await?;
+
+        // Update L2 cache to reflect the batch writes.
+        for (key, value) in l2_ops {
+            match value {
+                Some(v) => {
+                    self.l2.insert(key, v);
+                }
+                None => {
+                    self.l2.remove(&key);
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -282,10 +320,10 @@ mod tests {
 
         // Two operators sharing the same L2 cache (namespaced via PrefixedBackend).
         let backend_a = shared.create_tiered_backend(l3.clone());
-        let op_a = PrefixedBackend::new("op_a", Box::new(backend_a));
+        let op_a = PrefixedBackend::new("op_a", Box::new(backend_a)).unwrap();
 
         let backend_b = shared.create_tiered_backend(l3.clone());
-        let op_b = PrefixedBackend::new("op_b", Box::new(backend_b));
+        let op_b = PrefixedBackend::new("op_b", Box::new(backend_b)).unwrap();
 
         // Write via op_a, read via op_a — should work.
         op_a.put(b"key", b"val_a").await.unwrap();

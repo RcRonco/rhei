@@ -1,8 +1,11 @@
+use std::collections::HashMap;
+use std::time::{Duration, Instant};
+
 use bytes::Bytes;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
-use super::backend::StateBackend;
+use super::backend::{BatchOp, StateBackend};
 use super::memtable::MemTable;
 use super::timer_service::TimerService;
 
@@ -11,6 +14,17 @@ use super::timer_service::TimerService;
 /// Reads go through the L1 `MemTable` first (read-your-own-writes). On miss the
 /// request falls through to the backend. Writes always go to the `MemTable`
 /// (synchronous, fast). Dirty entries are flushed to the backend on checkpoint.
+///
+/// ## TTL support
+///
+/// When configured via [`with_ttl`](Self::with_ttl), keys are automatically
+/// expired on read (lazy eviction). Expired keys return `None` from `get`/`get_raw`
+/// and are deleted from the memtable. On checkpoint, any remaining expired keys
+/// are swept and converted to backend deletes.
+///
+/// TTL tracking uses `Instant` (monotonic clock), so it is immune to wall-clock
+/// jumps. The tradeoff is that TTL timestamps are not persisted across restarts;
+/// after recovery, keys loaded from the backend start with a fresh write timestamp.
 pub struct StateContext {
     memtable: MemTable,
     backend: Box<dyn StateBackend>,
@@ -18,6 +32,11 @@ pub struct StateContext {
     worker_label: Option<String>,
     /// Lazy-initialized timer service for event-time callbacks.
     timer_service: Option<TimerService>,
+    /// Optional TTL for state entries.
+    ttl: Option<Duration>,
+    /// Write timestamps for TTL tracking. Only populated when `ttl` is `Some`.
+    /// Uses `Instant` (monotonic) to avoid wall-clock drift issues.
+    write_times: HashMap<Vec<u8>, Instant>,
 }
 
 impl std::fmt::Debug for StateContext {
@@ -36,6 +55,8 @@ impl StateContext {
             backend,
             worker_label: None,
             timer_service: None,
+            ttl: None,
+            write_times: HashMap::new(),
         }
     }
 
@@ -48,6 +69,19 @@ impl StateContext {
     /// Replace the memtable with one using the given configuration.
     pub fn with_memtable_config(mut self, config: super::memtable::MemTableConfig) -> Self {
         self.memtable = MemTable::with_config(config);
+        self
+    }
+
+    /// Enable time-to-live for state entries.
+    ///
+    /// Keys written after this call will be lazily expired on read when
+    /// their age exceeds `ttl`. Expired keys are also swept during
+    /// checkpoint.
+    ///
+    /// Note: TTL timestamps are not persisted. After recovery, keys
+    /// loaded from the backend are treated as freshly written.
+    pub fn with_ttl(mut self, ttl: Duration) -> Self {
+        self.ttl = Some(ttl);
         self
     }
 
@@ -66,7 +100,23 @@ impl StateContext {
         Ok(())
     }
 
+    /// Returns `true` if the key has exceeded its TTL.
+    fn is_expired(&self, key: &[u8]) -> bool {
+        if let Some(ttl) = self.ttl
+            && let Some(write_time) = self.write_times.get(key)
+        {
+            return write_time.elapsed() > ttl;
+        }
+        // No TTL configured, or no write_time recorded (key loaded from
+        // backend post-recovery, or TTL enabled after key was written).
+        // In all cases, treat the key as not expired.
+        false
+    }
+
     /// Get raw bytes — checks memtable first, then falls back to backend.
+    ///
+    /// If TTL is configured, expired keys are lazily evicted: they return
+    /// `None` and are marked as deleted in the memtable.
     pub async fn get_raw(&mut self, key: &[u8]) -> anyhow::Result<Option<Bytes>> {
         if let Some(ref wl) = self.worker_label {
             metrics::counter!("state_gets_total", "worker" => wl.clone()).increment(1);
@@ -82,7 +132,19 @@ impl StateContext {
                 } else {
                     metrics::counter!("state_l1_hits_total").increment(1);
                 }
-                Ok(Some(v))
+                // Check TTL — lazily expire on read.
+                if self.is_expired(key) {
+                    metrics::counter!("state_ttl_expired_total").increment(1);
+                    // Mark as deleted (tombstone) in the memtable so the next
+                    // checkpoint flushes a backend delete. This prevents the
+                    // expired key from being re-fetched from the backend after
+                    // the tombstone is evicted from L1.
+                    self.memtable.delete(key.to_vec());
+                    self.write_times.remove(key);
+                    Ok(None)
+                } else {
+                    Ok(Some(v))
+                }
             }
             Some(None) => {
                 if let Some(ref wl) = self.worker_label {
@@ -98,10 +160,28 @@ impl StateContext {
                 } else {
                     metrics::counter!("state_l1_misses_total").increment(1);
                 }
-                // Cache miss — fetch from backend
+                // Cache miss — fetch from backend.
+                //
+                // Known limitation: keys loaded from the backend after a
+                // restart (or L1 eviction + checkpoint) receive a fresh
+                // `Instant::now()` write timestamp, effectively resetting
+                // their TTL. This is unavoidable because `Instant` is not
+                // persisted. The checkpoint sweep (see `checkpoint()`)
+                // mitigates this by deleting expired keys from the backend
+                // before they can be re-fetched. After recovery, all
+                // backend keys are treated as freshly written.
                 let result = self.backend.get(key).await?;
                 if let Some(ref v) = result {
                     self.memtable.merge(key.to_vec(), v.clone());
+                    // Track write time for backend-loaded keys so TTL applies.
+                    // Uses `or_insert_with` to avoid overwriting an existing
+                    // timestamp if the key was already tracked (should not
+                    // happen on a true L1 miss, but is defensive).
+                    if self.ttl.is_some() {
+                        self.write_times
+                            .entry(key.to_vec())
+                            .or_insert_with(Instant::now);
+                    }
                 }
                 Ok(result)
             }
@@ -118,6 +198,9 @@ impl StateContext {
         } else {
             metrics::counter!("state_puts_total").increment(1);
         }
+        if self.ttl.is_some() {
+            self.write_times.insert(key.to_vec(), Instant::now());
+        }
         self.memtable
             .put(key.to_vec(), Bytes::copy_from_slice(value));
     }
@@ -129,14 +212,30 @@ impl StateContext {
         } else {
             metrics::counter!("state_deletes_total").increment(1);
         }
+        self.write_times.remove(key);
         self.memtable.delete(key.to_vec());
     }
 
     /// Returns all keys in the memtable that start with the given prefix.
     ///
-    /// **Important:** This only returns keys currently in the L1 memtable —
-    /// it does NOT scan the backend (L2/L3). For TTL cleanup this is sufficient
-    /// because all active state passes through the memtable on read.
+    /// # L1-only limitation
+    ///
+    /// This **only** returns keys currently in the L1 memtable (dirty +
+    /// clean cache). It does **not** scan L2 (Foyer) or L3 (`SlateDB`).
+    ///
+    /// Keys that were persisted to L2/L3 but have since been evicted from
+    /// the L1 clean cache will not be returned. After a restart, the L1
+    /// memtable is empty, so this method returns nothing until keys are
+    /// re-read from the backend or written by the operator.
+    ///
+    /// This is acceptable for:
+    /// - **TTL cleanup** — active state passes through the memtable on read,
+    ///   so recently-accessed keys are always present.
+    /// - **Window state enumeration** — window operators keep all active
+    ///   keys in the memtable during processing.
+    ///
+    /// Callers that need a complete key listing across all tiers should
+    /// implement a backend-level scan (e.g. `SlateDB` range scan).
     pub fn keys_with_prefix(&self, prefix: &[u8]) -> Vec<Vec<u8>> {
         self.memtable.keys_with_prefix(prefix)
     }
@@ -160,8 +259,46 @@ impl StateContext {
     }
 
     /// Flush dirty entries from memtable to backend, then trigger backend checkpoint.
+    ///
+    /// Dirty keys are collected into a single `put_batch` call so that backends
+    /// with native atomic batches (e.g. `SlateDB` `WriteBatch`) can apply them
+    /// atomically. This prevents partial flushes from leaving the backend in
+    /// an inconsistent state on crash.
+    ///
+    /// # Invariants
+    ///
+    /// - After a successful checkpoint, all dirty entries are persisted to the
+    ///   backend and the memtable's dirty set is empty.
+    /// - Timer state is included in the same batch when dirty.
+    /// - The backend's `checkpoint()` is called after the batch write to ensure
+    ///   durability (no-op for `SlateDB` which is WAL-durable by default).
     pub async fn checkpoint(&mut self) -> anyhow::Result<()> {
         let start = std::time::Instant::now();
+
+        // Sweep expired keys before flushing. This converts any remaining
+        // expired entries into memtable deletes (tombstones) so that the
+        // subsequent flush will propagate backend deletes, preventing
+        // unbounded growth of expired-but-never-read keys in the backend.
+        if let Some(ttl) = self.ttl {
+            let expired_keys: Vec<Vec<u8>> = self
+                .write_times
+                .iter()
+                .filter(|(_, write_time)| write_time.elapsed() > ttl)
+                .map(|(key, _)| key.clone())
+                .collect();
+
+            let expired_count = expired_keys.len();
+            if expired_count > 0 {
+                tracing::debug!(expired_count, "sweeping expired TTL keys at checkpoint");
+                metrics::counter!("state_ttl_swept_total").increment(expired_count as u64);
+            }
+
+            for key in expired_keys {
+                self.memtable.delete(key.clone());
+                self.write_times.remove(&key);
+            }
+        }
+
         let dirty = self.memtable.flush();
         let dirty_count = dirty.len();
 
@@ -169,22 +306,32 @@ impl StateContext {
         #[allow(clippy::cast_precision_loss)]
         metrics::gauge!("state_checkpoint_dirty_keys").set(dirty_count as f64);
 
+        // Collect all dirty entries into batch operations.
+        let mut ops: Vec<BatchOp> = Vec::with_capacity(dirty_count + 1);
         for (key, value) in dirty {
             match value {
-                Some(v) => self.backend.put(&key, &v).await?,
-                None => self.backend.delete(&key).await?,
+                Some(v) => ops.push(BatchOp::Put {
+                    key,
+                    value: v.to_vec(),
+                }),
+                None => ops.push(BatchOp::Delete { key }),
             }
         }
 
-        // Persist timer state if dirty.
+        // Include timer state in the same batch if dirty.
         if let Some(ref mut ts) = self.timer_service
             && ts.is_dirty()
         {
             let timer_bytes = ts.serialize()?;
-            self.backend
-                .put(super::timer_service::TIMER_STATE_KEY, &timer_bytes)
-                .await?;
+            ops.push(BatchOp::Put {
+                key: super::timer_service::TIMER_STATE_KEY.to_vec(),
+                value: timer_bytes,
+            });
             ts.clear_dirty();
+        }
+
+        if !ops.is_empty() {
+            self.backend.put_batch(ops).await?;
         }
 
         self.backend.checkpoint().await?;
@@ -293,6 +440,124 @@ mod tests {
         ctx.delete(b"key");
         let val = ctx.get_raw(b"key").await.unwrap();
         assert_eq!(val, None);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn ttl_expires_key_on_read() {
+        let path = temp_path("ttl_expire");
+        let _ = std::fs::remove_file(&path);
+
+        let backend = LocalBackend::new(path.clone(), None).unwrap();
+        let mut ctx = StateContext::new(Box::new(backend)).with_ttl(Duration::from_millis(50));
+
+        ctx.put_raw(b"key", b"value");
+        // Immediately readable.
+        let val = ctx.get_raw(b"key").await.unwrap();
+        assert_eq!(val.as_deref(), Some(b"value".as_slice()));
+
+        // Wait for TTL to expire.
+        tokio::time::sleep(Duration::from_millis(60)).await;
+
+        // Should now return None (expired).
+        let val = ctx.get_raw(b"key").await.unwrap();
+        assert_eq!(val, None);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn ttl_not_set_no_expiry() {
+        let path = temp_path("ttl_none");
+        let _ = std::fs::remove_file(&path);
+
+        let backend = LocalBackend::new(path.clone(), None).unwrap();
+        let mut ctx = StateContext::new(Box::new(backend));
+        // No TTL configured.
+
+        ctx.put_raw(b"key", b"value");
+        // Still readable after any delay (no TTL).
+        let val = ctx.get_raw(b"key").await.unwrap();
+        assert_eq!(val.as_deref(), Some(b"value".as_slice()));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn ttl_checkpoint_sweeps_expired_keys() {
+        let path = temp_path("ttl_sweep");
+        let _ = std::fs::remove_file(&path);
+
+        let backend = LocalBackend::new(path.clone(), None).unwrap();
+        let mut ctx = StateContext::new(Box::new(backend)).with_ttl(Duration::from_millis(50));
+
+        ctx.put_raw(b"key1", b"val1");
+        ctx.put_raw(b"key2", b"val2");
+
+        // Wait for TTL to expire.
+        tokio::time::sleep(Duration::from_millis(60)).await;
+
+        // Checkpoint should sweep expired keys — they become backend deletes.
+        ctx.checkpoint().await.unwrap();
+
+        // After sweep + checkpoint, expired keys should not be in the backend.
+        // Re-open with a fresh context to verify.
+        let backend = LocalBackend::new(path.clone(), None).unwrap();
+        let mut ctx = StateContext::new(Box::new(backend));
+        assert_eq!(ctx.get_raw(b"key1").await.unwrap(), None);
+        assert_eq!(ctx.get_raw(b"key2").await.unwrap(), None);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn ttl_checkpoint_preserves_live_keys() {
+        let path = temp_path("ttl_preserve");
+        let _ = std::fs::remove_file(&path);
+
+        let backend = LocalBackend::new(path.clone(), None).unwrap();
+        let mut ctx = StateContext::new(Box::new(backend)).with_ttl(Duration::from_millis(500));
+
+        ctx.put_raw(b"live", b"value");
+        ctx.put_raw(b"also_live", b"value2");
+
+        // Checkpoint before TTL expires.
+        ctx.checkpoint().await.unwrap();
+
+        // Re-open and verify keys are persisted.
+        let backend = LocalBackend::new(path.clone(), None).unwrap();
+        let mut ctx = StateContext::new(Box::new(backend));
+        assert_eq!(
+            ctx.get_raw(b"live").await.unwrap().as_deref(),
+            Some(b"value".as_slice())
+        );
+        assert_eq!(
+            ctx.get_raw(b"also_live").await.unwrap().as_deref(),
+            Some(b"value2".as_slice())
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn ttl_rewrite_resets_timer() {
+        let path = temp_path("ttl_rewrite");
+        let _ = std::fs::remove_file(&path);
+
+        let backend = LocalBackend::new(path.clone(), None).unwrap();
+        let mut ctx = StateContext::new(Box::new(backend)).with_ttl(Duration::from_millis(80));
+
+        ctx.put_raw(b"key", b"value1");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Rewrite resets the TTL timer.
+        ctx.put_raw(b"key", b"value2");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Still alive because the rewrite reset the timer.
+        let val = ctx.get_raw(b"key").await.unwrap();
+        assert_eq!(val.as_deref(), Some(b"value2".as_slice()));
 
         let _ = std::fs::remove_file(&path);
     }
