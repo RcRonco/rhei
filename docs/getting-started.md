@@ -25,7 +25,7 @@ If you don't have the `rhei` CLI installed, create a project manually:
 ```bash
 cargo init my-pipeline
 cd my-pipeline
-cargo add rhei anyhow async-trait serde tokio --features serde/derive,tokio/full
+cargo add rhei-core rhei-runtime anyhow async-trait serde tokio --features serde/derive,tokio/full
 ```
 
 ## Your First Pipeline
@@ -33,20 +33,30 @@ cargo add rhei anyhow async-trait serde tokio --features serde/derive,tokio/full
 Replace `src/main.rs` with:
 
 ```rust
-use rhei::{PrintSink, VecSource};
+use rhei_core::connectors::print_sink::PrintSink;
+use rhei_core::connectors::vec_source::VecSource;
+use rhei_runtime::dataflow::DataflowGraph;
+use rhei_runtime::Executor;
 
-#[rhei::pipeline]
-fn main(graph: &DataflowGraph) {
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
     let events = vec![
         "sensor-1:23.5".to_string(),
         "sensor-2:18.0".to_string(),
         "sensor-1:24.1".to_string(),
     ];
 
+    let graph = DataflowGraph::new();
     graph
         .source(VecSource::new(events))
         .map(|line: String| line.to_uppercase())
         .sink(PrintSink::<String>::new());
+
+    let executor = Executor::builder()
+        .checkpoint_dir("./checkpoints")
+        .build()?;
+    executor.run(graph).await?;
+    Ok(())
 }
 ```
 
@@ -64,7 +74,7 @@ SENSOR-2:18.0
 SENSOR-1:24.1
 ```
 
-The `#[rhei::pipeline]` macro generates the executor setup and tokio runtime. For full control, see [Manual Executor Setup](#manual-executor-setup) below.
+For full control over workers, checkpointing, and clustering, see [Manual Executor Setup](#manual-executor-setup) below.
 
 ## Core Concepts
 
@@ -106,17 +116,28 @@ graph
 Stateful operators implement the `StreamFunction` trait. Use `KeyedState<K, V>` for typed key-value state:
 
 ```rust
-use rhei::{KeyedState, StateContext};
+use async_trait::async_trait;
+use rhei_core::operators::keyed_state::KeyedState;
+use rhei_core::state::context::StateContext;
+use rhei_core::traits::StreamFunction;
 
-#[rhei::op]
-async fn count_events(
-    input: SensorReading,
-    ctx: &mut StateContext,
-) -> anyhow::Result<Vec<String>> {
-    let mut state = KeyedState::<String, u64>::new(ctx, "counts");
-    let count = state.get(&input.sensor_id).await?.unwrap_or(0) + 1;
-    state.put(&input.sensor_id, &count)?;
-    Ok(vec![format!("{}: {} events", input.sensor_id, count)])
+struct CountEvents;
+
+#[async_trait]
+impl StreamFunction for CountEvents {
+    type Input = SensorReading;
+    type Output = String;
+
+    async fn process(
+        &mut self,
+        input: SensorReading,
+        ctx: &mut StateContext,
+    ) -> anyhow::Result<Vec<String>> {
+        let mut state = KeyedState::<String, u64>::new(ctx, "counts");
+        let count = state.get(&input.sensor_id).await?.unwrap_or(0) + 1;
+        state.put(&input.sensor_id, &count)?;
+        Ok(vec![format!("{}: {} events", input.sensor_id, count)])
+    }
 }
 ```
 
