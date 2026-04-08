@@ -89,25 +89,32 @@ where
     T: Clone + Send + std::fmt::Debug + serde::Serialize + serde::de::DeserializeOwned + 'static,
 {
     let type_hash = seahash::hash(std::any::type_name::<T>().as_bytes());
-    let needs_insert = {
+
+    // Fast path: check with a read lock (no contention). This avoids taking
+    // the write lock on every AnyItem::new() call after the type is registered.
+    {
         let reg = TYPE_REGISTRY.read().unwrap_or_else(|e| {
             tracing::warn!("TYPE_REGISTRY read lock poisoned, recovering: {e}");
             e.into_inner()
         });
-        !reg.contains_key(&type_hash)
-    };
-    if needs_insert {
-        let mut reg = TYPE_REGISTRY.write().unwrap_or_else(|e| {
-            tracing::warn!("TYPE_REGISTRY write lock poisoned, recovering: {e}");
-            e.into_inner()
-        });
-        reg.entry(type_hash).or_insert_with(|| {
-            Box::new(|bytes: &[u8]| {
-                let value: T = bincode::deserialize(bytes)?;
-                Ok(AnyItem(Box::new(value)))
-            })
-        });
+        if reg.contains_key(&type_hash) {
+            return;
+        }
     }
+
+    // Slow path: take a single write lock and use or_insert_with to
+    // atomically check-and-insert, eliminating any TOCTOU race between
+    // the read check above and this write.
+    let mut reg = TYPE_REGISTRY.write().unwrap_or_else(|e| {
+        tracing::warn!("TYPE_REGISTRY write lock poisoned, recovering: {e}");
+        e.into_inner()
+    });
+    reg.entry(type_hash).or_insert_with(|| {
+        Box::new(|bytes: &[u8]| {
+            let value: T = bincode::deserialize(bytes)?;
+            Ok(AnyItem(Box::new(value)))
+        })
+    });
 }
 
 // ── AnyItem ─────────────────────────────────────────────────────────
