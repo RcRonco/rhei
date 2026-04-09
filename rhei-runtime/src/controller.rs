@@ -143,6 +143,42 @@ pub struct PipelineControllerBuilder {
 }
 
 impl PipelineControllerBuilder {
+    /// Apply settings from a [`PipelineConfig`](rhei_core::config::PipelineConfig).
+    ///
+    /// Core fields (`checkpoint_dir`, `workers`, `checkpoint_interval`) are
+    /// set unconditionally from the config. Optional fields (`pipeline_name`,
+    /// `metrics_addr`, `process_id`, `peers`) are only set when present in
+    /// the config. Call this early in the builder chain so that subsequent
+    /// builder methods can override the values.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let config = PipelineConfig::load("pipeline.toml")?.apply_env();
+    /// let executor = Executor::builder()
+    ///     .apply_config(&config)  // sets all core fields from config
+    ///     .workers(8)             // overrides the config value
+    ///     .build()?;
+    /// ```
+    pub fn apply_config(mut self, config: &rhei_core::config::PipelineConfig) -> Self {
+        self.checkpoint_dir = std::path::PathBuf::from(&config.pipeline.checkpoint_dir);
+        self.workers = config.pipeline.workers;
+        self.checkpoint_interval = config.pipeline.checkpoint_interval;
+        if let Some(ref name) = config.pipeline.name {
+            self.pipeline_name = Some(name.clone());
+        }
+        if let Some(addr) = config.metrics_addr() {
+            self.metrics_addr = Some(addr);
+        }
+        if let Some(pid) = config.cluster.process_id {
+            self.process_id = Some(pid);
+        }
+        if let Some(ref peers) = config.cluster.peers {
+            self.peers = Some(peers.clone());
+        }
+        self
+    }
+
     /// Set the checkpoint directory.
     pub fn checkpoint_dir(mut self, dir: impl Into<std::path::PathBuf>) -> Self {
         self.checkpoint_dir = dir.into();
@@ -501,7 +537,11 @@ impl PipelineController {
     ///
     /// Build the graph first with [`DataflowGraph::source()`], stream
     /// transforms, and sinks, then pass it here for execution.
+    ///
+    /// Validates the graph structure before compilation. Returns a clear
+    /// error if any streams do not terminate at a sink.
     pub async fn run(&self, graph: DataflowGraph) -> anyhow::Result<()> {
+        graph.validate().map_err(|e| anyhow::anyhow!("{e}"))?;
         run_graph(graph, self, None).await
     }
 
@@ -510,18 +550,23 @@ impl PipelineController {
     ///
     /// This is the recommended entry point for `#[rhei::pipeline]` generated
     /// code. It handles the full lifecycle: telemetry init, HTTP server start,
-    /// graph compilation, and execution.
+    /// graph validation, compilation, and execution.
     pub async fn start(&self, graph: DataflowGraph) -> anyhow::Result<()> {
+        graph.validate().map_err(|e| anyhow::anyhow!("{e}"))?;
         let _http_handle = self.maybe_start_http()?;
-        self.run(graph).await
+        run_graph(graph, self, None).await
     }
 
     /// Compile and execute a [`DataflowGraph`] with graceful shutdown.
+    ///
+    /// Validates the graph structure before compilation. Returns a clear
+    /// error if any streams do not terminate at a sink.
     pub async fn run_with_shutdown(
         &self,
         graph: DataflowGraph,
         shutdown: ShutdownHandle,
     ) -> anyhow::Result<()> {
+        graph.validate().map_err(|e| anyhow::anyhow!("{e}"))?;
         run_graph(graph, self, Some(shutdown)).await
     }
 
