@@ -1,0 +1,24 @@
+[package]
+name = "rhei-python"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+
+[lib]
+name = "rhei"
+crate-type = ["cdylib"]
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+pyo3 = { version = "0.23", features = ["extension-module"] }
+rhei-core = { path = "../rhei-core" }
+rhei-runtime = { path = "../rhei-runtime" }
+serde_json.workspace = true
+tempfile.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true
