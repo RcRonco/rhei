@@ -1,5 +1,5 @@
 [workspace]
-members = ["rhei-core", "rhei-runtime", "rhei-cli", "rhei-macros", "rhei"]
+members = ["rhei-core", "rhei-runtime", "rhei-cli", "rhei-macros", "rhei", "rhei-python"]
 resolver = "3"
 
 [workspace.dependencies]
