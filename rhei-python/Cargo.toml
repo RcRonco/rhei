@@ -6,7 +6,7 @@ license = "Apache-2.0"
 publish = false
 
 [lib]
-name = "rhei"
+name = "rhei_native"
 crate-type = ["cdylib"]
 
 [dependencies]

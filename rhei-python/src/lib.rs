@@ -11,9 +11,9 @@ mod sink;
 mod source;
 mod stream;
 
-/// The `rhei` Python module.
+/// The native extension module, imported as `rhei._native`.
 #[pymodule]
-fn rhei(m: &Bound<'_, PyModule>) -> PyResult<()> {
+fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<pipeline::Pipeline>()?;
     m.add_class::<stream::PyStream>()?;
     m.add_class::<connectors::PyVecSource>()?;
