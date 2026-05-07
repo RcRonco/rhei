@@ -375,7 +375,7 @@ async fn run_demo_pipeline_with(
 
     // Keep alive so the HTTP server stays up
     loop {
-        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+        tokio::time::sleep(std::time::Duration::from_mins(1)).await;
     }
 }
 

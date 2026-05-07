@@ -541,9 +541,7 @@ impl PipelineController {
         let handles = crate::telemetry::init(crate::telemetry::TelemetryConfig {
             metrics_addr: Some(addr),
             log_filter: std::env::var("RHEI_LOG_LEVEL").unwrap_or_else(|_| "info".to_string()),
-            json_logs: std::env::var("RHEI_JSON_LOGS")
-                .map(|v| v == "1" || v == "true")
-                .unwrap_or(false),
+            json_logs: std::env::var("RHEI_JSON_LOGS").is_ok_and(|v| v == "1" || v == "true"),
             tui: false,
         })?;
 
