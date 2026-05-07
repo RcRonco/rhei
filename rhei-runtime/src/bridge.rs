@@ -8,6 +8,17 @@ use crate::any_item::AnyItem;
 use crate::erased::ErasedSource;
 use crate::shutdown::ShutdownHandle;
 
+/// Default bounded channel capacity for source and sink bridges.
+///
+/// This controls backpressure between async source/sink tasks and the
+/// synchronous Timely worker thread. A higher value increases throughput
+/// at the cost of memory and latency; a lower value provides tighter
+/// backpressure but may cause the source to stall more frequently.
+///
+/// Used by [`source_bridge`], [`sink_bridge`], and [`local_source_bridge`].
+/// The executor and `task_manager` also use this for their internal channels.
+pub const DEFAULT_CHANNEL_SIZE: usize = 16;
+
 /// Bridges an async `Source` into a `flume::Receiver` for use in Timely.
 ///
 /// Spawns a Tokio task that calls `source.next_batch().await` in a loop,
@@ -20,7 +31,7 @@ pub fn source_bridge<S>(
 where
     S: Source + 'static,
 {
-    let (tx, rx) = flume::bounded(16);
+    let (tx, rx) = flume::bounded(DEFAULT_CHANNEL_SIZE);
     rt.spawn(async move {
         while let Some(batch) = source.next_batch().await {
             if tx.send_async(batch).await.is_err() {
@@ -43,7 +54,7 @@ pub fn sink_bridge<K>(mut sink: K, rt: &tokio::runtime::Handle) -> flume::Sender
 where
     K: Sink + 'static,
 {
-    let (tx, rx) = flume::bounded::<K::Input>(16);
+    let (tx, rx) = flume::bounded::<K::Input>(DEFAULT_CHANNEL_SIZE);
     rt.spawn(async move {
         while let Ok(item) = rx.recv_async().await {
             if let Err(e) = sink.write(item).await {
@@ -74,6 +85,16 @@ pub(crate) type SourceBatch = (Vec<AnyItem>, Option<u64>);
 ///
 /// The only direct atomic write is the `SourceExhausted` sentinel when the
 /// source is naturally exhausted (returns `None`).
+///
+/// # Design note: `std::sync::Mutex` for `offsets_writer`
+///
+/// We intentionally use `std::sync::Mutex` (not `tokio::sync::Mutex`) because
+/// `offsets_writer` is read from synchronous Timely worker threads in
+/// `task_manager.rs` (via `merge_source_offsets`). A `tokio::sync::Mutex`
+/// requires `.await` to lock, which is not available in the sync Timely
+/// context. The lock is held only for a brief `HashMap` swap, so contention
+/// is negligible and the async executor is never blocked for meaningful
+/// duration.
 pub(crate) async fn local_source_bridge(
     mut source: Box<dyn ErasedSource>,
     tx: flume::Sender<SourceBatch>,
@@ -85,9 +106,10 @@ pub(crate) async fn local_source_bridge(
         // Snapshot offsets after reading each batch.
         let offsets = source.current_offsets();
         if !offsets.is_empty() {
-            *offsets_writer
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) = offsets;
+            *offsets_writer.lock().unwrap_or_else(|e| {
+                tracing::warn!("offsets_writer mutex poisoned, recovering: {e}");
+                e.into_inner()
+            }) = offsets;
         }
 
         // Capture watermark to send alongside the batch data. The Timely
@@ -114,7 +136,7 @@ pub(crate) async fn local_source_bridge(
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used, deprecated)]
 mod tests {
     use super::*;
     use crate::executor::Sentinel;

@@ -314,10 +314,15 @@ impl<
             + 'static,
     {
         let node = LazyTransformNode(Box::new(move || {
-            Arc::new(move |item: AnyItem, _ctx: &TransformContext| {
-                let typed: T = item.downcast();
-                vec![AnyItem::new(f(typed))]
-            })
+            Arc::new(
+                move |item: AnyItem, _ctx: &TransformContext| match item.try_downcast::<T>() {
+                    Ok(typed) => vec![AnyItem::new(f(typed))],
+                    Err(e) => {
+                        tracing::error!("map downcast failed: {e}");
+                        vec![]
+                    }
+                },
+            )
         }));
         let node_id = self
             .graph
@@ -337,10 +342,15 @@ impl<
             + 'static,
     {
         let node = LazyTransformNode(Box::new(move || {
-            Arc::new(move |item: AnyItem, ctx: &TransformContext| {
-                let typed: T = item.downcast();
-                vec![AnyItem::new(f(typed, ctx))]
-            })
+            Arc::new(
+                move |item: AnyItem, ctx: &TransformContext| match item.try_downcast::<T>() {
+                    Ok(typed) => vec![AnyItem::new(f(typed, ctx))],
+                    Err(e) => {
+                        tracing::error!("map_ctx downcast failed: {e}");
+                        vec![]
+                    }
+                },
+            )
         }));
         let node_id = self
             .graph
@@ -354,14 +364,21 @@ impl<
         F: Fn(&T) -> bool + Send + Sync + 'static,
     {
         let node = LazyTransformNode(Box::new(move || {
-            Arc::new(move |item: AnyItem, _ctx: &TransformContext| {
-                let typed: T = item.downcast();
-                if f(&typed) {
-                    vec![AnyItem::new(typed)]
-                } else {
-                    vec![]
-                }
-            })
+            Arc::new(
+                move |item: AnyItem, _ctx: &TransformContext| match item.try_downcast::<T>() {
+                    Ok(typed) => {
+                        if f(&typed) {
+                            vec![AnyItem::new(typed)]
+                        } else {
+                            vec![]
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!("filter downcast failed: {e}");
+                        vec![]
+                    }
+                },
+            )
         }));
         let node_id = self
             .graph
@@ -376,14 +393,21 @@ impl<
         F: Fn(&T, &TransformContext) -> bool + Send + Sync + 'static,
     {
         let node = LazyTransformNode(Box::new(move || {
-            Arc::new(move |item: AnyItem, ctx: &TransformContext| {
-                let typed: T = item.downcast();
-                if f(&typed, ctx) {
-                    vec![AnyItem::new(typed)]
-                } else {
-                    vec![]
-                }
-            })
+            Arc::new(
+                move |item: AnyItem, ctx: &TransformContext| match item.try_downcast::<T>() {
+                    Ok(typed) => {
+                        if f(&typed, ctx) {
+                            vec![AnyItem::new(typed)]
+                        } else {
+                            vec![]
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!("filter_ctx downcast failed: {e}");
+                        vec![]
+                    }
+                },
+            )
         }));
         let node_id = self
             .graph
@@ -403,10 +427,15 @@ impl<
             + 'static,
     {
         let node = LazyTransformNode(Box::new(move || {
-            Arc::new(move |item: AnyItem, _ctx: &TransformContext| {
-                let typed: T = item.downcast();
-                f(typed).into_iter().map(AnyItem::new).collect()
-            })
+            Arc::new(
+                move |item: AnyItem, _ctx: &TransformContext| match item.try_downcast::<T>() {
+                    Ok(typed) => f(typed).into_iter().map(AnyItem::new).collect(),
+                    Err(e) => {
+                        tracing::error!("flat_map downcast failed: {e}");
+                        vec![]
+                    }
+                },
+            )
         }));
         let node_id = self
             .graph
@@ -426,10 +455,15 @@ impl<
             + 'static,
     {
         let node = LazyTransformNode(Box::new(move || {
-            Arc::new(move |item: AnyItem, ctx: &TransformContext| {
-                let typed: T = item.downcast();
-                f(typed, ctx).into_iter().map(AnyItem::new).collect()
-            })
+            Arc::new(
+                move |item: AnyItem, ctx: &TransformContext| match item.try_downcast::<T>() {
+                    Ok(typed) => f(typed, ctx).into_iter().map(AnyItem::new).collect(),
+                    Err(e) => {
+                        tracing::error!("flat_map_ctx downcast failed: {e}");
+                        vec![]
+                    }
+                },
+            )
         }));
         let node_id = self
             .graph
@@ -447,9 +481,12 @@ impl<
         KF: Fn(&T) -> String + Send + Sync + 'static,
     {
         let node = LazyKeyByNode(Box::new(move || {
-            Arc::new(move |item: &AnyItem| {
-                let typed = item.downcast_ref::<T>();
-                key_fn(typed)
+            Arc::new(move |item: &AnyItem| match item.try_downcast_ref::<T>() {
+                Ok(typed) => key_fn(typed),
+                Err(e) => {
+                    tracing::error!("key_by downcast failed: {e}");
+                    String::new()
+                }
             })
         }));
         let node_id = self
@@ -616,10 +653,15 @@ impl<
             + 'static,
     {
         let node = LazyTransformNode(Box::new(move || {
-            Arc::new(move |item: AnyItem, _ctx: &TransformContext| {
-                let typed: T = item.downcast();
-                vec![AnyItem::new(f(typed))]
-            })
+            Arc::new(
+                move |item: AnyItem, _ctx: &TransformContext| match item.try_downcast::<T>() {
+                    Ok(typed) => vec![AnyItem::new(f(typed))],
+                    Err(e) => {
+                        tracing::error!("keyed map downcast failed: {e}");
+                        vec![]
+                    }
+                },
+            )
         }));
         let node_id = self
             .graph
@@ -640,10 +682,15 @@ impl<
             + 'static,
     {
         let node = LazyTransformNode(Box::new(move || {
-            Arc::new(move |item: AnyItem, ctx: &TransformContext| {
-                let typed: T = item.downcast();
-                vec![AnyItem::new(f(typed, ctx))]
-            })
+            Arc::new(
+                move |item: AnyItem, ctx: &TransformContext| match item.try_downcast::<T>() {
+                    Ok(typed) => vec![AnyItem::new(f(typed, ctx))],
+                    Err(e) => {
+                        tracing::error!("keyed map_ctx downcast failed: {e}");
+                        vec![]
+                    }
+                },
+            )
         }));
         let node_id = self
             .graph
@@ -657,14 +704,21 @@ impl<
         F: Fn(&T) -> bool + Send + Sync + 'static,
     {
         let node = LazyTransformNode(Box::new(move || {
-            Arc::new(move |item: AnyItem, _ctx: &TransformContext| {
-                let typed: T = item.downcast();
-                if f(&typed) {
-                    vec![AnyItem::new(typed)]
-                } else {
-                    vec![]
-                }
-            })
+            Arc::new(
+                move |item: AnyItem, _ctx: &TransformContext| match item.try_downcast::<T>() {
+                    Ok(typed) => {
+                        if f(&typed) {
+                            vec![AnyItem::new(typed)]
+                        } else {
+                            vec![]
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!("keyed filter downcast failed: {e}");
+                        vec![]
+                    }
+                },
+            )
         }));
         let node_id = self
             .graph
@@ -679,14 +733,21 @@ impl<
         F: Fn(&T, &TransformContext) -> bool + Send + Sync + 'static,
     {
         let node = LazyTransformNode(Box::new(move || {
-            Arc::new(move |item: AnyItem, ctx: &TransformContext| {
-                let typed: T = item.downcast();
-                if f(&typed, ctx) {
-                    vec![AnyItem::new(typed)]
-                } else {
-                    vec![]
-                }
-            })
+            Arc::new(
+                move |item: AnyItem, ctx: &TransformContext| match item.try_downcast::<T>() {
+                    Ok(typed) => {
+                        if f(&typed, ctx) {
+                            vec![AnyItem::new(typed)]
+                        } else {
+                            vec![]
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!("keyed filter_ctx downcast failed: {e}");
+                        vec![]
+                    }
+                },
+            )
         }));
         let node_id = self
             .graph
@@ -706,10 +767,15 @@ impl<
             + 'static,
     {
         let node = LazyTransformNode(Box::new(move || {
-            Arc::new(move |item: AnyItem, _ctx: &TransformContext| {
-                let typed: T = item.downcast();
-                f(typed).into_iter().map(AnyItem::new).collect()
-            })
+            Arc::new(
+                move |item: AnyItem, _ctx: &TransformContext| match item.try_downcast::<T>() {
+                    Ok(typed) => f(typed).into_iter().map(AnyItem::new).collect(),
+                    Err(e) => {
+                        tracing::error!("keyed flat_map downcast failed: {e}");
+                        vec![]
+                    }
+                },
+            )
         }));
         let node_id = self
             .graph
@@ -730,10 +796,15 @@ impl<
             + 'static,
     {
         let node = LazyTransformNode(Box::new(move || {
-            Arc::new(move |item: AnyItem, ctx: &TransformContext| {
-                let typed: T = item.downcast();
-                f(typed, ctx).into_iter().map(AnyItem::new).collect()
-            })
+            Arc::new(
+                move |item: AnyItem, ctx: &TransformContext| match item.try_downcast::<T>() {
+                    Ok(typed) => f(typed, ctx).into_iter().map(AnyItem::new).collect(),
+                    Err(e) => {
+                        tracing::error!("keyed flat_map_ctx downcast failed: {e}");
+                        vec![]
+                    }
+                },
+            )
         }));
         let node_id = self
             .graph
@@ -803,10 +874,13 @@ impl<
         // The operator now emits DlqTag items. Split into main/error streams.
         let main_node = LazyTransformNode(Box::new(|| {
             Arc::new(|item: AnyItem, _ctx: &TransformContext| {
-                let tag: DlqTag<AnyItem> = item.downcast();
-                match tag {
-                    DlqTag::Main(inner) => vec![inner],
-                    DlqTag::Error(_) => vec![],
+                match item.try_downcast::<DlqTag<AnyItem>>() {
+                    Ok(DlqTag::Main(inner)) => vec![inner],
+                    Ok(DlqTag::Error(_)) => vec![],
+                    Err(e) => {
+                        tracing::error!("DLQ main split downcast failed: {e}");
+                        vec![]
+                    }
                 }
             })
         }));
@@ -816,10 +890,13 @@ impl<
 
         let side_node = LazyTransformNode(Box::new(|| {
             Arc::new(|item: AnyItem, _ctx: &TransformContext| {
-                let tag: DlqTag<AnyItem> = item.downcast();
-                match tag {
-                    DlqTag::Main(_) => vec![],
-                    DlqTag::Error(msg) => vec![AnyItem::new(msg)],
+                match item.try_downcast::<DlqTag<AnyItem>>() {
+                    Ok(DlqTag::Main(_)) => vec![],
+                    Ok(DlqTag::Error(msg)) => vec![AnyItem::new(msg)],
+                    Err(e) => {
+                        tracing::error!("DLQ side split downcast failed: {e}");
+                        vec![]
+                    }
                 }
             })
         }));
@@ -839,9 +916,12 @@ impl<
         KF: Fn(&T) -> String + Send + Sync + 'static,
     {
         let node = LazyKeyByNode(Box::new(move || {
-            Arc::new(move |item: &AnyItem| {
-                let typed = item.downcast_ref::<T>();
-                key_fn(typed)
+            Arc::new(move |item: &AnyItem| match item.try_downcast_ref::<T>() {
+                Ok(typed) => key_fn(typed),
+                Err(e) => {
+                    tracing::error!("keyed key_by downcast failed: {e}");
+                    String::new()
+                }
             })
         }));
         let node_id = self
@@ -977,10 +1057,13 @@ impl<
     pub fn split_side(self) -> (Stream<'a, M>, Stream<'a, S>) {
         let main_node = LazyTransformNode(Box::new(|| {
             Arc::new(|item: AnyItem, _ctx: &TransformContext| {
-                let ws: WithSide<M, S> = item.downcast();
-                match ws {
-                    WithSide::Main(m) => vec![AnyItem::new(m)],
-                    WithSide::Side(_) => vec![],
+                match item.try_downcast::<WithSide<M, S>>() {
+                    Ok(WithSide::Main(m)) => vec![AnyItem::new(m)],
+                    Ok(WithSide::Side(_)) => vec![],
+                    Err(e) => {
+                        tracing::error!("split_side main downcast failed: {e}");
+                        vec![]
+                    }
                 }
             })
         }));
@@ -990,10 +1073,13 @@ impl<
 
         let side_node = LazyTransformNode(Box::new(|| {
             Arc::new(|item: AnyItem, _ctx: &TransformContext| {
-                let ws: WithSide<M, S> = item.downcast();
-                match ws {
-                    WithSide::Main(_) => vec![],
-                    WithSide::Side(s) => vec![AnyItem::new(s)],
+                match item.try_downcast::<WithSide<M, S>>() {
+                    Ok(WithSide::Main(_)) => vec![],
+                    Ok(WithSide::Side(s)) => vec![AnyItem::new(s)],
+                    Err(e) => {
+                        tracing::error!("split_side side downcast failed: {e}");
+                        vec![]
+                    }
                 }
             })
         }));
@@ -1020,10 +1106,13 @@ impl<
     pub fn split_side(self) -> (KeyedStream<'a, M>, Stream<'a, S>) {
         let main_node = LazyTransformNode(Box::new(|| {
             Arc::new(|item: AnyItem, _ctx: &TransformContext| {
-                let ws: WithSide<M, S> = item.downcast();
-                match ws {
-                    WithSide::Main(m) => vec![AnyItem::new(m)],
-                    WithSide::Side(_) => vec![],
+                match item.try_downcast::<WithSide<M, S>>() {
+                    Ok(WithSide::Main(m)) => vec![AnyItem::new(m)],
+                    Ok(WithSide::Side(_)) => vec![],
+                    Err(e) => {
+                        tracing::error!("keyed split_side main downcast failed: {e}");
+                        vec![]
+                    }
                 }
             })
         }));
@@ -1033,10 +1122,13 @@ impl<
 
         let side_node = LazyTransformNode(Box::new(|| {
             Arc::new(|item: AnyItem, _ctx: &TransformContext| {
-                let ws: WithSide<M, S> = item.downcast();
-                match ws {
-                    WithSide::Main(_) => vec![],
-                    WithSide::Side(s) => vec![AnyItem::new(s)],
+                match item.try_downcast::<WithSide<M, S>>() {
+                    Ok(WithSide::Main(_)) => vec![],
+                    Ok(WithSide::Side(s)) => vec![AnyItem::new(s)],
+                    Err(e) => {
+                        tracing::error!("keyed split_side side downcast failed: {e}");
+                        vec![]
+                    }
                 }
             })
         }));
@@ -1072,7 +1164,7 @@ mod tests {
         let item = AnyItem::new(42u16);
         let bytes = bincode::serialize(&item).unwrap();
         let restored: AnyItem = bincode::deserialize(&bytes).unwrap();
-        assert_eq!(restored.downcast::<u16>(), 42);
+        assert_eq!(restored.try_downcast::<u16>().unwrap(), 42);
     }
 
     #[test]
@@ -1085,14 +1177,14 @@ mod tests {
         let item = AnyItem::new(99u16);
         let bytes = bincode::serialize(&item).unwrap();
         let restored: AnyItem = bincode::deserialize(&bytes).unwrap();
-        assert_eq!(restored.downcast::<u16>(), 99);
+        assert_eq!(restored.try_downcast::<u16>().unwrap(), 99);
     }
 
     #[test]
     fn lazy_transform_node_compiles_and_executes() {
         let node: Box<dyn TransformNode> = Box::new(LazyTransformNode(Box::new(|| {
             Arc::new(|item: AnyItem, _ctx: &TransformContext| {
-                let val: i32 = item.downcast();
+                let val: i32 = item.try_downcast().unwrap();
                 vec![AnyItem::new(val * 2)]
             })
         })));
@@ -1103,14 +1195,14 @@ mod tests {
         };
         let result = transform(AnyItem::new(5i32), &ctx);
         assert_eq!(result.len(), 1);
-        assert_eq!(result[0].clone().downcast::<i32>(), 10);
+        assert_eq!(result[0].clone().try_downcast::<i32>().unwrap(), 10);
     }
 
     #[test]
     fn lazy_key_by_node_compiles_and_extracts() {
         let node: Box<dyn KeyByNode> = Box::new(LazyKeyByNode(Box::new(|| {
             Arc::new(|item: &AnyItem| {
-                let val = item.downcast_ref::<i32>();
+                let val = item.try_downcast_ref::<i32>().unwrap();
                 format!("key-{val}")
             })
         })));

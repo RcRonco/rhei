@@ -83,9 +83,10 @@ impl TaskManager {
     /// Panics if the data for this worker was already taken or was never populated.
     #[allow(clippy::expect_used)] // invariant: each worker takes data exactly once
     pub(crate) fn take_executor_data(&self, idx: usize) -> ExecutorData {
-        self.per_executor
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)[idx]
+        self.per_executor.lock().unwrap_or_else(|e| {
+            tracing::warn!("mutex poisoned in per_executor lock, recovering inner data");
+            e.into_inner()
+        })[idx]
             .take()
             .expect("executor data already taken for worker")
     }
@@ -245,7 +246,12 @@ impl TaskManager {
     pub(crate) fn take_checkpoint_rx(&self) -> flume::Receiver<u64> {
         self.checkpoint_notify_rx
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .unwrap_or_else(|e| {
+                tracing::warn!(
+                    "mutex poisoned in checkpoint_notify_rx lock, recovering inner data"
+                );
+                e.into_inner()
+            })
             .take()
             .expect("checkpoint_rx already taken")
     }
@@ -265,7 +271,12 @@ impl TaskManager {
         let _ = self
             .checkpoint_notify_tx
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .unwrap_or_else(|e| {
+                tracing::warn!(
+                    "mutex poisoned in checkpoint_notify_tx lock (close), recovering inner data"
+                );
+                e.into_inner()
+            })
             .take();
     }
 
@@ -341,7 +352,12 @@ impl TaskManager {
         let checkpoint_notify_tx = self
             .checkpoint_notify_tx
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .unwrap_or_else(|e| {
+                tracing::warn!(
+                    "mutex poisoned in checkpoint_notify_tx lock (run), recovering inner data"
+                );
+                e.into_inner()
+            })
             .as_ref()
             .cloned();
 
@@ -826,7 +842,7 @@ fn bridge_sinks(
 
     for &sink_id in &graph.sink_ids {
         let sink = extract_sink(&mut graph.nodes[sink_id.0]);
-        let (tx, rx) = flume::bounded::<AnyItem>(16);
+        let (tx, rx) = flume::bounded::<AnyItem>(crate::bridge::DEFAULT_CHANNEL_SIZE);
         sink_senders.insert(sink_id, tx);
         sink_handles.push(tokio::spawn(async move {
             let mut sink = sink;
@@ -992,7 +1008,12 @@ pub(crate) fn merge_source_offsets(
         combined.extend(
             offsets
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .unwrap_or_else(|e| {
+                    tracing::warn!(
+                        "mutex poisoned in source_offsets merge lock, recovering inner data"
+                    );
+                    e.into_inner()
+                })
                 .clone(),
         );
     }

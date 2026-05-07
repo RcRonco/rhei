@@ -193,7 +193,7 @@ impl DataflowExecutor {
         let mut source_rx: HashMap<NodeId, flume::Receiver<crate::bridge::SourceBatch>> =
             HashMap::new();
         for (node_id, source) in data.sources.drain() {
-            let (tx, rx) = flume::bounded(16);
+            let (tx, rx) = flume::bounded(crate::bridge::DEFAULT_CHANNEL_SIZE);
             let offsets = data
                 .source_offsets
                 .remove(&node_id)
@@ -226,7 +226,10 @@ impl DataflowExecutor {
             if let Some(ref barrier) = self.shutdown_barrier
                 && let Some(rx) = barrier
                     .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .unwrap_or_else(|e| {
+                        tracing::warn!("shutdown barrier mutex poisoned, recovering: {e}");
+                        e.into_inner()
+                    })
                     .take()
             {
                 tracing::debug!("worker {} waiting on shutdown barrier", self.worker_index);
@@ -503,6 +506,7 @@ impl DataflowExecutor {
     }
 
     /// Build a stateful operator with DLQ, watermark, timer, and checkpoint support.
+    #[allow(clippy::too_many_lines)]
     fn build_operator<'a, A: Allocate>(
         &self,
         node_id: NodeId,
@@ -538,10 +542,23 @@ impl DataflowExecutor {
             &format!("Op_{}", node_id.0),
             move |_init_cap, _info| {
                 let mut timely_op = TimelyErasedOperator::new(op, ctx);
-                timely_op.open(&oc.rt);
+                if let Err(e) = timely_op.open(&oc.rt) {
+                    tracing::error!(
+                        error = %e,
+                        operator = %op_name,
+                        "operator open failed"
+                    );
+                    metrics::counter!(
+                        "operator_lifecycle_errors_total",
+                        "phase" => "open"
+                    )
+                    .increment(1);
+                }
                 let mut last_watermark: u64 = 0;
                 let mut retained_cap: Option<Capability<u64>> = None;
+                let mut cap_retained_since: Option<std::time::Instant> = None;
                 let mut closed = false;
+                let cap_worker_label = oc.worker_label.clone();
                 move |(input, frontier), output| {
                     let mut emit = |items: Vec<AnyItem>, cap: &Option<Capability<u64>>| {
                         if let Some(c) = cap
@@ -571,6 +588,9 @@ impl DataflowExecutor {
                             );
                         }
                         emit(results, &Some(owned_cap.clone()));
+                        if retained_cap.is_none() {
+                            cap_retained_since = Some(std::time::Instant::now());
+                        }
                         retained_cap = Some(owned_cap);
                     });
                     let wm = frontier_min_or_max(frontier.frontier());
@@ -579,6 +599,22 @@ impl DataflowExecutor {
                     if let Some(ref cap) = retained_cap
                         && !frontier.less_equal(cap.time())
                     {
+                        if let Some(since) = cap_retained_since.take() {
+                            let held_secs = since.elapsed().as_secs_f64();
+                            metrics::gauge!(
+                                "capability_held_duration_seconds",
+                                "worker" => cap_worker_label.clone()
+                            )
+                            .set(held_secs);
+                            if held_secs > 30.0 {
+                                tracing::warn!(
+                                    held_seconds = held_secs,
+                                    epoch = cap.time(),
+                                    "capability held for over 30s — \
+                                     possible stall in operator processing"
+                                );
+                            }
+                        }
                         retained_cap = None;
                     }
                     let fv: Vec<u64> = frontier.frontier().iter().copied().collect();
@@ -594,7 +630,18 @@ impl DataflowExecutor {
                         let _ = n.send(epoch);
                     }
                     if frontier.frontier().is_empty() && !closed {
-                        timely_op.close(&oc.rt);
+                        if let Err(e) = timely_op.close(&oc.rt) {
+                            tracing::error!(
+                                error = %e,
+                                operator = %op_name,
+                                "operator close failed"
+                            );
+                            metrics::counter!(
+                                "operator_lifecycle_errors_total",
+                                "phase" => "close"
+                            )
+                            .increment(1);
+                        }
                         closed = true;
                     }
                 }
@@ -747,7 +794,18 @@ fn try_checkpoint(
     worker_index: usize,
     local_first_worker: usize,
 ) -> Option<u64> {
-    let epoch = timely_op.maybe_checkpoint(frontier_vec, rt);
+    let epoch = match timely_op.maybe_checkpoint(frontier_vec, rt) {
+        Ok(epoch) => epoch,
+        Err(e) => {
+            tracing::error!(error = %e, "checkpoint failed");
+            metrics::counter!(
+                "operator_lifecycle_errors_total",
+                "phase" => "checkpoint"
+            )
+            .increment(1);
+            None
+        }
+    };
     if is_last_op && worker_index == local_first_worker {
         epoch
     } else {
@@ -765,7 +823,7 @@ fn frontier_min_or_max(frontier: timely::progress::frontier::AntichainRef<'_, u6
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used, deprecated)]
 mod tests {
     use crate::any_item::AnyItem;
 

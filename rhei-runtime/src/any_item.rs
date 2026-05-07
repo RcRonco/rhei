@@ -5,7 +5,29 @@
 //! serialization via bincode.
 
 use std::any::Any;
+use std::fmt;
 use std::sync::{LazyLock, RwLock};
+
+// ── DowncastError ──────────────────────────────────────────────────
+
+/// Error returned when an [`AnyItem`] downcast fails due to a type mismatch.
+///
+/// Contains the expected type name for diagnostic purposes. The original
+/// `AnyItem` is consumed and cannot be recovered (use `try_downcast_ref`
+/// for a non-consuming alternative).
+#[derive(Debug, Clone)]
+pub(crate) struct DowncastError {
+    /// The expected concrete type name (from `std::any::type_name::<T>()`).
+    pub expected: &'static str,
+}
+
+impl fmt::Display for DowncastError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "AnyItem downcast failed: expected {}", self.expected)
+    }
+}
+
+impl std::error::Error for DowncastError {}
 
 // ── Cloneable type-erased wrapper ────────────────────────────────────
 
@@ -67,23 +89,32 @@ where
     T: Clone + Send + std::fmt::Debug + serde::Serialize + serde::de::DeserializeOwned + 'static,
 {
     let type_hash = seahash::hash(std::any::type_name::<T>().as_bytes());
-    let needs_insert = {
-        let reg = TYPE_REGISTRY
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        !reg.contains_key(&type_hash)
-    };
-    if needs_insert {
-        let mut reg = TYPE_REGISTRY
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        reg.entry(type_hash).or_insert_with(|| {
-            Box::new(|bytes: &[u8]| {
-                let value: T = bincode::deserialize(bytes)?;
-                Ok(AnyItem(Box::new(value)))
-            })
+
+    // Fast path: check with a read lock (no contention). This avoids taking
+    // the write lock on every AnyItem::new() call after the type is registered.
+    {
+        let reg = TYPE_REGISTRY.read().unwrap_or_else(|e| {
+            tracing::warn!("TYPE_REGISTRY read lock poisoned, recovering: {e}");
+            e.into_inner()
         });
+        if reg.contains_key(&type_hash) {
+            return;
+        }
     }
+
+    // Slow path: take a single write lock and use or_insert_with to
+    // atomically check-and-insert, eliminating any TOCTOU race between
+    // the read check above and this write.
+    let mut reg = TYPE_REGISTRY.write().unwrap_or_else(|e| {
+        tracing::warn!("TYPE_REGISTRY write lock poisoned, recovering: {e}");
+        e.into_inner()
+    });
+    reg.entry(type_hash).or_insert_with(|| {
+        Box::new(|bytes: &[u8]| {
+            let value: T = bincode::deserialize(bytes)?;
+            Ok(AnyItem(Box::new(value)))
+        })
+    });
 }
 
 // ── AnyItem ─────────────────────────────────────────────────────────
@@ -124,7 +155,35 @@ impl AnyItem {
         AnyItem(Box::new(value))
     }
 
+    /// Consume and downcast to concrete type `T`.
+    ///
+    /// Returns `Err(DowncastError)` if the contained value is not of type `T`.
+    pub(crate) fn try_downcast<T: 'static>(self) -> Result<T, DowncastError> {
+        self.0
+            .into_any()
+            .downcast::<T>()
+            .map(|b| *b)
+            .map_err(|_| DowncastError {
+                expected: std::any::type_name::<T>(),
+            })
+    }
+
+    /// Borrow and downcast to `&T`.
+    ///
+    /// Returns `Err(DowncastError)` if the contained value is not of type `T`.
+    #[allow(dead_code)]
+    pub(crate) fn try_downcast_ref<T: 'static>(&self) -> Result<&T, DowncastError> {
+        self.0
+            .as_any_ref()
+            .downcast_ref::<T>()
+            .ok_or(DowncastError {
+                expected: std::any::type_name::<T>(),
+            })
+    }
+
     /// Consume and downcast to concrete type `T`. Panics on type mismatch.
+    #[deprecated(note = "use try_downcast() which returns Result instead of panicking")]
+    #[allow(dead_code)]
     pub(crate) fn downcast<T: 'static>(self) -> T {
         *self
             .0
@@ -134,6 +193,8 @@ impl AnyItem {
     }
 
     /// Borrow and downcast to `&T`. Panics on type mismatch.
+    #[deprecated(note = "use try_downcast_ref() which returns Result instead of panicking")]
+    #[allow(dead_code)]
     pub(crate) fn downcast_ref<T: 'static>(&self) -> &T {
         self.0
             .as_any_ref()
@@ -165,9 +226,10 @@ impl serde::Serialize for AnyItem {
 impl<'de> serde::Deserialize<'de> for AnyItem {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let (type_hash, bytes): (u64, Vec<u8>) = serde::Deserialize::deserialize(deserializer)?;
-        let reg = TYPE_REGISTRY
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let reg = TYPE_REGISTRY.read().unwrap_or_else(|e| {
+            tracing::warn!("TYPE_REGISTRY read lock poisoned during deserialize, recovering: {e}");
+            e.into_inner()
+        });
         let deser_fn = reg.get(&type_hash).ok_or_else(|| {
             serde::de::Error::custom(format!("unknown AnyItem type hash: {type_hash}"))
         })?;
@@ -188,7 +250,7 @@ mod tests {
         let bytes = bincode::serialize(&item).unwrap();
 
         let restored: AnyItem = bincode::deserialize(&bytes).unwrap();
-        assert_eq!(restored.downcast::<String>(), "hello");
+        assert_eq!(restored.try_downcast::<String>().unwrap(), "hello");
     }
 
     #[test]
@@ -199,6 +261,39 @@ mod tests {
         let item = AnyItem::new(42u32);
         let bytes = bincode::serialize(&item).unwrap();
         let restored: AnyItem = bincode::deserialize(&bytes).unwrap();
-        assert_eq!(restored.downcast::<u32>(), 42);
+        assert_eq!(restored.try_downcast::<u32>().unwrap(), 42);
+    }
+
+    #[test]
+    fn try_downcast_success() {
+        let item = AnyItem::new(42i32);
+        assert_eq!(item.try_downcast::<i32>().unwrap(), 42);
+    }
+
+    #[test]
+    fn try_downcast_wrong_type_returns_error() {
+        let item = AnyItem::new(42i32);
+        let err = item.try_downcast::<String>().unwrap_err();
+        assert!(
+            err.to_string().contains("String"),
+            "error should mention expected type, got: {err}"
+        );
+    }
+
+    #[test]
+    fn try_downcast_ref_success() {
+        let item = AnyItem::new("hello".to_string());
+        let val = item.try_downcast_ref::<String>().unwrap();
+        assert_eq!(val, "hello");
+    }
+
+    #[test]
+    fn try_downcast_ref_wrong_type_returns_error() {
+        let item = AnyItem::new(42i32);
+        let err = item.try_downcast_ref::<String>().unwrap_err();
+        assert!(
+            err.to_string().contains("String"),
+            "error should mention expected type, got: {err}"
+        );
     }
 }

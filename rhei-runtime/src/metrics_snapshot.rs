@@ -126,16 +126,14 @@ pub struct MetricsHandle {
 impl MetricsHandle {
     /// Produce a current snapshot by reading all counters and gauges.
     pub fn snapshot(&self) -> MetricsSnapshot {
-        let counters = self
-            .inner
-            .counters
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let gauges = self
-            .inner
-            .gauges
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let counters = self.inner.counters.lock().unwrap_or_else(|e| {
+            tracing::warn!("mutex poisoned in metrics counters lock, recovering inner data");
+            e.into_inner()
+        });
+        let gauges = self.inner.gauges.lock().unwrap_or_else(|e| {
+            tracing::warn!("mutex poisoned in metrics gauges lock, recovering inner data");
+            e.into_inner()
+        });
 
         let get = |map: &HashMap<String, Arc<AtomicU64>>, key: &str| -> u64 {
             map.get(key).map_or(0, |v| v.load(Ordering::Relaxed))
@@ -218,22 +216,20 @@ impl SnapshotRecorder {
     }
 
     fn counter_arc(&self, key: &Key) -> Arc<AtomicU64> {
-        let mut map = self
-            .inner
-            .counters
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut map = self.inner.counters.lock().unwrap_or_else(|e| {
+            tracing::warn!("mutex poisoned in recorder counters lock, recovering inner data");
+            e.into_inner()
+        });
         map.entry(key.name().to_string())
             .or_insert_with(|| Arc::new(AtomicU64::new(0)))
             .clone()
     }
 
     fn gauge_arc(&self, key: &Key) -> Arc<AtomicU64> {
-        let mut map = self
-            .inner
-            .gauges
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut map = self.inner.gauges.lock().unwrap_or_else(|e| {
+            tracing::warn!("mutex poisoned in recorder gauges lock, recovering inner data");
+            e.into_inner()
+        });
         map.entry(key.name().to_string())
             .or_insert_with(|| Arc::new(AtomicU64::new(0)))
             .clone()
