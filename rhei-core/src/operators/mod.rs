@@ -36,7 +36,6 @@ pub use count_window::{CountWindow, CountWindowOutput};
 pub use enrich::EnrichOp;
 pub use filter::FilterOp;
 pub use interval_join::{IntervalJoin, IntervalSide};
-pub use keyed_state::KeyedState;
 pub use keyed_state::{BincodeEncoder, JsonEncoder, KeyEncoder, KeyedState};
 pub use late_event::LateEventWindow;
 pub use map::{FlatMapOp, MapOp};

@@ -228,7 +228,7 @@ where
         input: AnyItem,
         ctx: &mut StateContext,
     ) -> anyhow::Result<Vec<AnyItem>> {
-        let typed: F::Input = input.downcast();
+        let typed: F::Input = input.try_downcast()?;
         match self.0.process(typed, ctx).await {
             Ok(results) => Ok(results.into_iter().map(AnyItem::new).collect()),
             Err(e) => {
@@ -243,7 +243,10 @@ where
         inputs: Vec<AnyItem>,
         ctx: &mut StateContext,
     ) -> anyhow::Result<Vec<AnyItem>> {
-        let typed: Vec<F::Input> = inputs.into_iter().map(AnyItem::downcast).collect();
+        let typed: Vec<F::Input> = inputs
+            .into_iter()
+            .map(AnyItem::try_downcast)
+            .collect::<Result<Vec<_>, _>>()?;
         match self.0.process_batch(typed, ctx).await {
             Ok(results) => Ok(results.into_iter().map(AnyItem::new).collect()),
             Err(e) => {
@@ -538,7 +541,10 @@ mod tests {
         assert!(result.is_ok());
         let items = result.unwrap();
         assert_eq!(items.len(), 1);
-        assert_eq!(items[0].clone().downcast::<String>(), "recovered");
+        assert_eq!(
+            items[0].clone().try_downcast::<String>().unwrap(),
+            "recovered"
+        );
     }
 
     #[tokio::test]
@@ -569,7 +575,10 @@ mod tests {
         assert!(result.is_ok());
         let items = result.unwrap();
         assert_eq!(items.len(), 1);
-        assert_eq!(items[0].clone().downcast::<String>(), "recovered");
+        assert_eq!(
+            items[0].clone().try_downcast::<String>().unwrap(),
+            "recovered"
+        );
     }
 
     #[tokio::test]
@@ -584,7 +593,7 @@ mod tests {
         assert!(result.is_ok());
         let items = result.unwrap();
         assert_eq!(items.len(), 1);
-        let tag: DlqTag<AnyItem> = items[0].clone().downcast();
+        let tag: DlqTag<AnyItem> = items[0].clone().try_downcast().unwrap();
         match tag {
             DlqTag::Error(msg) => assert!(msg.contains("processing failed")),
             DlqTag::Main(_) => panic!("expected DlqTag::Error"),
@@ -603,10 +612,10 @@ mod tests {
         assert!(result.is_ok());
         let items = result.unwrap();
         assert_eq!(items.len(), 1);
-        let tag: DlqTag<AnyItem> = items[0].clone().downcast();
+        let tag: DlqTag<AnyItem> = items[0].clone().try_downcast().unwrap();
         match tag {
             DlqTag::Main(inner_item) => {
-                assert_eq!(inner_item.downcast::<String>(), "recovered");
+                assert_eq!(inner_item.try_downcast::<String>().unwrap(), "recovered");
             }
             DlqTag::Error(msg) => panic!("expected DlqTag::Main, got Error({msg})"),
         }
