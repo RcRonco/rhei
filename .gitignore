@@ -27,3 +27,7 @@ target
 # Added by cargo
 
 /target
+
+reports
+
+.claude/agent-memory

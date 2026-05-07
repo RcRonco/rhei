@@ -1,0 +1,3 @@
+- [State Architecture](state-architecture.md) — L1/L2/L3 tier layout, key files, invariants discovered in initial review
+- [Checkpoint Design](checkpoint-design.md) — Manifest format, coordination protocol, flush ordering, edge cases
+- [Known Issues](known-issues.md) — Correctness risks and performance concerns found during code review
