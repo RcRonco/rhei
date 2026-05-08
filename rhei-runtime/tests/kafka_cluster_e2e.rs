@@ -267,7 +267,7 @@ async fn orchestrator_main() {
     }
 
     // ── Wait for children with timeout ──────────────────────────────
-    let timeout = Duration::from_secs(30);
+    let timeout = Duration::from_secs(45);
     let deadline = std::time::Instant::now() + timeout;
 
     for (pid, mut child) in children {
@@ -492,9 +492,35 @@ async fn worker_main() {
         .sink(file_sink);
 
     // ── Run with shutdown ───────────────────────────────────────────
+    // Instead of a fixed timer, wait for the output file to stabilize
+    // (no new data for 3s), indicating the pipeline has fully drained.
+    // This avoids flakiness when Kafka consumers are slow under CI load.
     let (handle, trigger) = ShutdownHandle::new();
+    let poll_path = output_path.clone();
     tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_secs(15)).await;
+        let mut last_size = 0u64;
+        let mut stable_since: Option<tokio::time::Instant> = None;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(25);
+
+        // Wait at least 3s for first data to appear
+        tokio::time::sleep(Duration::from_secs(3)).await;
+
+        loop {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            if tokio::time::Instant::now() >= deadline {
+                break;
+            }
+            let size = std::fs::metadata(&poll_path).map(|m| m.len()).unwrap_or(0);
+            if size > 0 && size == last_size {
+                let since = stable_since.get_or_insert(tokio::time::Instant::now());
+                if since.elapsed() >= Duration::from_secs(3) {
+                    break;
+                }
+            } else {
+                last_size = size;
+                stable_since = None;
+            }
+        }
         trigger.shutdown();
     });
 
