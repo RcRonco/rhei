@@ -514,9 +514,7 @@ async fn api_state_operators(State(state): State<Arc<AppState>>) -> impl IntoRes
         .operators
         .iter()
         .map(|name| {
-            let entry_count = load_operator_state(dir, name)
-                .map(|entries| entries.len())
-                .unwrap_or(0);
+            let entry_count = load_operator_state(dir, name).map_or(0, |entries| entries.len());
             OperatorStateInfo {
                 name: name.clone(),
                 entry_count,
@@ -559,9 +557,7 @@ async fn api_state_entries(
         })
         .filter(|(key, _)| {
             if let Some(ref pattern) = query.pattern {
-                regex::Regex::new(pattern)
-                    .map(|re| re.is_match(key))
-                    .unwrap_or(false)
+                regex::Regex::new(pattern).is_ok_and(|re| re.is_match(key))
             } else {
                 true
             }

@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use bytes::Bytes;
 
-use super::backend::StateBackend;
+use super::backend::{BatchOp, StateBackend};
 
 /// A key-namespacing wrapper that prepends a prefix to every key.
 ///
@@ -23,13 +23,26 @@ impl std::fmt::Debug for PrefixedBackend {
 
 impl PrefixedBackend {
     /// Wraps `inner` so that every key is prefixed with `prefix/`.
-    pub fn new(prefix: impl Into<String>, inner: Box<dyn StateBackend>) -> Self {
-        let mut prefix_bytes = prefix.into().into_bytes();
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `prefix` contains a `/` character. Since the
+    /// separator between prefix and user key is `/`, allowing slashes in
+    /// operator names would create ambiguous key namespaces (e.g. operator
+    /// `"a/b"` with key `"c"` would produce `"a/b/c"`, colliding with
+    /// operator `"a"` and key `"b/c"`).
+    pub fn new(prefix: impl Into<String>, inner: Box<dyn StateBackend>) -> anyhow::Result<Self> {
+        let prefix_str = prefix.into();
+        anyhow::ensure!(
+            !prefix_str.contains('/'),
+            "operator name must not contain '/': got {prefix_str:?}"
+        );
+        let mut prefix_bytes = prefix_str.into_bytes();
         prefix_bytes.push(b'/');
-        Self {
+        Ok(Self {
             prefix: prefix_bytes,
             inner,
-        }
+        })
     }
 
     fn prefixed_key(&self, key: &[u8]) -> Vec<u8> {
@@ -57,6 +70,22 @@ impl StateBackend for PrefixedBackend {
     async fn checkpoint(&self) -> anyhow::Result<()> {
         self.inner.checkpoint().await
     }
+
+    async fn put_batch(&self, ops: Vec<BatchOp>) -> anyhow::Result<()> {
+        let prefixed_ops = ops
+            .into_iter()
+            .map(|op| match op {
+                BatchOp::Put { key, value } => BatchOp::Put {
+                    key: self.prefixed_key(&key),
+                    value,
+                },
+                BatchOp::Delete { key } => BatchOp::Delete {
+                    key: self.prefixed_key(&key),
+                },
+            })
+            .collect();
+        self.inner.put_batch(prefixed_ops).await
+    }
 }
 
 #[cfg(test)]
@@ -81,8 +110,10 @@ mod tests {
         let shared: std::sync::Arc<LocalBackend> = std::sync::Arc::new(backend);
 
         // Create two prefixed views on the same backend
-        let op_a = PrefixedBackend::new("operator_a", Box::new(ArcBackend(shared.clone())));
-        let op_b = PrefixedBackend::new("operator_b", Box::new(ArcBackend(shared.clone())));
+        let op_a =
+            PrefixedBackend::new("operator_a", Box::new(ArcBackend(shared.clone()))).unwrap();
+        let op_b =
+            PrefixedBackend::new("operator_b", Box::new(ArcBackend(shared.clone()))).unwrap();
 
         // Both write to "count"
         op_a.put(b"count", b"10").await.unwrap();
@@ -117,7 +148,7 @@ mod tests {
         let backend = LocalBackend::new(path.clone(), None).unwrap();
         let shared = std::sync::Arc::new(backend);
 
-        let prefixed = PrefixedBackend::new("myop", Box::new(ArcBackend(shared.clone())));
+        let prefixed = PrefixedBackend::new("myop", Box::new(ArcBackend(shared.clone()))).unwrap();
         prefixed.put(b"key", b"val").await.unwrap();
 
         // The raw backend should have the prefixed key
@@ -127,6 +158,34 @@ mod tests {
         // Non-prefixed key should not exist
         let raw = shared.get(b"key").await.unwrap();
         assert_eq!(raw, None);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn rejects_slash_in_prefix() {
+        let path = temp_path("slash_prefix");
+        let _ = std::fs::remove_file(&path);
+
+        let backend = LocalBackend::new(path.clone(), None).unwrap();
+        let result = PrefixedBackend::new("bad/name", Box::new(backend));
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().to_string().contains("must not contain"),
+            "error should explain the slash restriction"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn accepts_valid_prefix() {
+        let path = temp_path("valid_prefix");
+        let _ = std::fs::remove_file(&path);
+
+        let backend = LocalBackend::new(path.clone(), None).unwrap();
+        let result = PrefixedBackend::new("valid_name", Box::new(backend));
+        assert!(result.is_ok());
 
         let _ = std::fs::remove_file(&path);
     }
@@ -147,6 +206,9 @@ mod tests {
         }
         async fn checkpoint(&self) -> anyhow::Result<()> {
             self.0.checkpoint().await
+        }
+        async fn put_batch(&self, ops: Vec<BatchOp>) -> anyhow::Result<()> {
+            self.0.put_batch(ops).await
         }
     }
 }

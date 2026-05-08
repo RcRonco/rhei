@@ -14,6 +14,19 @@ use super::context::StateContext;
 /// A typed list state accessor.
 ///
 /// The entire list is stored as one bincode-encoded `Vec<V>` under `"{name}"`.
+///
+/// # Performance
+///
+/// Each [`append`](Self::append) / [`append_all`](Self::append_all) call
+/// deserializes the entire list from state, extends it in memory, and
+/// re-serializes the whole list back. This makes each append **O(n)** in the
+/// current list length, and a sequence of n single-element appends is
+/// **O(n^2)** total.
+///
+/// For hot-path usage with large lists, prefer batching writes with
+/// [`append_all`](Self::append_all), or accumulate items in a local `Vec`
+/// and flush once before checkpoint. A future delta-encoding or log-structured
+/// append scheme could eliminate this cost.
 pub struct ListState<'a, V> {
     ctx: &'a mut StateContext,
     key: Vec<u8>,
@@ -47,14 +60,20 @@ where
     }
 
     /// Appends a single value to the list.
-    pub async fn append(&mut self, value: &V) -> anyhow::Result<()> {
+    ///
+    /// **O(n)** — reads the full list, appends, and rewrites. See the
+    /// [struct-level docs](Self) for performance guidance.
+    pub async fn append(&mut self, value: V) -> anyhow::Result<()> {
         let mut list = self.get().await?;
-        list.push(bincode::deserialize(&bincode::serialize(value)?)?);
+        list.push(value);
         self.ctx.put(&self.key, &list)?;
         Ok(())
     }
 
     /// Appends all values from a slice to the list.
+    ///
+    /// **O(n + m)** where n is the current list length and m is the slice
+    /// length. Prefer this over repeated [`append`](Self::append) calls.
     pub async fn append_all(&mut self, values: &[V]) -> anyhow::Result<()>
     where
         V: Clone,
@@ -89,9 +108,9 @@ mod tests {
         let mut ctx = test_ctx("append");
         {
             let mut ls = ListState::<u64>::new(&mut ctx, "nums");
-            ls.append(&1).await.unwrap();
-            ls.append(&2).await.unwrap();
-            ls.append(&3).await.unwrap();
+            ls.append(1).await.unwrap();
+            ls.append(2).await.unwrap();
+            ls.append(3).await.unwrap();
             assert_eq!(ls.get().await.unwrap(), vec![1, 2, 3]);
         }
     }
@@ -101,7 +120,7 @@ mod tests {
         let mut ctx = test_ctx("append_all");
         {
             let mut ls = ListState::<String>::new(&mut ctx, "words");
-            ls.append(&"hello".to_string()).await.unwrap();
+            ls.append("hello".to_string()).await.unwrap();
             ls.append_all(&["world".to_string(), "!".to_string()])
                 .await
                 .unwrap();
@@ -124,7 +143,7 @@ mod tests {
         let mut ctx = test_ctx("clear");
         {
             let mut ls = ListState::<u64>::new(&mut ctx, "nums");
-            ls.append(&42).await.unwrap();
+            ls.append(42).await.unwrap();
             ls.clear();
             assert!(ls.get().await.unwrap().is_empty());
         }
@@ -139,8 +158,8 @@ mod tests {
             let backend = LocalBackend::new(path.clone(), None).unwrap();
             let mut ctx = StateContext::new(Box::new(backend));
             let mut ls = ListState::<u64>::new(&mut ctx, "nums");
-            ls.append(&10).await.unwrap();
-            ls.append(&20).await.unwrap();
+            ls.append(10).await.unwrap();
+            ls.append(20).await.unwrap();
             drop(ls);
             ctx.checkpoint().await.unwrap();
         }

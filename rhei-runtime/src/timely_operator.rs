@@ -118,10 +118,23 @@ impl<F: StreamFunction + 'static> TimelyAsyncOperator<F> {
 /// checkpoint tracking for the dataflow graph execution path.
 ///
 /// Analogous to [`TimelyAsyncOperator`] but for `Box<dyn ErasedOperator>`.
+///
+/// # Checkpoint guard
+///
+/// Like [`TimelyAsyncOperator`], `maybe_checkpoint` guards on `!has_pending()`
+/// to prevent checkpointing while items are still being processed. Currently
+/// the erased path is fully synchronous (`block_on`), so `has_pending()` is
+/// always `false` after `process_batch` returns. The guard is present for
+/// consistency and to prevent correctness regressions if the erased path
+/// becomes asynchronous in the future.
 pub(crate) struct TimelyErasedOperator {
     op: Box<dyn ErasedOperator>,
     ctx: StateContext,
     last_checkpoint_epoch: Option<u64>,
+    /// Number of items currently being processed. Always 0 after
+    /// `process`/`process_batch` returns (synchronous `block_on`).
+    /// Tracked for defensive correctness — mirrors `AsyncOperator::has_pending()`.
+    pending_items: usize,
 }
 
 impl TimelyErasedOperator {
@@ -131,7 +144,17 @@ impl TimelyErasedOperator {
             op,
             ctx,
             last_checkpoint_epoch: None,
+            pending_items: 0,
         }
+    }
+
+    /// Returns `true` if there are items currently being processed.
+    ///
+    /// Always `false` after `process`/`process_batch` returns, since the
+    /// erased path uses synchronous `block_on`. Present for consistency
+    /// with [`TimelyAsyncOperator::has_pending`].
+    pub fn has_pending(&self) -> bool {
+        self.pending_items > 0
     }
 
     /// Process a type-erased input item. Blocks on the Tokio runtime since
@@ -144,10 +167,13 @@ impl TimelyErasedOperator {
         input: AnyItem,
         rt: &tokio::runtime::Handle,
     ) -> (Vec<AnyItem>, Vec<anyhow::Error>) {
-        match rt.block_on(self.op.process(input, &mut self.ctx)) {
+        self.pending_items += 1;
+        let result = match rt.block_on(self.op.process(input, &mut self.ctx)) {
             Ok(results) => (results, vec![]),
             Err(e) => (vec![], vec![e]),
-        }
+        };
+        self.pending_items -= 1;
+        result
     }
 
     /// Process a batch of items with a single `block_on` call.
@@ -156,19 +182,22 @@ impl TimelyErasedOperator {
         inputs: Vec<AnyItem>,
         rt: &tokio::runtime::Handle,
     ) -> (Vec<AnyItem>, Vec<anyhow::Error>) {
-        match rt.block_on(self.op.process_batch(inputs, &mut self.ctx)) {
+        self.pending_items += inputs.len();
+        let result = match rt.block_on(self.op.process_batch(inputs, &mut self.ctx)) {
             Ok(results) => (results, vec![]),
             Err(e) => (vec![], vec![e]),
-        }
+        };
+        self.pending_items = 0;
+        result
     }
 
     /// Checkpoint state when frontier advances past last checkpoint epoch.
     ///
-    /// Returns `Ok(Some(epoch))` if a checkpoint was performed at a specific
-    /// epoch, `Ok(None)` if no checkpoint was needed **or** if the frontier
-    /// is empty (computation complete — final flush, no meaningful epoch),
-    /// or `Err` if the checkpoint failed. On error, the checkpoint epoch is
-    /// NOT advanced so it will be retried on the next frontier change.
+    /// Guards on `!has_pending()` to prevent checkpointing while items are
+    /// still being processed, matching the behavior of
+    /// [`TimelyAsyncOperator::maybe_checkpoint`].
+    ///
+    /// Returns `Some(epoch)` if a checkpoint was performed, `None` otherwise.
     pub fn maybe_checkpoint(
         &mut self,
         frontier: &[u64],
@@ -181,7 +210,7 @@ impl TimelyErasedOperator {
             (Some(_), None) | (None, _) => true,
         };
 
-        if should_checkpoint {
+        if should_checkpoint && !self.has_pending() {
             let ckpt_start = std::time::Instant::now();
             rt.block_on(self.ctx.checkpoint())?;
             metrics::gauge!("executor_checkpoint_duration_seconds")

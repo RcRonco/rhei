@@ -541,9 +541,7 @@ impl PipelineController {
         let handles = crate::telemetry::init(crate::telemetry::TelemetryConfig {
             metrics_addr: Some(addr),
             log_filter: std::env::var("RHEI_LOG_LEVEL").unwrap_or_else(|_| "info".to_string()),
-            json_logs: std::env::var("RHEI_JSON_LOGS")
-                .map(|v| v == "1" || v == "true")
-                .unwrap_or(false),
+            json_logs: std::env::var("RHEI_JSON_LOGS").is_ok_and(|v| v == "1" || v == "true"),
             tui: false,
         })?;
 
@@ -629,11 +627,11 @@ impl PipelineController {
                         Box::new(local),
                         Box::new(remote_l3.clone()),
                     );
-                    let prefixed = PrefixedBackend::new(operator_name, Box::new(fork));
+                    let prefixed = PrefixedBackend::new(operator_name, Box::new(fork))?;
                     StateContext::new(Box::new(prefixed))
                 } else if let Some(ref tiered) = self.tiered {
                     let tiered_backend = tiered.shared_l2.create_tiered_backend(tiered.l3.clone());
-                    let prefixed = PrefixedBackend::new(operator_name, Box::new(tiered_backend));
+                    let prefixed = PrefixedBackend::new(operator_name, Box::new(tiered_backend))?;
                     StateContext::new(Box::new(prefixed))
                 } else {
                     let path = self
@@ -647,7 +645,7 @@ impl PipelineController {
             {
                 if let Some(ref tiered) = self.tiered {
                     let tiered_backend = tiered.shared_l2.create_tiered_backend(tiered.l3.clone());
-                    let prefixed = PrefixedBackend::new(operator_name, Box::new(tiered_backend));
+                    let prefixed = PrefixedBackend::new(operator_name, Box::new(tiered_backend))?;
                     StateContext::new(Box::new(prefixed))
                 } else {
                     let path = self

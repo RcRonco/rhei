@@ -62,11 +62,7 @@ fn build_clean_cache(config: &MemTableConfig) -> Cache<Vec<u8>, Bytes> {
         // the entry count limit: `max_entries` entries × `min_weight` ≈ `max_bytes`.
         let max_bytes = config.max_bytes;
         let max_entries = config.max_entries;
-        let min_weight = if max_entries > 0 {
-            (max_bytes / max_entries).max(1)
-        } else {
-            1
-        };
+        let min_weight = max_bytes.checked_div(max_entries).unwrap_or(1);
 
         Cache::builder()
             .max_capacity(max_bytes as u64)
