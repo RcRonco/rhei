@@ -6,6 +6,8 @@ use rhei_core::traits::{Sink, Source};
 
 use crate::any_item::AnyItem;
 use crate::erased::ErasedSource;
+use crate::erased_batch::{ErasedBatchSink, ErasedBatchSource};
+use crate::erased_buffer::ErasedBuffer;
 use crate::shutdown::ShutdownHandle;
 
 /// Default bounded channel capacity for source and sink bridges.
@@ -133,6 +135,70 @@ pub(crate) async fn local_source_bridge(
         crate::executor::Sentinel::SourceExhausted as u64,
         Ordering::Release,
     );
+}
+
+// ── Batch (Arrow) bridges ────────────────────────────────────────────
+
+/// A batch produced by the batch source bridge, carrying an `ErasedBuffer`
+/// and an optional watermark.
+#[allow(dead_code)]
+pub(crate) type BatchSourceBatch = (ErasedBuffer, Option<u64>);
+
+/// Bridges a type-erased [`ErasedBatchSource`] into a `flume::Sender`,
+/// suitable for `spawn` on the shared Tokio runtime.
+///
+/// Reads batches from the source and sends `(ErasedBuffer, watermark)` tuples
+/// through the flume channel. The watermark is committed by the Timely source
+/// operator after emitting items, ensuring it never races ahead of the data.
+#[allow(dead_code)]
+pub(crate) async fn local_batch_source_bridge(
+    mut source: Box<dyn ErasedBatchSource>,
+    tx: flume::Sender<BatchSourceBatch>,
+    offsets_writer: Arc<Mutex<HashMap<String, String>>>,
+    wm_writer: Arc<AtomicU64>,
+    shutdown: Option<ShutdownHandle>,
+) {
+    while let Some(buf) = source.next_batch().await {
+        let offsets = source.current_offsets();
+        if !offsets.is_empty() {
+            *offsets_writer.lock().unwrap_or_else(|e| {
+                tracing::warn!("offsets_writer mutex poisoned, recovering: {e}");
+                e.into_inner()
+            }) = offsets;
+        }
+
+        let wm = source.current_watermark();
+
+        if tx.send_async((buf, wm)).await.is_err() {
+            break;
+        }
+        if let Some(ref handle) = shutdown
+            && handle.is_shutdown()
+        {
+            tracing::info!("shutdown requested, stopping batch source bridge");
+            return;
+        }
+    }
+    wm_writer.store(
+        crate::executor::Sentinel::SourceExhausted as u64,
+        Ordering::Release,
+    );
+}
+
+/// Bridges an [`ErasedBatchSink`] to a `flume::Receiver` for batch writes.
+///
+/// Spawns an async task that reads `ErasedBuffer` batches from the channel
+/// and writes them to the sink. Flushes when the channel closes.
+#[allow(dead_code)]
+pub(crate) async fn batch_sink_drain(
+    mut sink: Box<dyn ErasedBatchSink>,
+    rx: flume::Receiver<ErasedBuffer>,
+) -> anyhow::Result<()> {
+    while let Ok(buf) = rx.recv_async().await {
+        sink.write_batch(buf).await?;
+    }
+    sink.flush().await?;
+    Ok(())
 }
 
 #[cfg(test)]
