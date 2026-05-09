@@ -25,7 +25,7 @@ pub use rhei_core::traits::{Sink, Source, StreamFunction};
 pub use rhei_core::state::context::StateContext;
 
 // Dataflow graph API
-pub use rhei_runtime::dataflow::{DataflowGraph, KeyedStream, Stream, TransformContext};
+pub use rhei_runtime::dataflow::{BatchStream, DataflowGraph, KeyedStream, Stream, TransformContext};
 
 // Pipeline controller
 pub use rhei_runtime::controller::{PipelineController, PipelineControllerBuilder};
@@ -33,6 +33,9 @@ pub use rhei_runtime::controller::{PipelineController, PipelineControllerBuilder
 // Common connectors
 pub use rhei_core::connectors::print_sink::PrintSink;
 pub use rhei_core::connectors::vec_source::VecSource;
+
+// Batch connectors
+pub use rhei_core::connectors::batch::{BatchPrintSink, BatchVecSource};
 
 // State types
 pub use rhei_core::state::list_state::ListState;

@@ -66,13 +66,13 @@ pub(crate) fn compile_graph(nodes: Vec<GraphNode>) -> anyhow::Result<CompiledGra
     // Classify nodes.
     let source_ids: Vec<NodeId> = nodes
         .iter()
-        .filter(|n| matches!(n.kind, NodeKind::Source(_)))
+        .filter(|n| matches!(n.kind, NodeKind::Source(_) | NodeKind::BatchSource(_)))
         .map(|n| n.id)
         .collect();
 
     let sink_ids: Vec<NodeId> = nodes
         .iter()
-        .filter(|n| matches!(n.kind, NodeKind::Sink(_)))
+        .filter(|n| matches!(n.kind, NodeKind::Sink(_) | NodeKind::BatchSink(_)))
         .map(|n| n.id)
         .collect();
 
@@ -125,12 +125,11 @@ pub(crate) fn compile_graph(nodes: Vec<GraphNode>) -> anyhow::Result<CompiledGra
     // Extract sorted operator names.
     let mut operator_names: Vec<String> = nodes
         .iter()
-        .filter_map(|node| {
-            if let NodeKind::Operator { name, .. } = &node.kind {
+        .filter_map(|node| match &node.kind {
+            NodeKind::Operator { name, .. } | NodeKind::BatchOperator { name, .. } => {
                 Some(name.clone())
-            } else {
-                None
             }
+            _ => None,
         })
         .collect();
     operator_names.sort();
@@ -155,12 +154,20 @@ fn extract_topology(nodes: &[GraphNode]) -> ApiTopology {
 
     for node in nodes {
         let (kind, name) = match &node.kind {
-            NodeKind::Source(_) => ("source", format!("Source_{}", node.id.0)),
-            NodeKind::Transform(_) => ("transform", format!("Transform_{}", node.id.0)),
+            NodeKind::Source(_) | NodeKind::BatchSource(_) => {
+                ("source", format!("Source_{}", node.id.0))
+            }
+            NodeKind::Transform(_) | NodeKind::BatchTransform(_) => {
+                ("transform", format!("Transform_{}", node.id.0))
+            }
             NodeKind::KeyBy(_) => ("key_by", format!("KeyBy_{}", node.id.0)),
-            NodeKind::Operator { name, .. } => ("operator", name.clone()),
+            NodeKind::Operator { name, .. } | NodeKind::BatchOperator { name, .. } => {
+                ("operator", name.clone())
+            }
             NodeKind::Merge => ("merge", format!("Merge_{}", node.id.0)),
-            NodeKind::Sink(_) => ("sink", format!("Sink_{}", node.id.0)),
+            NodeKind::Sink(_) | NodeKind::BatchSink(_) => {
+                ("sink", format!("Sink_{}", node.id.0))
+            }
         };
 
         api_nodes.push(ApiTopologyNode {

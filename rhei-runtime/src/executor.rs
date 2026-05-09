@@ -32,6 +32,8 @@ pub use crate::controller::PipelineControllerBuilder as ExecutorBuilder;
 type Scope<'a, A> = Child<'a, Worker<A>, u64>;
 type ScopedStream<'a, A, R> = timely::dataflow::Stream<Scope<'a, A>, Vec<R>>;
 type ScopedAnyStream<'a, A> = ScopedStream<'a, A, AnyItem>;
+type ScopedBatchStream<'a, A> =
+    ScopedStream<'a, A, crate::erased_buffer::ErasedBuffer>;
 
 /// Special sentinel values in the `u64` timeline shared by watermarks and epochs.
 ///
@@ -73,6 +75,10 @@ pub(crate) enum NodeKindTag {
     Operator,
     Merge,
     Sink,
+    BatchSource,
+    BatchTransform,
+    BatchOperator,
+    BatchSink,
 }
 
 impl NodeKindTag {
@@ -84,6 +90,10 @@ impl NodeKindTag {
             NodeKind::Operator { .. } => Self::Operator,
             NodeKind::Merge => Self::Merge,
             NodeKind::Sink(_) => Self::Sink,
+            NodeKind::BatchSource(_) => Self::BatchSource,
+            NodeKind::BatchTransform(_) => Self::BatchTransform,
+            NodeKind::BatchOperator { .. } => Self::BatchOperator,
+            NodeKind::BatchSink(_) => Self::BatchSink,
         }
     }
 }
@@ -97,6 +107,7 @@ impl NodeKindTag {
 /// Each `build_*` method constructs one category of Timely operator.
 pub(crate) struct DataflowExecutor {
     sink_senders: Arc<HashMap<NodeId, flume::Sender<AnyItem>>>,
+    batch_sink_senders: Arc<HashMap<NodeId, flume::Sender<crate::erased_buffer::ErasedBuffer>>>,
     topo_order: Arc<Vec<NodeId>>,
     node_inputs: Arc<HashMap<NodeId, Vec<NodeId>>>,
     node_kinds: Arc<HashMap<NodeId, NodeKindTag>>,
@@ -134,8 +145,11 @@ impl DataflowExecutor {
         data: ExecutorData,
         shutdown_barrier: Option<Arc<std::sync::Mutex<Option<std::sync::mpsc::Receiver<()>>>>>,
     ) -> Self {
+        let batch_sink_senders: HashMap<NodeId, flume::Sender<crate::erased_buffer::ErasedBuffer>> =
+            data.batch_sink_senders.clone();
         Self {
             sink_senders,
+            batch_sink_senders: Arc::new(batch_sink_senders),
             topo_order,
             node_inputs,
             node_kinds,
@@ -252,6 +266,7 @@ impl DataflowExecutor {
         source_rx: &mut HashMap<NodeId, flume::Receiver<crate::bridge::SourceBatch>>,
     ) -> probe::Handle<u64> {
         let mut streams: HashMap<NodeId, ScopedAnyStream<_>> = HashMap::new();
+        let mut batch_streams: HashMap<NodeId, ScopedBatchStream<_>> = HashMap::new();
         let probe = probe::Handle::new();
 
         for &node_id in self.topo_order.iter() {
@@ -291,6 +306,40 @@ impl DataflowExecutor {
                 NodeKindTag::Sink => {
                     let input_stream = streams[&inputs[0]].clone();
                     self.build_sink(node_id, input_stream, &probe);
+                }
+
+                // ── Batch (Arrow) path ──────────────────────────────
+                NodeKindTag::BatchSource => {
+                    let stream = self.build_batch_source(
+                        scope,
+                        node_id,
+                        &mut data.batch_source_rx,
+                        &mut data.source_wm,
+                    );
+                    batch_streams.insert(node_id, stream);
+                }
+                NodeKindTag::BatchTransform => {
+                    let input_stream = batch_streams[&inputs[0]].clone();
+                    let stream = self.build_batch_transform(
+                        node_id,
+                        input_stream,
+                        &mut data.batch_transforms,
+                    );
+                    batch_streams.insert(node_id, stream);
+                }
+                NodeKindTag::BatchOperator => {
+                    let input_stream = batch_streams[&inputs[0]].clone();
+                    let stream = self.build_batch_operator(
+                        node_id,
+                        input_stream,
+                        &mut data.batch_operators,
+                        &mut data.batch_contexts,
+                    );
+                    batch_streams.insert(node_id, stream);
+                }
+                NodeKindTag::BatchSink => {
+                    let input_stream = batch_streams[&inputs[0]].clone();
+                    self.build_batch_sink(node_id, input_stream, &probe);
                 }
             }
         }
@@ -695,6 +744,333 @@ impl DataflowExecutor {
             )
             .probe_with(probe);
     }
+
+    // ── Batch (Arrow) build methods ─────────────────────────────────
+
+    /// Build a batch source operator that reads `ErasedBuffer` from a flume channel.
+    fn build_batch_source<'a, A: Allocate>(
+        &self,
+        scope: &mut Scope<'a, A>,
+        node_id: NodeId,
+        batch_source_rx: &mut HashMap<
+            NodeId,
+            flume::Receiver<crate::bridge::BatchSourceBatch>,
+        >,
+        source_watermarks: &mut HashMap<NodeId, Arc<AtomicU64>>,
+    ) -> ScopedBatchStream<'a, A> {
+        use timely::dataflow::operators::generic::OutputBuilder;
+        use timely::dataflow::operators::generic::builder_rc::OperatorBuilder;
+        use timely::scheduling::Scheduler;
+
+        let mut source_builder =
+            OperatorBuilder::new(format!("BatchSource_{}", node_id.0), scope.clone());
+        let (output, stream) =
+            source_builder.new_output::<Vec<crate::erased_buffer::ErasedBuffer>>();
+        let mut output = OutputBuilder::from(output);
+        let activator = scope.activator_for(source_builder.operator_info().address);
+        source_builder.set_notify(false);
+
+        let rx = batch_source_rx.remove(&node_id);
+        let worker_label = self.worker_index.to_string();
+        let all_wms = self.all_source_watermarks.clone();
+        let per_source_wm = source_watermarks.remove(&node_id);
+
+        source_builder.build_reschedule(move |mut capabilities| {
+            #[allow(clippy::expect_used)]
+            let mut cap = Some(
+                capabilities
+                    .pop()
+                    .expect("batch source operator should have initial capability"),
+            );
+            let mut epoch: u64 = 0;
+            let mut source_rx = rx;
+            let mut draining = false;
+
+            move |_frontiers| {
+                if cap.is_none() {
+                    return false;
+                }
+
+                let Some(ref mut rx) = source_rx else {
+                    cap = None;
+                    return false;
+                };
+
+                if draining {
+                    if compute_min_watermark(&all_wms) >= Sentinel::SourceExhausted as u64 {
+                        cap = None;
+                        return false;
+                    }
+                    activator.activate();
+                    return true;
+                }
+
+                match rx.try_recv() {
+                    Ok((buf, wm)) => {
+                        #[allow(clippy::cast_possible_truncation)]
+                        let rows = buf.num_rows() as u64;
+                        if let Some(ref c) = cap {
+                            let mut handle = output.activate();
+                            let mut session = handle.session(c);
+                            session.give(buf);
+                        }
+                        if let Some(wm) = wm
+                            && let Some(ref wm_atomic) = per_source_wm
+                        {
+                            wm_atomic.fetch_max(wm, Ordering::Release);
+                        }
+                        metrics::counter!(
+                            "executor_batches_total",
+                            "worker" => worker_label.clone()
+                        )
+                        .increment(1);
+                        metrics::counter!(
+                            "executor_elements_total",
+                            "worker" => worker_label.clone()
+                        )
+                        .increment(rows);
+                        if let Some(wm) = wm {
+                            epoch = epoch.max(wm);
+                        } else {
+                            epoch += 1;
+                        }
+                        if let Some(ref mut c) = cap {
+                            c.downgrade(&epoch);
+                        }
+                        activator.activate();
+                        true
+                    }
+                    Err(flume::TryRecvError::Empty) => {
+                        activator.activate();
+                        true
+                    }
+                    Err(flume::TryRecvError::Disconnected) => {
+                        let exhausted = per_source_wm.as_ref().is_some_and(|wm| {
+                            wm.load(Ordering::Acquire) >= Sentinel::SourceExhausted as u64
+                        });
+                        if exhausted {
+                            epoch = epoch.max(Sentinel::SourceExhausted as u64);
+                            if let Some(ref mut c) = cap {
+                                c.downgrade(&epoch);
+                            }
+                            draining = true;
+                            activator.activate();
+                            true
+                        } else {
+                            cap = None;
+                            false
+                        }
+                    }
+                }
+            }
+        });
+
+        stream
+    }
+
+    /// Build a batch transform (stateless `map`/`filter`/`flat_map`).
+    #[allow(clippy::unused_self)]
+    fn build_batch_transform<'a, A: Allocate>(
+        &self,
+        node_id: NodeId,
+        input_stream: ScopedBatchStream<'a, A>,
+        batch_transforms: &mut HashMap<NodeId, crate::dataflow::BatchTransformFn>,
+    ) -> ScopedBatchStream<'a, A> {
+        use timely::container::CapacityContainerBuilder;
+        use timely::dataflow::channels::pact::Pipeline;
+        use timely::dataflow::operators::generic::operator::Operator;
+
+        #[allow(clippy::expect_used)]
+        let f = batch_transforms
+            .remove(&node_id)
+            .expect("missing batch transform for node");
+        let name = format!("BatchTransform_{}", node_id.0);
+        input_stream.unary::<CapacityContainerBuilder<Vec<crate::erased_buffer::ErasedBuffer>>, _, _, _>(
+            Pipeline,
+            &name,
+            move |_cap, _info| {
+                let f = f;
+                move |input, output| {
+                    input.for_each(|cap, data| {
+                        let mut session = output.session(&cap);
+                        for buf in data.drain(..) {
+                            for result_buf in f(buf) {
+                                session.give(result_buf);
+                            }
+                        }
+                    });
+                }
+            },
+        )
+    }
+
+    /// Build a batch stateful operator with watermark, timer, and checkpoint support.
+    #[allow(clippy::too_many_lines)]
+    fn build_batch_operator<'a, A: Allocate>(
+        &self,
+        node_id: NodeId,
+        input_stream: ScopedBatchStream<'a, A>,
+        batch_operators: &mut HashMap<
+            NodeId,
+            (String, Box<dyn crate::erased_batch::ErasedBatchOperator>),
+        >,
+        batch_contexts: &mut HashMap<NodeId, rhei_core::arrow::OperatorContext>,
+    ) -> ScopedBatchStream<'a, A> {
+        use timely::container::CapacityContainerBuilder;
+        use timely::dataflow::channels::pact::Pipeline;
+        use timely::dataflow::operators::Capability;
+        use timely::dataflow::operators::generic::operator::Operator;
+
+        #[allow(clippy::expect_used)]
+        let (op_name, op) = batch_operators
+            .remove(&node_id)
+            .expect("missing batch operator for node");
+        #[allow(clippy::expect_used)]
+        let ctx = batch_contexts
+            .remove(&node_id)
+            .expect("missing batch operator ctx for node");
+
+        let oc = OperatorCfg {
+            rt: self.rt.clone(),
+            worker_label: self.worker_index.to_string(),
+            is_last_op: self.last_operator_id == Some(node_id),
+            notify: self.checkpoint_notify.clone(),
+            dlq: self.dlq_tx.clone(),
+            worker_index: self.worker_index,
+            local_first_worker: self.local_first_worker,
+        };
+
+        input_stream.unary_frontier::<CapacityContainerBuilder<Vec<crate::erased_buffer::ErasedBuffer>>, _, _, _>(
+            Pipeline,
+            &format!("BatchOp_{}", node_id.0),
+            move |_init_cap, _info| {
+                let mut timely_op =
+                    crate::timely_operator::TimelyBatchOperator::new(op, ctx);
+                if let Err(e) = timely_op.open(&oc.rt) {
+                    tracing::error!(
+                        error = %e,
+                        operator = %op_name,
+                        "batch operator open failed"
+                    );
+                    metrics::counter!(
+                        "operator_lifecycle_errors_total",
+                        "phase" => "open"
+                    )
+                    .increment(1);
+                }
+                let mut last_watermark: u64 = 0;
+                let mut retained_cap: Option<Capability<u64>> = None;
+                let mut closed = false;
+                move |(input, frontier), output| {
+                    let mut emit = |bufs: Vec<crate::erased_buffer::ErasedBuffer>,
+                                    cap: &Option<Capability<u64>>| {
+                        if let Some(c) = cap
+                            && !bufs.is_empty()
+                        {
+                            let mut s = output.session(c);
+                            for b in bufs {
+                                s.give(b);
+                            }
+                        }
+                    };
+                    input.for_each(|cap, data| {
+                        let owned_cap = cap.retain(0);
+                        let buffers: Vec<crate::erased_buffer::ErasedBuffer> =
+                            std::mem::take(data);
+                        for buf in buffers {
+                            let (results, errors) = timely_op.process(buf, &oc.rt);
+                            for e in &errors {
+                                tracing::warn!(
+                                    error = %e,
+                                    operator = %op_name,
+                                    "batch operator error"
+                                );
+                                metrics::counter!("dlq_items_total").increment(1);
+                            }
+                            emit(results, &Some(owned_cap.clone()));
+                        }
+                        retained_cap = Some(owned_cap);
+                    });
+                    let wm = frontier_min_or_max(frontier.frontier());
+                    let time_results =
+                        timely_op.advance_time(wm, &mut last_watermark, &oc.rt);
+                    emit(time_results, &retained_cap);
+                    if let Some(ref cap) = retained_cap
+                        && !frontier.less_equal(cap.time())
+                    {
+                        retained_cap = None;
+                    }
+                    let fv: Vec<u64> = frontier.frontier().iter().copied().collect();
+                    if let Some(epoch) = try_batch_checkpoint(
+                        &mut timely_op,
+                        &fv,
+                        &oc.rt,
+                        oc.is_last_op,
+                        oc.worker_index,
+                        oc.local_first_worker,
+                    ) && let Some(ref n) = oc.notify
+                    {
+                        let _ = n.send(epoch);
+                    }
+                    if frontier.frontier().is_empty() && !closed {
+                        if let Err(e) = timely_op.close(&oc.rt) {
+                            tracing::error!(
+                                error = %e,
+                                operator = %op_name,
+                                "batch operator close failed"
+                            );
+                            metrics::counter!(
+                                "operator_lifecycle_errors_total",
+                                "phase" => "close"
+                            )
+                            .increment(1);
+                        }
+                        closed = true;
+                    }
+                }
+            },
+        )
+    }
+
+    /// Build a batch sink node that forwards `ErasedBuffer` batches to an async channel.
+    fn build_batch_sink<A: Allocate>(
+        &self,
+        node_id: NodeId,
+        input_stream: ScopedBatchStream<'_, A>,
+        probe: &probe::Handle<u64>,
+    ) {
+        use timely::container::CapacityContainerBuilder;
+        use timely::dataflow::channels::pact::Pipeline;
+        use timely::dataflow::operators::core::probe::Probe;
+        use timely::dataflow::operators::generic::operator::Operator;
+
+        #[allow(clippy::expect_used)]
+        let sink_tx = self
+            .batch_sink_senders
+            .get(&node_id)
+            .expect("missing batch sink sender")
+            .clone();
+
+        input_stream
+            .unary::<CapacityContainerBuilder<Vec<crate::erased_buffer::ErasedBuffer>>, _, _, _>(
+                Pipeline,
+                &format!("BatchSink_{}", node_id.0),
+                move |_cap, _info| {
+                    let sink_tx = sink_tx;
+                    move |input, _output| {
+                        input.for_each(|_cap, data| {
+                            for buf in data.drain(..) {
+                                if let Err(e) = sink_tx.send(buf) {
+                                    tracing::error!(error = %e, "batch sink send failed");
+                                    metrics::counter!("sink_send_errors_total").increment(1);
+                                }
+                            }
+                        });
+                    }
+                },
+            )
+            .probe_with(probe);
+    }
 }
 
 // ── Operator helper types ───────────────────────────────────────────
@@ -798,6 +1174,34 @@ fn try_checkpoint(
         Ok(epoch) => epoch,
         Err(e) => {
             tracing::error!(error = %e, "checkpoint failed");
+            metrics::counter!(
+                "operator_lifecycle_errors_total",
+                "phase" => "checkpoint"
+            )
+            .increment(1);
+            None
+        }
+    };
+    if is_last_op && worker_index == local_first_worker {
+        epoch
+    } else {
+        None
+    }
+}
+
+/// Batch variant of [`try_checkpoint`] for [`TimelyBatchOperator`].
+fn try_batch_checkpoint(
+    timely_op: &mut crate::timely_operator::TimelyBatchOperator,
+    frontier_vec: &[u64],
+    rt: &tokio::runtime::Handle,
+    is_last_op: bool,
+    worker_index: usize,
+    local_first_worker: usize,
+) -> Option<u64> {
+    let epoch = match timely_op.maybe_checkpoint(frontier_vec, rt) {
+        Ok(epoch) => epoch,
+        Err(e) => {
+            tracing::error!(error = %e, "batch checkpoint failed");
             metrics::counter!(
                 "operator_lifecycle_errors_total",
                 "phase" => "checkpoint"

@@ -15,11 +15,15 @@ use rhei_core::dlq::ErrorPolicy;
 use rhei_core::state::context::StateContext;
 use tokio::task::JoinHandle;
 
+use rhei_core::arrow::OperatorContext;
+
 use crate::any_item::AnyItem;
 use crate::compiler::CompiledGraph;
 use crate::controller::PipelineController;
-use crate::dataflow::{NodeId, NodeKind};
+use crate::dataflow::{BatchTransformFn, NodeId, NodeKind};
 use crate::erased::{ErasedOperator, ErasedSource, TransformFn};
+use crate::erased_batch::{ErasedBatchOperator, ErasedBatchSink, ErasedBatchSource};
+use crate::erased_buffer::ErasedBuffer;
 use crate::executor::NodeKindTag;
 use crate::shutdown::ShutdownHandle;
 
@@ -75,6 +79,13 @@ pub(crate) struct ExecutorData {
     pub operators: HashMap<NodeId, (String, Box<dyn ErasedOperator>)>,
     pub contexts: HashMap<NodeId, StateContext>,
     pub dlq_tx: Option<DlqSender>,
+    // Batch (Arrow) fields
+    pub batch_source_rx:
+        HashMap<NodeId, flume::Receiver<crate::bridge::BatchSourceBatch>>,
+    pub batch_transforms: HashMap<NodeId, BatchTransformFn>,
+    pub batch_operators: HashMap<NodeId, (String, Box<dyn ErasedBatchOperator>)>,
+    pub batch_contexts: HashMap<NodeId, OperatorContext>,
+    pub batch_sink_senders: HashMap<NodeId, flume::Sender<ErasedBuffer>>,
 }
 
 impl TaskManager {
@@ -95,6 +106,7 @@ impl TaskManager {
     ///
     /// Performs DLQ setup, node classification, source/sink bridging,
     /// per-worker data extraction, and global watermark task spawning.
+    #[allow(clippy::too_many_lines)]
     pub(crate) async fn build(
         mut graph: CompiledGraph,
         controller: &PipelineController,
@@ -118,8 +130,8 @@ impl TaskManager {
             mut per_worker_sources,
             mut per_worker_source_wm,
             mut per_worker_source_offsets,
-            all_source_offsets,
-            all_source_watermarks,
+            mut all_source_offsets,
+            mut all_source_watermarks,
         ) = prepare_sources(
             &mut graph,
             total_workers,
@@ -137,7 +149,7 @@ impl TaskManager {
         }
 
         // ── Sink bridging ─────────────────────────────────────────────
-        let (sink_senders, sink_handles) = bridge_sinks(&mut graph);
+        let (sink_senders, mut sink_handles) = bridge_sinks(&mut graph);
 
         // ── Per-worker data extraction ────────────────────────────────
         let (mut all_transforms, mut all_key_fns, mut all_operators, mut all_contexts) =
@@ -151,6 +163,28 @@ impl TaskManager {
 
         let topo_order = graph.topo_order.clone();
         let all_operator_names = graph.operator_names.clone();
+
+        // ── Batch (Arrow) data extraction ────────────────────────────
+        let (
+            mut per_worker_batch_source_rx,
+            mut per_worker_batch_transforms,
+            mut per_worker_batch_operators,
+            mut per_worker_batch_contexts,
+            mut per_worker_batch_sink_senders,
+            batch_sink_handles_new,
+        ) = extract_batch_per_worker_data(
+            &mut graph,
+            controller,
+            &node_kinds,
+            &local_range,
+            total_workers,
+            shutdown,
+            &mut per_worker_source_wm,
+            &mut per_worker_source_offsets,
+            &mut all_source_offsets,
+            &mut all_source_watermarks,
+        )?;
+        sink_handles.extend(batch_sink_handles_new);
 
         // Assemble per-executor data into ExecutorData structs.
         let mut per_executor: Vec<Option<ExecutorData>> =
@@ -166,6 +200,11 @@ impl TaskManager {
                 operators: all_operators[idx].take().unwrap_or_default(),
                 contexts: all_contexts[idx].take().unwrap_or_default(),
                 dlq_tx: dlq_senders[idx].take(),
+                batch_source_rx: std::mem::take(&mut per_worker_batch_source_rx[idx]),
+                batch_transforms: per_worker_batch_transforms[idx].take().unwrap_or_default(),
+                batch_operators: per_worker_batch_operators[idx].take().unwrap_or_default(),
+                batch_contexts: per_worker_batch_contexts[idx].take().unwrap_or_default(),
+                batch_sink_senders: std::mem::take(&mut per_worker_batch_sink_senders[idx]),
             });
         }
 
@@ -758,6 +797,9 @@ async fn prepare_sources(
     let _ = shutdown;
 
     for &source_id in &graph.source_ids {
+        if matches!(graph.nodes[source_id.0].kind, NodeKind::BatchSource(_)) {
+            continue;
+        }
         let source = extract_source(&mut graph.nodes[source_id.0]);
 
         // Register the output type in the global AnyItem type registry before
@@ -841,6 +883,9 @@ fn bridge_sinks(
     let mut sink_handles: Vec<JoinHandle<anyhow::Result<()>>> = Vec::new();
 
     for &sink_id in &graph.sink_ids {
+        if matches!(graph.nodes[sink_id.0].kind, NodeKind::BatchSink(_)) {
+            continue;
+        }
         let sink = extract_sink(&mut graph.nodes[sink_id.0]);
         let (tx, rx) = flume::bounded::<AnyItem>(crate::bridge::DEFAULT_CHANNEL_SIZE);
         sink_senders.insert(sink_id, tx);
@@ -947,6 +992,186 @@ fn extract_per_worker_data(
     }
 
     Ok((all_transforms, all_key_fns, all_operators, all_contexts))
+}
+
+// ── Batch (Arrow) per-worker data extraction ───────────────────────
+
+/// Extract batch sources, transforms, operators, sinks, and contexts for each local worker.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines, clippy::type_complexity)]
+fn extract_batch_per_worker_data(
+    graph: &mut CompiledGraph,
+    controller: &PipelineController,
+    node_kinds: &HashMap<NodeId, NodeKindTag>,
+    local_range: &Range<usize>,
+    total_workers: usize,
+    shutdown: Option<&ShutdownHandle>,
+    per_worker_source_wm: &mut [HashMap<NodeId, Arc<AtomicU64>>],
+    per_worker_source_offsets: &mut [HashMap<NodeId, Arc<std::sync::Mutex<HashMap<String, String>>>>],
+    all_source_offsets: &mut Vec<Arc<std::sync::Mutex<HashMap<String, String>>>>,
+    all_source_watermarks: &mut Vec<Arc<AtomicU64>>,
+) -> anyhow::Result<(
+    Vec<HashMap<NodeId, flume::Receiver<crate::bridge::BatchSourceBatch>>>,
+    Vec<Option<HashMap<NodeId, BatchTransformFn>>>,
+    Vec<Option<HashMap<NodeId, (String, Box<dyn ErasedBatchOperator>)>>>,
+    Vec<Option<HashMap<NodeId, OperatorContext>>>,
+    Vec<HashMap<NodeId, flume::Sender<ErasedBuffer>>>,
+    Vec<JoinHandle<anyhow::Result<()>>>,
+)> {
+    let rt = tokio::runtime::Handle::current();
+    let mut per_worker_batch_source_rx: Vec<HashMap<NodeId, flume::Receiver<crate::bridge::BatchSourceBatch>>> =
+        (0..total_workers).map(|_| HashMap::new()).collect();
+    let mut per_worker_batch_transforms: Vec<Option<HashMap<NodeId, BatchTransformFn>>> =
+        (0..total_workers).map(|_| None).collect();
+    let mut per_worker_batch_operators: Vec<Option<HashMap<NodeId, (String, Box<dyn ErasedBatchOperator>)>>> =
+        (0..total_workers).map(|_| None).collect();
+    let mut per_worker_batch_contexts: Vec<Option<HashMap<NodeId, OperatorContext>>> =
+        (0..total_workers).map(|_| None).collect();
+    let mut per_worker_batch_sink_senders: Vec<HashMap<NodeId, flume::Sender<ErasedBuffer>>> =
+        (0..total_workers).map(|_| HashMap::new()).collect();
+    let mut batch_sink_handles: Vec<JoinHandle<anyhow::Result<()>>> = Vec::new();
+
+    // Collect batch node IDs by kind.
+    let batch_source_ids: Vec<NodeId> = graph
+        .topo_order
+        .iter()
+        .filter(|id| node_kinds[id] == NodeKindTag::BatchSource)
+        .copied()
+        .collect();
+    let batch_transform_ids: Vec<NodeId> = graph
+        .topo_order
+        .iter()
+        .filter(|id| node_kinds[id] == NodeKindTag::BatchTransform)
+        .copied()
+        .collect();
+    let batch_operator_ids: Vec<NodeId> = graph
+        .topo_order
+        .iter()
+        .filter(|id| node_kinds[id] == NodeKindTag::BatchOperator)
+        .copied()
+        .collect();
+    let batch_sink_ids: Vec<NodeId> = graph
+        .topo_order
+        .iter()
+        .filter(|id| node_kinds[id] == NodeKindTag::BatchSink)
+        .copied()
+        .collect();
+
+    // Bridge batch sources: compile, create channel, spawn bridge task.
+    for &source_id in &batch_source_ids {
+        let source = extract_batch_source(&mut graph.nodes[source_id.0]);
+        // Non-partitioned: only worker 0 reads (same as row-based path).
+        if local_range.contains(&0) {
+            let (tx, rx) = flume::bounded(crate::bridge::DEFAULT_CHANNEL_SIZE);
+            let offsets: Arc<std::sync::Mutex<HashMap<String, String>>> =
+                Arc::new(std::sync::Mutex::new(HashMap::new()));
+            let wm: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
+            let shutdown_handle = shutdown.cloned();
+            rt.spawn(crate::bridge::local_batch_source_bridge(
+                source,
+                tx,
+                offsets.clone(),
+                wm.clone(),
+                shutdown_handle,
+            ));
+            per_worker_batch_source_rx[0].insert(source_id, rx);
+            per_worker_source_wm[0].insert(source_id, wm.clone());
+            per_worker_source_offsets[0].insert(source_id, offsets.clone());
+            all_source_offsets.push(offsets);
+            all_source_watermarks.push(wm);
+        }
+    }
+
+    // Extract batch transforms.
+    let mut orig_batch_transforms: HashMap<NodeId, BatchTransformFn> = HashMap::new();
+    for &nid in &batch_transform_ids {
+        orig_batch_transforms.insert(nid, extract_batch_transform(&mut graph.nodes[nid.0]));
+    }
+
+    // Extract batch operators.
+    let mut orig_batch_operators: HashMap<NodeId, (String, Box<dyn ErasedBatchOperator>)> =
+        HashMap::new();
+    for &nid in &batch_operator_ids {
+        orig_batch_operators.insert(nid, extract_batch_operator(&mut graph.nodes[nid.0]));
+    }
+
+    // Bridge batch sinks.
+    for &sink_id in &batch_sink_ids {
+        let sink = extract_batch_sink(&mut graph.nodes[sink_id.0]);
+        let (tx, rx) = flume::bounded::<ErasedBuffer>(crate::bridge::DEFAULT_CHANNEL_SIZE);
+        // All workers share the same sender (Pipeline pact).
+        for idx in local_range.clone() {
+            per_worker_batch_sink_senders[idx].insert(sink_id, tx.clone());
+        }
+        batch_sink_handles.push(tokio::spawn(crate::bridge::batch_sink_drain(sink, rx)));
+    }
+
+    // Distribute per-worker copies for local workers.
+    for worker_idx in local_range.clone() {
+        let mut w_transforms = HashMap::new();
+        let mut w_operators = HashMap::new();
+        let mut w_contexts = HashMap::new();
+
+        for &nid in &batch_transform_ids {
+            w_transforms.insert(nid, orig_batch_transforms[&nid].clone());
+        }
+
+        for &nid in &batch_operator_ids {
+            let (ref name, ref op) = orig_batch_operators[&nid];
+            let (name, op) = (name.clone(), op.clone_erased());
+            let ctx = controller.create_context_for_worker(&name, worker_idx)?;
+            w_contexts.insert(nid, OperatorContext::new(ctx));
+            w_operators.insert(nid, (name, op));
+        }
+
+        per_worker_batch_transforms[worker_idx] = Some(w_transforms);
+        per_worker_batch_operators[worker_idx] = Some(w_operators);
+        per_worker_batch_contexts[worker_idx] = Some(w_contexts);
+    }
+
+    Ok((
+        per_worker_batch_source_rx,
+        per_worker_batch_transforms,
+        per_worker_batch_operators,
+        per_worker_batch_contexts,
+        per_worker_batch_sink_senders,
+        batch_sink_handles,
+    ))
+}
+
+// ── Batch node extraction helpers ──────────────────────────────────
+
+fn extract_batch_source(node: &mut crate::dataflow::GraphNode) -> Box<dyn ErasedBatchSource> {
+    let kind = std::mem::replace(&mut node.kind, NodeKind::Merge);
+    match kind {
+        NodeKind::BatchSource(src) => src.compile(),
+        _ => panic!("expected BatchSource node at {:?}", node.id),
+    }
+}
+
+fn extract_batch_transform(node: &mut crate::dataflow::GraphNode) -> BatchTransformFn {
+    let kind = std::mem::replace(&mut node.kind, NodeKind::Merge);
+    match kind {
+        NodeKind::BatchTransform(f) => f.compile(),
+        _ => panic!("expected BatchTransform node at {:?}", node.id),
+    }
+}
+
+fn extract_batch_operator(
+    node: &mut crate::dataflow::GraphNode,
+) -> (String, Box<dyn ErasedBatchOperator>) {
+    let kind = std::mem::replace(&mut node.kind, NodeKind::Merge);
+    match kind {
+        NodeKind::BatchOperator { name, op } => (name, op.compile()),
+        _ => panic!("expected BatchOperator node at {:?}", node.id),
+    }
+}
+
+fn extract_batch_sink(node: &mut crate::dataflow::GraphNode) -> Box<dyn ErasedBatchSink> {
+    let kind = std::mem::replace(&mut node.kind, NodeKind::Merge);
+    match kind {
+        NodeKind::BatchSink(sink) => sink.compile(),
+        _ => panic!("expected BatchSink node at {:?}", node.id),
+    }
 }
 
 // ── Other helpers ───────────────────────────────────────────────────
