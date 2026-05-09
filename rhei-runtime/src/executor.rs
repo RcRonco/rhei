@@ -32,8 +32,7 @@ pub use crate::controller::PipelineControllerBuilder as ExecutorBuilder;
 type Scope<'a, A> = Child<'a, Worker<A>, u64>;
 type ScopedStream<'a, A, R> = timely::dataflow::Stream<Scope<'a, A>, Vec<R>>;
 type ScopedAnyStream<'a, A> = ScopedStream<'a, A, AnyItem>;
-type ScopedBatchStream<'a, A> =
-    ScopedStream<'a, A, crate::erased_buffer::ErasedBuffer>;
+type ScopedBatchStream<'a, A> = ScopedStream<'a, A, crate::erased_buffer::ErasedBuffer>;
 
 /// Special sentinel values in the `u64` timeline shared by watermarks and epochs.
 ///
@@ -752,10 +751,7 @@ impl DataflowExecutor {
         &self,
         scope: &mut Scope<'a, A>,
         node_id: NodeId,
-        batch_source_rx: &mut HashMap<
-            NodeId,
-            flume::Receiver<crate::bridge::BatchSourceBatch>,
-        >,
+        batch_source_rx: &mut HashMap<NodeId, flume::Receiver<crate::bridge::BatchSourceBatch>>,
         source_watermarks: &mut HashMap<NodeId, Arc<AtomicU64>>,
     ) -> ScopedBatchStream<'a, A> {
         use timely::dataflow::operators::generic::OutputBuilder;
@@ -885,23 +881,24 @@ impl DataflowExecutor {
             .remove(&node_id)
             .expect("missing batch transform for node");
         let name = format!("BatchTransform_{}", node_id.0);
-        input_stream.unary::<CapacityContainerBuilder<Vec<crate::erased_buffer::ErasedBuffer>>, _, _, _>(
-            Pipeline,
-            &name,
-            move |_cap, _info| {
-                let f = f;
-                move |input, output| {
-                    input.for_each(|cap, data| {
-                        let mut session = output.session(&cap);
-                        for buf in data.drain(..) {
-                            for result_buf in f(buf) {
-                                session.give(result_buf);
+        input_stream
+            .unary::<CapacityContainerBuilder<Vec<crate::erased_buffer::ErasedBuffer>>, _, _, _>(
+                Pipeline,
+                &name,
+                move |_cap, _info| {
+                    let f = f;
+                    move |input, output| {
+                        input.for_each(|cap, data| {
+                            let mut session = output.session(&cap);
+                            for buf in data.drain(..) {
+                                for result_buf in f(buf) {
+                                    session.give(result_buf);
+                                }
                             }
-                        }
-                    });
-                }
-            },
-        )
+                        });
+                    }
+                },
+            )
     }
 
     /// Build a batch stateful operator with watermark, timer, and checkpoint support.

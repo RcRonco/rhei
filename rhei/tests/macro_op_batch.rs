@@ -1,7 +1,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use rhei::arrow::{BufferOutput, OperatorContext, RheiBuffer, RheiBuilder, RheiSchema};
 use rhei::RheiSchema as RheiSchemaDerive;
+use rhei::arrow::{BufferOutput, OperatorContext, RheiBuffer, RheiBuilder, RheiSchema};
 use rhei_core::state::context::StateContext;
 use rhei_core::state::local_backend::LocalBackend;
 

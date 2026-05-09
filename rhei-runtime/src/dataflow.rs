@@ -101,8 +101,7 @@ pub(crate) trait BatchSinkNode: Send {
 }
 
 /// A batch-level transform: `ErasedBuffer` → `Vec<ErasedBuffer>`.
-pub(crate) type BatchTransformFn =
-    Arc<dyn Fn(ErasedBuffer) -> Vec<ErasedBuffer> + Send + Sync>;
+pub(crate) type BatchTransformFn = Arc<dyn Fn(ErasedBuffer) -> Vec<ErasedBuffer> + Send + Sync>;
 
 // ── Typed node wrappers ─────────────────────────────────────────────
 
@@ -223,9 +222,7 @@ where
 }
 
 /// Deferred batch transform: stores a factory that produces the erased closure.
-pub(crate) struct LazyBatchTransformNode(
-    pub(crate) Box<dyn FnOnce() -> BatchTransformFn + Send>,
-);
+pub(crate) struct LazyBatchTransformNode(pub(crate) Box<dyn FnOnce() -> BatchTransformFn + Send>);
 
 impl LazyBatchTransformNode {
     pub fn compile(self) -> BatchTransformFn {
@@ -260,7 +257,6 @@ pub(crate) enum NodeKind {
     Sink(Box<dyn SinkNode>),
 
     // ── Batch (Arrow columnar) variants ─────────────────────────────
-
     /// A batch data source producing `ErasedBuffer` batches.
     BatchSource(Box<dyn BatchSourceNode>),
     /// A batch stateless transform (`ErasedBuffer` → `Vec<ErasedBuffer>`).
@@ -479,9 +475,7 @@ impl DataflowGraph {
             .map(|node| {
                 let kind_label = match &node.kind {
                     NodeKind::Source(_) | NodeKind::BatchSource(_) => "source".to_string(),
-                    NodeKind::Transform(_) | NodeKind::BatchTransform(_) => {
-                        "transform".to_string()
-                    }
+                    NodeKind::Transform(_) | NodeKind::BatchTransform(_) => "transform".to_string(),
                     NodeKind::KeyBy(_) => "key_by".to_string(),
                     NodeKind::Operator { name, .. } | NodeKind::BatchOperator { name, .. } => {
                         format!("operator \"{name}\"")
@@ -1480,10 +1474,9 @@ impl<'a, T: RheiSchema + 'static> BatchStream<'a, T> {
                 vec![ErasedBuffer::from_typed(buf)]
             })
         }));
-        let node_id = self.graph.add_node(
-            NodeKind::BatchTransform(node),
-            vec![self.node_id],
-        );
+        let node_id = self
+            .graph
+            .add_node(NodeKind::BatchTransform(node), vec![self.node_id]);
         BatchStream::new(self.graph, node_id)
     }
 
@@ -1520,10 +1513,9 @@ impl<'a, T: RheiSchema + 'static> BatchStream<'a, T> {
                 vec![ErasedBuffer::from_typed(filtered)]
             })
         }));
-        let node_id = self.graph.add_node(
-            NodeKind::BatchTransform(node),
-            vec![self.node_id],
-        );
+        let node_id = self
+            .graph
+            .add_node(NodeKind::BatchTransform(node), vec![self.node_id]);
         BatchStream::new(self.graph, node_id)
     }
 
@@ -1561,10 +1553,9 @@ impl<'a, T: RheiSchema + 'static> BatchStream<'a, T> {
                 vec![ErasedBuffer::from_typed(buf)]
             })
         }));
-        let node_id = self.graph.add_node(
-            NodeKind::BatchTransform(node),
-            vec![self.node_id],
-        );
+        let node_id = self
+            .graph
+            .add_node(NodeKind::BatchTransform(node), vec![self.node_id]);
         BatchStream::new(self.graph, node_id)
     }
 

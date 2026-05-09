@@ -146,12 +146,36 @@ async fn batch_tumbling_window_pipeline() {
     // Events: 3 in window [0,10) for key "a", 2 in window [10,20) for key "a",
     //         1 in window [0,10) for key "b".
     let events = vec![
-        TimedEvent { key: "a".into(), ts: 1, value: 1.0 },
-        TimedEvent { key: "a".into(), ts: 5, value: 2.0 },
-        TimedEvent { key: "b".into(), ts: 3, value: 3.0 },
-        TimedEvent { key: "a".into(), ts: 8, value: 4.0 },
-        TimedEvent { key: "a".into(), ts: 12, value: 5.0 },
-        TimedEvent { key: "a".into(), ts: 15, value: 6.0 },
+        TimedEvent {
+            key: "a".into(),
+            ts: 1,
+            value: 1.0,
+        },
+        TimedEvent {
+            key: "a".into(),
+            ts: 5,
+            value: 2.0,
+        },
+        TimedEvent {
+            key: "b".into(),
+            ts: 3,
+            value: 3.0,
+        },
+        TimedEvent {
+            key: "a".into(),
+            ts: 8,
+            value: 4.0,
+        },
+        TimedEvent {
+            key: "a".into(),
+            ts: 12,
+            value: 5.0,
+        },
+        TimedEvent {
+            key: "a".into(),
+            ts: 15,
+            value: 6.0,
+        },
     ];
 
     let source = BatchVecSource::new(events).with_batch_size(10);
@@ -188,7 +212,11 @@ async fn batch_tumbling_window_pipeline() {
     // "a" [0,10) count=3 (ts: 1, 5, 8)
     // "a" [10,20) count=2 (ts: 12, 15)
     // "b" [0,10) count=1 (ts: 3)
-    assert_eq!(results.len(), 3, "expected 3 window outputs, got {results:?}");
+    assert_eq!(
+        results.len(),
+        3,
+        "expected 3 window outputs, got {results:?}"
+    );
     assert_eq!(results[0], ("a".to_string(), 0, 10, 3));
     assert_eq!(results[1], ("a".to_string(), 10, 20, 2));
     assert_eq!(results[2], ("b".to_string(), 0, 10, 1));

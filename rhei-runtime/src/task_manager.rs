@@ -80,8 +80,7 @@ pub(crate) struct ExecutorData {
     pub contexts: HashMap<NodeId, StateContext>,
     pub dlq_tx: Option<DlqSender>,
     // Batch (Arrow) fields
-    pub batch_source_rx:
-        HashMap<NodeId, flume::Receiver<crate::bridge::BatchSourceBatch>>,
+    pub batch_source_rx: HashMap<NodeId, flume::Receiver<crate::bridge::BatchSourceBatch>>,
     pub batch_transforms: HashMap<NodeId, BatchTransformFn>,
     pub batch_operators: HashMap<NodeId, (String, Box<dyn ErasedBatchOperator>)>,
     pub batch_contexts: HashMap<NodeId, OperatorContext>,
@@ -997,7 +996,11 @@ fn extract_per_worker_data(
 // ── Batch (Arrow) per-worker data extraction ───────────────────────
 
 /// Extract batch sources, transforms, operators, sinks, and contexts for each local worker.
-#[allow(clippy::too_many_arguments, clippy::too_many_lines, clippy::type_complexity)]
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    clippy::type_complexity
+)]
 fn extract_batch_per_worker_data(
     graph: &mut CompiledGraph,
     controller: &PipelineController,
@@ -1006,7 +1009,10 @@ fn extract_batch_per_worker_data(
     total_workers: usize,
     shutdown: Option<&ShutdownHandle>,
     per_worker_source_wm: &mut [HashMap<NodeId, Arc<AtomicU64>>],
-    per_worker_source_offsets: &mut [HashMap<NodeId, Arc<std::sync::Mutex<HashMap<String, String>>>>],
+    per_worker_source_offsets: &mut [HashMap<
+        NodeId,
+        Arc<std::sync::Mutex<HashMap<String, String>>>,
+    >],
     all_source_offsets: &mut Vec<Arc<std::sync::Mutex<HashMap<String, String>>>>,
     all_source_watermarks: &mut Vec<Arc<AtomicU64>>,
 ) -> anyhow::Result<(
@@ -1018,12 +1024,14 @@ fn extract_batch_per_worker_data(
     Vec<JoinHandle<anyhow::Result<()>>>,
 )> {
     let rt = tokio::runtime::Handle::current();
-    let mut per_worker_batch_source_rx: Vec<HashMap<NodeId, flume::Receiver<crate::bridge::BatchSourceBatch>>> =
-        (0..total_workers).map(|_| HashMap::new()).collect();
+    let mut per_worker_batch_source_rx: Vec<
+        HashMap<NodeId, flume::Receiver<crate::bridge::BatchSourceBatch>>,
+    > = (0..total_workers).map(|_| HashMap::new()).collect();
     let mut per_worker_batch_transforms: Vec<Option<HashMap<NodeId, BatchTransformFn>>> =
         (0..total_workers).map(|_| None).collect();
-    let mut per_worker_batch_operators: Vec<Option<HashMap<NodeId, (String, Box<dyn ErasedBatchOperator>)>>> =
-        (0..total_workers).map(|_| None).collect();
+    let mut per_worker_batch_operators: Vec<
+        Option<HashMap<NodeId, (String, Box<dyn ErasedBatchOperator>)>>,
+    > = (0..total_workers).map(|_| None).collect();
     let mut per_worker_batch_contexts: Vec<Option<HashMap<NodeId, OperatorContext>>> =
         (0..total_workers).map(|_| None).collect();
     let mut per_worker_batch_sink_senders: Vec<HashMap<NodeId, flume::Sender<ErasedBuffer>>> =

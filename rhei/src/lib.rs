@@ -25,7 +25,9 @@ pub use rhei_core::traits::{Sink, Source, StreamFunction};
 pub use rhei_core::state::context::StateContext;
 
 // Dataflow graph API
-pub use rhei_runtime::dataflow::{BatchStream, DataflowGraph, KeyedStream, Stream, TransformContext};
+pub use rhei_runtime::dataflow::{
+    BatchStream, DataflowGraph, KeyedStream, Stream, TransformContext,
+};
 
 // Pipeline controller
 pub use rhei_runtime::controller::{PipelineController, PipelineControllerBuilder};

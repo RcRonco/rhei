@@ -165,9 +165,7 @@ fn extract_topology(nodes: &[GraphNode]) -> ApiTopology {
                 ("operator", name.clone())
             }
             NodeKind::Merge => ("merge", format!("Merge_{}", node.id.0)),
-            NodeKind::Sink(_) | NodeKind::BatchSink(_) => {
-                ("sink", format!("Sink_{}", node.id.0))
-            }
+            NodeKind::Sink(_) | NodeKind::BatchSink(_) => ("sink", format!("Sink_{}", node.id.0)),
         };
 
         api_nodes.push(ApiTopologyNode {
