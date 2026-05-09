@@ -3124,6 +3124,7 @@ dependencies = [
  "bytes",
  "foyer 0.22.3",
  "futures",
+ "hex",
  "metrics",
  "moka",
  "object_store",
@@ -3133,6 +3134,7 @@ dependencies = [
  "slatedb",
  "tempfile",
  "tokio",
+ "toml 0.8.23",
  "tracing",
 ]
 

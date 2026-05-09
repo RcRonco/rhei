@@ -29,6 +29,7 @@ tower-http = { version = "0.6", features = ["cors"] }
 rdkafka = { version = "0.39.0", features = ["cmake-build"] }
 reqwest = { version = "0.13.2", default-features = false, features = ["json"] }
 tempfile = "3.27.0"
+toml = "0.8"
 syn = { version = "2.0.117", features = ["full"] }
 quote = "1.0.45"
 proc-macro2 = "1"

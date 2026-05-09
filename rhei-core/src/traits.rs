@@ -69,6 +69,23 @@ pub trait StreamFunction: Send + Sync {
     ) -> anyhow::Result<Vec<Self::Output>> {
         Ok(vec![])
     }
+
+    /// Called when `process` or `process_batch` returns an error.
+    ///
+    /// The operator can inspect the error and decide to:
+    /// - Return `Err(e)` to propagate the error (default behavior)
+    /// - Return `Ok(vec![...])` to emit recovery output items
+    /// - Return `Ok(vec![])` to silently skip the error
+    ///
+    /// This hook enables operator-level error recovery patterns without
+    /// requiring external DLQ wiring for every error case.
+    async fn on_error(
+        &mut self,
+        error: anyhow::Error,
+        _ctx: &mut StateContext,
+    ) -> anyhow::Result<Vec<Self::Output>> {
+        Err(error)
+    }
 }
 
 /// A source that produces elements into a stream.
@@ -295,6 +312,119 @@ mod tests {
             let mut ctx = test_ctx("noop");
             op.open(&mut ctx).await.unwrap();
             op.close().await.unwrap();
+        }
+    }
+
+    /// Verify `on_error` hook behavior with default and custom implementations.
+    mod on_error {
+        use super::*;
+
+        use crate::state::context::StateContext;
+        use crate::state::local_backend::LocalBackend;
+
+        fn test_ctx(name: &str) -> StateContext {
+            let path = std::env::temp_dir()
+                .join(format!("rhei_on_error_test_{name}_{}", std::process::id()));
+            let _ = std::fs::remove_file(&path);
+            let backend = LocalBackend::new(path, None).unwrap();
+            StateContext::new(Box::new(backend))
+        }
+
+        /// Operator that uses the default `on_error` (propagates errors).
+        struct DefaultErrorOp;
+
+        #[async_trait]
+        impl StreamFunction for DefaultErrorOp {
+            type Input = String;
+            type Output = String;
+
+            async fn process(
+                &mut self,
+                _input: String,
+                _ctx: &mut StateContext,
+            ) -> anyhow::Result<Vec<String>> {
+                anyhow::bail!("process failed")
+            }
+        }
+
+        /// Operator that recovers from errors by returning fallback items.
+        struct RecoveringOp;
+
+        #[async_trait]
+        impl StreamFunction for RecoveringOp {
+            type Input = String;
+            type Output = String;
+
+            async fn process(
+                &mut self,
+                _input: String,
+                _ctx: &mut StateContext,
+            ) -> anyhow::Result<Vec<String>> {
+                anyhow::bail!("process failed")
+            }
+
+            async fn on_error(
+                &mut self,
+                _error: anyhow::Error,
+                _ctx: &mut StateContext,
+            ) -> anyhow::Result<Vec<String>> {
+                Ok(vec!["recovered".to_string()])
+            }
+        }
+
+        /// Operator that silently skips errors by returning an empty vec.
+        struct SkippingOp;
+
+        #[async_trait]
+        impl StreamFunction for SkippingOp {
+            type Input = String;
+            type Output = String;
+
+            async fn process(
+                &mut self,
+                _input: String,
+                _ctx: &mut StateContext,
+            ) -> anyhow::Result<Vec<String>> {
+                anyhow::bail!("process failed")
+            }
+
+            async fn on_error(
+                &mut self,
+                _error: anyhow::Error,
+                _ctx: &mut StateContext,
+            ) -> anyhow::Result<Vec<String>> {
+                Ok(vec![])
+            }
+        }
+
+        #[tokio::test]
+        async fn default_on_error_propagates() {
+            let mut op = DefaultErrorOp;
+            let mut ctx = test_ctx("default_propagate");
+            let err = anyhow::anyhow!("test error");
+            let result = op.on_error(err, &mut ctx).await;
+            assert!(result.is_err());
+            assert_eq!(result.unwrap_err().to_string(), "test error");
+        }
+
+        #[tokio::test]
+        async fn custom_on_error_can_recover() {
+            let mut op = RecoveringOp;
+            let mut ctx = test_ctx("custom_recover");
+            let err = anyhow::anyhow!("test error");
+            let result = op.on_error(err, &mut ctx).await;
+            assert!(result.is_ok());
+            assert_eq!(result.unwrap(), vec!["recovered".to_string()]);
+        }
+
+        #[tokio::test]
+        async fn custom_on_error_can_skip() {
+            let mut op = SkippingOp;
+            let mut ctx = test_ctx("custom_skip");
+            let err = anyhow::anyhow!("test error");
+            let result = op.on_error(err, &mut ctx).await;
+            assert!(result.is_ok());
+            assert!(result.unwrap().is_empty());
         }
     }
 }

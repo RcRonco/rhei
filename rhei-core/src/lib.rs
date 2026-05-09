@@ -14,10 +14,14 @@
 
 /// Checkpoint manifest for recording pipeline checkpoint metadata.
 pub mod checkpoint;
+/// TOML-based pipeline configuration with environment variable overrides.
+pub mod config;
 /// Built-in source and sink connectors.
 pub mod connectors;
 /// Dead-letter queue types.
 pub mod dlq;
+/// Classified pipeline errors for structured error handling and DLQ routing.
+pub mod error;
 /// Event serialization and the [`Event`](event::Event) marker trait.
 pub mod event;
 /// Logical execution plan builder ([`StreamGraph`](graph::StreamGraph)).
@@ -26,6 +30,8 @@ pub mod graph;
 pub mod operators;
 /// Tiered state management (memtable, local, Foyer, `SlateDB`).
 pub mod state;
+/// Test harness: in-memory sources, collecting sinks, and assertion helpers.
+pub mod testing;
 /// Time providers for processing-time windowing and deterministic replay.
 pub mod time;
 /// Core stream processing traits ([`StreamFunction`](traits::StreamFunction),

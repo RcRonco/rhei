@@ -1,9 +1,10 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, UNIX_EPOCH};
 
 use clap::{Parser, Subcommand};
 
+mod scaffold;
 mod tui;
 
 #[derive(Parser)]
@@ -48,11 +49,24 @@ enum Commands {
         /// Path to hostfile (one host:port per line), alternative to --peers
         #[arg(long, conflicts_with = "peers")]
         hostfile: Option<std::path::PathBuf>,
+
+        /// Path to TOML config file (env vars override config values)
+        #[arg(long)]
+        config: Option<std::path::PathBuf>,
     },
     /// Attach to a running pipeline's HTTP server and display the TUI dashboard
     Attach {
         /// Address of the running pipeline's HTTP server (e.g. `127.0.0.1:9090`)
         addr: String,
+    },
+    /// Create a new Rhei pipeline project
+    New {
+        /// Project name (used as directory name and Cargo package name)
+        name: String,
+
+        /// Parent directory for the project (defaults to current directory)
+        #[arg(long)]
+        path: Option<PathBuf>,
     },
     /// Run the built-in demo pipeline with the HTTP server for the web dashboard
     Demo {
@@ -80,16 +94,47 @@ fn main() -> anyhow::Result<()> {
             process_id,
             peers,
             hostfile,
+            config,
         } => {
+            // Load TOML config if --config is specified, then apply env overrides.
+            let file_config = if let Some(ref config_path) = config {
+                Some(rhei_core::config::PipelineConfig::load(config_path)?.apply_env())
+            } else {
+                None
+            };
+
+            // CLI flags override config file values; config overrides defaults.
+            let effective_workers = if workers > 1 {
+                workers
+            } else {
+                file_config.as_ref().map_or(workers, |c| c.pipeline.workers)
+            };
+            let effective_metrics_addr = metrics_addr.or_else(|| {
+                file_config
+                    .as_ref()
+                    .and_then(rhei_core::config::PipelineConfig::metrics_addr)
+            });
+            let effective_log_level = if cli.log_level == "info" {
+                file_config
+                    .as_ref()
+                    .map_or(cli.log_level.clone(), |c| c.metrics.log_level.clone())
+            } else {
+                cli.log_level.clone()
+            };
+            let effective_json_logs =
+                cli.json_logs || file_config.as_ref().is_some_and(|c| c.metrics.json_logs);
+            let effective_process_id =
+                process_id.or_else(|| file_config.as_ref().and_then(|c| c.cluster.process_id));
+
             let _telemetry =
                 rhei_runtime::telemetry::init(rhei_runtime::telemetry::TelemetryConfig {
-                    metrics_addr,
-                    log_filter: cli.log_level.clone(),
-                    json_logs: cli.json_logs,
+                    metrics_addr: effective_metrics_addr,
+                    log_filter: effective_log_level,
+                    json_logs: effective_json_logs,
                     tui: false,
                 })?;
 
-            // Resolve peers from --peers or --hostfile.
+            // Resolve peers from --peers, --hostfile, or config file.
             let resolved_peers = if let Some(peers) = peers {
                 Some(peers)
             } else if let Some(ref path) = hostfile {
@@ -105,11 +150,17 @@ fn main() -> anyhow::Result<()> {
                 }
                 Some(peers)
             } else {
-                None
+                file_config.and_then(|c| c.cluster.peers)
             };
 
-            cmd_run(workers, metrics_addr, process_id, resolved_peers)
+            cmd_run(
+                effective_workers,
+                effective_metrics_addr,
+                effective_process_id,
+                resolved_peers,
+            )
         }
+        Commands::New { name, path } => scaffold::create_project(&name, path.as_deref()),
         Commands::Attach { addr } => cmd_attach(addr),
         Commands::Demo { workers, addr } => cmd_demo(workers, addr),
     }
