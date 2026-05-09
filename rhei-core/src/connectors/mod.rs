@@ -1,3 +1,5 @@
+/// Batch (Arrow columnar) sources and sinks.
+pub mod batch;
 /// File-backed dead-letter queue sink.
 pub mod dlq_file_sink;
 /// A sink that writes JSON lines to a file.

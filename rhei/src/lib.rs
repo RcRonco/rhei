@@ -7,8 +7,11 @@
 // Re-export macros
 pub use rhei_macros::{RheiSchema, op, op_batch, pipeline};
 
-// Arrow primitives
-pub use rhei_core::arrow::{OperatorContext, OperatorMetrics, RheiBuffer, RheiBuilder, RheiIter};
+// Arrow primitives and batch traits
+pub use rhei_core::arrow::{
+    BatchSink, BatchSource, BatchStreamFunction, BufferOutput, OperatorContext, OperatorMetrics,
+    RheiBuffer, RheiBuilder, RheiIter,
+};
 
 /// Arrow module re-exports for direct access to traits and types.
 pub mod arrow {

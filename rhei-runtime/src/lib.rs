@@ -45,6 +45,8 @@ pub mod controller;
 pub mod dataflow;
 /// Type-erased traits and wrappers for the Timely execution layer.
 pub(crate) mod erased;
+/// Type-erased Arrow buffer for Timely dataflow channels.
+pub mod erased_buffer;
 /// Pure Timely DAG construction and execution.
 pub mod executor;
 /// Fan-out recorder delegating to Prometheus and Snapshot recorders.

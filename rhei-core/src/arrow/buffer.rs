@@ -214,6 +214,56 @@ impl<T: RheiSchema> std::fmt::Debug for RheiBuffer<T> {
     }
 }
 
+/// Output from a batch operator: zero, one, or multiple buffers.
+///
+/// Avoids `Vec` allocation in the common single-buffer case while still
+/// supporting window operators that emit multiple buffers per invocation.
+#[derive(Debug, Clone)]
+pub enum BufferOutput<T: RheiSchema> {
+    /// No output (e.g. filter removed all rows, or operator is buffering).
+    None,
+    /// Single output buffer (the common case for map, filter, flat-map).
+    Single(RheiBuffer<T>),
+    /// Multiple output buffers (e.g. window operator closing several windows).
+    Multi(Vec<RheiBuffer<T>>),
+}
+
+impl<T: RheiSchema> BufferOutput<T> {
+    /// Convert into a `Vec<RheiBuffer<T>>` for compatibility.
+    pub fn into_vec(self) -> Vec<RheiBuffer<T>> {
+        match self {
+            Self::None => vec![],
+            Self::Single(buf) => vec![buf],
+            Self::Multi(bufs) => bufs,
+        }
+    }
+
+    /// Returns true if the output contains no data.
+    pub fn is_empty(&self) -> bool {
+        match self {
+            Self::None => true,
+            Self::Single(_) => false,
+            Self::Multi(bufs) => bufs.is_empty(),
+        }
+    }
+}
+
+impl<T: RheiSchema> From<RheiBuffer<T>> for BufferOutput<T> {
+    fn from(buf: RheiBuffer<T>) -> Self {
+        Self::Single(buf)
+    }
+}
+
+impl<T: RheiSchema> From<Vec<RheiBuffer<T>>> for BufferOutput<T> {
+    fn from(mut bufs: Vec<RheiBuffer<T>>) -> Self {
+        match bufs.len() {
+            0 => Self::None,
+            1 => Self::Single(bufs.swap_remove(0)),
+            _ => Self::Multi(bufs),
+        }
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {

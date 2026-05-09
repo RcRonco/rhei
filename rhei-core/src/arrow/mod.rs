@@ -10,9 +10,11 @@ mod builder;
 mod context;
 mod iter;
 mod schema;
+mod traits;
 
-pub use buffer::RheiBuffer;
+pub use buffer::{BufferOutput, RheiBuffer};
 pub use builder::RheiBuilder;
 pub use context::{OperatorContext, OperatorMetrics};
 pub use iter::RheiIter;
 pub use schema::RheiSchema;
+pub use traits::{BatchSink, BatchSource, BatchStreamFunction};

@@ -4378,6 +4378,7 @@ dependencies = [
  "async-trait",
  "bincode",
  "bytes",
+ "datafusion-physical-expr",
  "foyer 0.22.3",
  "futures",
  "hex",
@@ -4409,6 +4410,8 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "arrow",
+ "arrow-array",
+ "arrow-schema",
  "async-trait",
  "axum",
  "bincode",

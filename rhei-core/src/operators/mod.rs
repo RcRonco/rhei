@@ -13,6 +13,7 @@
 //! - **Async enrichment:** [`EnrichOp`] — bounded-concurrency async lookup
 
 pub mod aggregator;
+pub mod batch;
 pub mod broadcast_join;
 pub mod count_window;
 pub mod enrich;
@@ -31,6 +32,7 @@ pub mod tumbling_window;
 pub mod with_side;
 
 pub use aggregator::{Aggregator, Avg, Count, Sum};
+pub use batch::{BatchFilterFnOp, BatchFilterOp, BatchFlatMapOp, BatchMapOp};
 pub use broadcast_join::{BroadcastJoin, BroadcastSide};
 pub use count_window::{CountWindow, CountWindowOutput};
 pub use enrich::EnrichOp;
