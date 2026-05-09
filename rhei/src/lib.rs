@@ -52,6 +52,7 @@ pub use rhei_core::connectors::kafka::source::KafkaSource;
 pub use rhei_core::connectors::kafka::types::{KafkaHeader, KafkaMessage, KafkaRecord};
 
 // Operators
+pub use rhei_core::operators::batch::BatchTumblingWindow;
 pub use rhei_core::operators::count_window::{CountWindow, CountWindowOutput};
 pub use rhei_core::operators::enrich::EnrichOp;
 pub use rhei_core::operators::keyed_state::KeyedState;

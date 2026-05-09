@@ -5,6 +5,7 @@
 //! - [`RheiBuilder`] — columnar builder for accumulating rows into Arrow arrays
 //! - [`RheiBuffer`] — buffer wrapping a `RecordBatch` with optional selection vector
 
+pub mod aggregator;
 mod buffer;
 mod builder;
 mod context;
@@ -12,6 +13,7 @@ mod iter;
 mod schema;
 mod traits;
 
+pub use aggregator::{ArrowAggregator, AvgAgg, CountAgg, SumAgg};
 pub use buffer::{BufferOutput, RheiBuffer};
 pub use builder::RheiBuilder;
 pub use context::{OperatorContext, OperatorMetrics};

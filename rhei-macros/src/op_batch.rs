@@ -2,10 +2,9 @@ use proc_macro2::TokenStream;
 use quote::quote;
 use syn::{Error, ItemFn, ReturnType};
 
-use crate::util::{extract_result_vec_inner, extract_vec_inner, snake_to_pascal};
+use crate::util::{extract_generic_inner, extract_result_buffer_output_inner, snake_to_pascal};
 
 pub(crate) fn expand(item: ItemFn) -> Result<TokenStream, Error> {
-    // Must be async
     if item.sig.asyncness.is_none() {
         return Err(Error::new_spanned(
             item.sig.fn_token,
@@ -13,17 +12,16 @@ pub(crate) fn expand(item: ItemFn) -> Result<TokenStream, Error> {
         ));
     }
 
-    // Must have exactly 2 params (no self)
     let params: Vec<_> = item.sig.inputs.iter().collect();
     if params.len() != 2 {
         return Err(Error::new_spanned(
             &item.sig.inputs,
             "#[op_batch] function must have exactly 2 parameters: \
-             (inputs: Vec<T>, ctx: &mut StateContext)",
+             (input: RheiBuffer<I>, ctx: &mut OperatorContext)",
         ));
     }
 
-    // Extract input type from first param — must be Vec<T>
+    // Extract input type from first param — must be RheiBuffer<T>
     let first_param = &params[0];
     let syn::FnArg::Typed(first_pat) = first_param else {
         return Err(Error::new_spanned(
@@ -31,13 +29,13 @@ pub(crate) fn expand(item: ItemFn) -> Result<TokenStream, Error> {
             "#[op_batch] function must not have a self parameter",
         ));
     };
-    let batch_input_type = &*first_pat.ty;
-    let batch_input_pat = &*first_pat.pat;
+    let input_buf_type = &*first_pat.ty;
+    let input_buf_pat = &*first_pat.pat;
 
-    let input_type = extract_vec_inner(batch_input_type).ok_or_else(|| {
+    let input_type = extract_generic_inner(input_buf_type, "RheiBuffer").ok_or_else(|| {
         Error::new_spanned(
-            batch_input_type,
-            "#[op_batch] first parameter must be Vec<T>",
+            input_buf_type,
+            "#[op_batch] first parameter must be RheiBuffer<T>",
         )
     })?;
 
@@ -52,26 +50,23 @@ pub(crate) fn expand(item: ItemFn) -> Result<TokenStream, Error> {
     let ctx_pat = &*second_pat.pat;
     let ctx_type = &*second_pat.ty;
 
-    // Extract return type — must be Result<Vec<T>>
+    // Extract return type — must be Result<BufferOutput<T>>
     let ReturnType::Type(_, ref return_ty) = item.sig.output else {
         return Err(Error::new_spanned(
             &item.sig,
-            "#[op_batch] function must return anyhow::Result<Vec<T>>",
+            "#[op_batch] function must return anyhow::Result<BufferOutput<T>>",
         ));
     };
 
-    let output_type = extract_result_vec_inner(return_ty).ok_or_else(|| {
+    let output_type = extract_result_buffer_output_inner(return_ty).ok_or_else(|| {
         Error::new_spanned(
             return_ty,
-            "#[op_batch] function must return anyhow::Result<Vec<T>>",
+            "#[op_batch] function must return anyhow::Result<BufferOutput<T>>",
         )
     })?;
 
     let return_type = &**return_ty;
-
-    // Generate struct name from function name
     let struct_name = snake_to_pascal(&item.sig.ident.to_string());
-
     let body = &item.block;
 
     Ok(quote! {
@@ -79,21 +74,13 @@ pub(crate) fn expand(item: ItemFn) -> Result<TokenStream, Error> {
         struct #struct_name;
 
         #[::rhei::__private::async_trait]
-        impl ::rhei::StreamFunction for #struct_name {
+        impl ::rhei::BatchStreamFunction for #struct_name {
             type Input = #input_type;
             type Output = #output_type;
 
             async fn process(
                 &mut self,
-                input: #input_type,
-                ctx: &mut ::rhei::StateContext,
-            ) -> #return_type {
-                self.process_batch(vec![input], ctx).await
-            }
-
-            async fn process_batch(
-                &mut self,
-                #batch_input_pat: #batch_input_type,
+                #input_buf_pat: #input_buf_type,
                 #ctx_pat: #ctx_type,
             ) -> #return_type {
                 #body
