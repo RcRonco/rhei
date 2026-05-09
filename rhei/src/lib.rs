@@ -5,7 +5,15 @@
 //! boilerplate.
 
 // Re-export macros
-pub use rhei_macros::{op, op_batch, pipeline};
+pub use rhei_macros::{RheiSchema, op, op_batch, pipeline};
+
+// Arrow primitives
+pub use rhei_core::arrow::{OperatorContext, OperatorMetrics, RheiBuffer, RheiBuilder, RheiIter};
+
+/// Arrow module re-exports for direct access to traits and types.
+pub mod arrow {
+    pub use rhei_core::arrow::*;
+}
 
 // Core traits
 pub use rhei_core::traits::{Sink, Source, StreamFunction};

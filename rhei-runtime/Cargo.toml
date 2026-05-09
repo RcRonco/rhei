@@ -25,6 +25,10 @@ hex = "0.4"
 regex = "1"
 urlencoding = "2"
 seahash = "4"
+arrow.workspace = true
+datafusion.workspace = true
+datafusion-expr.workspace = true
+datafusion-physical-expr.workspace = true
 core_affinity = "0.8"
 # rdkafka is an optional dep activated by the `kafka` feature so that
 # `cargo test --workspace` (without --features kafka) doesn't require

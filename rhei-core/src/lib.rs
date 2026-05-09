@@ -12,6 +12,8 @@
 
 #![warn(missing_docs)]
 
+/// Apache Arrow columnar execution primitives.
+pub mod arrow;
 /// Checkpoint manifest for recording pipeline checkpoint metadata.
 pub mod checkpoint;
 /// TOML-based pipeline configuration with environment variable overrides.

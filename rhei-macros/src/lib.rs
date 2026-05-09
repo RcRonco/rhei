@@ -6,10 +6,11 @@
 mod op;
 mod op_batch;
 mod pipeline;
+mod rhei_schema;
 mod util;
 
 use proc_macro::TokenStream;
-use syn::parse_macro_input;
+use syn::{DeriveInput, parse_macro_input};
 
 /// Define a stateful stream operator from an async function.
 ///
@@ -74,6 +75,33 @@ pub fn op_batch(_attr: TokenStream, item: TokenStream) -> TokenStream {
 pub fn pipeline(_attr: TokenStream, item: TokenStream) -> TokenStream {
     let item_fn = parse_macro_input!(item as syn::ItemFn);
     match pipeline::expand(item_fn) {
+        Ok(tokens) => tokens.into(),
+        Err(err) => err.to_compile_error().into(),
+    }
+}
+
+/// Derive the `RheiSchema` trait for a struct, generating Arrow schema,
+/// columnar builder, zero-copy view, typed column accessors, and column constants.
+///
+/// # Example
+///
+/// ```ignore
+/// #[derive(RheiSchema)]
+/// pub struct WebEvent {
+///     pub user_id: i64,
+///     pub path: String,
+///     pub is_active: bool,
+///     pub timestamp: Option<i64>,
+///     pub tags: Vec<String>,
+/// }
+/// ```
+///
+/// Generates: `WebEventBuilder`, `WebEventView<'a>`, `WebEventColumns<'a>`,
+/// and constants like `WebEvent::USER_ID`, `WebEvent::PATH`, etc.
+#[proc_macro_derive(RheiSchema)]
+pub fn derive_rhei_schema(input: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(input as DeriveInput);
+    match rhei_schema::expand(input) {
         Ok(tokens) => tokens.into(),
         Err(err) => err.to_compile_error().into(),
     }

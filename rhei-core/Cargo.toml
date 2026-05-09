@@ -21,6 +21,10 @@ metrics.workspace = true
 moka.workspace = true
 hex = "0.4"
 toml.workspace = true
+arrow.workspace = true
+arrow-schema.workspace = true
+arrow-array.workspace = true
+arrow-buffer.workspace = true
 rdkafka = { workspace = true, optional = true }
 
 [features]
