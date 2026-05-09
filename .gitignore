@@ -23,7 +23,7 @@ target
 
 # Git worktrees
 .worktrees/
-
+.claude/worktrees/
 # Added by cargo
 
 /target
