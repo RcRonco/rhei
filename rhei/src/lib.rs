@@ -53,8 +53,17 @@ pub use rhei_core::connectors::kafka::source::KafkaSource;
 #[cfg(feature = "kafka")]
 pub use rhei_core::connectors::kafka::types::{KafkaHeader, KafkaMessage, KafkaRecord};
 
-// Operators
-pub use rhei_core::operators::batch::BatchTumblingWindow;
+// Batch operators
+pub use rhei_core::operators::batch::{
+    BatchCountWindow, BatchFilterExprOp, BatchReduceOp, BatchRollingAggregateOp,
+    BatchSessionWindow, BatchSlidingWindow, BatchTemporalJoin, BatchTumblingWindow, Expr, Side,
+    col, lit_bool, lit_f64, lit_i64, lit_str, lit_u64,
+};
+
+// Batch connectors (partitioned)
+pub use rhei_core::connectors::batch::BatchPartitionedVecSource;
+
+// Row-based operators
 pub use rhei_core::operators::count_window::{CountWindow, CountWindowOutput};
 pub use rhei_core::operators::enrich::EnrichOp;
 pub use rhei_core::operators::keyed_state::KeyedState;

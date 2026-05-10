@@ -1519,6 +1519,43 @@ impl<'a, T: RheiSchema + 'static> BatchStream<'a, T> {
         BatchStream::new(self.graph, node_id)
     }
 
+    /// Expression-based zero-copy filter using Arrow compute kernels.
+    pub fn filter(self, expr: rhei_core::operators::batch::Expr) -> BatchStream<'a, T> {
+        let node = LazyBatchTransformNode(Box::new(move || {
+            let expr = expr.clone();
+            Arc::new(move |buf: ErasedBuffer| {
+                let typed = match buf.downcast::<T>() {
+                    Ok(t) => t,
+                    Err(e) => {
+                        tracing::error!("batch filter downcast failed: {e}");
+                        return vec![];
+                    }
+                };
+                if typed.is_empty() {
+                    return vec![];
+                }
+                let batch = typed.as_record_batch();
+                let mask =
+                    match rhei_core::operators::batch::filter_expr::eval_predicate(&expr, batch) {
+                        Ok(m) => m,
+                        Err(e) => {
+                            tracing::error!("batch filter eval failed: {e}");
+                            return vec![];
+                        }
+                    };
+                let filtered = typed.and_mask(mask);
+                if filtered.is_empty() {
+                    return vec![];
+                }
+                vec![ErasedBuffer::from_typed(filtered)]
+            })
+        }));
+        let node_id = self
+            .graph
+            .add_node(NodeKind::BatchTransform(node), vec![self.node_id]);
+        BatchStream::new(self.graph, node_id)
+    }
+
     /// Per-row flat-map transform. Each view produces zero or more output rows.
     pub fn flat_map<F, O>(self, f: F) -> BatchStream<'a, O>
     where
