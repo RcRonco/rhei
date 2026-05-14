@@ -16,6 +16,10 @@ use arrow_schema::Schema;
 
 use rhei_core::arrow::{RheiBuffer, RheiSchema};
 
+/// Type-erased key extraction function: given a `RecordBatch` and row index,
+/// returns the key string for that row. Used by `key_by` exchange.
+pub(crate) type BatchKeyFn = Arc<dyn Fn(&RecordBatch, usize) -> String + Send + Sync>;
+
 /// Type-erased Arrow buffer for flowing through Timely dataflow channels.
 ///
 /// Contains a `RecordBatch` (the actual columnar data) and an optional
@@ -26,6 +30,9 @@ pub struct ErasedBuffer {
     batch: RecordBatch,
     mask: Option<BooleanArray>,
     schema_id: u64,
+    /// Transient routing hint set by `key_by`, read by Exchange pact.
+    /// Not serialized — defaults to `None` after deserialization.
+    exchange_target: Option<u64>,
 }
 
 impl std::fmt::Debug for ErasedBuffer {
@@ -49,6 +56,7 @@ impl ErasedBuffer {
             batch,
             mask,
             schema_id,
+            exchange_target: None,
         }
     }
 
@@ -84,6 +92,78 @@ impl ErasedBuffer {
     /// Returns a reference to the underlying `RecordBatch`.
     pub fn as_record_batch(&self) -> &RecordBatch {
         &self.batch
+    }
+
+    /// Set the exchange routing target (worker index).
+    #[allow(dead_code)]
+    pub(crate) fn with_exchange_target(mut self, target: u64) -> Self {
+        self.exchange_target = Some(target);
+        self
+    }
+
+    /// Get the exchange routing target, if set.
+    pub(crate) fn exchange_target(&self) -> Option<u64> {
+        self.exchange_target
+    }
+
+    /// Partition this buffer into per-worker sub-buffers based on key hashes.
+    ///
+    /// For each row, extracts the key via `key_fn`, hashes it with seahash,
+    /// and assigns it to `hash % num_workers`. Returns one `ErasedBuffer` per
+    /// non-empty partition, tagged with `exchange_target`.
+    #[allow(clippy::cast_possible_truncation)]
+    pub(crate) fn partition_for_exchange(
+        &self,
+        key_fn: &BatchKeyFn,
+        num_workers: usize,
+    ) -> Vec<ErasedBuffer> {
+        if num_workers <= 1 {
+            return vec![self.clone()];
+        }
+
+        let num_rows = self.batch.num_rows();
+        if num_rows == 0 {
+            return vec![];
+        }
+
+        // Assign each logical row to a worker.
+        let mut worker_rows: Vec<Vec<usize>> = vec![vec![]; num_workers];
+        for row_idx in 0..num_rows {
+            if let Some(ref mask) = self.mask
+                && !mask.value(row_idx)
+            {
+                continue;
+            }
+            let key = key_fn(&self.batch, row_idx);
+            let target = (seahash::hash(key.as_bytes()) as usize) % num_workers;
+            worker_rows[target].push(row_idx);
+        }
+
+        // Build per-worker sub-buffers using Arrow take kernel.
+        let mut result = Vec::with_capacity(num_workers);
+        for (worker_idx, rows) in worker_rows.into_iter().enumerate() {
+            if rows.is_empty() {
+                continue;
+            }
+            let indices =
+                arrow_array::UInt32Array::from(rows.iter().map(|&r| r as u32).collect::<Vec<_>>());
+            let columns: Vec<Arc<dyn arrow_array::Array>> = self
+                .batch
+                .columns()
+                .iter()
+                .filter_map(|col| arrow::compute::take(col.as_ref(), &indices, None).ok())
+                .collect();
+            if let Ok(sub_batch) = RecordBatch::try_new(self.batch.schema(), columns) {
+                let buf = ErasedBuffer {
+                    batch: sub_batch,
+                    mask: None,
+                    schema_id: self.schema_id,
+                    exchange_target: Some(worker_idx as u64),
+                };
+                result.push(buf);
+            }
+        }
+        result
     }
 }
 
@@ -150,6 +230,7 @@ impl<'de> serde::Deserialize<'de> for ErasedBuffer {
             batch,
             mask,
             schema_id,
+            exchange_target: None,
         })
     }
 }
@@ -199,7 +280,12 @@ fn deserialize_mask(bytes: &[u8]) -> BooleanArray {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::cast_possible_wrap,
+    clippy::cast_possible_truncation
+)]
 mod tests {
     use arrow_array::builder::ArrayBuilder;
 
@@ -405,5 +491,154 @@ mod tests {
         let typed: RheiBuffer<TestRow> = restored.downcast().unwrap();
         assert_eq!(typed.len(), 2);
         assert_eq!(typed.physical_len(), 3);
+    }
+
+    #[test]
+    fn partition_for_exchange_no_loss() {
+        let mut builder = TestRow::builder(6);
+        for (i, name) in ["alice", "bob", "alice", "charlie", "bob", "alice"]
+            .iter()
+            .enumerate()
+        {
+            builder.append(TestRow {
+                id: i as i64,
+                name: name.to_string(),
+            });
+        }
+        let buf: RheiBuffer<TestRow> = RheiBuffer::from_builder(builder);
+        let erased = ErasedBuffer::from_typed(buf);
+
+        let key_fn: BatchKeyFn = Arc::new(|batch: &RecordBatch, row_idx: usize| {
+            use arrow_array::cast::AsArray;
+            batch
+                .column(1)
+                .as_string::<i32>()
+                .value(row_idx)
+                .to_string()
+        });
+
+        let partitions = erased.partition_for_exchange(&key_fn, 3);
+        let total_rows: usize = partitions.iter().map(ErasedBuffer::num_rows).sum();
+        assert_eq!(total_rows, 6, "no rows should be lost during partitioning");
+    }
+
+    #[test]
+    fn partition_for_exchange_deterministic() {
+        let mut builder = TestRow::builder(4);
+        for name in ["alpha", "beta", "gamma", "delta"] {
+            builder.append(TestRow {
+                id: 0,
+                name: name.to_string(),
+            });
+        }
+        let buf: RheiBuffer<TestRow> = RheiBuffer::from_builder(builder);
+        let erased = ErasedBuffer::from_typed(buf);
+
+        let key_fn: BatchKeyFn = Arc::new(|batch: &RecordBatch, row_idx: usize| {
+            use arrow_array::cast::AsArray;
+            batch
+                .column(1)
+                .as_string::<i32>()
+                .value(row_idx)
+                .to_string()
+        });
+
+        let p1 = erased.partition_for_exchange(&key_fn, 4);
+        let p2 = erased.partition_for_exchange(&key_fn, 4);
+        assert_eq!(
+            p1.len(),
+            p2.len(),
+            "partition count should be deterministic"
+        );
+        for (a, b) in p1.iter().zip(p2.iter()) {
+            assert_eq!(a.exchange_target(), b.exchange_target());
+            assert_eq!(a.num_rows(), b.num_rows());
+        }
+    }
+
+    #[test]
+    fn partition_for_exchange_matches_partition_key() {
+        use crate::executor::partition_key;
+
+        let mut builder = TestRow::builder(4);
+        for name in ["alpha", "beta", "gamma", "delta"] {
+            builder.append(TestRow {
+                id: 0,
+                name: name.to_string(),
+            });
+        }
+        let buf: RheiBuffer<TestRow> = RheiBuffer::from_builder(builder);
+        let erased = ErasedBuffer::from_typed(buf);
+
+        let key_fn: BatchKeyFn = Arc::new(|batch: &RecordBatch, row_idx: usize| {
+            use arrow_array::cast::AsArray;
+            batch
+                .column(1)
+                .as_string::<i32>()
+                .value(row_idx)
+                .to_string()
+        });
+
+        let partitions = erased.partition_for_exchange(&key_fn, 4);
+        for part in &partitions {
+            let target = part.exchange_target().unwrap() as usize;
+            // Verify every row in this partition hashes to the same target.
+            for row in 0..part.num_rows() {
+                let key = key_fn(part.as_record_batch(), row);
+                let expected = partition_key(&key, 4);
+                assert_eq!(target, expected, "key '{key}' routed to wrong worker");
+            }
+        }
+    }
+
+    #[test]
+    fn partition_for_exchange_single_worker_passthrough() {
+        let mut builder = TestRow::builder(2);
+        builder.append(TestRow {
+            id: 1,
+            name: "a".into(),
+        });
+        builder.append(TestRow {
+            id: 2,
+            name: "b".into(),
+        });
+        let buf: RheiBuffer<TestRow> = RheiBuffer::from_builder(builder);
+        let erased = ErasedBuffer::from_typed(buf);
+
+        let key_fn: BatchKeyFn =
+            Arc::new(|_batch: &RecordBatch, _row_idx: usize| "any".to_string());
+
+        let partitions = erased.partition_for_exchange(&key_fn, 1);
+        assert_eq!(partitions.len(), 1);
+        assert_eq!(partitions[0].num_rows(), 2);
+    }
+
+    #[test]
+    fn partition_for_exchange_respects_mask() {
+        let mut builder = TestRow::builder(4);
+        for (i, name) in ["a", "b", "c", "d"].iter().enumerate() {
+            builder.append(TestRow {
+                id: i as i64,
+                name: name.to_string(),
+            });
+        }
+        let buf: RheiBuffer<TestRow> = RheiBuffer::from_builder(builder);
+        // Mask out rows 1 ("b") and 3 ("d").
+        let masked = buf.with_mask(BooleanArray::from(vec![true, false, true, false]));
+        let erased = ErasedBuffer::from_typed(masked);
+
+        let key_fn: BatchKeyFn = Arc::new(|batch: &RecordBatch, row_idx: usize| {
+            use arrow_array::cast::AsArray;
+            batch
+                .column(1)
+                .as_string::<i32>()
+                .value(row_idx)
+                .to_string()
+        });
+
+        let partitions = erased.partition_for_exchange(&key_fn, 4);
+        let total_rows: usize = partitions.iter().map(ErasedBuffer::num_rows).sum();
+        // Only 2 rows should be routed (masked rows excluded).
+        assert_eq!(total_rows, 2);
     }
 }

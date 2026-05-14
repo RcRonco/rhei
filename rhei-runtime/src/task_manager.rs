@@ -1,6 +1,6 @@
 //! Task management, I/O bridging, and per-executor data preparation for Timely execution.
 //!
-//! [`TaskManager`] packages all per-executor data (source receivers, transforms,
+//! [`TaskManager`] packages all per-executor data (batch source receivers, transforms,
 //! operators, state contexts, sink channels) and orchestrates checkpoint coordination
 //! and Timely DAG execution.
 
@@ -12,18 +12,15 @@ use std::sync::atomic::AtomicU64;
 
 use rhei_core::checkpoint::CheckpointManifest;
 use rhei_core::dlq::ErrorPolicy;
-use rhei_core::state::context::StateContext;
 use tokio::task::JoinHandle;
 
 use rhei_core::arrow::OperatorContext;
 
-use crate::any_item::AnyItem;
 use crate::compiler::CompiledGraph;
 use crate::controller::PipelineController;
-use crate::dataflow::{BatchTransformFn, NodeId, NodeKind};
-use crate::erased::{ErasedOperator, ErasedSource, TransformFn};
+use crate::dataflow::{BatchTransformFn, LazyBatchTransformNode, NodeId, NodeKind};
 use crate::erased_batch::{ErasedBatchOperator, ErasedBatchSink, ErasedBatchSource};
-use crate::erased_buffer::ErasedBuffer;
+use crate::erased_buffer::{BatchKeyFn, ErasedBuffer};
 use crate::executor::NodeKindTag;
 use crate::shutdown::ShutdownHandle;
 
@@ -39,7 +36,6 @@ pub(crate) struct TaskManager {
     per_executor: Arc<std::sync::Mutex<Vec<Option<ExecutorData>>>>,
 
     // Shared state
-    pub sink_senders: Arc<HashMap<NodeId, flume::Sender<AnyItem>>>,
     pub all_source_watermarks: Arc<Vec<Arc<AtomicU64>>>,
     pub checkpoint_notify_rx: std::sync::Mutex<Option<flume::Receiver<u64>>>,
     pub checkpoint_notify_tx: std::sync::Mutex<Option<flume::Sender<u64>>>,
@@ -69,15 +65,11 @@ pub(crate) struct TaskManager {
 /// Per-executor data extracted from the shared Mutex vectors.
 ///
 /// Returned by [`TaskManager::take_executor_data`] for consumption inside a Timely closure.
+#[allow(dead_code)] // some fields are reserved for future batch-path use
 pub(crate) struct ExecutorData {
-    pub sources: HashMap<NodeId, Box<dyn ErasedSource>>,
     pub source_wm: HashMap<NodeId, Arc<AtomicU64>>,
     pub source_offsets: HashMap<NodeId, Arc<std::sync::Mutex<HashMap<String, String>>>>,
     pub shutdown: Option<ShutdownHandle>,
-    pub transforms: HashMap<NodeId, TransformFn>,
-    pub key_fns: HashMap<NodeId, crate::erased::KeyFn>,
-    pub operators: HashMap<NodeId, (String, Box<dyn ErasedOperator>)>,
-    pub contexts: HashMap<NodeId, StateContext>,
     pub dlq_tx: Option<DlqSender>,
     // Batch (Arrow) fields
     pub batch_source_rx: HashMap<NodeId, flume::Receiver<crate::bridge::BatchSourceBatch>>,
@@ -85,6 +77,7 @@ pub(crate) struct ExecutorData {
     pub batch_operators: HashMap<NodeId, (String, Box<dyn ErasedBatchOperator>)>,
     pub batch_contexts: HashMap<NodeId, OperatorContext>,
     pub batch_sink_senders: HashMap<NodeId, flume::Sender<ErasedBuffer>>,
+    pub batch_key_fns: HashMap<NodeId, BatchKeyFn>,
 }
 
 impl TaskManager {
@@ -103,9 +96,10 @@ impl TaskManager {
 
     /// Build a `TaskManager` from a compiled graph and controller configuration.
     ///
-    /// Performs DLQ setup, node classification, source/sink bridging,
+    /// Performs DLQ setup, node classification, batch source/sink bridging,
     /// per-worker data extraction, and global watermark task spawning.
     #[allow(clippy::too_many_lines)]
+    #[allow(clippy::unused_async)] // kept async for API compatibility with callers
     pub(crate) async fn build(
         mut graph: CompiledGraph,
         controller: &PipelineController,
@@ -124,22 +118,6 @@ impl TaskManager {
         // ── Node classification ───────────────────────────────────────
         let (node_kinds, node_inputs, last_operator_id) = classify_nodes(&graph);
 
-        // ── Source preparation ─────────────────────────────────────────
-        let (
-            mut per_worker_sources,
-            mut per_worker_source_wm,
-            mut per_worker_source_offsets,
-            mut all_source_offsets,
-            mut all_source_watermarks,
-        ) = prepare_sources(
-            &mut graph,
-            total_workers,
-            &local_range,
-            shutdown,
-            &restored_offsets,
-        )
-        .await?;
-
         if !restored_offsets.is_empty() {
             tracing::info!(
                 offsets = restored_offsets.len(),
@@ -147,21 +125,19 @@ impl TaskManager {
             );
         }
 
-        // ── Sink bridging ─────────────────────────────────────────────
-        let (sink_senders, mut sink_handles) = bridge_sinks(&mut graph);
-
-        // ── Per-worker data extraction ────────────────────────────────
-        let (mut all_transforms, mut all_key_fns, mut all_operators, mut all_contexts) =
-            extract_per_worker_data(
-                &mut graph,
-                controller,
-                &node_kinds,
-                &local_range,
-                total_workers,
-            )?;
-
         let topo_order = graph.topo_order.clone();
         let all_operator_names = graph.operator_names.clone();
+
+        // Per-worker watermark/offset vecs initialised empty; batch extraction populates them.
+        let mut per_worker_source_wm: Vec<HashMap<NodeId, Arc<AtomicU64>>> =
+            (0..total_workers).map(|_| HashMap::new()).collect();
+        #[allow(clippy::type_complexity)]
+        let mut per_worker_source_offsets: Vec<
+            HashMap<NodeId, Arc<std::sync::Mutex<HashMap<String, String>>>>,
+        > = (0..total_workers).map(|_| HashMap::new()).collect();
+        let mut all_source_offsets: Vec<Arc<std::sync::Mutex<HashMap<String, String>>>> =
+            Vec::new();
+        let mut all_source_watermarks: Vec<Arc<AtomicU64>> = Vec::new();
 
         // ── Batch (Arrow) data extraction ────────────────────────────
         let (
@@ -170,7 +146,8 @@ impl TaskManager {
             mut per_worker_batch_operators,
             mut per_worker_batch_contexts,
             mut per_worker_batch_sink_senders,
-            batch_sink_handles_new,
+            mut per_worker_batch_key_fns,
+            sink_handles,
         ) = extract_batch_per_worker_data(
             &mut graph,
             controller,
@@ -183,27 +160,22 @@ impl TaskManager {
             &mut all_source_offsets,
             &mut all_source_watermarks,
         )?;
-        sink_handles.extend(batch_sink_handles_new);
 
         // Assemble per-executor data into ExecutorData structs.
         let mut per_executor: Vec<Option<ExecutorData>> =
             (0..total_workers).map(|_| None).collect();
         for idx in local_range.clone() {
             per_executor[idx] = Some(ExecutorData {
-                sources: std::mem::take(&mut per_worker_sources[idx]),
                 source_wm: std::mem::take(&mut per_worker_source_wm[idx]),
                 source_offsets: std::mem::take(&mut per_worker_source_offsets[idx]),
                 shutdown: shutdown.cloned(),
-                transforms: all_transforms[idx].take().unwrap_or_default(),
-                key_fns: all_key_fns[idx].take().unwrap_or_default(),
-                operators: all_operators[idx].take().unwrap_or_default(),
-                contexts: all_contexts[idx].take().unwrap_or_default(),
                 dlq_tx: dlq_senders[idx].take(),
                 batch_source_rx: std::mem::take(&mut per_worker_batch_source_rx[idx]),
                 batch_transforms: per_worker_batch_transforms[idx].take().unwrap_or_default(),
                 batch_operators: per_worker_batch_operators[idx].take().unwrap_or_default(),
                 batch_contexts: per_worker_batch_contexts[idx].take().unwrap_or_default(),
                 batch_sink_senders: std::mem::take(&mut per_worker_batch_sink_senders[idx]),
+                batch_key_fns: per_worker_batch_key_fns[idx].take().unwrap_or_default(),
             });
         }
 
@@ -227,7 +199,6 @@ impl TaskManager {
 
         Ok(TaskManager {
             per_executor: Arc::new(std::sync::Mutex::new(per_executor)),
-            sink_senders: Arc::new(sink_senders),
             all_source_watermarks,
             checkpoint_notify_rx: std::sync::Mutex::new(Some(checkpoint_notify_rx)),
             checkpoint_notify_tx: std::sync::Mutex::new(Some(checkpoint_notify_tx)),
@@ -248,12 +219,7 @@ impl TaskManager {
     }
 
     /// Join all sink and DLQ async task handles.
-    ///
-    /// Drops the sink senders first so that sink channels close and the
-    /// async drain tasks can terminate.
     pub(crate) async fn drain(self) -> anyhow::Result<()> {
-        // Drop sink senders so receivers see channel-closed and terminate.
-        drop(self.sink_senders);
         for handle in self.sink_handles {
             handle
                 .await
@@ -333,7 +299,6 @@ impl TaskManager {
         let mut data = self.take_executor_data(idx);
         let dlq_tx = data.dlq_tx.take();
         crate::executor::DataflowExecutor::new(
-            self.sink_senders.clone(),
             self.topo_order.clone(),
             self.node_inputs.clone(),
             self.node_kinds.clone(),
@@ -754,243 +719,10 @@ fn classify_nodes(
         .topo_order
         .iter()
         .rev()
-        .find(|id| node_kinds[id] == NodeKindTag::Operator)
+        .find(|id| node_kinds[id] == NodeKindTag::BatchOperator)
         .copied();
 
     (node_kinds, node_inputs, last_operator_id)
-}
-
-/// Prepare all sources for per-worker execution without spawning tasks or creating channels.
-///
-/// Extracts sources from the graph, restores offsets, distributes across workers,
-/// and creates shared watermark/offset state. Raw `Box<dyn ErasedSource>` instances
-/// are stored per-worker for later bridging inside the executor's local runtime.
-///
-/// Returns `(per_worker_sources, per_worker_source_wm, per_worker_source_offsets, all_source_offsets, all_source_watermarks)`.
-#[allow(clippy::type_complexity)]
-async fn prepare_sources(
-    graph: &mut CompiledGraph,
-    total_workers: usize,
-    local_range: &Range<usize>,
-    shutdown: Option<&ShutdownHandle>,
-    restored_offsets: &HashMap<String, String>,
-) -> anyhow::Result<(
-    Vec<HashMap<NodeId, Box<dyn ErasedSource>>>,
-    Vec<HashMap<NodeId, Arc<AtomicU64>>>,
-    Vec<HashMap<NodeId, Arc<std::sync::Mutex<HashMap<String, String>>>>>,
-    Vec<Arc<std::sync::Mutex<HashMap<String, String>>>>,
-    Vec<Arc<AtomicU64>>,
-)> {
-    let mut per_worker_sources: Vec<HashMap<NodeId, Box<dyn ErasedSource>>> =
-        (0..total_workers).map(|_| HashMap::new()).collect();
-    let mut per_worker_source_wm: Vec<HashMap<NodeId, Arc<AtomicU64>>> =
-        (0..total_workers).map(|_| HashMap::new()).collect();
-    let mut per_worker_source_offsets: Vec<
-        HashMap<NodeId, Arc<std::sync::Mutex<HashMap<String, String>>>>,
-    > = (0..total_workers).map(|_| HashMap::new()).collect();
-    let mut all_source_offsets: Vec<Arc<std::sync::Mutex<HashMap<String, String>>>> = Vec::new();
-    let mut all_source_watermarks: Vec<Arc<AtomicU64>> = Vec::new();
-
-    // Suppress unused variable warning when shutdown is not used directly here
-    // (it is passed through to ExecutorData for per-worker bridge creation).
-    let _ = shutdown;
-
-    for &source_id in &graph.source_ids {
-        if matches!(graph.nodes[source_id.0].kind, NodeKind::BatchSource(_)) {
-            continue;
-        }
-        let source = extract_source(&mut graph.nodes[source_id.0]);
-
-        // Register the output type in the global AnyItem type registry before
-        // Timely starts, so cross-process deserialization works.
-        source.register_output_type();
-
-        if let Some(n_partitions) = source.partition_count() {
-            // Partitioned: round-robin distribute partitions across total workers.
-            tracing::info!(
-                source = ?source_id,
-                partitions = n_partitions,
-                total_workers = total_workers,
-                "distributing partitioned source"
-            );
-            let mut worker_partitions: Vec<Vec<usize>> = vec![vec![]; total_workers];
-            for p in 0..n_partitions {
-                worker_partitions[p % total_workers].push(p);
-            }
-            // Only prepare sources for workers in local_range.
-            for (worker_idx, parts) in worker_partitions.into_iter().enumerate() {
-                if parts.is_empty() || !local_range.contains(&worker_idx) {
-                    continue;
-                }
-                let mut psrc = source.create_partition_source(&parts).ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "partitioned source failed to create reader for partitions {parts:?}"
-                    )
-                })?;
-                if !restored_offsets.is_empty() {
-                    psrc.restore_offsets(restored_offsets).await?;
-                }
-                let offsets: Arc<std::sync::Mutex<HashMap<String, String>>> =
-                    Arc::new(std::sync::Mutex::new(HashMap::new()));
-                let wm: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
-                per_worker_sources[worker_idx].insert(source_id, psrc);
-                per_worker_source_wm[worker_idx].insert(source_id, wm.clone());
-                per_worker_source_offsets[worker_idx].insert(source_id, offsets.clone());
-                all_source_offsets.push(offsets);
-                all_source_watermarks.push(wm);
-            }
-        } else {
-            // Non-partitioned: only global worker 0 reads.
-            // In cluster mode, only process 0 creates this source.
-            if local_range.contains(&0) {
-                let mut source = source;
-                if !restored_offsets.is_empty() {
-                    source.restore_offsets(restored_offsets).await?;
-                }
-                let offsets: Arc<std::sync::Mutex<HashMap<String, String>>> =
-                    Arc::new(std::sync::Mutex::new(HashMap::new()));
-                let wm: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
-                per_worker_sources[0].insert(source_id, source);
-                per_worker_source_wm[0].insert(source_id, wm.clone());
-                per_worker_source_offsets[0].insert(source_id, offsets.clone());
-                all_source_offsets.push(offsets);
-                all_source_watermarks.push(wm);
-            }
-        }
-    }
-
-    Ok((
-        per_worker_sources,
-        per_worker_source_wm,
-        per_worker_source_offsets,
-        all_source_offsets,
-        all_source_watermarks,
-    ))
-}
-
-/// Bridge all sinks in the graph to async drain tasks.
-///
-/// Returns `(sink_senders, sink_handles)`.
-#[allow(clippy::type_complexity)]
-fn bridge_sinks(
-    graph: &mut CompiledGraph,
-) -> (
-    HashMap<NodeId, flume::Sender<AnyItem>>,
-    Vec<JoinHandle<anyhow::Result<()>>>,
-) {
-    let mut sink_senders: HashMap<NodeId, flume::Sender<AnyItem>> = HashMap::new();
-    let mut sink_handles: Vec<JoinHandle<anyhow::Result<()>>> = Vec::new();
-
-    for &sink_id in &graph.sink_ids {
-        if matches!(graph.nodes[sink_id.0].kind, NodeKind::BatchSink(_)) {
-            continue;
-        }
-        let sink = extract_sink(&mut graph.nodes[sink_id.0]);
-        let (tx, rx) = flume::bounded::<AnyItem>(crate::bridge::DEFAULT_CHANNEL_SIZE);
-        sink_senders.insert(sink_id, tx);
-        sink_handles.push(tokio::spawn(async move {
-            let mut sink = sink;
-            while let Ok(item) = rx.recv_async().await {
-                sink.write(item).await?;
-            }
-            sink.flush().await?;
-            Ok(())
-        }));
-    }
-
-    (sink_senders, sink_handles)
-}
-
-/// Extract per-worker transforms, key functions, operators, and state contexts.
-///
-/// Creates clones for each local worker from the originals in the graph.
-#[allow(clippy::type_complexity)]
-fn extract_per_worker_data(
-    graph: &mut CompiledGraph,
-    controller: &PipelineController,
-    node_kinds: &HashMap<NodeId, NodeKindTag>,
-    local_range: &Range<usize>,
-    total_workers: usize,
-) -> anyhow::Result<(
-    Vec<Option<HashMap<NodeId, TransformFn>>>,
-    Vec<Option<HashMap<NodeId, crate::erased::KeyFn>>>,
-    Vec<Option<HashMap<NodeId, (String, Box<dyn ErasedOperator>)>>>,
-    Vec<Option<HashMap<NodeId, StateContext>>>,
-)> {
-    let mut all_transforms: Vec<Option<HashMap<NodeId, TransformFn>>> =
-        (0..total_workers).map(|_| None).collect();
-    let mut all_key_fns: Vec<Option<HashMap<NodeId, crate::erased::KeyFn>>> =
-        (0..total_workers).map(|_| None).collect();
-    #[allow(clippy::type_complexity)]
-    let mut all_operators: Vec<Option<HashMap<NodeId, (String, Box<dyn ErasedOperator>)>>> =
-        (0..total_workers).map(|_| None).collect();
-    let mut all_contexts: Vec<Option<HashMap<NodeId, StateContext>>> =
-        (0..total_workers).map(|_| None).collect();
-
-    // Collect node IDs by kind for extraction.
-    let transform_ids: Vec<NodeId> = graph
-        .topo_order
-        .iter()
-        .filter(|id| node_kinds[id] == NodeKindTag::Transform)
-        .copied()
-        .collect();
-    let key_by_ids: Vec<NodeId> = graph
-        .topo_order
-        .iter()
-        .filter(|id| node_kinds[id] == NodeKindTag::KeyBy)
-        .copied()
-        .collect();
-    let operator_ids: Vec<NodeId> = graph
-        .topo_order
-        .iter()
-        .filter(|id| node_kinds[id] == NodeKindTag::Operator)
-        .copied()
-        .collect();
-
-    // Extract originals from graph.
-    let mut orig_transforms: HashMap<NodeId, TransformFn> = HashMap::new();
-    for &nid in &transform_ids {
-        orig_transforms.insert(nid, extract_transform(&mut graph.nodes[nid.0]));
-    }
-    let mut orig_key_fns: HashMap<NodeId, crate::erased::KeyFn> = HashMap::new();
-    for &nid in &key_by_ids {
-        orig_key_fns.insert(nid, extract_key_fn(&mut graph.nodes[nid.0]));
-    }
-    let mut orig_operators: HashMap<NodeId, (String, Box<dyn ErasedOperator>)> = HashMap::new();
-    for &nid in &operator_ids {
-        orig_operators.insert(nid, extract_operator(&mut graph.nodes[nid.0]));
-    }
-
-    // Create per-worker copies for local workers only.
-    for worker_idx in local_range.clone() {
-        let mut w_transforms = HashMap::new();
-        let mut w_key_fns = HashMap::new();
-        let mut w_operators = HashMap::new();
-        let mut w_contexts = HashMap::new();
-
-        for &nid in &transform_ids {
-            w_transforms.insert(nid, orig_transforms[&nid].clone());
-        }
-
-        for &nid in &key_by_ids {
-            w_key_fns.insert(nid, orig_key_fns[&nid].clone());
-        }
-
-        for &nid in &operator_ids {
-            let (ref name, ref op) = orig_operators[&nid];
-            let (name, op) = (name.clone(), op.clone_erased());
-            let ctx = controller.create_context_for_worker(&name, worker_idx)?;
-            w_contexts.insert(nid, ctx);
-            w_operators.insert(nid, (name, op));
-        }
-
-        all_transforms[worker_idx] = Some(w_transforms);
-        all_key_fns[worker_idx] = Some(w_key_fns);
-        all_operators[worker_idx] = Some(w_operators);
-        all_contexts[worker_idx] = Some(w_contexts);
-    }
-
-    Ok((all_transforms, all_key_fns, all_operators, all_contexts))
 }
 
 // ── Batch (Arrow) per-worker data extraction ───────────────────────
@@ -1021,6 +753,7 @@ fn extract_batch_per_worker_data(
     Vec<Option<HashMap<NodeId, (String, Box<dyn ErasedBatchOperator>)>>>,
     Vec<Option<HashMap<NodeId, OperatorContext>>>,
     Vec<HashMap<NodeId, flume::Sender<ErasedBuffer>>>,
+    Vec<Option<HashMap<NodeId, BatchKeyFn>>>,
     Vec<JoinHandle<anyhow::Result<()>>>,
 )> {
     let rt = tokio::runtime::Handle::current();
@@ -1055,6 +788,12 @@ fn extract_batch_per_worker_data(
         .topo_order
         .iter()
         .filter(|id| node_kinds[id] == NodeKindTag::BatchOperator)
+        .copied()
+        .collect();
+    let batch_key_by_ids: Vec<NodeId> = graph
+        .topo_order
+        .iter()
+        .filter(|id| node_kinds[id] == NodeKindTag::BatchKeyBy)
         .copied()
         .collect();
     let batch_sink_ids: Vec<NodeId> = graph
@@ -1102,6 +841,12 @@ fn extract_batch_per_worker_data(
         orig_batch_operators.insert(nid, extract_batch_operator(&mut graph.nodes[nid.0]));
     }
 
+    // Extract batch key_by functions.
+    let mut orig_batch_key_fns: HashMap<NodeId, BatchKeyFn> = HashMap::new();
+    for &nid in &batch_key_by_ids {
+        orig_batch_key_fns.insert(nid, extract_batch_key_by(&mut graph.nodes[nid.0]));
+    }
+
     // Bridge batch sinks.
     for &sink_id in &batch_sink_ids {
         let sink = extract_batch_sink(&mut graph.nodes[sink_id.0]);
@@ -1114,10 +859,14 @@ fn extract_batch_per_worker_data(
     }
 
     // Distribute per-worker copies for local workers.
+    let mut per_worker_batch_key_fns: Vec<Option<HashMap<NodeId, BatchKeyFn>>> =
+        (0..total_workers).map(|_| None).collect();
+
     for worker_idx in local_range.clone() {
         let mut w_transforms = HashMap::new();
         let mut w_operators = HashMap::new();
         let mut w_contexts = HashMap::new();
+        let mut w_key_fns = HashMap::new();
 
         for &nid in &batch_transform_ids {
             w_transforms.insert(nid, orig_batch_transforms[&nid].clone());
@@ -1131,9 +880,14 @@ fn extract_batch_per_worker_data(
             w_operators.insert(nid, (name, op));
         }
 
+        for &nid in &batch_key_by_ids {
+            w_key_fns.insert(nid, orig_batch_key_fns[&nid].clone());
+        }
+
         per_worker_batch_transforms[worker_idx] = Some(w_transforms);
         per_worker_batch_operators[worker_idx] = Some(w_operators);
         per_worker_batch_contexts[worker_idx] = Some(w_contexts);
+        per_worker_batch_key_fns[worker_idx] = Some(w_key_fns);
     }
 
     Ok((
@@ -1142,14 +896,25 @@ fn extract_batch_per_worker_data(
         per_worker_batch_operators,
         per_worker_batch_contexts,
         per_worker_batch_sink_senders,
+        per_worker_batch_key_fns,
         batch_sink_handles,
     ))
 }
 
 // ── Batch node extraction helpers ──────────────────────────────────
 
+/// Create a lightweight placeholder `NodeKind` for `std::mem::replace`.
+///
+/// Uses a `BatchTransform` with a no-op closure. The placeholder is never
+/// compiled; it only satisfies the borrow checker during extraction.
+fn placeholder_node_kind() -> NodeKind {
+    NodeKind::BatchTransform(LazyBatchTransformNode(Box::new(|| {
+        Arc::new(|buf| vec![buf])
+    })))
+}
+
 fn extract_batch_source(node: &mut crate::dataflow::GraphNode) -> Box<dyn ErasedBatchSource> {
-    let kind = std::mem::replace(&mut node.kind, NodeKind::Merge);
+    let kind = std::mem::replace(&mut node.kind, placeholder_node_kind());
     match kind {
         NodeKind::BatchSource(src) => src.compile(),
         _ => panic!("expected BatchSource node at {:?}", node.id),
@@ -1157,7 +922,7 @@ fn extract_batch_source(node: &mut crate::dataflow::GraphNode) -> Box<dyn Erased
 }
 
 fn extract_batch_transform(node: &mut crate::dataflow::GraphNode) -> BatchTransformFn {
-    let kind = std::mem::replace(&mut node.kind, NodeKind::Merge);
+    let kind = std::mem::replace(&mut node.kind, placeholder_node_kind());
     match kind {
         NodeKind::BatchTransform(f) => f.compile(),
         _ => panic!("expected BatchTransform node at {:?}", node.id),
@@ -1167,7 +932,7 @@ fn extract_batch_transform(node: &mut crate::dataflow::GraphNode) -> BatchTransf
 fn extract_batch_operator(
     node: &mut crate::dataflow::GraphNode,
 ) -> (String, Box<dyn ErasedBatchOperator>) {
-    let kind = std::mem::replace(&mut node.kind, NodeKind::Merge);
+    let kind = std::mem::replace(&mut node.kind, placeholder_node_kind());
     match kind {
         NodeKind::BatchOperator { name, op } => (name, op.compile()),
         _ => panic!("expected BatchOperator node at {:?}", node.id),
@@ -1175,10 +940,18 @@ fn extract_batch_operator(
 }
 
 fn extract_batch_sink(node: &mut crate::dataflow::GraphNode) -> Box<dyn ErasedBatchSink> {
-    let kind = std::mem::replace(&mut node.kind, NodeKind::Merge);
+    let kind = std::mem::replace(&mut node.kind, placeholder_node_kind());
     match kind {
         NodeKind::BatchSink(sink) => sink.compile(),
         _ => panic!("expected BatchSink node at {:?}", node.id),
+    }
+}
+
+fn extract_batch_key_by(node: &mut crate::dataflow::GraphNode) -> BatchKeyFn {
+    let kind = std::mem::replace(&mut node.kind, placeholder_node_kind());
+    match kind {
+        NodeKind::BatchKeyBy(key_by) => key_by.compile(),
+        _ => panic!("expected BatchKeyBy node at {:?}", node.id),
     }
 }
 
@@ -1191,43 +964,12 @@ fn extract_batch_sink(node: &mut crate::dataflow::GraphNode) -> Box<dyn ErasedBa
 fn setup_dlq_sinks(
     policy: &ErrorPolicy,
     total_workers: usize,
-    local_range: &Range<usize>,
+    _local_range: &Range<usize>,
 ) -> (Vec<Option<DlqSender>>, Vec<JoinHandle<anyhow::Result<()>>>) {
     match policy {
         ErrorPolicy::Skip => {
             let senders = vec![None; total_workers];
             (senders, Vec::new())
-        }
-        ErrorPolicy::DeadLetter(factory) => {
-            let mut senders: Vec<Option<DlqSender>> = vec![None; total_workers];
-            let mut handles = Vec::with_capacity(local_range.len());
-
-            for i in local_range.clone() {
-                match factory.create(i) {
-                    Ok(sink) => {
-                        let (tx, rx) = flume::bounded::<rhei_core::dlq::DeadLetterRecord>(64);
-                        senders[i] = Some(tx);
-                        handles.push(tokio::spawn(async move {
-                            let mut sink = sink;
-                            while let Ok(record) = rx.recv_async().await {
-                                sink.write(record).await?;
-                            }
-                            sink.flush().await?;
-                            Ok(())
-                        }));
-                        tracing::info!(worker = i, "DLQ sink opened for worker");
-                    }
-                    Err(e) => {
-                        tracing::error!(
-                            error = %e,
-                            worker = i,
-                            "failed to open DLQ sink — falling back to skip for worker"
-                        );
-                    }
-                }
-            }
-
-            (senders, handles)
         }
     }
 }
@@ -1251,51 +993,4 @@ pub(crate) fn merge_source_offsets(
         );
     }
     combined
-}
-
-// ── Node extraction helpers ─────────────────────────────────────────
-
-/// Extract and compile a source from a graph node, replacing it with a Merge placeholder.
-fn extract_source(node: &mut crate::dataflow::GraphNode) -> Box<dyn ErasedSource> {
-    let kind = std::mem::replace(&mut node.kind, NodeKind::Merge);
-    match kind {
-        NodeKind::Source(src) => src.compile(),
-        _ => panic!("expected Source node at {:?}", node.id),
-    }
-}
-
-/// Extract and compile a sink from a graph node, replacing it with a Merge placeholder.
-fn extract_sink(node: &mut crate::dataflow::GraphNode) -> Box<dyn crate::erased::ErasedSink> {
-    let kind = std::mem::replace(&mut node.kind, NodeKind::Merge);
-    match kind {
-        NodeKind::Sink(sink) => sink.compile(),
-        _ => panic!("expected Sink node at {:?}", node.id),
-    }
-}
-
-/// Extract and compile an operator from a graph node, replacing it with a Merge placeholder.
-fn extract_operator(node: &mut crate::dataflow::GraphNode) -> (String, Box<dyn ErasedOperator>) {
-    let kind = std::mem::replace(&mut node.kind, NodeKind::Merge);
-    match kind {
-        NodeKind::Operator { name, op } => (name, op.compile()),
-        _ => panic!("expected Operator node at {:?}", node.id),
-    }
-}
-
-/// Extract and compile a transform function from a graph node.
-fn extract_transform(node: &mut crate::dataflow::GraphNode) -> TransformFn {
-    let kind = std::mem::replace(&mut node.kind, NodeKind::Merge);
-    match kind {
-        NodeKind::Transform(f) => f.compile(),
-        _ => panic!("expected Transform node at {:?}", node.id),
-    }
-}
-
-/// Extract and compile a key function from a graph node.
-fn extract_key_fn(node: &mut crate::dataflow::GraphNode) -> crate::erased::KeyFn {
-    let kind = std::mem::replace(&mut node.kind, NodeKind::Merge);
-    match kind {
-        NodeKind::KeyBy(f) => f.compile(),
-        _ => panic!("expected KeyBy node at {:?}", node.id),
-    }
 }
