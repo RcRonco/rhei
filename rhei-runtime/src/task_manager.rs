@@ -112,8 +112,17 @@ impl TaskManager {
         let n_local = local_range.len();
 
         // ── DLQ setup ─────────────────────────────────────────────────
-        let (mut dlq_senders, dlq_handles) =
-            setup_dlq_sinks(&controller.error_policy, total_workers, &local_range);
+        let dlq_sink = controller
+            .dlq_sink
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        let (mut dlq_senders, dlq_handles) = setup_dlq_sinks(
+            &controller.error_policy,
+            dlq_sink,
+            total_workers,
+            &local_range,
+        );
 
         // ── Node classification ───────────────────────────────────────
         let (node_kinds, node_inputs, last_operator_id) = classify_nodes(&graph);
@@ -999,6 +1008,7 @@ fn extract_batch_key_by(node: &mut crate::dataflow::GraphNode) -> BatchKeyFn {
 /// for remote workers) and the async task handles that drive the sinks.
 fn setup_dlq_sinks(
     policy: &ErrorPolicy,
+    dlq_sink: Option<Box<dyn rhei_core::dlq::DlqSink>>,
     total_workers: usize,
     local_range: &Range<usize>,
 ) -> (Vec<Option<DlqSender>>, Vec<JoinHandle<anyhow::Result<()>>>) {
@@ -1008,6 +1018,10 @@ fn setup_dlq_sinks(
             (senders, Vec::new())
         }
         ErrorPolicy::SendToDlq => {
+            let sink = dlq_sink.unwrap_or_else(|| {
+                tracing::warn!("SendToDlq policy set but no DLQ sink provided, using log sink");
+                Box::new(rhei_core::dlq::LogDlqSink)
+            });
             let mut senders: Vec<Option<DlqSender>> = vec![None; total_workers];
             let mut handles = Vec::new();
             let (tx, rx) = flume::bounded::<rhei_core::dlq::DeadLetterRecord>(256);
@@ -1015,25 +1029,23 @@ fn setup_dlq_sinks(
                 senders[idx] = Some(tx.clone());
             }
             drop(tx);
-            handles.push(tokio::spawn(dlq_file_sink(rx)));
+            handles.push(tokio::spawn(dlq_drain(rx, sink)));
             (senders, handles)
         }
     }
 }
 
-/// DLQ file sink: writes dead-letter records as newline-delimited JSON to stderr.
-async fn dlq_file_sink(
+/// Drains DLQ records from the channel into the user-provided sink.
+async fn dlq_drain(
     rx: flume::Receiver<rhei_core::dlq::DeadLetterRecord>,
+    mut sink: Box<dyn rhei_core::dlq::DlqSink>,
 ) -> anyhow::Result<()> {
     while let Ok(record) = rx.recv_async().await {
-        tracing::error!(
-            operator = %record.operator_name,
-            error = %record.error,
-            input = %record.input_repr,
-            timestamp = %record.timestamp,
-            "DLQ record"
-        );
+        if let Err(e) = sink.write(record).await {
+            tracing::warn!(error = %e, "DLQ sink write failed");
+        }
     }
+    sink.flush().await?;
     Ok(())
 }
 
