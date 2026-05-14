@@ -106,6 +106,39 @@ impl ErasedBuffer {
         self.exchange_target
     }
 
+    /// Concatenate multiple buffers into one using Arrow's `concat_batches`.
+    ///
+    /// All buffers must have the same schema. Returns `None` if the input is empty.
+    /// Masks are applied (compacted) before concatenation.
+    pub(crate) fn concat(buffers: Vec<ErasedBuffer>) -> Option<ErasedBuffer> {
+        if buffers.is_empty() {
+            return None;
+        }
+        if buffers.len() == 1 {
+            return Some(buffers.into_iter().next().unwrap_or_else(|| unreachable!()));
+        }
+        let schema = buffers[0].batch.schema();
+        let schema_id = buffers[0].schema_id;
+        let batches: Vec<RecordBatch> = buffers
+            .into_iter()
+            .map(|b| {
+                if let Some(mask) = b.mask {
+                    arrow::compute::filter_record_batch(&b.batch, &mask).unwrap_or(b.batch)
+                } else {
+                    b.batch
+                }
+            })
+            .collect();
+        let combined = arrow::compute::concat_batches(&schema, batches.iter())
+            .unwrap_or_else(|_| RecordBatch::new_empty(schema));
+        Some(ErasedBuffer {
+            batch: combined,
+            mask: None,
+            schema_id,
+            exchange_target: None,
+        })
+    }
+
     /// Partition this buffer into per-worker sub-buffers based on key hashes.
     ///
     /// For each row, extracts the key via `key_fn`, hashes it with seahash,

@@ -567,6 +567,21 @@ impl DataflowExecutor {
                                     "batch operator error"
                                 );
                                 metrics::counter!("dlq_items_total").increment(1);
+                                if let Some(ref dlq) = oc.dlq {
+                                    let record = rhei_core::dlq::DeadLetterRecord {
+                                        input_repr: String::new(),
+                                        operator_name: op_name.clone(),
+                                        error: e.to_string(),
+                                        timestamp: format!(
+                                            "{}",
+                                            std::time::SystemTime::now()
+                                                .duration_since(std::time::UNIX_EPOCH)
+                                                .unwrap_or_default()
+                                                .as_millis()
+                                        ),
+                                    };
+                                    let _ = dlq.try_send(record);
+                                }
                             }
                             emit(results, &Some(owned_cap.clone()));
                         }

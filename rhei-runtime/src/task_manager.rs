@@ -806,25 +806,61 @@ fn extract_batch_per_worker_data(
     // Bridge batch sources: compile, create channel, spawn bridge task.
     for &source_id in &batch_source_ids {
         let source = extract_batch_source(&mut graph.nodes[source_id.0]);
-        // Non-partitioned: only worker 0 reads (same as row-based path).
-        if local_range.contains(&0) {
-            let (tx, rx) = flume::bounded(crate::bridge::DEFAULT_CHANNEL_SIZE);
-            let offsets: Arc<std::sync::Mutex<HashMap<String, String>>> =
-                Arc::new(std::sync::Mutex::new(HashMap::new()));
-            let wm: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
-            let shutdown_handle = shutdown.cloned();
-            rt.spawn(crate::bridge::local_batch_source_bridge(
-                source,
-                tx,
-                offsets.clone(),
-                wm.clone(),
-                shutdown_handle,
-            ));
-            per_worker_batch_source_rx[0].insert(source_id, rx);
-            per_worker_source_wm[0].insert(source_id, wm.clone());
-            per_worker_source_offsets[0].insert(source_id, offsets.clone());
-            all_source_offsets.push(offsets);
-            all_source_watermarks.push(wm);
+
+        if let Some(n_partitions) = source.partition_count() {
+            // Partitioned source: distribute partitions across all workers.
+            let partitions_per_worker = assign_partitions(n_partitions, total_workers);
+            for worker_idx in local_range.clone() {
+                let assigned = &partitions_per_worker[worker_idx];
+                if assigned.is_empty() {
+                    continue;
+                }
+                let Some(partition_source) = source.create_partition_source(assigned) else {
+                    tracing::warn!(
+                        worker = worker_idx,
+                        "partitioned source returned None for assigned partitions"
+                    );
+                    continue;
+                };
+                let (tx, rx) = flume::bounded(crate::bridge::DEFAULT_CHANNEL_SIZE);
+                let offsets: Arc<std::sync::Mutex<HashMap<String, String>>> =
+                    Arc::new(std::sync::Mutex::new(HashMap::new()));
+                let wm: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
+                let shutdown_handle = shutdown.cloned();
+                rt.spawn(crate::bridge::local_batch_source_bridge(
+                    partition_source,
+                    tx,
+                    offsets.clone(),
+                    wm.clone(),
+                    shutdown_handle,
+                ));
+                per_worker_batch_source_rx[worker_idx].insert(source_id, rx);
+                per_worker_source_wm[worker_idx].insert(source_id, wm.clone());
+                per_worker_source_offsets[worker_idx].insert(source_id, offsets.clone());
+                all_source_offsets.push(offsets);
+                all_source_watermarks.push(wm);
+            }
+        } else {
+            // Non-partitioned: only worker 0 reads.
+            if local_range.contains(&0) {
+                let (tx, rx) = flume::bounded(crate::bridge::DEFAULT_CHANNEL_SIZE);
+                let offsets: Arc<std::sync::Mutex<HashMap<String, String>>> =
+                    Arc::new(std::sync::Mutex::new(HashMap::new()));
+                let wm: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
+                let shutdown_handle = shutdown.cloned();
+                rt.spawn(crate::bridge::local_batch_source_bridge(
+                    source,
+                    tx,
+                    offsets.clone(),
+                    wm.clone(),
+                    shutdown_handle,
+                ));
+                per_worker_batch_source_rx[0].insert(source_id, rx);
+                per_worker_source_wm[0].insert(source_id, wm.clone());
+                per_worker_source_offsets[0].insert(source_id, offsets.clone());
+                all_source_offsets.push(offsets);
+                all_source_watermarks.push(wm);
+            }
         }
     }
 
@@ -964,14 +1000,53 @@ fn extract_batch_key_by(node: &mut crate::dataflow::GraphNode) -> BatchKeyFn {
 fn setup_dlq_sinks(
     policy: &ErrorPolicy,
     total_workers: usize,
-    _local_range: &Range<usize>,
+    local_range: &Range<usize>,
 ) -> (Vec<Option<DlqSender>>, Vec<JoinHandle<anyhow::Result<()>>>) {
     match policy {
         ErrorPolicy::Skip => {
             let senders = vec![None; total_workers];
             (senders, Vec::new())
         }
+        ErrorPolicy::SendToDlq => {
+            let mut senders: Vec<Option<DlqSender>> = vec![None; total_workers];
+            let mut handles = Vec::new();
+            let (tx, rx) = flume::bounded::<rhei_core::dlq::DeadLetterRecord>(256);
+            for idx in local_range.clone() {
+                senders[idx] = Some(tx.clone());
+            }
+            drop(tx);
+            handles.push(tokio::spawn(dlq_file_sink(rx)));
+            (senders, handles)
+        }
     }
+}
+
+/// DLQ file sink: writes dead-letter records as newline-delimited JSON to stderr.
+async fn dlq_file_sink(
+    rx: flume::Receiver<rhei_core::dlq::DeadLetterRecord>,
+) -> anyhow::Result<()> {
+    while let Ok(record) = rx.recv_async().await {
+        tracing::error!(
+            operator = %record.operator_name,
+            error = %record.error,
+            input = %record.input_repr,
+            timestamp = %record.timestamp,
+            "DLQ record"
+        );
+    }
+    Ok(())
+}
+
+/// Assign partitions round-robin to workers.
+///
+/// Returns a `Vec<Vec<usize>>` of length `num_workers`, where each inner vec
+/// contains the partition indices assigned to that worker.
+fn assign_partitions(num_partitions: usize, num_workers: usize) -> Vec<Vec<usize>> {
+    let mut assignments: Vec<Vec<usize>> = vec![vec![]; num_workers];
+    for partition in 0..num_partitions {
+        assignments[partition % num_workers].push(partition);
+    }
+    assignments
 }
 
 /// Merge offsets from all source bridges.

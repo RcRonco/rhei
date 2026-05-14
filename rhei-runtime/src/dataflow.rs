@@ -152,6 +152,8 @@ pub(crate) struct GraphNode {
     pub kind: NodeKind,
     /// Input node IDs (0 for Source, 1 for Transform/Operator/Sink).
     pub inputs: Vec<NodeId>,
+    /// Optional human-readable label for debugging and observability.
+    pub label: Option<String>,
 }
 
 /// The dataflow graph: a collection of nodes connected by edges.
@@ -202,8 +204,19 @@ impl DataflowGraph {
     pub(crate) fn add_node(&self, kind: NodeKind, inputs: Vec<NodeId>) -> NodeId {
         let mut nodes = self.nodes.borrow_mut();
         let id = NodeId(nodes.len());
-        nodes.push(GraphNode { id, kind, inputs });
+        nodes.push(GraphNode {
+            id,
+            kind,
+            inputs,
+            label: None,
+        });
         id
+    }
+
+    /// Set a human-readable label on the most recently added node.
+    pub(crate) fn set_label(&self, node_id: NodeId, label: String) {
+        let mut nodes = self.nodes.borrow_mut();
+        nodes[node_id.0].label = Some(label);
     }
 
     /// Consume the graph and return the raw node list for compilation.
@@ -577,6 +590,165 @@ impl<'a, T: RheiSchema + 'static> BatchStream<'a, T> {
         let node_id = self
             .graph
             .add_node(NodeKind::BatchMerge, vec![self.node_id, other.node_id]);
+        BatchStream::new(self.graph, node_id)
+    }
+
+    /// Assign a human-readable name to this stream point for debugging.
+    pub fn name(self, label: &str) -> BatchStream<'a, T> {
+        self.graph.set_label(self.node_id, label.to_string());
+        self
+    }
+
+    /// Side-effect inspection: calls the closure for each row without modifying the stream.
+    pub fn inspect<F>(self, f: F) -> BatchStream<'a, T>
+    where
+        F: Fn(&T::View<'_>) + Send + Sync + 'static,
+    {
+        let node = LazyBatchTransformNode(Box::new(move || {
+            Arc::new(move |buf: ErasedBuffer| {
+                let typed = match buf.downcast::<T>() {
+                    Ok(t) => t,
+                    Err(e) => {
+                        tracing::error!("batch inspect downcast failed: {e}");
+                        return vec![];
+                    }
+                };
+                for view in &typed {
+                    f(&view);
+                }
+                vec![ErasedBuffer::from_typed(typed)]
+            })
+        }));
+        let node_id = self
+            .graph
+            .add_node(NodeKind::BatchTransform(node), vec![self.node_id]);
+        BatchStream::new(self.graph, node_id)
+    }
+
+    /// Limit the stream to at most `max` rows total, then stop producing output.
+    pub fn limit(self, max: usize) -> BatchStream<'a, T> {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let remaining = Arc::new(AtomicUsize::new(max));
+
+        let node = LazyBatchTransformNode(Box::new(move || {
+            Arc::new(move |buf: ErasedBuffer| {
+                let left = remaining.load(Ordering::Relaxed);
+                if left == 0 {
+                    return vec![];
+                }
+                let typed = match buf.downcast::<T>() {
+                    Ok(t) => t,
+                    Err(e) => {
+                        tracing::error!("batch limit downcast failed: {e}");
+                        return vec![];
+                    }
+                };
+                let len = typed.len();
+                if len <= left {
+                    remaining.fetch_sub(len, Ordering::Relaxed);
+                    vec![ErasedBuffer::from_typed(typed)]
+                } else {
+                    remaining.store(0, Ordering::Relaxed);
+                    let mut mask_vec = vec![false; typed.physical_len()];
+                    for (i, (phys_idx, _view)) in typed.iter().enumerate_physical().enumerate() {
+                        if i >= left {
+                            break;
+                        }
+                        mask_vec[phys_idx] = true;
+                    }
+                    let mask = arrow_array::BooleanArray::from(mask_vec);
+                    let filtered = typed.and_mask(mask);
+                    vec![ErasedBuffer::from_typed(filtered)]
+                }
+            })
+        }));
+        let node_id = self
+            .graph
+            .add_node(NodeKind::BatchTransform(node), vec![self.node_id]);
+        BatchStream::new(self.graph, node_id)
+    }
+
+    /// Re-batch the stream: accumulate rows and emit in chunks of `size`.
+    pub fn batch(self, size: usize) -> BatchStream<'a, T> {
+        use std::sync::Mutex;
+
+        let pending: Arc<Mutex<Vec<ErasedBuffer>>> = Arc::new(Mutex::new(Vec::new()));
+        let pending_rows: Arc<std::sync::atomic::AtomicUsize> =
+            Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        let node = LazyBatchTransformNode(Box::new(move || {
+            Arc::new(move |buf: ErasedBuffer| {
+                let rows = buf.num_rows();
+                let mut guard = pending
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                guard.push(buf);
+                let total =
+                    pending_rows.fetch_add(rows, std::sync::atomic::Ordering::Relaxed) + rows;
+                if total >= size {
+                    let batches: Vec<ErasedBuffer> = guard.drain(..).collect();
+                    pending_rows.store(0, std::sync::atomic::Ordering::Relaxed);
+                    let merged = ErasedBuffer::concat(batches);
+                    match merged {
+                        Some(m) => vec![m],
+                        None => vec![],
+                    }
+                } else {
+                    vec![]
+                }
+            })
+        }));
+        let node_id = self
+            .graph
+            .add_node(NodeKind::BatchTransform(node), vec![self.node_id]);
+        BatchStream::new(self.graph, node_id)
+    }
+
+    /// Deduplicate consecutive rows with the same key within each batch.
+    pub fn distinct_by<F>(self, key_fn: F) -> BatchStream<'a, T>
+    where
+        F: Fn(&T::View<'_>) -> String + Send + Sync + 'static,
+    {
+        use std::collections::HashSet;
+        use std::sync::Mutex;
+
+        let seen: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
+
+        let node = LazyBatchTransformNode(Box::new(move || {
+            Arc::new(move |buf: ErasedBuffer| {
+                let typed = match buf.downcast::<T>() {
+                    Ok(t) => t,
+                    Err(e) => {
+                        tracing::error!("batch distinct_by downcast failed: {e}");
+                        return vec![];
+                    }
+                };
+                if typed.is_empty() {
+                    return vec![];
+                }
+                let mut guard = seen
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let mut mask_vec = vec![false; typed.physical_len()];
+                let mut any_true = false;
+                for (phys_idx, view) in typed.iter().enumerate_physical() {
+                    let k = key_fn(&view);
+                    if guard.insert(k) {
+                        mask_vec[phys_idx] = true;
+                        any_true = true;
+                    }
+                }
+                if !any_true {
+                    return vec![];
+                }
+                let mask = arrow_array::BooleanArray::from(mask_vec);
+                let filtered = typed.and_mask(mask);
+                vec![ErasedBuffer::from_typed(filtered)]
+            })
+        }));
+        let node_id = self
+            .graph
+            .add_node(NodeKind::BatchTransform(node), vec![self.node_id]);
         BatchStream::new(self.graph, node_id)
     }
 
