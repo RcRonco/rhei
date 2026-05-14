@@ -26,7 +26,7 @@ metrics-exporter-prometheus = "0.18.1"
 ratatui = "0.30.0"
 axum = "0.8"
 tower-http = { version = "0.6", features = ["cors"] }
-rdkafka = { version = "0.39.0", features = ["cmake-build"] }
+rdkafka = { version = "0.39.0", features = ["dynamic-linking"] }
 reqwest = { version = "0.13.2", default-features = false, features = ["json"] }
 tempfile = "3.27.0"
 toml = "0.8"
@@ -40,6 +40,7 @@ arrow-buffer = "54"
 datafusion = "45"
 datafusion-expr = "45"
 datafusion-physical-expr = "45"
+criterion = { version = "0.5", features = ["html_reports"] }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

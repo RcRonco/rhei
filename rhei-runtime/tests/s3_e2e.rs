@@ -1,7 +1,7 @@
 #![cfg(feature = "remote-state")]
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-//! End-to-end S3 tiered storage test.
+//! End-to-end S3 tiered storage test (batch API).
 //!
 //! Exercises the full L1 memtable → L2 Foyer → L3 SlateDB/S3 storage path
 //! against a real S3-compatible service (`MinIO`).
@@ -9,7 +9,7 @@
 //! Pipeline topology:
 //!
 //! ```text
-//! VecSource(words) → key_by(first_char) → WordCounter → CollectSink
+//! BatchVecSource(words) → WordCounter(KeyedState) → CollectSink
 //! ```
 
 use std::collections::HashMap;
@@ -19,14 +19,17 @@ use async_trait::async_trait;
 use futures::TryStreamExt;
 use object_store::ObjectStore;
 use object_store::aws::AmazonS3Builder;
-use rhei_core::connectors::vec_source::VecSource;
+use rhei_core::arrow::{
+    BatchSink, BatchStreamFunction, BufferOutput, OperatorContext, RheiBuffer, RheiBuilder,
+    RheiSchema,
+};
+use rhei_core::connectors::batch::BatchVecSource;
+use rhei_core::operators::batch::keyed_state::KeyedState;
 use rhei_core::state::backend::StateBackend;
-use rhei_core::state::context::StateContext;
 use rhei_core::state::slatedb_backend::SlateDbBackend;
 use rhei_core::state::tiered_backend::TieredBackendConfig;
-use rhei_core::traits::{Sink, StreamFunction};
+use rhei_runtime::controller::PipelineController;
 use rhei_runtime::dataflow::DataflowGraph;
-use rhei_runtime::executor::Executor;
 
 // ── Helpers ────────────────────────────────────────────────────────
 
@@ -58,46 +61,242 @@ fn build_s3_store() -> Arc<dyn ObjectStore> {
     Arc::new(s3)
 }
 
-// ── Domain types ───────────────────────────────────────────────────
+// ── Schema types ───────────────────────────────────────────────────
 
-struct CollectSink<T> {
-    collected: Arc<Mutex<Vec<T>>>,
+struct WordEvent {
+    word: String,
 }
 
-#[async_trait]
-impl<T: Send + Sync + 'static> Sink for CollectSink<T> {
-    type Input = T;
+struct WordEventBuilder {
+    word: arrow_array::builder::StringBuilder,
+}
 
-    async fn write(&mut self, input: T) -> anyhow::Result<()> {
-        self.collected.lock().unwrap().push(input);
-        Ok(())
+struct WordEventView<'a> {
+    word: &'a str,
+}
+
+struct WordEventColumns<'a> {
+    #[allow(dead_code)]
+    word: &'a arrow_array::StringArray,
+}
+
+impl RheiBuilder for WordEventBuilder {
+    type Item = WordEvent;
+
+    fn append(&mut self, item: WordEvent) {
+        self.word.append_value(&item.word);
+    }
+
+    fn append_null(&mut self) {
+        self.word.append_null();
+    }
+
+    fn len(&self) -> usize {
+        arrow_array::builder::ArrayBuilder::len(&self.word)
+    }
+
+    fn finish(mut self) -> arrow_array::RecordBatch {
+        use std::sync::Arc;
+        arrow_array::RecordBatch::try_new(
+            WordEvent::arrow_schema(),
+            vec![Arc::new(self.word.finish())],
+        )
+        .unwrap()
     }
 }
 
+impl RheiSchema for WordEvent {
+    type Builder = WordEventBuilder;
+    type View<'a> = WordEventView<'a>;
+    type Columns<'a> = WordEventColumns<'a>;
+
+    fn arrow_schema() -> std::sync::Arc<arrow_schema::Schema> {
+        use std::sync::Arc;
+        Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+            "word",
+            arrow_schema::DataType::Utf8,
+            false,
+        )]))
+    }
+
+    fn builder(capacity: usize) -> Self::Builder {
+        WordEventBuilder {
+            word: arrow_array::builder::StringBuilder::with_capacity(capacity, capacity * 16),
+        }
+    }
+
+    fn view(batch: &arrow_array::RecordBatch, index: usize) -> Self::View<'_> {
+        use arrow_array::cast::AsArray;
+        WordEventView {
+            word: batch.column(0).as_string::<i32>().value(index),
+        }
+    }
+
+    fn columns(batch: &arrow_array::RecordBatch) -> Self::Columns<'_> {
+        use arrow_array::cast::AsArray;
+        WordEventColumns {
+            word: batch.column(0).as_string::<i32>(),
+        }
+    }
+}
+
+struct WordCount {
+    word: String,
+    count: u64,
+}
+
+struct WordCountBuilder {
+    word: arrow_array::builder::StringBuilder,
+    count: arrow_array::builder::PrimitiveBuilder<arrow_array::types::UInt64Type>,
+}
+
+#[derive(Debug, Clone)]
+struct WordCountView<'a> {
+    word: &'a str,
+    count: u64,
+}
+
+struct WordCountColumns<'a> {
+    #[allow(dead_code)]
+    word: &'a arrow_array::StringArray,
+    #[allow(dead_code)]
+    count: &'a arrow_array::PrimitiveArray<arrow_array::types::UInt64Type>,
+}
+
+impl RheiBuilder for WordCountBuilder {
+    type Item = WordCount;
+
+    fn append(&mut self, item: WordCount) {
+        self.word.append_value(&item.word);
+        self.count.append_value(item.count);
+    }
+
+    fn append_null(&mut self) {
+        self.word.append_null();
+        self.count.append_null();
+    }
+
+    fn len(&self) -> usize {
+        arrow_array::builder::ArrayBuilder::len(&self.word)
+    }
+
+    fn finish(mut self) -> arrow_array::RecordBatch {
+        use std::sync::Arc;
+        arrow_array::RecordBatch::try_new(
+            WordCount::arrow_schema(),
+            vec![Arc::new(self.word.finish()), Arc::new(self.count.finish())],
+        )
+        .unwrap()
+    }
+}
+
+impl RheiSchema for WordCount {
+    type Builder = WordCountBuilder;
+    type View<'a> = WordCountView<'a>;
+    type Columns<'a> = WordCountColumns<'a>;
+
+    fn arrow_schema() -> std::sync::Arc<arrow_schema::Schema> {
+        use std::sync::Arc;
+        Arc::new(arrow_schema::Schema::new(vec![
+            arrow_schema::Field::new("word", arrow_schema::DataType::Utf8, false),
+            arrow_schema::Field::new("count", arrow_schema::DataType::UInt64, false),
+        ]))
+    }
+
+    fn builder(capacity: usize) -> Self::Builder {
+        WordCountBuilder {
+            word: arrow_array::builder::StringBuilder::with_capacity(capacity, capacity * 16),
+            count: arrow_array::builder::PrimitiveBuilder::with_capacity(capacity),
+        }
+    }
+
+    fn view(batch: &arrow_array::RecordBatch, index: usize) -> Self::View<'_> {
+        use arrow_array::cast::AsArray;
+        use arrow_array::types::UInt64Type;
+        WordCountView {
+            word: batch.column(0).as_string::<i32>().value(index),
+            count: batch.column(1).as_primitive::<UInt64Type>().value(index),
+        }
+    }
+
+    fn columns(batch: &arrow_array::RecordBatch) -> Self::Columns<'_> {
+        use arrow_array::cast::AsArray;
+        use arrow_array::types::UInt64Type;
+        WordCountColumns {
+            word: batch.column(0).as_string::<i32>(),
+            count: batch.column(1).as_primitive::<UInt64Type>(),
+        }
+    }
+}
+
+// ── Stateful operator ──────────────────────────────────────────────
+
 #[derive(Clone)]
-struct WordCounter;
+struct BatchWordCounter;
 
 #[async_trait]
-impl StreamFunction for WordCounter {
-    type Input = String;
-    type Output = String;
+impl BatchStreamFunction for BatchWordCounter {
+    type Input = WordEvent;
+    type Output = WordCount;
 
     async fn process(
         &mut self,
-        input: String,
-        ctx: &mut StateContext,
-    ) -> anyhow::Result<Vec<String>> {
-        let word = input.trim();
-        let key = word.as_bytes();
-        let count = ctx.get::<u64>(key).await?.unwrap_or(0) + 1;
-        ctx.put(key, &count);
-        Ok(vec![format!("{word}:{count}")])
+        input: RheiBuffer<WordEvent>,
+        ctx: &mut OperatorContext,
+    ) -> anyhow::Result<BufferOutput<WordCount>> {
+        if input.is_empty() {
+            return Ok(BufferOutput::None);
+        }
+
+        let words: Vec<String> = input.iter().map(|v| v.word.to_string()).collect();
+        let mut outputs = Vec::with_capacity(words.len());
+
+        for word in words {
+            let count: u64 = {
+                let mut state = KeyedState::<String, u64>::new(&mut ctx.state, "counts");
+                state.get(&word).await?.unwrap_or(0)
+            };
+            let new_count = count + 1;
+            {
+                let mut state = KeyedState::<String, u64>::new(&mut ctx.state, "counts");
+                state.put(&word, &new_count)?;
+            }
+            outputs.push(WordCount {
+                word,
+                count: new_count,
+            });
+        }
+
+        let mut builder = WordCount::builder(outputs.len());
+        for item in outputs {
+            builder.append(item);
+        }
+        Ok(BufferOutput::Single(RheiBuffer::from_builder(builder)))
+    }
+}
+
+// ── Collecting sink ────────────────────────────────────────────────
+
+struct CollectSink {
+    collected: Arc<Mutex<Vec<(String, u64)>>>,
+}
+
+#[async_trait]
+impl BatchSink for CollectSink {
+    type Input = WordCount;
+
+    async fn write_batch(&mut self, input: RheiBuffer<WordCount>) -> anyhow::Result<()> {
+        let mut guard = self.collected.lock().unwrap();
+        for view in &input {
+            guard.push((view.word.to_string(), view.count));
+        }
+        Ok(())
     }
 }
 
 // ── Word generation ────────────────────────────────────────────────
 
-fn generate_words() -> Vec<String> {
+fn generate_words() -> Vec<WordEvent> {
     let base_words = [
         "alpha", "arden", "arrow", "azure", "apex", "beta", "blaze", "brook", "bright", "brine",
         "cedar", "cliff", "coral", "crest", "crane", "delta", "drift", "dusk", "dawn", "depth",
@@ -109,16 +308,18 @@ fn generate_words() -> Vec<String> {
     let mut words = Vec::new();
     for &w in &base_words {
         for _ in 0..5 {
-            words.push(w.to_string());
+            words.push(WordEvent {
+                word: w.to_string(),
+            });
         }
     }
     words
 }
 
-fn expected_counts(words: &[String]) -> HashMap<String, u64> {
+fn expected_counts(words: &[WordEvent]) -> HashMap<String, u64> {
     let mut counts = HashMap::new();
     for w in words {
-        *counts.entry(w.clone()).or_insert(0u64) += 1;
+        *counts.entry(w.word.clone()).or_insert(0u64) += 1;
     }
     counts
 }
@@ -154,7 +355,8 @@ async fn s3_tiered_storage_e2e() {
         foyer_block_size: 256 * 1024,
     };
 
-    let executor = Executor::new(checkpoint_dir.path().to_path_buf())
+    let ctrl = PipelineController::new(checkpoint_dir.path().to_path_buf())
+        .with_workers(1)
         .with_tiered_storage(
             checkpoint_dir.path().to_path_buf(),
             l3.clone(),
@@ -166,36 +368,30 @@ async fn s3_tiered_storage_e2e() {
     // ── 3. Build pipeline ──────────────────────────────────────────
     let words = generate_words();
     let expected = expected_counts(&words);
-    let collected = Arc::new(Mutex::new(Vec::<String>::new()));
+    let collected = Arc::new(Mutex::new(Vec::<(String, u64)>::new()));
+
+    let source = BatchVecSource::new(words).with_batch_size(50);
 
     let graph = DataflowGraph::new();
-    let stream = graph.source(VecSource::new(words));
-    stream
-        .key_by(|w: &String| w.chars().next().unwrap_or('_').to_string())
-        .operator("word_counter", WordCounter)
+    graph
+        .batch_source(source)
+        .operator("word_counter", BatchWordCounter)
         .sink(CollectSink {
             collected: collected.clone(),
         });
 
-    // ── 4. Run pipeline (single worker — checkpoints at completion)
-    executor
-        .run(graph)
-        .await
-        .expect("pipeline execution failed");
+    // ── 4. Run pipeline ────────────────────────────────────────────
+    ctrl.run(graph).await.expect("pipeline execution failed");
 
     // ── 5. Verify output ───────────────────────────────────────────
     let results = collected.lock().unwrap().clone();
     assert!(!results.is_empty(), "pipeline produced no output");
 
-    // Parse "word:count" outputs and find the final (max) count per word.
+    // Find the final (max) count per word from all emitted outputs.
     let mut final_counts: HashMap<String, u64> = HashMap::new();
-    for r in &results {
-        let (word, count_str) = r
-            .rsplit_once(':')
-            .unwrap_or_else(|| panic!("unexpected output format: {r}"));
-        let count: u64 = count_str.parse().expect("bad count");
-        let entry = final_counts.entry(word.to_string()).or_insert(0);
-        *entry = (*entry).max(count);
+    for (word, count) in &results {
+        let entry = final_counts.entry(word.clone()).or_insert(0);
+        *entry = (*entry).max(*count);
     }
 
     for (word, expected_count) in &expected {
@@ -216,8 +412,6 @@ async fn s3_tiered_storage_e2e() {
     l3.close().await.expect("failed to close SlateDB");
 
     // ── 7. Verify S3 persistence ───────────────────────────────────
-    // Reopen a fresh SlateDB at the same S3 path and read back state keys.
-    // Keys in SlateDB are prefixed: "word_counter_w0/{word}" (operator_name_w0/).
     let l3_verify = SlateDbBackend::open(slate_path.as_str(), s3_store.clone())
         .await
         .expect("failed to reopen SlateDB on S3");

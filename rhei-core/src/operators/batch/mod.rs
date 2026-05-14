@@ -6,6 +6,7 @@
 pub mod count_window;
 pub mod filter;
 pub mod filter_expr;
+pub mod keyed_state;
 pub mod map;
 pub mod reduce;
 pub mod session_window;

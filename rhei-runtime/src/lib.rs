@@ -6,32 +6,12 @@
 //! - [`executor`] — per-worker Timely DAG compilation and execution
 //! - [`task_manager`] — task management, I/O bridging, and checkpoint orchestration
 //! - [`dataflow::DataflowGraph`] — type-erased graph builder with
-//!   [`Stream<T>`](dataflow::Stream) and [`KeyedStream<T>`](dataflow::KeyedStream)
+//!   [`BatchStream<T>`](dataflow::BatchStream)
 //! - [`bridge`] — async-to-sync channel bridges for Timely integration
 //! - [`telemetry`] — tracing and Prometheus metrics initialization
-//!
-//! # Example
-//!
-//! ```ignore
-//! let graph = DataflowGraph::new();
-//! graph.source(my_source)
-//!     .key_by(|item| item.key.clone())
-//!     .operator("agg", MyOperator)
-//!     .sink(my_sink);
-//!
-//! let executor = Executor::builder()
-//!     .checkpoint_dir("./checkpoints")
-//!     .workers(4)
-//!     .build();
-//! executor.run(graph).await?;
-//! ```
 
 #![warn(missing_docs)]
 
-/// Cloneable, type-erased wrapper for Timely dataflow elements.
-pub(crate) mod any_item;
-/// Non-blocking async wrapper for [`StreamFunction`](rhei_core::traits::StreamFunction).
-pub mod async_operator;
 /// Async-to-sync channel bridges for Timely dataflow integration.
 pub mod bridge;
 /// Cross-process checkpoint coordination via lightweight TCP.
@@ -41,10 +21,8 @@ pub mod compiler;
 /// Pipeline configuration, lifecycle orchestration, and checkpointing.
 pub mod controller;
 /// Dataflow graph API: [`DataflowGraph`](dataflow::DataflowGraph),
-/// [`Stream<T>`](dataflow::Stream), [`KeyedStream<T>`](dataflow::KeyedStream).
+/// [`BatchStream<T>`](dataflow::BatchStream).
 pub mod dataflow;
-/// Type-erased traits and wrappers for the Timely execution layer.
-pub(crate) mod erased;
 /// Type-erased batch operator/source/sink wrappers for Arrow columnar execution.
 pub(crate) mod erased_batch;
 /// Type-erased Arrow buffer for Timely dataflow channels.
@@ -61,8 +39,6 @@ pub mod http_server;
 pub mod metrics_snapshot;
 /// Graceful shutdown coordination.
 pub mod shutdown;
-/// FIFO event stash for pending state fetches.
-pub mod stash;
 /// Task management, I/O bridging, and checkpoint orchestration for Timely execution.
 pub(crate) mod task_manager;
 /// Tracing and Prometheus metrics initialization.

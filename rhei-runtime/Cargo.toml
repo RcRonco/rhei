@@ -45,12 +45,12 @@ remote-state = ["dep:object_store"]
 [lints]
 workspace = true
 
-[[example]]
-name = "kafka_transform"
-required-features = ["kafka"]
-
 [dev-dependencies]
 tokio = { workspace = true, features = ["full"] }
 tempfile.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+rhei-macros = { path = "../rhei-macros" }
+arrow-array.workspace = true
+arrow-schema.workspace = true
+async-trait.workspace = true

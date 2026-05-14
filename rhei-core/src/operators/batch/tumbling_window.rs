@@ -12,10 +12,10 @@ use async_trait::async_trait;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
+use super::keyed_state::KeyedState;
 use crate::arrow::{
     BatchStreamFunction, BufferOutput, OperatorContext, RheiBuffer, RheiBuilder, RheiSchema,
 };
-use crate::operators::keyed_state::KeyedState;
 
 /// A batch tumbling (fixed-size, non-overlapping) window operator.
 ///

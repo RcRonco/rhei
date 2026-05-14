@@ -37,3 +37,8 @@ workspace = true
 [dev-dependencies]
 tokio = { workspace = true, features = ["full"] }
 tempfile.workspace = true
+criterion.workspace = true
+
+[[bench]]
+name = "columnar_vs_row"
+harness = false

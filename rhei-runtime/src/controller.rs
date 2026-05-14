@@ -49,7 +49,7 @@ pub struct RemoteStateConfig {
     pub bucket: String,
     /// Key prefix inside the bucket/container (e.g. `"rhei/state/"`).
     pub prefix: String,
-    /// Custom endpoint URL (for MinIO, Azurite, fake-gcs-server, etc.).
+    /// Custom endpoint URL (for `MinIO`, Azurite, `fake-gcs-server`, etc.).
     pub endpoint: Option<String>,
     /// Cloud region (when applicable).
     pub region: String,
@@ -116,7 +116,7 @@ pub struct PipelineController {
     /// Signed offset delta for fork mode.
     #[allow(dead_code)] // Used only when remote-state feature is enabled
     pub(crate) offset_delta: i64,
-    /// Remote L3 backend for fork mode (read-only). Populated during run_graph().
+    /// Remote L3 backend for fork mode (read-only). Populated during `run_graph()`.
     #[cfg(feature = "remote-state")]
     pub(crate) fork_remote_l3: std::sync::Mutex<Option<Arc<SlateDbBackend>>>,
 }
@@ -344,25 +344,24 @@ impl PipelineControllerBuilder {
             self.pipeline_name = Some(val);
         }
         #[cfg(feature = "remote-state")]
-        if self.remote_state.is_none() {
-            if let Ok(bucket) = std::env::var("RHEI_REMOTE_BUCKET") {
-                self.remote_state = Some(RemoteStateConfig {
-                    bucket,
-                    prefix: std::env::var("RHEI_REMOTE_PREFIX").unwrap_or_default(),
-                    endpoint: std::env::var("RHEI_REMOTE_ENDPOINT").ok(),
-                    region: std::env::var("RHEI_REMOTE_REGION")
-                        .unwrap_or_else(|_| "us-east-1".to_string()),
-                    allow_http: std::env::var("RHEI_REMOTE_ALLOW_HTTP")
-                        .map(|v| v == "1" || v == "true")
-                        .unwrap_or(false),
-                });
-            }
+        if self.remote_state.is_none()
+            && let Ok(bucket) = std::env::var("RHEI_REMOTE_BUCKET")
+        {
+            self.remote_state = Some(RemoteStateConfig {
+                bucket,
+                prefix: std::env::var("RHEI_REMOTE_PREFIX").unwrap_or_default(),
+                endpoint: std::env::var("RHEI_REMOTE_ENDPOINT").ok(),
+                region: std::env::var("RHEI_REMOTE_REGION")
+                    .unwrap_or_else(|_| "us-east-1".to_string()),
+                allow_http: std::env::var("RHEI_REMOTE_ALLOW_HTTP")
+                    .is_ok_and(|v| v == "1" || v == "true"),
+            });
         }
         #[cfg(feature = "remote-state")]
-        if self.from_checkpoint.is_none() {
-            if let Ok(val) = std::env::var("RHEI_FROM_CHECKPOINT") {
-                self.from_checkpoint = Some(val);
-            }
+        if self.from_checkpoint.is_none()
+            && let Ok(val) = std::env::var("RHEI_FROM_CHECKPOINT")
+        {
+            self.from_checkpoint = Some(val);
         }
         if self.offset_delta == 0
             && let Ok(val) = std::env::var("RHEI_OFFSET_DELTA")
@@ -792,14 +791,14 @@ async fn run_graph(
                 })?;
 
             // Validate topology if manifest includes it.
-            if let Some(manifest_workers) = manifest.workers_per_process {
-                if manifest_workers != controller.workers {
-                    anyhow::bail!(
-                        "fork mode: manifest has {manifest_workers} workers per process, \
-                         but local pipeline has {}. Must match.",
-                        controller.workers,
-                    );
-                }
+            if let Some(manifest_workers) = manifest.workers_per_process
+                && manifest_workers != controller.workers
+            {
+                anyhow::bail!(
+                    "fork mode: manifest has {manifest_workers} workers per process, \
+                     but local pipeline has {}. Must match.",
+                    controller.workers,
+                );
             }
 
             let offsets = apply_offset_delta(&manifest.source_offsets, controller.offset_delta);

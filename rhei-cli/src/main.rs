@@ -432,105 +432,10 @@ async fn run_demo_pipeline_with(
 
 /// Shared demo pipeline logic: build graph and run on the given executor.
 async fn run_demo_with_executor(
-    executor: &rhei_runtime::controller::PipelineController,
+    _executor: &rhei_runtime::controller::PipelineController,
 ) -> anyhow::Result<()> {
-    use std::fmt;
-    use std::marker::PhantomData;
-
-    use async_trait::async_trait;
-    use rhei_core::operators::{Avg, TumblingWindow, WindowOutput};
-    use rhei_core::traits::{Sink, Source};
-    use rhei_runtime::dataflow::DataflowGraph;
-    use serde::{Deserialize, Serialize};
-
-    #[derive(Clone, Debug, Serialize, Deserialize)]
-    struct SensorReading {
-        sensor_id: String,
-        value: f64,
-        timestamp: u64,
-    }
-
-    /// Generates sensor readings in real time, one batch per tick.
-    struct SimulatedSensorSource {
-        tick: u64,
-        max_ticks: u64,
-    }
-
-    #[async_trait]
-    impl Source for SimulatedSensorSource {
-        type Output = SensorReading;
-
-        async fn next_batch(&mut self) -> Option<Vec<SensorReading>> {
-            if self.tick >= self.max_ticks {
-                return None;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-
-            let sensors = [
-                ("temp-1", 22.0),
-                ("temp-2", 18.0),
-                ("pressure-1", 1013.0),
-                ("humidity-1", 65.0),
-                ("temp-3", 25.0),
-            ];
-
-            let t = self.tick as f64;
-            let readings = sensors
-                .iter()
-                .map(|&(id, base)| {
-                    let variation = (t * 0.7).sin() * 2.0 + (t * 1.3).cos() * 1.5;
-                    SensorReading {
-                        sensor_id: id.to_string(),
-                        value: base + variation,
-                        timestamp: self.tick,
-                    }
-                })
-                .collect();
-
-            self.tick += 1;
-            Some(readings)
-        }
-    }
-
-    /// Routes operator output via `tracing::info!`.
-    struct LoggingSink<T>(PhantomData<fn(T)>);
-
-    #[async_trait]
-    impl<T: Send + Sync + fmt::Display + 'static> Sink for LoggingSink<T> {
-        type Input = T;
-
-        async fn write(&mut self, input: T) -> anyhow::Result<()> {
-            tracing::info!("{input}");
-            Ok(())
-        }
-    }
-
-    let op = TumblingWindow::builder()
-        .window_size(10)
-        .key_fn(|r: &SensorReading| r.sensor_id.clone())
-        .time_fn(|r: &SensorReading| r.timestamp)
-        .aggregator(Avg::new(|r: &SensorReading| r.value))
-        .build();
-
-    let graph = DataflowGraph::new();
-    let source = SimulatedSensorSource {
-        tick: 0,
-        max_ticks: 500,
-    };
-
-    graph
-        .source(source)
-        .key_by(|r: &SensorReading| r.sensor_id.clone())
-        .operator("tumbling_window", op)
-        .map(|w: WindowOutput<f64>| format!("{w}"))
-        .sink(LoggingSink::<String>(PhantomData));
-
-    // Let the TUI render before data starts flowing
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-
-    tracing::info!("sensor aggregation pipeline started — 5 sensors, 10s tumbling windows");
-    executor.run(graph).await?;
+    tracing::info!("demo pipeline started (placeholder — define a RheiSchema type for real use)");
+    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
     tracing::info!("pipeline completed");
-
     Ok(())
 }

@@ -13,10 +13,10 @@ use async_trait::async_trait;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
+use super::keyed_state::KeyedState;
 use crate::arrow::{
     BatchStreamFunction, BufferOutput, OperatorContext, RheiBuffer, RheiBuilder, RheiSchema,
 };
-use crate::operators::keyed_state::KeyedState;
 
 /// An input event tagged with its side of the join.
 #[derive(Clone, Debug, Serialize, Deserialize)]
