@@ -6,24 +6,24 @@ use std::marker::PhantomData;
 use arrow_array::BooleanArray;
 use async_trait::async_trait;
 
-use crate::arrow::{BatchStreamFunction, BufferOutput, OperatorContext, RheiBuffer, RheiSchema};
+use crate::arrow::{BufferOutput, OperatorContext, RheiBuffer, RheiSchema, StreamFunction};
 
 /// Zero-copy filter using a closure over Views to build a selection mask.
 ///
 /// The closure evaluates each row via its View; rows returning `false` are
 /// masked out without any data copying.
-pub struct BatchFilterFnOp<F, T> {
+pub struct FilterFnOp<F, T> {
     predicate: F,
     _phantom: PhantomData<fn(T)>,
 }
 
-impl<F, T> fmt::Debug for BatchFilterFnOp<F, T> {
+impl<F, T> fmt::Debug for FilterFnOp<F, T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("BatchFilterFnOp").finish_non_exhaustive()
+        f.debug_struct("FilterFnOp").finish_non_exhaustive()
     }
 }
 
-impl<F, T> BatchFilterFnOp<F, T>
+impl<F, T> FilterFnOp<F, T>
 where
     T: RheiSchema,
     F: for<'a> Fn(&T::View<'a>) -> bool,
@@ -38,7 +38,7 @@ where
 }
 
 #[async_trait]
-impl<F, T> BatchStreamFunction for BatchFilterFnOp<F, T>
+impl<F, T> StreamFunction for FilterFnOp<F, T>
 where
     T: RheiSchema,
     F: for<'a> Fn(&T::View<'a>) -> bool + Send + Sync,
@@ -77,20 +77,20 @@ where
 /// The expression is evaluated against the underlying `RecordBatch`,
 /// producing a `BooleanArray` mask that is composed with any existing mask.
 /// No data is copied — filtering is purely via selection vectors.
-pub struct BatchFilterOp<T> {
+pub struct FilterOp<T> {
     expr: std::sync::Arc<dyn datafusion_physical_expr::PhysicalExpr>,
     _phantom: PhantomData<fn(T)>,
 }
 
-impl<T> fmt::Debug for BatchFilterOp<T> {
+impl<T> fmt::Debug for FilterOp<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("BatchFilterOp")
+        f.debug_struct("FilterOp")
             .field("expr", &self.expr)
             .finish_non_exhaustive()
     }
 }
 
-impl<T: RheiSchema> BatchFilterOp<T> {
+impl<T: RheiSchema> FilterOp<T> {
     /// Creates a new `DataFusion` expression-based batch filter.
     pub fn new(expr: std::sync::Arc<dyn datafusion_physical_expr::PhysicalExpr>) -> Self {
         Self {
@@ -101,7 +101,7 @@ impl<T: RheiSchema> BatchFilterOp<T> {
 }
 
 #[async_trait]
-impl<T: RheiSchema> BatchStreamFunction for BatchFilterOp<T> {
+impl<T: RheiSchema> StreamFunction for FilterOp<T> {
     type Input = T;
     type Output = T;
 

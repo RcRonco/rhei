@@ -7,9 +7,9 @@
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 
 use rhei_core::arrow::{
-    BatchStreamFunction, BufferOutput, OperatorContext, RheiBuffer, RheiBuilder, RheiSchema,
+    BufferOutput, OperatorContext, RheiBuffer, RheiBuilder, RheiSchema, StreamFunction,
 };
-use rhei_core::operators::batch::{BatchFilterFnOp, BatchMapOp};
+use rhei_core::operators::batch::{FilterFnOp, MapOp};
 use rhei_core::state::context::StateContext;
 use rhei_core::state::local_backend::LocalBackend;
 
@@ -221,7 +221,7 @@ fn bench_map(c: &mut Criterion) {
             let buffer = make_buffer(n);
             b.iter(|| {
                 rt.block_on(async {
-                    let mut op = BatchMapOp::new(|view: EventView| Output {
+                    let mut op = MapOp::new(|view: EventView| Output {
                         id: view.id,
                         doubled: view.value * 2.0,
                     });
@@ -245,7 +245,7 @@ fn bench_filter(c: &mut Criterion) {
             let buffer = make_buffer(n);
             b.iter(|| {
                 rt.block_on(async {
-                    let mut op = BatchFilterFnOp::new(|view: &EventView| view.value > 50.0);
+                    let mut op = FilterFnOp::new(|view: &EventView| view.value > 50.0);
                     let (mut ctx, _dir) = make_ctx();
                     let result = op.process(buffer.clone(), &mut ctx).await.unwrap();
                     criterion::black_box(&result);
@@ -278,12 +278,12 @@ fn bench_filter_expr(c: &mut Criterion) {
 
         // Full operator (kernel + and_mask)
         group.bench_with_input(BenchmarkId::new("operator", size), &size, |b, &n| {
-            use rhei_core::operators::batch::BatchFilterExprOp;
+            use rhei_core::operators::batch::FilterExprOp;
             let rt = tokio::runtime::Runtime::new().unwrap();
             let buffer = make_buffer(n);
             b.iter(|| {
                 rt.block_on(async {
-                    let mut op = BatchFilterExprOp::<Event>::new(col("value").gt(lit_f64(50.0)));
+                    let mut op = FilterExprOp::<Event>::new(col("value").gt(lit_f64(50.0)));
                     let (mut ctx, _dir) = make_ctx();
                     let result = op.process(buffer.clone(), &mut ctx).await.unwrap();
                     criterion::black_box(&result);
@@ -305,12 +305,11 @@ fn bench_map_filter_chain(c: &mut Criterion) {
             let buffer = make_buffer(n);
             b.iter(|| {
                 rt.block_on(async {
-                    let mut map_op = BatchMapOp::new(|view: EventView| Output {
+                    let mut map_op = MapOp::new(|view: EventView| Output {
                         id: view.id,
                         doubled: view.value * 2.0,
                     });
-                    let mut filter_op =
-                        BatchFilterFnOp::new(|view: &OutputView| view.doubled > 100.0);
+                    let mut filter_op = FilterFnOp::new(|view: &OutputView| view.doubled > 100.0);
                     let (mut ctx, _dir) = make_ctx();
                     let mapped = map_op.process(buffer.clone(), &mut ctx).await.unwrap();
                     if let BufferOutput::Single(buf) = mapped {

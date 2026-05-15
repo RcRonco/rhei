@@ -12,8 +12,8 @@
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use rhei_core::arrow::{BatchSink, RheiBuffer, RheiBuilder, RheiSchema};
-use rhei_core::connectors::batch::BatchVecSource;
+use rhei_core::arrow::{RheiBuffer, RheiBuilder, RheiSchema, Sink};
+use rhei_core::connectors::batch::VecSource;
 use rhei_runtime::controller::PipelineController;
 use rhei_runtime::dataflow::DataflowGraph;
 
@@ -103,7 +103,7 @@ struct CollectSink {
 }
 
 #[async_trait]
-impl BatchSink for CollectSink {
+impl Sink for CollectSink {
     type Input = WordEvent;
 
     async fn write_batch(&mut self, input: RheiBuffer<WordEvent>) -> anyhow::Result<()> {
@@ -136,8 +136,8 @@ async fn merge_combines_two_sources() {
     let checkpoint_dir = tempfile::tempdir().unwrap();
     let collected = Arc::new(Mutex::new(Vec::<String>::new()));
 
-    let source1 = BatchVecSource::new(make_events(&["a", "b", "c"])).with_batch_size(10);
-    let source2 = BatchVecSource::new(make_events(&["x", "y", "z"])).with_batch_size(10);
+    let source1 = VecSource::new(make_events(&["a", "b", "c"])).with_batch_size(10);
+    let source2 = VecSource::new(make_events(&["x", "y", "z"])).with_batch_size(10);
 
     let graph = DataflowGraph::new();
     let stream1 = graph.batch_source(source1);
@@ -176,8 +176,8 @@ async fn merge_works_with_multiple_workers() {
         .collect();
     let words2: Vec<&str> = (0..10).map(|_| "extra").collect();
 
-    let source1 = BatchVecSource::new(make_events(&words1)).with_batch_size(5);
-    let source2 = BatchVecSource::new(make_events(&words2)).with_batch_size(5);
+    let source1 = VecSource::new(make_events(&words1)).with_batch_size(5);
+    let source2 = VecSource::new(make_events(&words2)).with_batch_size(5);
 
     let graph = DataflowGraph::new();
     let stream1 = graph.batch_source(source1);

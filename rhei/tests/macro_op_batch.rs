@@ -50,7 +50,7 @@ fn make_input(words: &[&str]) -> RheiBuffer<Word> {
 
 #[tokio::test]
 async fn op_batch_process_batch() {
-    use rhei::BatchStreamFunction;
+    use rhei::StreamFunction;
 
     let mut ctx = test_ctx();
     let mut op = BatchUpper;
@@ -69,7 +69,7 @@ async fn op_batch_process_batch() {
 
 #[tokio::test]
 async fn op_batch_process_single() {
-    use rhei::BatchStreamFunction;
+    use rhei::StreamFunction;
 
     let mut ctx = test_ctx();
     let mut op = BatchUpper;

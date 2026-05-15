@@ -6,7 +6,7 @@
 //! - [`executor`] — per-worker Timely DAG compilation and execution
 //! - [`task_manager`] — task management, I/O bridging, and checkpoint orchestration
 //! - [`dataflow::DataflowGraph`] — type-erased graph builder with
-//!   [`BatchStream<T>`](dataflow::BatchStream)
+//!   [`Stream<T>`](dataflow::Stream)
 //! - [`bridge`] — async-to-sync channel bridges for Timely integration
 //! - [`telemetry`] — tracing and Prometheus metrics initialization
 
@@ -21,7 +21,7 @@ pub mod compiler;
 /// Pipeline configuration, lifecycle orchestration, and checkpointing.
 pub mod controller;
 /// Dataflow graph API: [`DataflowGraph`](dataflow::DataflowGraph),
-/// [`BatchStream<T>`](dataflow::BatchStream).
+/// [`Stream<T>`](dataflow::Stream).
 pub mod dataflow;
 /// Type-erased batch operator/source/sink wrappers for Arrow columnar execution.
 pub(crate) mod erased_batch;

@@ -19,7 +19,7 @@ use rhei_core::arrow::OperatorContext;
 use crate::compiler::CompiledGraph;
 use crate::controller::PipelineController;
 use crate::dataflow::{BatchTransformFn, LazyBatchTransformNode, NodeId, NodeKind};
-use crate::erased_batch::{ErasedBatchOperator, ErasedBatchSink, ErasedBatchSource};
+use crate::erased_batch::{ErasedBatchOperator, ErasedSink, ErasedSource};
 use crate::erased_buffer::{BatchKeyFn, ErasedBuffer};
 use crate::executor::NodeKindTag;
 use crate::shutdown::ShutdownHandle;
@@ -72,7 +72,7 @@ pub(crate) struct ExecutorData {
     pub shutdown: Option<ShutdownHandle>,
     pub dlq_tx: Option<DlqSender>,
     // Batch (Arrow) fields
-    pub batch_source_rx: HashMap<NodeId, flume::Receiver<crate::bridge::BatchSourceBatch>>,
+    pub batch_source_rx: HashMap<NodeId, flume::Receiver<crate::bridge::SourceBatch>>,
     pub batch_transforms: HashMap<NodeId, BatchTransformFn>,
     pub batch_operators: HashMap<NodeId, (String, Box<dyn ErasedBatchOperator>)>,
     pub batch_contexts: HashMap<NodeId, OperatorContext>,
@@ -757,7 +757,7 @@ fn extract_batch_per_worker_data(
     all_source_offsets: &mut Vec<Arc<std::sync::Mutex<HashMap<String, String>>>>,
     all_source_watermarks: &mut Vec<Arc<AtomicU64>>,
 ) -> anyhow::Result<(
-    Vec<HashMap<NodeId, flume::Receiver<crate::bridge::BatchSourceBatch>>>,
+    Vec<HashMap<NodeId, flume::Receiver<crate::bridge::SourceBatch>>>,
     Vec<Option<HashMap<NodeId, BatchTransformFn>>>,
     Vec<Option<HashMap<NodeId, (String, Box<dyn ErasedBatchOperator>)>>>,
     Vec<Option<HashMap<NodeId, OperatorContext>>>,
@@ -767,7 +767,7 @@ fn extract_batch_per_worker_data(
 )> {
     let rt = tokio::runtime::Handle::current();
     let mut per_worker_batch_source_rx: Vec<
-        HashMap<NodeId, flume::Receiver<crate::bridge::BatchSourceBatch>>,
+        HashMap<NodeId, flume::Receiver<crate::bridge::SourceBatch>>,
     > = (0..total_workers).map(|_| HashMap::new()).collect();
     let mut per_worker_batch_transforms: Vec<Option<HashMap<NodeId, BatchTransformFn>>> =
         (0..total_workers).map(|_| None).collect();
@@ -784,7 +784,7 @@ fn extract_batch_per_worker_data(
     let batch_source_ids: Vec<NodeId> = graph
         .topo_order
         .iter()
-        .filter(|id| node_kinds[id] == NodeKindTag::BatchSource)
+        .filter(|id| node_kinds[id] == NodeKindTag::Source)
         .copied()
         .collect();
     let batch_transform_ids: Vec<NodeId> = graph
@@ -808,7 +808,7 @@ fn extract_batch_per_worker_data(
     let batch_sink_ids: Vec<NodeId> = graph
         .topo_order
         .iter()
-        .filter(|id| node_kinds[id] == NodeKindTag::BatchSink)
+        .filter(|id| node_kinds[id] == NodeKindTag::Sink)
         .copied()
         .collect();
 
@@ -958,11 +958,11 @@ fn placeholder_node_kind() -> NodeKind {
     })))
 }
 
-fn extract_batch_source(node: &mut crate::dataflow::GraphNode) -> Box<dyn ErasedBatchSource> {
+fn extract_batch_source(node: &mut crate::dataflow::GraphNode) -> Box<dyn ErasedSource> {
     let kind = std::mem::replace(&mut node.kind, placeholder_node_kind());
     match kind {
-        NodeKind::BatchSource(src) => src.compile(),
-        _ => panic!("expected BatchSource node at {:?}", node.id),
+        NodeKind::Source(src) => src.compile(),
+        _ => panic!("expected Source node at {:?}", node.id),
     }
 }
 
@@ -984,11 +984,11 @@ fn extract_batch_operator(
     }
 }
 
-fn extract_batch_sink(node: &mut crate::dataflow::GraphNode) -> Box<dyn ErasedBatchSink> {
+fn extract_batch_sink(node: &mut crate::dataflow::GraphNode) -> Box<dyn ErasedSink> {
     let kind = std::mem::replace(&mut node.kind, placeholder_node_kind());
     match kind {
-        NodeKind::BatchSink(sink) => sink.compile(),
-        _ => panic!("expected BatchSink node at {:?}", node.id),
+        NodeKind::Sink(sink) => sink.compile(),
+        _ => panic!("expected Sink node at {:?}", node.id),
     }
 }
 

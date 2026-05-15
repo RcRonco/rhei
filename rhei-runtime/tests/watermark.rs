@@ -2,14 +2,14 @@
 //! Integration test: watermark propagation triggers window closure.
 //!
 //! Uses a custom batch source that emits explicit watermarks with each batch.
-//! A `BatchTumblingWindow` operator accumulates events into windows and closes
+//! A `TumblingWindow` operator accumulates events into windows and closes
 //! them when the watermark advances past the window boundary.
 
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use rhei_core::arrow::{BatchSink, BatchSource, RheiBuffer, RheiBuilder, RheiSchema};
-use rhei_core::operators::batch::BatchTumblingWindow;
+use rhei_core::arrow::{RheiBuffer, RheiBuilder, RheiSchema, Sink, Source};
+use rhei_core::operators::batch::TumblingWindow;
 use rhei_runtime::controller::PipelineController;
 use rhei_runtime::dataflow::DataflowGraph;
 
@@ -243,7 +243,7 @@ impl RheiSchema for WindowResult {
 /// A batch source that emits pre-built batches with explicit watermarks.
 /// Each batch is associated with a watermark value. After emitting a batch,
 /// `current_watermark()` returns the associated watermark.
-struct WatermarkedBatchSource {
+struct WatermarkedSource {
     /// Remaining batches and their watermarks: `(events, watermark)`.
     batches: Vec<(Vec<TimedEvent>, u64)>,
     /// Index of the next batch to emit.
@@ -252,7 +252,7 @@ struct WatermarkedBatchSource {
     watermark: Option<u64>,
 }
 
-impl WatermarkedBatchSource {
+impl WatermarkedSource {
     fn new(batches: Vec<(Vec<TimedEvent>, u64)>) -> Self {
         Self {
             batches,
@@ -263,7 +263,7 @@ impl WatermarkedBatchSource {
 }
 
 #[async_trait]
-impl BatchSource for WatermarkedBatchSource {
+impl Source for WatermarkedSource {
     type Output = TimedEvent;
 
     async fn next_batch(&mut self) -> Option<RheiBuffer<TimedEvent>> {
@@ -301,7 +301,7 @@ struct WindowCollectSink {
 }
 
 #[async_trait]
-impl BatchSink for WindowCollectSink {
+impl Sink for WindowCollectSink {
     type Input = WindowResult;
 
     async fn write_batch(&mut self, input: RheiBuffer<WindowResult>) -> anyhow::Result<()> {
@@ -329,7 +329,7 @@ async fn watermark_triggers_window_closure() {
     // Batch 1: events in window [0, 10) for keys "a" and "b". Watermark = 5.
     // Batch 2: more events in [0, 10). Watermark = 9 (still < 10, no closure).
     // Batch 3: event in [10, 20). Watermark = 15 (>= 10, closes window [0,10)).
-    let source = WatermarkedBatchSource::new(vec![
+    let source = WatermarkedSource::new(vec![
         (
             vec![
                 TimedEvent {
@@ -377,7 +377,7 @@ async fn watermark_triggers_window_closure() {
 
     let collected: Arc<Mutex<Vec<(String, u64, u64, u64)>>> = Arc::new(Mutex::new(Vec::new()));
 
-    let window = BatchTumblingWindow::new(
+    let window = TumblingWindow::new(
         10,
         |view: <TimedEvent as RheiSchema>::View<'_>| view.key.to_string(),
         |view: <TimedEvent as RheiSchema>::View<'_>| view.ts,
@@ -441,7 +441,7 @@ async fn watermark_advance_closes_multiple_keys() {
 
     // All events in window [0,10) for three keys. Watermark jumps to 20 in
     // the second batch — should close all three windows.
-    let source = WatermarkedBatchSource::new(vec![
+    let source = WatermarkedSource::new(vec![
         (
             vec![
                 TimedEvent {
@@ -479,7 +479,7 @@ async fn watermark_advance_closes_multiple_keys() {
 
     let collected: Arc<Mutex<Vec<(String, u64, u64, u64)>>> = Arc::new(Mutex::new(Vec::new()));
 
-    let window = BatchTumblingWindow::new(
+    let window = TumblingWindow::new(
         10,
         |view: <TimedEvent as RheiSchema>::View<'_>| view.key.to_string(),
         |view: <TimedEvent as RheiSchema>::View<'_>| view.ts,

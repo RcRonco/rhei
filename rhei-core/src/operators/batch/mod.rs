@@ -1,6 +1,6 @@
 //! Batch (Arrow columnar) operator implementations.
 //!
-//! These implement [`BatchStreamFunction`] and operate on `RheiBuffer`
+//! These implement [`StreamFunction`] and operate on `RheiBuffer`
 //! batches rather than individual rows.
 
 pub mod count_window;
@@ -14,12 +14,12 @@ pub mod sliding_window;
 pub mod temporal_join;
 pub mod tumbling_window;
 
-pub use count_window::BatchCountWindow;
-pub use filter::{BatchFilterFnOp, BatchFilterOp};
-pub use filter_expr::{BatchFilterExprOp, Expr, col, lit_bool, lit_f64, lit_i64, lit_str, lit_u64};
-pub use map::{BatchFlatMapOp, BatchMapOp};
-pub use reduce::{BatchReduceOp, BatchRollingAggregateOp};
-pub use session_window::BatchSessionWindow;
-pub use sliding_window::BatchSlidingWindow;
-pub use temporal_join::{BatchTemporalJoin, Side};
-pub use tumbling_window::BatchTumblingWindow;
+pub use count_window::CountWindow;
+pub use filter::{FilterFnOp, FilterOp};
+pub use filter_expr::{Expr, FilterExprOp, col, lit_bool, lit_f64, lit_i64, lit_str, lit_u64};
+pub use map::{FlatMapOp, MapOp};
+pub use reduce::{ReduceOp, RollingAggregateOp};
+pub use session_window::SessionWindow;
+pub use sliding_window::SlidingWindow;
+pub use temporal_join::{Side, TemporalJoin};
+pub use tumbling_window::TumblingWindow;

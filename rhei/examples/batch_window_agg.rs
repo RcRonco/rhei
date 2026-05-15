@@ -1,14 +1,14 @@
 //! Batch tumbling window aggregation example using the Arrow columnar pipeline.
 //!
 //! Sensor readings are aggregated per-sensor over fixed 10-second tumbling
-//! windows using `BatchTumblingWindow` with a sum accumulator.
+//! windows using `TumblingWindow` with a sum accumulator.
 //! Windows close when data crosses into a new time bucket or on source exhaustion.
 //!
 //! Run with: `cargo run -p rhei --example batch_window_agg`
 
 use rhei::{
-    BatchPrintSink, BatchTumblingWindow, BatchVecSource, DataflowGraph, PipelineController,
-    RheiSchema as RheiSchemaDerive,
+    DataflowGraph, PipelineController, PrintSink, RheiSchema as RheiSchemaDerive, TumblingWindow,
+    VecSource,
 };
 
 #[derive(Debug, Clone, RheiSchemaDerive)]
@@ -88,9 +88,9 @@ async fn main() -> anyhow::Result<()> {
         },
     ];
 
-    let source = BatchVecSource::new(readings).with_batch_size(10);
+    let source = VecSource::new(readings).with_batch_size(10);
 
-    let window = BatchTumblingWindow::new(
+    let window = TumblingWindow::new(
         10,
         |view: SensorReadingView<'_>| view.sensor_id.to_string(),
         |view: SensorReadingView<'_>| view.timestamp,
@@ -111,7 +111,7 @@ async fn main() -> anyhow::Result<()> {
     graph
         .batch_source(source)
         .operator("sensor_window", window)
-        .sink(BatchPrintSink::<WindowResult>::new().with_prefix("output"));
+        .sink(PrintSink::<WindowResult>::new().with_prefix("output"));
 
     let ctrl = PipelineController::new(dir.clone()).with_workers(1);
     ctrl.run(graph).await?;

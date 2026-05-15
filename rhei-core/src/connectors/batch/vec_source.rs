@@ -4,14 +4,14 @@ use std::marker::PhantomData;
 
 use async_trait::async_trait;
 
-use crate::arrow::{BatchSource, RheiBuffer, RheiBuilder, RheiSchema};
+use crate::arrow::{RheiBuffer, RheiBuilder, RheiSchema, Source};
 
 /// A source that builds Arrow buffers from an in-memory `Vec<T>`.
 ///
 /// Items are consumed in batches of `batch_size`. Each `next_batch()` call
 /// returns a single `RheiBuffer` containing up to `batch_size` rows.
 #[derive(Debug)]
-pub struct BatchVecSource<T: RheiSchema> {
+pub struct VecSource<T: RheiSchema> {
     items: Vec<T>,
     batch_size: usize,
     records_since_watermark: usize,
@@ -20,8 +20,8 @@ pub struct BatchVecSource<T: RheiSchema> {
     _marker: PhantomData<T>,
 }
 
-impl<T: RheiSchema> BatchVecSource<T> {
-    /// Creates a new `BatchVecSource` from the given items.
+impl<T: RheiSchema> VecSource<T> {
+    /// Creates a new `VecSource` from the given items.
     pub fn new(items: Vec<T>) -> Self {
         Self {
             items,
@@ -47,7 +47,7 @@ impl<T: RheiSchema> BatchVecSource<T> {
 }
 
 #[async_trait]
-impl<T: RheiSchema + Sync> BatchSource for BatchVecSource<T> {
+impl<T: RheiSchema + Sync> Source for VecSource<T> {
     type Output = T;
 
     async fn next_batch(&mut self) -> Option<RheiBuffer<T>> {
@@ -165,7 +165,7 @@ mod tests {
     #[tokio::test]
     async fn emits_all_items_in_batches() {
         let items: Vec<_> = (0..10).map(|i| SimpleItem { val: i }).collect();
-        let mut src = BatchVecSource::new(items).with_batch_size(3);
+        let mut src = VecSource::new(items).with_batch_size(3);
 
         let mut total_rows = 0;
         while let Some(buf) = src.next_batch().await {
@@ -176,7 +176,7 @@ mod tests {
 
     #[tokio::test]
     async fn empty_source_returns_none() {
-        let mut src = BatchVecSource::<SimpleItem>::new(vec![]);
+        let mut src = VecSource::<SimpleItem>::new(vec![]);
         assert!(src.next_batch().await.is_none());
     }
 }

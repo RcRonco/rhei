@@ -15,7 +15,7 @@ use super::schema::RheiSchema;
 /// - **Batch:** access `input.as_record_batch()` for DataFusion/kernel operations
 /// - **Column:** access `input.columns()` for vectorized column-level processing
 #[async_trait]
-pub trait BatchStreamFunction: Send + Sync {
+pub trait StreamFunction: Send + Sync {
     /// The schema type for input buffers.
     type Input: RheiSchema;
     /// The schema type for output buffers.
@@ -74,7 +74,7 @@ pub trait BatchStreamFunction: Send + Sync {
 
 /// Batch-oriented source that produces Arrow buffers.
 #[async_trait]
-pub trait BatchSource: Send + Sync {
+pub trait Source: Send + Sync {
     /// The schema type for output buffers.
     type Output: RheiSchema;
 
@@ -118,7 +118,7 @@ pub trait BatchSource: Send + Sync {
     fn create_partition_source(
         &self,
         _assigned: &[usize],
-    ) -> Option<Box<dyn BatchSource<Output = Self::Output>>>
+    ) -> Option<Box<dyn Source<Output = Self::Output>>>
     where
         Self: Sized,
     {
@@ -128,7 +128,7 @@ pub trait BatchSource: Send + Sync {
 
 /// Batch-oriented sink that consumes Arrow buffers.
 #[async_trait]
-pub trait BatchSink: Send + Sync {
+pub trait Sink: Send + Sync {
     /// The schema type for input buffers.
     type Input: RheiSchema;
 

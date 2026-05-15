@@ -1,7 +1,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 //! Integration test: timers fire when watermark advances past their timestamp.
 //!
-//! A custom `BatchStreamFunction` registers a timer for each input event at
+//! A custom `StreamFunction` registers a timer for each input event at
 //! `ts + delay`. When the watermark advances past the timer timestamp, `on_timer`
 //! fires and emits a `TimerFired` output record.
 
@@ -9,8 +9,8 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use rhei_core::arrow::{
-    BatchSink, BatchSource, BatchStreamFunction, BufferOutput, OperatorContext, RheiBuffer,
-    RheiBuilder, RheiSchema,
+    BufferOutput, OperatorContext, RheiBuffer, RheiBuilder, RheiSchema, Sink, Source,
+    StreamFunction,
 };
 use rhei_runtime::controller::PipelineController;
 use rhei_runtime::dataflow::DataflowGraph;
@@ -209,7 +209,7 @@ const TIMER_DELAY: u64 = 10;
 struct DelayedEmitter;
 
 #[async_trait]
-impl BatchStreamFunction for DelayedEmitter {
+impl StreamFunction for DelayedEmitter {
     type Input = TimedEvent;
     type Output = TimerFired;
 
@@ -266,7 +266,7 @@ impl WatermarkedTimerSource {
 }
 
 #[async_trait]
-impl BatchSource for WatermarkedTimerSource {
+impl Source for WatermarkedTimerSource {
     type Output = TimedEvent;
 
     async fn next_batch(&mut self) -> Option<RheiBuffer<TimedEvent>> {
@@ -303,7 +303,7 @@ struct TimerFiredSink {
 }
 
 #[async_trait]
-impl BatchSink for TimerFiredSink {
+impl Sink for TimerFiredSink {
     type Input = TimerFired;
 
     async fn write_batch(&mut self, input: RheiBuffer<TimerFired>) -> anyhow::Result<()> {

@@ -15,12 +15,12 @@ use serde::{Deserialize, Serialize};
 
 use super::keyed_state::KeyedState;
 use crate::arrow::{
-    BatchStreamFunction, BufferOutput, OperatorContext, RheiBuffer, RheiBuilder, RheiSchema,
+    BufferOutput, OperatorContext, RheiBuffer, RheiBuilder, RheiSchema, StreamFunction,
 };
 
 /// An input event tagged with its side of the join.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub enum BatchJoinSide<L, R> {
+pub enum JoinSide<L, R> {
     /// Left side of the join.
     Left(L),
     /// Right side of the join.
@@ -36,7 +36,7 @@ struct Stamped<V> {
 
 /// Batch temporal join operator.
 ///
-/// Input type must be `BatchJoinSide<L, R>` where both L and R implement
+/// Input type must be `JoinSide<L, R>` where both L and R implement
 /// `RheiSchema`. The input buffer schema is that of the tagged enum (using
 /// a discriminant column + union of both schemas).
 ///
@@ -44,7 +44,7 @@ struct Stamped<V> {
 /// a `side` column and the superset of L/R fields. For simplicity, we use
 /// a closure-based approach where `SideF` extracts which side an input row
 /// belongs to, and separate closures extract L/R data.
-pub struct BatchTemporalJoin<I, O, KF, SF, LF, RF, JF> {
+pub struct TemporalJoin<I, O, KF, SF, LF, RF, JF> {
     key_fn: KF,
     side_fn: SF,
     left_fn: LF,
@@ -57,7 +57,7 @@ pub struct BatchTemporalJoin<I, O, KF, SF, LF, RF, JF> {
 }
 
 impl<I, O, KF: Clone, SF: Clone, LF: Clone, RF: Clone, JF: Clone> Clone
-    for BatchTemporalJoin<I, O, KF, SF, LF, RF, JF>
+    for TemporalJoin<I, O, KF, SF, LF, RF, JF>
 {
     fn clone(&self) -> Self {
         Self {
@@ -74,9 +74,9 @@ impl<I, O, KF: Clone, SF: Clone, LF: Clone, RF: Clone, JF: Clone> Clone
     }
 }
 
-impl<I, O, KF, SF, LF, RF, JF> fmt::Debug for BatchTemporalJoin<I, O, KF, SF, LF, RF, JF> {
+impl<I, O, KF, SF, LF, RF, JF> fmt::Debug for TemporalJoin<I, O, KF, SF, LF, RF, JF> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("BatchTemporalJoin")
+        f.debug_struct("TemporalJoin")
             .field("timeout", &self.timeout)
             .finish_non_exhaustive()
     }
@@ -91,7 +91,7 @@ pub enum Side {
     Right,
 }
 
-impl<I, O, KF, SF, LF, RF, JF> BatchTemporalJoin<I, O, KF, SF, LF, RF, JF> {
+impl<I, O, KF, SF, LF, RF, JF> TemporalJoin<I, O, KF, SF, LF, RF, JF> {
     /// Creates a new temporal join operator.
     pub fn new(key_fn: KF, side_fn: SF, left_fn: LF, right_fn: RF, join_fn: JF) -> Self {
         Self {
@@ -120,8 +120,7 @@ type LeftStamped<L> = Stamped<L>;
 type RightStamped<R> = Stamped<R>;
 
 #[async_trait]
-impl<I, O, L, R, KF, SF, LF, RF, JF> BatchStreamFunction
-    for BatchTemporalJoin<I, O, KF, SF, LF, RF, JF>
+impl<I, O, L, R, KF, SF, LF, RF, JF> StreamFunction for TemporalJoin<I, O, KF, SF, LF, RF, JF>
 where
     I: RheiSchema,
     O: RheiSchema,
@@ -464,7 +463,7 @@ mod tests {
     }
 
     #[allow(clippy::type_complexity)]
-    fn make_join() -> BatchTemporalJoin<
+    fn make_join() -> TemporalJoin<
         JoinInput,
         JoinOutput,
         impl for<'a> Fn(<JoinInput as RheiSchemaTrait>::View<'a>) -> String + Send + Sync,
@@ -473,7 +472,7 @@ mod tests {
         impl for<'a> Fn(<JoinInput as RheiSchemaTrait>::View<'a>) -> String + Send + Sync,
         impl Fn(&str, &String, &String) -> JoinOutput + Send + Sync,
     > {
-        BatchTemporalJoin::new(
+        TemporalJoin::new(
             |v: JoinInputView<'_>| v.key.to_string(),
             |v: JoinInputView<'_>| {
                 if v.side == 0 { Side::Left } else { Side::Right }

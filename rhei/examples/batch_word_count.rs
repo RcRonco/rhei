@@ -1,6 +1,6 @@
 //! Batch word-count example using the Arrow columnar pipeline.
 //!
-//! Demonstrates: `BatchVecSource` → `flat_map` → `BatchTumblingWindow` → `BatchPrintSink`
+//! Demonstrates: `VecSource` → `flat_map` → `TumblingWindow` → `PrintSink`
 //!
 //! Each line is split into words, then a tumbling window counts words per
 //! 1-second window (using synthetic timestamps). Windows close on source
@@ -9,8 +9,8 @@
 //! Run with: `cargo run -p rhei --example batch_word_count`
 
 use rhei::{
-    BatchPrintSink, BatchTumblingWindow, BatchVecSource, DataflowGraph, PipelineController,
-    RheiSchema as RheiSchemaDerive,
+    DataflowGraph, PipelineController, PrintSink, RheiSchema as RheiSchemaDerive, TumblingWindow,
+    VecSource,
 };
 
 #[derive(Debug, Clone, RheiSchemaDerive)]
@@ -58,9 +58,9 @@ async fn main() -> anyhow::Result<()> {
         },
     ];
 
-    let source = BatchVecSource::new(lines).with_batch_size(4);
+    let source = VecSource::new(lines).with_batch_size(4);
 
-    let window = BatchTumblingWindow::new(
+    let window = TumblingWindow::new(
         10,
         |view: WordView<'_>| view.word.to_string(),
         |view: WordView<'_>| view.ts,
@@ -86,7 +86,7 @@ async fn main() -> anyhow::Result<()> {
                 .collect::<Vec<_>>()
         })
         .operator("word_window", window)
-        .sink(BatchPrintSink::<WordCount>::new().with_prefix("output"));
+        .sink(PrintSink::<WordCount>::new().with_prefix("output"));
 
     let ctrl = PipelineController::new(dir.clone()).with_workers(1);
     ctrl.run(graph).await?;

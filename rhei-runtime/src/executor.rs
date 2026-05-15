@@ -28,7 +28,7 @@ pub use crate::controller::PipelineControllerBuilder as ExecutorBuilder;
 /// Type alias for a Timely worker scope parameterized by allocator.
 type Scope<'a, A> = Child<'a, Worker<A>, u64>;
 type ScopedStream<'a, A, R> = timely::dataflow::Stream<Scope<'a, A>, Vec<R>>;
-type ScopedBatchStream<'a, A> = ScopedStream<'a, A, crate::erased_buffer::ErasedBuffer>;
+type ErasedStream<'a, A> = ScopedStream<'a, A, crate::erased_buffer::ErasedBuffer>;
 
 /// Special sentinel values in the `u64` timeline shared by watermarks and epochs.
 ///
@@ -65,10 +65,10 @@ pub fn partition_key(key: &str, n_workers: usize) -> usize {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(clippy::enum_variant_names)] // all variants are batch-only after row API removal
 pub(crate) enum NodeKindTag {
-    BatchSource,
+    Source,
     BatchTransform,
     BatchOperator,
-    BatchSink,
+    Sink,
     BatchKeyBy,
     BatchMerge,
 }
@@ -76,10 +76,10 @@ pub(crate) enum NodeKindTag {
 impl NodeKindTag {
     pub(crate) fn from_kind(kind: &NodeKind) -> Self {
         match kind {
-            NodeKind::BatchSource(_) => Self::BatchSource,
+            NodeKind::Source(_) => Self::Source,
             NodeKind::BatchTransform(_) => Self::BatchTransform,
             NodeKind::BatchOperator { .. } => Self::BatchOperator,
-            NodeKind::BatchSink(_) => Self::BatchSink,
+            NodeKind::Sink(_) => Self::Sink,
             NodeKind::BatchKeyBy(_) => Self::BatchKeyBy,
             NodeKind::BatchMerge => Self::BatchMerge,
         }
@@ -215,7 +215,7 @@ impl DataflowExecutor {
         scope: &mut Scope<'_, A>,
         data: &mut ExecutorData,
     ) -> probe::Handle<u64> {
-        let mut batch_streams: HashMap<NodeId, ScopedBatchStream<_>> = HashMap::new();
+        let mut batch_streams: HashMap<NodeId, ErasedStream<_>> = HashMap::new();
         let probe = probe::Handle::new();
 
         for &node_id in self.topo_order.iter() {
@@ -223,7 +223,7 @@ impl DataflowExecutor {
             let inputs = &self.node_inputs[&node_id];
 
             match kind {
-                NodeKindTag::BatchSource => {
+                NodeKindTag::Source => {
                     let stream = self.build_batch_source(
                         scope,
                         node_id,
@@ -263,7 +263,7 @@ impl DataflowExecutor {
                     let stream = self.build_batch_merge(scope, input_streams);
                     batch_streams.insert(node_id, stream);
                 }
-                NodeKindTag::BatchSink => {
+                NodeKindTag::Sink => {
                     let input_stream = batch_streams[&inputs[0]].clone();
                     self.build_batch_sink(node_id, input_stream, &probe);
                 }
@@ -280,15 +280,15 @@ impl DataflowExecutor {
         &self,
         scope: &mut Scope<'a, A>,
         node_id: NodeId,
-        batch_source_rx: &mut HashMap<NodeId, flume::Receiver<crate::bridge::BatchSourceBatch>>,
+        batch_source_rx: &mut HashMap<NodeId, flume::Receiver<crate::bridge::SourceBatch>>,
         source_watermarks: &mut HashMap<NodeId, Arc<AtomicU64>>,
-    ) -> ScopedBatchStream<'a, A> {
+    ) -> ErasedStream<'a, A> {
         use timely::dataflow::operators::generic::OutputBuilder;
         use timely::dataflow::operators::generic::builder_rc::OperatorBuilder;
         use timely::scheduling::Scheduler;
 
         let mut source_builder =
-            OperatorBuilder::new(format!("BatchSource_{}", node_id.0), scope.clone());
+            OperatorBuilder::new(format!("Source_{}", node_id.0), scope.clone());
         let (output, stream) =
             source_builder.new_output::<Vec<crate::erased_buffer::ErasedBuffer>>();
         let mut output = OutputBuilder::from(output);
@@ -398,9 +398,9 @@ impl DataflowExecutor {
     fn build_batch_transform<'a, A: Allocate>(
         &self,
         node_id: NodeId,
-        input_stream: ScopedBatchStream<'a, A>,
+        input_stream: ErasedStream<'a, A>,
         batch_transforms: &mut HashMap<NodeId, crate::dataflow::BatchTransformFn>,
-    ) -> ScopedBatchStream<'a, A> {
+    ) -> ErasedStream<'a, A> {
         use timely::container::CapacityContainerBuilder;
         use timely::dataflow::channels::pact::Pipeline;
         use timely::dataflow::operators::generic::operator::Operator;
@@ -434,9 +434,9 @@ impl DataflowExecutor {
     fn build_batch_key_by<'a, A: Allocate>(
         &self,
         node_id: NodeId,
-        input_stream: ScopedBatchStream<'a, A>,
+        input_stream: ErasedStream<'a, A>,
         batch_key_fns: &mut HashMap<NodeId, BatchKeyFn>,
-    ) -> ScopedBatchStream<'a, A> {
+    ) -> ErasedStream<'a, A> {
         use timely::container::CapacityContainerBuilder;
         use timely::dataflow::channels::pact::Pipeline;
         use timely::dataflow::operators::Exchange as _;
@@ -479,8 +479,8 @@ impl DataflowExecutor {
     fn build_batch_merge<'a, A: Allocate>(
         &self,
         scope: &mut Scope<'a, A>,
-        input_streams: Vec<ScopedBatchStream<'a, A>>,
-    ) -> ScopedBatchStream<'a, A> {
+        input_streams: Vec<ErasedStream<'a, A>>,
+    ) -> ErasedStream<'a, A> {
         use timely::dataflow::operators::Concatenate;
         scope.concatenate(input_streams)
     }
@@ -490,13 +490,13 @@ impl DataflowExecutor {
     fn build_batch_operator<'a, A: Allocate>(
         &self,
         node_id: NodeId,
-        input_stream: ScopedBatchStream<'a, A>,
+        input_stream: ErasedStream<'a, A>,
         batch_operators: &mut HashMap<
             NodeId,
             (String, Box<dyn crate::erased_batch::ErasedBatchOperator>),
         >,
         batch_contexts: &mut HashMap<NodeId, rhei_core::arrow::OperatorContext>,
-    ) -> ScopedBatchStream<'a, A> {
+    ) -> ErasedStream<'a, A> {
         use timely::container::CapacityContainerBuilder;
         use timely::dataflow::channels::pact::Pipeline;
         use timely::dataflow::operators::Capability;
@@ -632,7 +632,7 @@ impl DataflowExecutor {
     fn build_batch_sink<A: Allocate>(
         &self,
         node_id: NodeId,
-        input_stream: ScopedBatchStream<'_, A>,
+        input_stream: ErasedStream<'_, A>,
         probe: &probe::Handle<u64>,
     ) {
         use timely::container::CapacityContainerBuilder;
@@ -650,7 +650,7 @@ impl DataflowExecutor {
         input_stream
             .unary::<CapacityContainerBuilder<Vec<crate::erased_buffer::ErasedBuffer>>, _, _, _>(
                 Pipeline,
-                &format!("BatchSink_{}", node_id.0),
+                &format!("Sink_{}", node_id.0),
                 move |_cap, _info| {
                     let sink_tx = sink_tx;
                     move |input, _output| {

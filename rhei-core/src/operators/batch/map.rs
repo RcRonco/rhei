@@ -6,25 +6,25 @@ use std::marker::PhantomData;
 use async_trait::async_trait;
 
 use crate::arrow::{
-    BatchStreamFunction, BufferOutput, OperatorContext, RheiBuffer, RheiBuilder, RheiSchema,
+    BufferOutput, OperatorContext, RheiBuffer, RheiBuilder, RheiSchema, StreamFunction,
 };
 
 /// Transforms each input row (via View) into exactly one output row.
 ///
 /// The closure receives a zero-copy view of each input row and returns an
 /// owned output value that is appended to the output builder.
-pub struct BatchMapOp<F, I, O> {
+pub struct MapOp<F, I, O> {
     f: F,
     _phantom: PhantomData<fn(I) -> O>,
 }
 
-impl<F, I, O> fmt::Debug for BatchMapOp<F, I, O> {
+impl<F, I, O> fmt::Debug for MapOp<F, I, O> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("BatchMapOp").finish_non_exhaustive()
+        f.debug_struct("MapOp").finish_non_exhaustive()
     }
 }
 
-impl<F, I, O> BatchMapOp<F, I, O>
+impl<F, I, O> MapOp<F, I, O>
 where
     I: RheiSchema,
     O: RheiSchema,
@@ -40,7 +40,7 @@ where
 }
 
 #[async_trait]
-impl<F, I, O> BatchStreamFunction for BatchMapOp<F, I, O>
+impl<F, I, O> StreamFunction for MapOp<F, I, O>
 where
     I: RheiSchema,
     O: RheiSchema,
@@ -68,18 +68,18 @@ where
 }
 
 /// Transforms each input row (via View) into zero or more output rows.
-pub struct BatchFlatMapOp<F, I, O> {
+pub struct FlatMapOp<F, I, O> {
     f: F,
     _phantom: PhantomData<fn(I) -> Vec<O>>,
 }
 
-impl<F, I, O> fmt::Debug for BatchFlatMapOp<F, I, O> {
+impl<F, I, O> fmt::Debug for FlatMapOp<F, I, O> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("BatchFlatMapOp").finish_non_exhaustive()
+        f.debug_struct("FlatMapOp").finish_non_exhaustive()
     }
 }
 
-impl<F, I, O> BatchFlatMapOp<F, I, O>
+impl<F, I, O> FlatMapOp<F, I, O>
 where
     I: RheiSchema,
     O: RheiSchema,
@@ -95,7 +95,7 @@ where
 }
 
 #[async_trait]
-impl<F, I, O> BatchStreamFunction for BatchFlatMapOp<F, I, O>
+impl<F, I, O> StreamFunction for FlatMapOp<F, I, O>
 where
     I: RheiSchema,
     O: RheiSchema,

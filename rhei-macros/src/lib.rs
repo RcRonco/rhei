@@ -23,7 +23,7 @@ use syn::{DeriveInput, parse_macro_input};
 /// }
 /// ```
 ///
-/// Generates a struct implementing `BatchStreamFunction`.
+/// Generates a struct implementing `StreamFunction`.
 #[proc_macro_attribute]
 pub fn op_batch(_attr: TokenStream, item: TokenStream) -> TokenStream {
     let item_fn = parse_macro_input!(item as syn::ItemFn);
@@ -40,9 +40,9 @@ pub fn op_batch(_attr: TokenStream, item: TokenStream) -> TokenStream {
 /// ```ignore
 /// #[rhei::pipeline]
 /// fn main(graph: &DataflowGraph) {
-///     graph.batch_source(BatchVecSource::new(data))
+///     graph.batch_source(VecSource::new(data))
 ///         .map(|e: EventView| Output { ... })
-///         .sink(BatchPrintSink::new());
+///         .sink(PrintSink::new());
 /// }
 /// ```
 ///

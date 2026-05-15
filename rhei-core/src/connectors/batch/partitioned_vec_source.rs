@@ -4,9 +4,9 @@ use std::marker::PhantomData;
 
 use async_trait::async_trait;
 
-use crate::arrow::{BatchSource, RheiBuffer, RheiSchema};
+use crate::arrow::{RheiBuffer, RheiSchema, Source};
 
-use super::vec_source::BatchVecSource;
+use super::vec_source::VecSource;
 
 /// A partitioned batch source that distributes items round-robin across partitions.
 ///
@@ -14,14 +14,14 @@ use super::vec_source::BatchVecSource;
 /// `i % num_partitions`. The executor calls `create_partition_source()` to
 /// create per-worker readers that only emit their assigned subset.
 #[derive(Debug)]
-pub struct BatchPartitionedVecSource<T: RheiSchema> {
+pub struct PartitionedVecSource<T: RheiSchema> {
     items: Vec<T>,
     num_partitions: usize,
     batch_size: usize,
     _marker: PhantomData<T>,
 }
 
-impl<T: RheiSchema> BatchPartitionedVecSource<T> {
+impl<T: RheiSchema> PartitionedVecSource<T> {
     /// Creates a new partitioned source distributing items across `num_partitions`.
     pub fn new(items: Vec<T>, num_partitions: usize) -> Self {
         assert!(num_partitions >= 1, "partition count must be at least 1");
@@ -41,7 +41,7 @@ impl<T: RheiSchema> BatchPartitionedVecSource<T> {
 }
 
 #[async_trait]
-impl<T: RheiSchema + Clone + Sync> BatchSource for BatchPartitionedVecSource<T> {
+impl<T: RheiSchema + Clone + Sync> Source for PartitionedVecSource<T> {
     type Output = T;
 
     async fn next_batch(&mut self) -> Option<RheiBuffer<T>> {
@@ -52,10 +52,7 @@ impl<T: RheiSchema + Clone + Sync> BatchSource for BatchPartitionedVecSource<T> 
         Some(self.num_partitions)
     }
 
-    fn create_partition_source(
-        &self,
-        assigned: &[usize],
-    ) -> Option<Box<dyn BatchSource<Output = T>>> {
+    fn create_partition_source(&self, assigned: &[usize]) -> Option<Box<dyn Source<Output = T>>> {
         let mut items = Vec::new();
         for (i, item) in self.items.iter().enumerate() {
             if assigned.contains(&(i % self.num_partitions)) {
@@ -63,7 +60,7 @@ impl<T: RheiSchema + Clone + Sync> BatchSource for BatchPartitionedVecSource<T> 
             }
         }
         Some(Box::new(
-            BatchVecSource::new(items).with_batch_size(self.batch_size),
+            VecSource::new(items).with_batch_size(self.batch_size),
         ))
     }
 }
@@ -163,22 +160,20 @@ mod tests {
     #[tokio::test]
     async fn factory_returns_none() {
         let mut src =
-            BatchPartitionedVecSource::new(vec![SimpleItem { val: 1 }, SimpleItem { val: 2 }], 2);
+            PartitionedVecSource::new(vec![SimpleItem { val: 1 }, SimpleItem { val: 2 }], 2);
         assert!(src.next_batch().await.is_none());
     }
 
     #[tokio::test]
     async fn partition_count_correct() {
-        let src =
-            BatchPartitionedVecSource::new((0..6).map(|i| SimpleItem { val: i }).collect(), 3);
+        let src = PartitionedVecSource::new((0..6).map(|i| SimpleItem { val: i }).collect(), 3);
         assert_eq!(src.partition_count(), Some(3));
     }
 
     #[tokio::test]
     async fn partition_source_gets_correct_items() {
-        let src =
-            BatchPartitionedVecSource::new((0..6).map(|i| SimpleItem { val: i }).collect(), 3)
-                .with_batch_size(10);
+        let src = PartitionedVecSource::new((0..6).map(|i| SimpleItem { val: i }).collect(), 3)
+            .with_batch_size(10);
 
         let mut p0 = src.create_partition_source(&[0]).unwrap();
         let mut all = Vec::new();
@@ -201,9 +196,8 @@ mod tests {
 
     #[tokio::test]
     async fn multiple_partitions_assigned() {
-        let src =
-            BatchPartitionedVecSource::new((0..6).map(|i| SimpleItem { val: i }).collect(), 3)
-                .with_batch_size(10);
+        let src = PartitionedVecSource::new((0..6).map(|i| SimpleItem { val: i }).collect(), 3)
+            .with_batch_size(10);
 
         let mut p = src.create_partition_source(&[0, 2]).unwrap();
         let mut all = Vec::new();

@@ -5,17 +5,17 @@ use std::marker::PhantomData;
 
 use async_trait::async_trait;
 
-use crate::arrow::{BatchSink, RheiBuffer, RheiSchema};
+use crate::arrow::{RheiBuffer, RheiSchema, Sink};
 
 /// A sink that iterates over buffer rows and prints each via `Debug`.
 #[derive(Debug)]
-pub struct BatchPrintSink<T: RheiSchema> {
+pub struct PrintSink<T: RheiSchema> {
     prefix: Option<String>,
     _marker: PhantomData<T>,
 }
 
-impl<T: RheiSchema> BatchPrintSink<T> {
-    /// Creates a new `BatchPrintSink` with no prefix.
+impl<T: RheiSchema> PrintSink<T> {
+    /// Creates a new `PrintSink` with no prefix.
     pub fn new() -> Self {
         Self {
             prefix: None,
@@ -30,14 +30,14 @@ impl<T: RheiSchema> BatchPrintSink<T> {
     }
 }
 
-impl<T: RheiSchema> Default for BatchPrintSink<T> {
+impl<T: RheiSchema> Default for PrintSink<T> {
     fn default() -> Self {
         Self::new()
     }
 }
 
 #[async_trait]
-impl<T: RheiSchema + Sync> BatchSink for BatchPrintSink<T>
+impl<T: RheiSchema + Sync> Sink for PrintSink<T>
 where
     for<'a> T::View<'a>: Debug,
 {

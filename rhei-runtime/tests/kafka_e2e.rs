@@ -7,7 +7,7 @@
 //! Pipeline topology:
 //!
 //! ```text
-//! BatchKafkaSource([orders_topic])
+//! KafkaSource([orders_topic])
 //!   → map(parse → OrderEvent)
 //!   → filter_fn(amount > 50)
 //!   → operator("aggregator", PerUserAggregator)
@@ -31,10 +31,9 @@ use rdkafka::ClientConfig;
 use rdkafka::admin::{AdminClient, AdminOptions, NewTopic, TopicReplication};
 use rdkafka::producer::{FutureProducer, FutureRecord};
 use rhei_core::arrow::{
-    BatchSink, BatchStreamFunction, BufferOutput, OperatorContext, RheiBuffer, RheiBuilder,
-    RheiSchema,
+    BufferOutput, OperatorContext, RheiBuffer, RheiBuilder, RheiSchema, Sink, StreamFunction,
 };
-use rhei_core::connectors::batch::BatchKafkaSource;
+use rhei_core::connectors::batch::KafkaSource;
 use rhei_core::operators::batch::keyed_state::KeyedState;
 use rhei_runtime::controller::PipelineController;
 use rhei_runtime::dataflow::DataflowGraph;
@@ -248,7 +247,7 @@ impl RheiSchema for UserTotal {
 struct PerUserAggregator;
 
 #[async_trait]
-impl BatchStreamFunction for PerUserAggregator {
+impl StreamFunction for PerUserAggregator {
     type Input = OrderEvent;
     type Output = UserTotal;
 
@@ -299,7 +298,7 @@ struct CollectSink {
 }
 
 #[async_trait]
-impl BatchSink for CollectSink {
+impl Sink for CollectSink {
     type Input = UserTotal;
 
     async fn write_batch(&mut self, input: RheiBuffer<UserTotal>) -> anyhow::Result<()> {
@@ -411,7 +410,7 @@ async fn kafka_batch_aggregation_e2e() {
     let collected = Arc::new(Mutex::new(Vec::<(String, f64)>::new()));
 
     let group_id = format!("rhei_batch_e2e_group_{}", std::process::id());
-    let source = BatchKafkaSource::new(&brokers(), &group_id, &[&orders_topic])
+    let source = KafkaSource::new(&brokers(), &group_id, &[&orders_topic])
         .unwrap()
         .with_batch_size(50)
         .with_poll_timeout(Duration::from_millis(200));
@@ -527,7 +526,7 @@ async fn kafka_multi_partition_batch_e2e() {
     let collected = Arc::new(Mutex::new(Vec::<(String, f64)>::new()));
 
     let group_id = format!("rhei_batch_mp_e2e_group_{}", std::process::id());
-    let source = BatchKafkaSource::new(&brokers(), &group_id, &[&orders_topic])
+    let source = KafkaSource::new(&brokers(), &group_id, &[&orders_topic])
         .unwrap()
         .with_batch_size(50)
         .with_poll_timeout(Duration::from_millis(200));

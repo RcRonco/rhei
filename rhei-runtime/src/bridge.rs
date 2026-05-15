@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use crate::erased_batch::{ErasedBatchSink, ErasedBatchSource};
+use crate::erased_batch::{ErasedSink, ErasedSource};
 use crate::erased_buffer::ErasedBuffer;
 use crate::shutdown::ShutdownHandle;
 
@@ -13,17 +13,17 @@ pub const DEFAULT_CHANNEL_SIZE: usize = 16;
 
 /// A batch produced by the batch source bridge, carrying an `ErasedBuffer`
 /// and an optional watermark.
-pub(crate) type BatchSourceBatch = (ErasedBuffer, Option<u64>);
+pub(crate) type SourceBatch = (ErasedBuffer, Option<u64>);
 
-/// Bridges a type-erased [`ErasedBatchSource`] into a `flume::Sender`,
+/// Bridges a type-erased [`ErasedSource`] into a `flume::Sender`,
 /// suitable for `spawn` on the shared Tokio runtime.
 ///
 /// Reads batches from the source and sends `(ErasedBuffer, watermark)` tuples
 /// through the flume channel. The watermark is committed by the Timely source
 /// operator after emitting items, ensuring it never races ahead of the data.
 pub(crate) async fn local_batch_source_bridge(
-    mut source: Box<dyn ErasedBatchSource>,
-    tx: flume::Sender<BatchSourceBatch>,
+    mut source: Box<dyn ErasedSource>,
+    tx: flume::Sender<SourceBatch>,
     offsets_writer: Arc<Mutex<HashMap<String, String>>>,
     wm_writer: Arc<AtomicU64>,
     shutdown: Option<ShutdownHandle>,
@@ -55,12 +55,12 @@ pub(crate) async fn local_batch_source_bridge(
     );
 }
 
-/// Bridges an [`ErasedBatchSink`] to a `flume::Receiver` for batch writes.
+/// Bridges an [`ErasedSink`] to a `flume::Receiver` for batch writes.
 ///
 /// Reads `ErasedBuffer` batches from the channel and writes them to the sink.
 /// Flushes when the channel closes.
 pub(crate) async fn batch_sink_drain(
-    mut sink: Box<dyn ErasedBatchSink>,
+    mut sink: Box<dyn ErasedSink>,
     rx: flume::Receiver<ErasedBuffer>,
 ) -> anyhow::Result<()> {
     while let Ok(buf) = rx.recv_async().await {
@@ -75,13 +75,13 @@ pub(crate) async fn batch_sink_drain(
 mod tests {
     use super::*;
 
-    struct MockBatchSource {
+    struct MockSource {
         buffers: Vec<ErasedBuffer>,
         idx: usize,
         watermark: Option<u64>,
     }
 
-    impl MockBatchSource {
+    impl MockSource {
         fn new(buffers: Vec<ErasedBuffer>) -> Self {
             Self {
                 buffers,
@@ -98,7 +98,7 @@ mod tests {
     }
 
     #[async_trait::async_trait]
-    impl ErasedBatchSource for MockBatchSource {
+    impl ErasedSource for MockSource {
         async fn next_batch(&mut self) -> Option<ErasedBuffer> {
             if self.idx < self.buffers.len() {
                 let buf = self.buffers[self.idx].clone();
@@ -128,10 +128,7 @@ mod tests {
             None
         }
 
-        fn create_partition_source(
-            &self,
-            _assigned: &[usize],
-        ) -> Option<Box<dyn ErasedBatchSource>> {
+        fn create_partition_source(&self, _assigned: &[usize]) -> Option<Box<dyn ErasedSource>> {
             None
         }
 
@@ -142,7 +139,7 @@ mod tests {
 
     #[tokio::test]
     async fn batch_bridge_sets_exhausted_sentinel() {
-        let source = MockBatchSource::new(vec![]);
+        let source = MockSource::new(vec![]);
         let (tx, rx) = flume::bounded(16);
         let offsets = Arc::new(Mutex::new(HashMap::new()));
         let wm = Arc::new(AtomicU64::new(0));

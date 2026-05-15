@@ -10,14 +10,14 @@ use rdkafka::consumer::{Consumer, StreamConsumer};
 use rdkafka::message::{Headers, Message};
 use rdkafka::{ClientConfig, TopicPartitionList};
 
-use crate::arrow::{BatchSource, RheiBuffer, RheiBuilder, RheiSchema};
+use crate::arrow::{RheiBuffer, RheiBuilder, RheiSchema, Source};
 use crate::connectors::kafka::types::KafkaMessage;
 
 /// A batch Kafka source that produces Arrow buffers of [`KafkaMessage`].
 ///
 /// Polls messages from Kafka topics and builds `RheiBuffer<KafkaMessage>` batches.
 /// Offset commits are deferred until checkpoint completes.
-pub struct BatchKafkaSource {
+pub struct KafkaSource {
     consumer: StreamConsumer,
     batch_size: usize,
     poll_timeout: Duration,
@@ -32,9 +32,9 @@ pub struct BatchKafkaSource {
     topics: Vec<String>,
 }
 
-impl std::fmt::Debug for BatchKafkaSource {
+impl std::fmt::Debug for KafkaSource {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("BatchKafkaSource")
+        f.debug_struct("KafkaSource")
             .field("batch_size", &self.batch_size)
             .field("poll_timeout", &self.poll_timeout)
             .field("watermark_interval", &self.watermark_interval)
@@ -42,8 +42,8 @@ impl std::fmt::Debug for BatchKafkaSource {
     }
 }
 
-impl BatchKafkaSource {
-    /// Create a new `BatchKafkaSource` that consumes from the given topics.
+impl KafkaSource {
+    /// Create a new `KafkaSource` that consumes from the given topics.
     pub fn new(brokers: &str, group_id: &str, topics: &[&str]) -> anyhow::Result<Self> {
         let consumer: StreamConsumer = ClientConfig::new()
             .set("bootstrap.servers", brokers)
@@ -172,7 +172,7 @@ impl BatchKafkaSource {
 }
 
 #[async_trait]
-impl BatchSource for BatchKafkaSource {
+impl Source for KafkaSource {
     type Output = KafkaMessage;
 
     async fn next_batch(&mut self) -> Option<RheiBuffer<KafkaMessage>> {
@@ -264,7 +264,7 @@ impl BatchSource for BatchKafkaSource {
     fn create_partition_source(
         &self,
         assigned: &[usize],
-    ) -> Option<Box<dyn BatchSource<Output = Self::Output>>> {
+    ) -> Option<Box<dyn Source<Output = Self::Output>>> {
         if self.brokers.is_empty() || self.topics.is_empty() {
             return None;
         }

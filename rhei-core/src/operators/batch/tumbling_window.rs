@@ -14,7 +14,7 @@ use serde::de::DeserializeOwned;
 
 use super::keyed_state::KeyedState;
 use crate::arrow::{
-    BatchStreamFunction, BufferOutput, OperatorContext, RheiBuffer, RheiBuilder, RheiSchema,
+    BufferOutput, OperatorContext, RheiBuffer, RheiBuilder, RheiSchema, StreamFunction,
 };
 
 /// A batch tumbling (fixed-size, non-overlapping) window operator.
@@ -28,7 +28,7 @@ use crate::arrow::{
 /// - `TF` — timestamp extraction: `Fn(I::View<'_>) -> u64`
 /// - `AF` — accumulation: `Fn(&mut Acc, I::View<'_>)`
 /// - `FF` — finish: `Fn(&str, u64, u64, &Acc) -> O` (key, `window_start`, `window_end`, acc)
-pub struct BatchTumblingWindow<I, O, Acc, KF, TF, AF, FF> {
+pub struct TumblingWindow<I, O, Acc, KF, TF, AF, FF> {
     window_size: u64,
     key_fn: KF,
     time_fn: TF,
@@ -41,7 +41,7 @@ pub struct BatchTumblingWindow<I, O, Acc, KF, TF, AF, FF> {
 }
 
 impl<I, O, Acc, KF: Clone, TF: Clone, AF: Clone, FF: Clone> Clone
-    for BatchTumblingWindow<I, O, Acc, KF, TF, AF, FF>
+    for TumblingWindow<I, O, Acc, KF, TF, AF, FF>
 {
     fn clone(&self) -> Self {
         Self {
@@ -58,9 +58,9 @@ impl<I, O, Acc, KF: Clone, TF: Clone, AF: Clone, FF: Clone> Clone
     }
 }
 
-impl<I, O, Acc, KF, TF, AF, FF> fmt::Debug for BatchTumblingWindow<I, O, Acc, KF, TF, AF, FF> {
+impl<I, O, Acc, KF, TF, AF, FF> fmt::Debug for TumblingWindow<I, O, Acc, KF, TF, AF, FF> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("BatchTumblingWindow")
+        f.debug_struct("TumblingWindow")
             .field("window_size", &self.window_size)
             .field("allowed_lateness", &self.allowed_lateness)
             .field("active_windows", &self.active_windows.len())
@@ -68,7 +68,7 @@ impl<I, O, Acc, KF, TF, AF, FF> fmt::Debug for BatchTumblingWindow<I, O, Acc, KF
     }
 }
 
-impl<I, O, Acc, KF, TF, AF, FF> BatchTumblingWindow<I, O, Acc, KF, TF, AF, FF> {
+impl<I, O, Acc, KF, TF, AF, FF> TumblingWindow<I, O, Acc, KF, TF, AF, FF> {
     /// Creates a new batch tumbling window operator.
     pub fn new(
         window_size: u64,
@@ -99,8 +99,7 @@ impl<I, O, Acc, KF, TF, AF, FF> BatchTumblingWindow<I, O, Acc, KF, TF, AF, FF> {
 }
 
 #[async_trait]
-impl<I, O, Acc, KF, TF, AF, FF> BatchStreamFunction
-    for BatchTumblingWindow<I, O, Acc, KF, TF, AF, FF>
+impl<I, O, Acc, KF, TF, AF, FF> StreamFunction for TumblingWindow<I, O, Acc, KF, TF, AF, FF>
 where
     I: RheiSchema,
     O: RheiSchema,
@@ -504,7 +503,7 @@ mod tests {
     }
 
     #[allow(clippy::type_complexity)]
-    fn make_window() -> BatchTumblingWindow<
+    fn make_window() -> TumblingWindow<
         Event,
         WinOut,
         u64,
@@ -513,7 +512,7 @@ mod tests {
         impl for<'a> Fn(&mut u64, <Event as RheiSchemaTrait>::View<'a>) + Send + Sync,
         impl Fn(&str, u64, u64, &u64) -> WinOut + Send + Sync,
     > {
-        BatchTumblingWindow::new(
+        TumblingWindow::new(
             10,
             |view: EventView<'_>| view.key.to_string(),
             |view: EventView<'_>| view.ts,

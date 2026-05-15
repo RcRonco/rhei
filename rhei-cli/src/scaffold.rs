@@ -145,22 +145,22 @@ log_level = "info"
     )
 }
 
-const MAIN_RS: &str = r#"use rhei_core::connectors::batch::{BatchPrintSink, BatchVecSource};
+const MAIN_RS: &str = r#"use rhei_core::connectors::batch::{PrintSink, VecSource};
 use rhei_runtime::dataflow::DataflowGraph;
 use rhei_runtime::Executor;
 
 /// A minimal Rhei streaming pipeline using Arrow columnar processing.
 ///
 /// This example reads i64 values from an in-memory source and prints them.
-/// Replace `BatchVecSource` with `BatchKafkaSource` for production use.
+/// Replace `VecSource` with `KafkaSource` for production use.
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let data: Vec<i64> = (0..10).collect();
 
     let graph = DataflowGraph::new();
     graph
-        .batch_source(BatchVecSource::new(data))
-        .sink(BatchPrintSink::<i64>::new());
+        .batch_source(VecSource::new(data))
+        .sink(PrintSink::<i64>::new());
 
     let executor = Executor::builder()
         .checkpoint_dir("./checkpoints")

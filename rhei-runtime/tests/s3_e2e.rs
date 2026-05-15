@@ -9,7 +9,7 @@
 //! Pipeline topology:
 //!
 //! ```text
-//! BatchVecSource(words) → WordCounter(KeyedState) → CollectSink
+//! VecSource(words) → WordCounter(KeyedState) → CollectSink
 //! ```
 
 use std::collections::HashMap;
@@ -20,10 +20,9 @@ use futures::TryStreamExt;
 use object_store::ObjectStore;
 use object_store::aws::AmazonS3Builder;
 use rhei_core::arrow::{
-    BatchSink, BatchStreamFunction, BufferOutput, OperatorContext, RheiBuffer, RheiBuilder,
-    RheiSchema,
+    BufferOutput, OperatorContext, RheiBuffer, RheiBuilder, RheiSchema, Sink, StreamFunction,
 };
-use rhei_core::connectors::batch::BatchVecSource;
+use rhei_core::connectors::batch::VecSource;
 use rhei_core::operators::batch::keyed_state::KeyedState;
 use rhei_core::state::backend::StateBackend;
 use rhei_core::state::slatedb_backend::SlateDbBackend;
@@ -235,7 +234,7 @@ impl RheiSchema for WordCount {
 struct BatchWordCounter;
 
 #[async_trait]
-impl BatchStreamFunction for BatchWordCounter {
+impl StreamFunction for BatchWordCounter {
     type Input = WordEvent;
     type Output = WordCount;
 
@@ -282,7 +281,7 @@ struct CollectSink {
 }
 
 #[async_trait]
-impl BatchSink for CollectSink {
+impl Sink for CollectSink {
     type Input = WordCount;
 
     async fn write_batch(&mut self, input: RheiBuffer<WordCount>) -> anyhow::Result<()> {
@@ -370,7 +369,7 @@ async fn s3_tiered_storage_e2e() {
     let expected = expected_counts(&words);
     let collected = Arc::new(Mutex::new(Vec::<(String, u64)>::new()));
 
-    let source = BatchVecSource::new(words).with_batch_size(50);
+    let source = VecSource::new(words).with_batch_size(50);
 
     let graph = DataflowGraph::new();
     graph

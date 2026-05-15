@@ -3,7 +3,7 @@
 //!
 //! Pipeline with 2 workers:
 //! ```text
-//! BatchPartitionedVecSource(items, 4 partitions) → CollectSink
+//! PartitionedVecSource(items, 4 partitions) → CollectSink
 //! ```
 //! Verify: all items reach the sink, proving that partition assignment
 //! distributes work to all workers (not just worker 0).
@@ -11,8 +11,8 @@
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use rhei_core::arrow::{BatchSink, RheiBuffer, RheiBuilder, RheiSchema};
-use rhei_core::connectors::batch::BatchPartitionedVecSource;
+use rhei_core::arrow::{RheiBuffer, RheiBuilder, RheiSchema, Sink};
+use rhei_core::connectors::batch::PartitionedVecSource;
 use rhei_runtime::controller::PipelineController;
 use rhei_runtime::dataflow::DataflowGraph;
 
@@ -108,7 +108,7 @@ struct CollectSink {
 }
 
 #[async_trait]
-impl BatchSink for CollectSink {
+impl Sink for CollectSink {
     type Input = IndexEvent;
 
     async fn write_batch(&mut self, input: RheiBuffer<IndexEvent>) -> anyhow::Result<()> {
@@ -133,7 +133,7 @@ async fn partitioned_source_distributes_to_workers() {
     let collected = Arc::new(Mutex::new(Vec::<i64>::new()));
 
     let items: Vec<IndexEvent> = (0..20).map(|i| IndexEvent { idx: i }).collect();
-    let source = BatchPartitionedVecSource::new(items, 4).with_batch_size(5);
+    let source = PartitionedVecSource::new(items, 4).with_batch_size(5);
 
     let graph = DataflowGraph::new();
     graph.batch_source(source).sink(CollectSink {
@@ -164,7 +164,7 @@ async fn partitioned_source_with_more_workers_than_partitions() {
 
     let items: Vec<IndexEvent> = (0..6).map(|i| IndexEvent { idx: i }).collect();
     // 2 partitions, 4 workers — some workers will have no partitions assigned
-    let source = BatchPartitionedVecSource::new(items, 2).with_batch_size(10);
+    let source = PartitionedVecSource::new(items, 2).with_batch_size(10);
 
     let graph = DataflowGraph::new();
     graph.batch_source(source).sink(CollectSink {

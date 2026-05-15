@@ -5,8 +5,8 @@
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use rhei_core::arrow::{BatchSink, RheiBuffer, RheiBuilder, RheiSchema};
-use rhei_core::connectors::batch::BatchVecSource;
+use rhei_core::arrow::{RheiBuffer, RheiBuilder, RheiSchema, Sink};
+use rhei_core::connectors::batch::VecSource;
 use rhei_runtime::controller::PipelineController;
 use rhei_runtime::dataflow::DataflowGraph;
 
@@ -101,7 +101,7 @@ struct CollectSink {
 }
 
 #[async_trait]
-impl BatchSink for CollectSink {
+impl Sink for CollectSink {
     type Input = NumEvent;
 
     async fn write_batch(&mut self, input: RheiBuffer<NumEvent>) -> anyhow::Result<()> {
@@ -126,7 +126,7 @@ async fn inspect_does_not_modify_stream() {
     let inspected = Arc::new(Mutex::new(Vec::<i64>::new()));
     let inspected_clone = inspected.clone();
 
-    let source = BatchVecSource::new(make_events(&[1, 2, 3, 4, 5])).with_batch_size(10);
+    let source = VecSource::new(make_events(&[1, 2, 3, 4, 5])).with_batch_size(10);
     let graph = DataflowGraph::new();
     graph
         .batch_source(source)
@@ -154,7 +154,7 @@ async fn limit_caps_output() {
     let checkpoint_dir = tempfile::tempdir().unwrap();
     let collected = Arc::new(Mutex::new(Vec::<i64>::new()));
 
-    let source = BatchVecSource::new(make_events(&[10, 20, 30, 40, 50])).with_batch_size(10);
+    let source = VecSource::new(make_events(&[10, 20, 30, 40, 50])).with_batch_size(10);
     let graph = DataflowGraph::new();
     graph.batch_source(source).limit(3).sink(CollectSink {
         collected: collected.clone(),
@@ -175,7 +175,7 @@ async fn distinct_by_deduplicates() {
     let collected = Arc::new(Mutex::new(Vec::<i64>::new()));
 
     // Values: 1, 2, 2, 3, 3, 3 — distinct_by key = val → should get 1, 2, 3
-    let source = BatchVecSource::new(make_events(&[1, 2, 2, 3, 3, 3])).with_batch_size(10);
+    let source = VecSource::new(make_events(&[1, 2, 2, 3, 3, 3])).with_batch_size(10);
     let graph = DataflowGraph::new();
     graph
         .batch_source(source)
@@ -197,7 +197,7 @@ async fn name_does_not_affect_data() {
     let checkpoint_dir = tempfile::tempdir().unwrap();
     let collected = Arc::new(Mutex::new(Vec::<i64>::new()));
 
-    let source = BatchVecSource::new(make_events(&[7, 8, 9])).with_batch_size(10);
+    let source = VecSource::new(make_events(&[7, 8, 9])).with_batch_size(10);
     let graph = DataflowGraph::new();
     graph
         .batch_source(source)

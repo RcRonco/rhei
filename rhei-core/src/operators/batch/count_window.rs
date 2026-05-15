@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 
 use super::keyed_state::KeyedState;
 use crate::arrow::{
-    BatchStreamFunction, BufferOutput, OperatorContext, RheiBuffer, RheiBuilder, RheiSchema,
+    BufferOutput, OperatorContext, RheiBuffer, RheiBuilder, RheiSchema, StreamFunction,
 };
 
 #[derive(Serialize, Deserialize)]
@@ -40,7 +40,7 @@ impl<Acc: Default> Default for CountState<Acc> {
 /// - `KF` — key extraction
 /// - `AF` — accumulate function
 /// - `FF` — finish function: `Fn(&str, u64, &Acc) -> O` (key, count, acc)
-pub struct BatchCountWindow<I, O, Acc, KF, AF, FF> {
+pub struct CountWindow<I, O, Acc, KF, AF, FF> {
     threshold: u64,
     key_fn: KF,
     accumulate_fn: AF,
@@ -48,7 +48,7 @@ pub struct BatchCountWindow<I, O, Acc, KF, AF, FF> {
     _phantom: PhantomData<fn(I, Acc) -> O>,
 }
 
-impl<I, O, Acc, KF: Clone, AF: Clone, FF: Clone> Clone for BatchCountWindow<I, O, Acc, KF, AF, FF> {
+impl<I, O, Acc, KF: Clone, AF: Clone, FF: Clone> Clone for CountWindow<I, O, Acc, KF, AF, FF> {
     fn clone(&self) -> Self {
         Self {
             threshold: self.threshold,
@@ -60,15 +60,15 @@ impl<I, O, Acc, KF: Clone, AF: Clone, FF: Clone> Clone for BatchCountWindow<I, O
     }
 }
 
-impl<I, O, Acc, KF, AF, FF> fmt::Debug for BatchCountWindow<I, O, Acc, KF, AF, FF> {
+impl<I, O, Acc, KF, AF, FF> fmt::Debug for CountWindow<I, O, Acc, KF, AF, FF> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("BatchCountWindow")
+        f.debug_struct("CountWindow")
             .field("threshold", &self.threshold)
             .finish_non_exhaustive()
     }
 }
 
-impl<I, O, Acc, KF, AF, FF> BatchCountWindow<I, O, Acc, KF, AF, FF> {
+impl<I, O, Acc, KF, AF, FF> CountWindow<I, O, Acc, KF, AF, FF> {
     /// Creates a new count window that fires after `threshold` elements per key.
     pub fn new(threshold: u64, key_fn: KF, accumulate_fn: AF, finish_fn: FF) -> Self {
         assert!(threshold > 0, "threshold must be > 0");
@@ -83,7 +83,7 @@ impl<I, O, Acc, KF, AF, FF> BatchCountWindow<I, O, Acc, KF, AF, FF> {
 }
 
 #[async_trait]
-impl<I, O, Acc, KF, AF, FF> BatchStreamFunction for BatchCountWindow<I, O, Acc, KF, AF, FF>
+impl<I, O, Acc, KF, AF, FF> StreamFunction for CountWindow<I, O, Acc, KF, AF, FF>
 where
     I: RheiSchema,
     O: RheiSchema,
@@ -330,7 +330,7 @@ mod tests {
     #[tokio::test]
     async fn fires_at_threshold() {
         let mut ctx = test_ctx("fire");
-        let mut win = BatchCountWindow::new(
+        let mut win = CountWindow::new(
             3,
             |v: EventView<'_>| v.key.to_string(),
             |acc: &mut u64, _v: EventView<'_>| *acc += 1,
@@ -358,7 +358,7 @@ mod tests {
     #[tokio::test]
     async fn resets_after_fire() {
         let mut ctx = test_ctx("reset");
-        let mut win = BatchCountWindow::new(
+        let mut win = CountWindow::new(
             2,
             |v: EventView<'_>| v.key.to_string(),
             |acc: &mut u64, _v: EventView<'_>| *acc += 1,
@@ -380,7 +380,7 @@ mod tests {
     #[tokio::test]
     async fn independent_keys() {
         let mut ctx = test_ctx("keys");
-        let mut win = BatchCountWindow::new(
+        let mut win = CountWindow::new(
             2,
             |v: EventView<'_>| v.key.to_string(),
             |acc: &mut u64, _v: EventView<'_>| *acc += 1,

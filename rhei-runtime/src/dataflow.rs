@@ -1,6 +1,6 @@
 //! Dataflow graph API for building batch (Arrow columnar) stream processing pipelines.
 //!
-//! Provides [`DataflowGraph`] as a standalone builder and [`BatchStream<T>`]
+//! Provides [`DataflowGraph`] as a standalone builder and [`Stream<T>`]
 //! as a lightweight, copyable handle into it. Operations like `.map()`,
 //! `.filter()`, `.flat_map()`, and `.operator()` add nodes to the graph.
 //! Pass the finished graph to
@@ -27,11 +27,10 @@ use std::cell::RefCell;
 use std::marker::PhantomData;
 use std::sync::Arc;
 
-use rhei_core::arrow::{BatchSink, BatchSource, BatchStreamFunction, RheiSchema};
+use rhei_core::arrow::{RheiSchema, Sink, Source, StreamFunction};
 
 use crate::erased_batch::{
-    BatchOperatorWrapper, BatchSinkWrapper, BatchSourceWrapper, ErasedBatchOperator,
-    ErasedBatchSink, ErasedBatchSource,
+    BatchOperatorWrapper, ErasedBatchOperator, ErasedSink, ErasedSource, SinkWrapper, SourceWrapper,
 };
 use crate::erased_buffer::{BatchKeyFn, ErasedBuffer};
 
@@ -44,8 +43,8 @@ pub(crate) struct NodeId(pub(crate) usize);
 // ── Batch (Arrow) compile traits ────────────────────────────────────
 
 /// A batch source node that produces `ErasedBuffer` batches.
-pub(crate) trait BatchSourceNode: Send {
-    fn compile(self: Box<Self>) -> Box<dyn ErasedBatchSource>;
+pub(crate) trait SourceNode: Send {
+    fn compile(self: Box<Self>) -> Box<dyn ErasedSource>;
 }
 
 /// A batch operator node. Compiles to [`ErasedBatchOperator`].
@@ -53,9 +52,9 @@ pub(crate) trait BatchOperatorNode: Send {
     fn compile(self: Box<Self>) -> Box<dyn ErasedBatchOperator>;
 }
 
-/// A batch sink node. Compiles to [`ErasedBatchSink`].
-pub(crate) trait BatchSinkNode: Send {
-    fn compile(self: Box<Self>) -> Box<dyn ErasedBatchSink>;
+/// A batch sink node. Compiles to [`ErasedSink`].
+pub(crate) trait SinkNode: Send {
+    fn compile(self: Box<Self>) -> Box<dyn ErasedSink>;
 }
 
 /// A batch-level transform: `ErasedBuffer` → `Vec<ErasedBuffer>`.
@@ -63,40 +62,40 @@ pub(crate) type BatchTransformFn = Arc<dyn Fn(ErasedBuffer) -> Vec<ErasedBuffer>
 
 // ── Typed batch node wrappers ───────────────────────────────────────
 
-/// Wraps a typed [`BatchSource`] for deferred compilation.
-pub(crate) struct TypedBatchSourceNode<S: BatchSource>(pub(crate) S);
+/// Wraps a typed [`Source`] for deferred compilation.
+pub(crate) struct TypedSourceNode<S: Source>(pub(crate) S);
 
-impl<S> BatchSourceNode for TypedBatchSourceNode<S>
+impl<S> SourceNode for TypedSourceNode<S>
 where
-    S: BatchSource + 'static,
+    S: Source + 'static,
     S::Output: Sync,
 {
-    fn compile(self: Box<Self>) -> Box<dyn ErasedBatchSource> {
-        Box::new(BatchSourceWrapper(self.0))
+    fn compile(self: Box<Self>) -> Box<dyn ErasedSource> {
+        Box::new(SourceWrapper(self.0))
     }
 }
 
-/// Wraps a typed [`BatchStreamFunction`] for deferred compilation.
-pub(crate) struct TypedBatchOperatorNode<F: BatchStreamFunction>(pub(crate) F);
+/// Wraps a typed [`StreamFunction`] for deferred compilation.
+pub(crate) struct TypedBatchOperatorNode<F: StreamFunction>(pub(crate) F);
 
 impl<F> BatchOperatorNode for TypedBatchOperatorNode<F>
 where
-    F: BatchStreamFunction + Clone + 'static,
+    F: StreamFunction + Clone + 'static,
 {
     fn compile(self: Box<Self>) -> Box<dyn ErasedBatchOperator> {
         Box::new(BatchOperatorWrapper(self.0))
     }
 }
 
-/// Wraps a typed [`BatchSink`] for deferred compilation.
-pub(crate) struct TypedBatchSinkNode<K: BatchSink>(pub(crate) K);
+/// Wraps a typed [`Sink`] for deferred compilation.
+pub(crate) struct TypedSinkNode<K: Sink>(pub(crate) K);
 
-impl<K> BatchSinkNode for TypedBatchSinkNode<K>
+impl<K> SinkNode for TypedSinkNode<K>
 where
-    K: BatchSink + 'static,
+    K: Sink + 'static,
 {
-    fn compile(self: Box<Self>) -> Box<dyn ErasedBatchSink> {
-        Box::new(BatchSinkWrapper(self.0))
+    fn compile(self: Box<Self>) -> Box<dyn ErasedSink> {
+        Box::new(SinkWrapper(self.0))
     }
 }
 
@@ -128,7 +127,7 @@ impl LazyBatchKeyByNode {
 #[allow(clippy::enum_variant_names)] // all variants are batch-only after row API removal
 pub(crate) enum NodeKind {
     /// A batch data source producing `ErasedBuffer` batches.
-    BatchSource(Box<dyn BatchSourceNode>),
+    Source(Box<dyn SourceNode>),
     /// A batch stateless transform (`ErasedBuffer` → `Vec<ErasedBuffer>`).
     BatchTransform(LazyBatchTransformNode),
     /// A batch stateful operator.
@@ -139,7 +138,7 @@ pub(crate) enum NodeKind {
         op: Box<dyn BatchOperatorNode>,
     },
     /// A batch data sink consuming `ErasedBuffer` batches.
-    BatchSink(Box<dyn BatchSinkNode>),
+    Sink(Box<dyn SinkNode>),
     /// Key-based exchange: partitions rows by key hash and routes to workers.
     BatchKeyBy(LazyBatchKeyByNode),
     /// Merges multiple streams into one (Timely Concatenate).
@@ -160,7 +159,7 @@ pub(crate) struct GraphNode {
 ///
 /// Build a graph by calling [`batch_source()`](Self::batch_source) to create
 /// entry points, then chaining transforms and sinks on the returned
-/// [`BatchStream`] handles. Pass the finished graph to
+/// [`Stream`] handles. Pass the finished graph to
 /// [`Executor::run()`](crate::executor::Executor::run) for execution.
 ///
 /// Uses interior mutability (`RefCell`) so stream handles can add nodes
@@ -187,17 +186,14 @@ impl DataflowGraph {
         }
     }
 
-    /// Add a batch (Arrow columnar) data source. Returns a [`BatchStream`] handle.
-    pub fn batch_source<S>(&self, source: S) -> BatchStream<'_, S::Output>
+    /// Add a batch (Arrow columnar) data source. Returns a [`Stream`] handle.
+    pub fn batch_source<S>(&self, source: S) -> Stream<'_, S::Output>
     where
-        S: BatchSource + 'static,
+        S: Source + 'static,
         S::Output: Sync,
     {
-        let id = self.add_node(
-            NodeKind::BatchSource(Box::new(TypedBatchSourceNode(source))),
-            vec![],
-        );
-        BatchStream::new(self, id)
+        let id = self.add_node(NodeKind::Source(Box::new(TypedSourceNode(source))), vec![]);
+        Stream::new(self, id)
     }
 
     /// Add a node and return its ID.
@@ -313,16 +309,12 @@ impl DataflowGraph {
             return Err(ValidationError::EmptyGraph);
         }
 
-        let has_sources = nodes
-            .iter()
-            .any(|n| matches!(n.kind, NodeKind::BatchSource(_)));
+        let has_sources = nodes.iter().any(|n| matches!(n.kind, NodeKind::Source(_)));
         if !has_sources {
             return Err(ValidationError::NoSources);
         }
 
-        let has_sinks = nodes
-            .iter()
-            .any(|n| matches!(n.kind, NodeKind::BatchSink(_)));
+        let has_sinks = nodes.iter().any(|n| matches!(n.kind, NodeKind::Sink(_)));
         if !has_sinks {
             return Err(ValidationError::NoSinks);
         }
@@ -340,18 +332,18 @@ impl DataflowGraph {
         let dangling: Vec<(usize, String)> = nodes
             .iter()
             .filter(|node| {
-                successors[node.id.0].is_empty() && !matches!(node.kind, NodeKind::BatchSink(_))
+                successors[node.id.0].is_empty() && !matches!(node.kind, NodeKind::Sink(_))
             })
             .map(|node| {
                 let kind_label = match &node.kind {
-                    NodeKind::BatchSource(_) => "source".to_string(),
+                    NodeKind::Source(_) => "source".to_string(),
                     NodeKind::BatchTransform(_) => "transform".to_string(),
                     NodeKind::BatchOperator { name, .. } => {
                         format!("operator \"{name}\"")
                     }
                     NodeKind::BatchKeyBy(_) => "key_by".to_string(),
                     NodeKind::BatchMerge => "merge".to_string(),
-                    NodeKind::BatchSink(_) => unreachable!(),
+                    NodeKind::Sink(_) => unreachable!(),
                 };
                 (node.id.0, kind_label)
             })
@@ -365,34 +357,34 @@ impl DataflowGraph {
     }
 }
 
-// ── BatchStream handle ──────────────────────────────────────────────
+// ── Stream handle ──────────────────────────────────────────────
 
 /// A lightweight handle representing a point in a batch (Arrow columnar) dataflow.
 ///
 /// `T` is the `RheiSchema` type flowing through this point. Operations add
 /// batch nodes to the graph and return new handles.
-pub struct BatchStream<'a, T: RheiSchema> {
+pub struct Stream<'a, T: RheiSchema> {
     graph: &'a DataflowGraph,
     node_id: NodeId,
     _phantom: PhantomData<T>,
 }
 
-impl<T: RheiSchema> std::fmt::Debug for BatchStream<'_, T> {
+impl<T: RheiSchema> std::fmt::Debug for Stream<'_, T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("BatchStream")
+        f.debug_struct("Stream")
             .field("node_id", &self.node_id)
             .finish_non_exhaustive()
     }
 }
 
-impl<T: RheiSchema> Clone for BatchStream<'_, T> {
+impl<T: RheiSchema> Clone for Stream<'_, T> {
     fn clone(&self) -> Self {
         *self
     }
 }
-impl<T: RheiSchema> Copy for BatchStream<'_, T> {}
+impl<T: RheiSchema> Copy for Stream<'_, T> {}
 
-impl<'a, T: RheiSchema + 'static> BatchStream<'a, T> {
+impl<'a, T: RheiSchema + 'static> Stream<'a, T> {
     pub(crate) fn new(graph: &'a DataflowGraph, node_id: NodeId) -> Self {
         Self {
             graph,
@@ -402,7 +394,7 @@ impl<'a, T: RheiSchema + 'static> BatchStream<'a, T> {
     }
 
     /// Per-row map transform. Iterates views, builds output buffer.
-    pub fn map<F, O>(self, f: F) -> BatchStream<'a, O>
+    pub fn map<F, O>(self, f: F) -> Stream<'a, O>
     where
         F: Fn(T::View<'_>) -> O + Send + Sync + 'static,
         O: RheiSchema + 'static,
@@ -433,11 +425,11 @@ impl<'a, T: RheiSchema + 'static> BatchStream<'a, T> {
         let node_id = self
             .graph
             .add_node(NodeKind::BatchTransform(node), vec![self.node_id]);
-        BatchStream::new(self.graph, node_id)
+        Stream::new(self.graph, node_id)
     }
 
     /// Closure-based zero-copy filter. Builds a selection mask from the predicate.
-    pub fn filter_fn<F>(self, f: F) -> BatchStream<'a, T>
+    pub fn filter_fn<F>(self, f: F) -> Stream<'a, T>
     where
         F: Fn(&T::View<'_>) -> bool + Send + Sync + 'static,
     {
@@ -472,11 +464,11 @@ impl<'a, T: RheiSchema + 'static> BatchStream<'a, T> {
         let node_id = self
             .graph
             .add_node(NodeKind::BatchTransform(node), vec![self.node_id]);
-        BatchStream::new(self.graph, node_id)
+        Stream::new(self.graph, node_id)
     }
 
     /// Expression-based zero-copy filter using Arrow compute kernels.
-    pub fn filter(self, expr: rhei_core::operators::batch::Expr) -> BatchStream<'a, T> {
+    pub fn filter(self, expr: rhei_core::operators::batch::Expr) -> Stream<'a, T> {
         let node = LazyBatchTransformNode(Box::new(move || {
             let expr = expr.clone();
             Arc::new(move |buf: ErasedBuffer| {
@@ -509,11 +501,11 @@ impl<'a, T: RheiSchema + 'static> BatchStream<'a, T> {
         let node_id = self
             .graph
             .add_node(NodeKind::BatchTransform(node), vec![self.node_id]);
-        BatchStream::new(self.graph, node_id)
+        Stream::new(self.graph, node_id)
     }
 
     /// Per-row flat-map transform. Each view produces zero or more output rows.
-    pub fn flat_map<F, O>(self, f: F) -> BatchStream<'a, O>
+    pub fn flat_map<F, O>(self, f: F) -> Stream<'a, O>
     where
         F: Fn(T::View<'_>) -> Vec<O> + Send + Sync + 'static,
         O: RheiSchema + 'static,
@@ -549,13 +541,13 @@ impl<'a, T: RheiSchema + 'static> BatchStream<'a, T> {
         let node_id = self
             .graph
             .add_node(NodeKind::BatchTransform(node), vec![self.node_id]);
-        BatchStream::new(self.graph, node_id)
+        Stream::new(self.graph, node_id)
     }
 
     /// Add a stateful batch operator.
-    pub fn operator<F>(self, name: &str, func: F) -> BatchStream<'a, F::Output>
+    pub fn operator<F>(self, name: &str, func: F) -> Stream<'a, F::Output>
     where
-        F: BatchStreamFunction<Input = T> + Clone + Send + 'static,
+        F: StreamFunction<Input = T> + Clone + Send + 'static,
     {
         let node_id = self.graph.add_node(
             NodeKind::BatchOperator {
@@ -564,12 +556,12 @@ impl<'a, T: RheiSchema + 'static> BatchStream<'a, T> {
             },
             vec![self.node_id],
         );
-        BatchStream::new(self.graph, node_id)
+        Stream::new(self.graph, node_id)
     }
 
     /// Key-based exchange: partitions rows by key hash and routes them
     /// so that all rows with the same key land on the same worker.
-    pub fn key_by<F>(self, key_fn: F) -> BatchStream<'a, T>
+    pub fn key_by<F>(self, key_fn: F) -> Stream<'a, T>
     where
         F: for<'v> Fn(&T::View<'v>) -> String + Send + Sync + 'static,
     {
@@ -582,25 +574,25 @@ impl<'a, T: RheiSchema + 'static> BatchStream<'a, T> {
         let node_id = self
             .graph
             .add_node(NodeKind::BatchKeyBy(node), vec![self.node_id]);
-        BatchStream::new(self.graph, node_id)
+        Stream::new(self.graph, node_id)
     }
 
     /// Merge two streams of the same type into one.
-    pub fn merge(self, other: BatchStream<'a, T>) -> BatchStream<'a, T> {
+    pub fn merge(self, other: Stream<'a, T>) -> Stream<'a, T> {
         let node_id = self
             .graph
             .add_node(NodeKind::BatchMerge, vec![self.node_id, other.node_id]);
-        BatchStream::new(self.graph, node_id)
+        Stream::new(self.graph, node_id)
     }
 
     /// Assign a human-readable name to this stream point for debugging.
-    pub fn name(self, label: &str) -> BatchStream<'a, T> {
+    pub fn name(self, label: &str) -> Stream<'a, T> {
         self.graph.set_label(self.node_id, label.to_string());
         self
     }
 
     /// Side-effect inspection: calls the closure for each row without modifying the stream.
-    pub fn inspect<F>(self, f: F) -> BatchStream<'a, T>
+    pub fn inspect<F>(self, f: F) -> Stream<'a, T>
     where
         F: Fn(&T::View<'_>) + Send + Sync + 'static,
     {
@@ -622,11 +614,11 @@ impl<'a, T: RheiSchema + 'static> BatchStream<'a, T> {
         let node_id = self
             .graph
             .add_node(NodeKind::BatchTransform(node), vec![self.node_id]);
-        BatchStream::new(self.graph, node_id)
+        Stream::new(self.graph, node_id)
     }
 
     /// Limit the stream to at most `max` rows total, then stop producing output.
-    pub fn limit(self, max: usize) -> BatchStream<'a, T> {
+    pub fn limit(self, max: usize) -> Stream<'a, T> {
         use std::sync::atomic::{AtomicUsize, Ordering};
         let remaining = Arc::new(AtomicUsize::new(max));
 
@@ -665,11 +657,11 @@ impl<'a, T: RheiSchema + 'static> BatchStream<'a, T> {
         let node_id = self
             .graph
             .add_node(NodeKind::BatchTransform(node), vec![self.node_id]);
-        BatchStream::new(self.graph, node_id)
+        Stream::new(self.graph, node_id)
     }
 
     /// Re-batch the stream: accumulate rows and emit in chunks of `size`.
-    pub fn batch(self, size: usize) -> BatchStream<'a, T> {
+    pub fn batch(self, size: usize) -> Stream<'a, T> {
         use std::sync::Mutex;
 
         let pending: Arc<Mutex<Vec<ErasedBuffer>>> = Arc::new(Mutex::new(Vec::new()));
@@ -701,11 +693,11 @@ impl<'a, T: RheiSchema + 'static> BatchStream<'a, T> {
         let node_id = self
             .graph
             .add_node(NodeKind::BatchTransform(node), vec![self.node_id]);
-        BatchStream::new(self.graph, node_id)
+        Stream::new(self.graph, node_id)
     }
 
     /// Deduplicate consecutive rows with the same key within each batch.
-    pub fn distinct_by<F>(self, key_fn: F) -> BatchStream<'a, T>
+    pub fn distinct_by<F>(self, key_fn: F) -> Stream<'a, T>
     where
         F: Fn(&T::View<'_>) -> String + Send + Sync + 'static,
     {
@@ -749,16 +741,16 @@ impl<'a, T: RheiSchema + 'static> BatchStream<'a, T> {
         let node_id = self
             .graph
             .add_node(NodeKind::BatchTransform(node), vec![self.node_id]);
-        BatchStream::new(self.graph, node_id)
+        Stream::new(self.graph, node_id)
     }
 
     /// Terminal: write buffers to a batch sink.
     pub fn sink<K>(self, sink: K)
     where
-        K: BatchSink<Input = T> + 'static,
+        K: Sink<Input = T> + 'static,
     {
         self.graph.add_node(
-            NodeKind::BatchSink(Box::new(TypedBatchSinkNode(sink))),
+            NodeKind::Sink(Box::new(TypedSinkNode(sink))),
             vec![self.node_id],
         );
     }

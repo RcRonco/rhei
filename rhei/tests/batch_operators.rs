@@ -2,8 +2,8 @@
 
 use rhei::RheiSchema;
 use rhei::arrow::{
-    BatchStreamFunction, BufferOutput, OperatorContext, RheiBuffer, RheiBuilder,
-    RheiSchema as RheiSchemaTrait,
+    BufferOutput, OperatorContext, RheiBuffer, RheiBuilder, RheiSchema as RheiSchemaTrait,
+    StreamFunction,
 };
 use rhei_core::state::context::StateContext;
 use rhei_core::state::local_backend::LocalBackend;
@@ -56,10 +56,10 @@ fn sample_buffer() -> RheiBuffer<InputEvent> {
 
 #[tokio::test]
 async fn batch_map_transforms_rows() {
-    use rhei_core::operators::batch::BatchMapOp;
+    use rhei_core::operators::batch::MapOp;
 
     let mut op =
-        BatchMapOp::new(
+        MapOp::new(
             |view: <InputEvent as rhei::arrow::RheiSchema>::View<'_>| OutputEvent {
                 id: view.id,
                 upper_name: view.name.to_uppercase(),
@@ -86,9 +86,9 @@ async fn batch_map_transforms_rows() {
 
 #[tokio::test]
 async fn batch_flat_map_expands_rows() {
-    use rhei_core::operators::batch::BatchFlatMapOp;
+    use rhei_core::operators::batch::FlatMapOp;
 
-    let mut op = BatchFlatMapOp::new(|view: <InputEvent as rhei::arrow::RheiSchema>::View<'_>| {
+    let mut op = FlatMapOp::new(|view: <InputEvent as rhei::arrow::RheiSchema>::View<'_>| {
         if view.score > 5.0 {
             vec![
                 OutputEvent {
@@ -118,12 +118,11 @@ async fn batch_flat_map_expands_rows() {
 
 #[tokio::test]
 async fn batch_filter_fn_zero_copy() {
-    use rhei_core::operators::batch::BatchFilterFnOp;
+    use rhei_core::operators::batch::FilterFnOp;
 
-    let mut op =
-        BatchFilterFnOp::new(|view: &<InputEvent as rhei::arrow::RheiSchema>::View<'_>| {
-            view.score > 5.0
-        });
+    let mut op = FilterFnOp::new(|view: &<InputEvent as rhei::arrow::RheiSchema>::View<'_>| {
+        view.score > 5.0
+    });
 
     let mut ctx = test_ctx("filter_fn");
     let input = sample_buffer();
@@ -144,12 +143,11 @@ async fn batch_filter_fn_zero_copy() {
 
 #[tokio::test]
 async fn batch_filter_fn_empty_result() {
-    use rhei_core::operators::batch::BatchFilterFnOp;
+    use rhei_core::operators::batch::FilterFnOp;
 
-    let mut op =
-        BatchFilterFnOp::new(|view: &<InputEvent as rhei::arrow::RheiSchema>::View<'_>| {
-            view.score > 100.0
-        });
+    let mut op = FilterFnOp::new(|view: &<InputEvent as rhei::arrow::RheiSchema>::View<'_>| {
+        view.score > 100.0
+    });
 
     let mut ctx = test_ctx("filter_empty");
     let input = sample_buffer();
@@ -160,10 +158,10 @@ async fn batch_filter_fn_empty_result() {
 
 #[tokio::test]
 async fn batch_map_empty_input() {
-    use rhei_core::operators::batch::BatchMapOp;
+    use rhei_core::operators::batch::MapOp;
 
     let mut op =
-        BatchMapOp::new(
+        MapOp::new(
             |view: <InputEvent as rhei::arrow::RheiSchema>::View<'_>| OutputEvent {
                 id: view.id,
                 upper_name: view.name.to_string(),

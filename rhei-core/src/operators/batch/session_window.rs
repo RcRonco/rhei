@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 
 use super::keyed_state::KeyedState;
 use crate::arrow::{
-    BatchStreamFunction, BufferOutput, OperatorContext, RheiBuffer, RheiBuilder, RheiSchema,
+    BufferOutput, OperatorContext, RheiBuffer, RheiBuilder, RheiSchema, StreamFunction,
 };
 
 #[derive(Serialize, Deserialize)]
@@ -35,7 +35,7 @@ struct SessionState<Acc> {
 /// - `TF` — timestamp extraction
 /// - `AF` — accumulate function
 /// - `FF` — finish function: `Fn(&str, u64, u64, &Acc) -> O` (key, `session_start`, `last_event`, acc)
-pub struct BatchSessionWindow<I, O, Acc, KF, TF, AF, FF> {
+pub struct SessionWindow<I, O, Acc, KF, TF, AF, FF> {
     gap: u64,
     key_fn: KF,
     time_fn: TF,
@@ -48,7 +48,7 @@ pub struct BatchSessionWindow<I, O, Acc, KF, TF, AF, FF> {
 }
 
 impl<I, O, Acc, KF: Clone, TF: Clone, AF: Clone, FF: Clone> Clone
-    for BatchSessionWindow<I, O, Acc, KF, TF, AF, FF>
+    for SessionWindow<I, O, Acc, KF, TF, AF, FF>
 {
     fn clone(&self) -> Self {
         Self {
@@ -65,16 +65,16 @@ impl<I, O, Acc, KF: Clone, TF: Clone, AF: Clone, FF: Clone> Clone
     }
 }
 
-impl<I, O, Acc, KF, TF, AF, FF> fmt::Debug for BatchSessionWindow<I, O, Acc, KF, TF, AF, FF> {
+impl<I, O, Acc, KF, TF, AF, FF> fmt::Debug for SessionWindow<I, O, Acc, KF, TF, AF, FF> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("BatchSessionWindow")
+        f.debug_struct("SessionWindow")
             .field("gap", &self.gap)
             .field("allowed_lateness", &self.allowed_lateness)
             .finish_non_exhaustive()
     }
 }
 
-impl<I, O, Acc, KF, TF, AF, FF> BatchSessionWindow<I, O, Acc, KF, TF, AF, FF> {
+impl<I, O, Acc, KF, TF, AF, FF> SessionWindow<I, O, Acc, KF, TF, AF, FF> {
     /// Creates a new session window with the given inactivity gap.
     pub fn new(gap: u64, key_fn: KF, time_fn: TF, accumulate_fn: AF, finish_fn: FF) -> Self {
         assert!(gap > 0, "gap must be > 0");
@@ -99,8 +99,7 @@ impl<I, O, Acc, KF, TF, AF, FF> BatchSessionWindow<I, O, Acc, KF, TF, AF, FF> {
 }
 
 #[async_trait]
-impl<I, O, Acc, KF, TF, AF, FF> BatchStreamFunction
-    for BatchSessionWindow<I, O, Acc, KF, TF, AF, FF>
+impl<I, O, Acc, KF, TF, AF, FF> StreamFunction for SessionWindow<I, O, Acc, KF, TF, AF, FF>
 where
     I: RheiSchema,
     O: RheiSchema,
@@ -448,7 +447,7 @@ mod tests {
     #[tokio::test]
     async fn gap_exceeded_closes_session() {
         let mut ctx = test_ctx("gap_close");
-        let mut win = BatchSessionWindow::new(
+        let mut win = SessionWindow::new(
             10,
             |v: EventView<'_>| v.key.to_string(),
             |v: EventView<'_>| v.ts,
@@ -482,7 +481,7 @@ mod tests {
     #[tokio::test]
     async fn watermark_closes_session() {
         let mut ctx = test_ctx("wm_close");
-        let mut win = BatchSessionWindow::new(
+        let mut win = SessionWindow::new(
             10,
             |v: EventView<'_>| v.key.to_string(),
             |v: EventView<'_>| v.ts,
@@ -511,7 +510,7 @@ mod tests {
     #[tokio::test]
     async fn within_gap_extends_session() {
         let mut ctx = test_ctx("extend");
-        let mut win = BatchSessionWindow::new(
+        let mut win = SessionWindow::new(
             10,
             |v: EventView<'_>| v.key.to_string(),
             |v: EventView<'_>| v.ts,

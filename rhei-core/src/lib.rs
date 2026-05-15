@@ -3,9 +3,9 @@
 //! This crate provides the foundational types and traits for building
 //! stateful stream processing pipelines using Apache Arrow columnar execution:
 //!
-//! - [`arrow::BatchStreamFunction`] — stateful operator that transforms Arrow buffers
-//! - [`arrow::BatchSource`] — produces columnar batches into a pipeline
-//! - [`arrow::BatchSink`] — consumes columnar batches from a pipeline
+//! - [`arrow::StreamFunction`] — stateful operator that transforms Arrow buffers
+//! - [`arrow::Source`] — produces columnar batches into a pipeline
+//! - [`arrow::Sink`] — consumes columnar batches from a pipeline
 //! - [`state::context::StateContext`] — operator-scoped key-value state with tiered storage
 //! - [`connectors`] — built-in sources and sinks
 

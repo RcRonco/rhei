@@ -12,7 +12,7 @@ use rdkafka::ClientConfig;
 use rdkafka::message::{Header, OwnedHeaders};
 use rdkafka::producer::{FutureProducer, FutureRecord, Producer};
 
-use crate::arrow::{BatchSink, RheiBuffer, RheiBuilder, RheiSchema};
+use crate::arrow::{RheiBuffer, RheiBuilder, RheiSchema, Sink};
 use crate::connectors::kafka::types::{KafkaHeader, KafkaRecord};
 
 // ── RheiSchema for KafkaRecord ─────────────────────────────────────
@@ -133,26 +133,26 @@ impl KafkaRecordView<'_> {
     }
 }
 
-// ── BatchKafkaSink ─────────────────────────────────────────────────
+// ── KafkaSink ─────────────────────────────────────────────────
 
 /// A batch Kafka sink that produces messages from Arrow buffers.
-pub struct BatchKafkaSink {
+pub struct KafkaSink {
     producer: FutureProducer,
     topic: String,
     produce_timeout: Duration,
 }
 
-impl std::fmt::Debug for BatchKafkaSink {
+impl std::fmt::Debug for KafkaSink {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("BatchKafkaSink")
+        f.debug_struct("KafkaSink")
             .field("topic", &self.topic)
             .field("produce_timeout", &self.produce_timeout)
             .finish_non_exhaustive()
     }
 }
 
-impl BatchKafkaSink {
-    /// Create a new `BatchKafkaSink` that produces to the given topic.
+impl KafkaSink {
+    /// Create a new `KafkaSink` that produces to the given topic.
     pub fn new(brokers: &str, topic: &str) -> anyhow::Result<Self> {
         let producer: FutureProducer = ClientConfig::new()
             .set("bootstrap.servers", brokers)
@@ -182,7 +182,7 @@ impl BatchKafkaSink {
 }
 
 #[async_trait]
-impl BatchSink for BatchKafkaSink {
+impl Sink for KafkaSink {
     type Input = KafkaRecord;
 
     async fn write_batch(&mut self, input: RheiBuffer<KafkaRecord>) -> anyhow::Result<()> {

@@ -9,10 +9,9 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use rhei_core::arrow::{
-    BatchSink, BatchStreamFunction, BufferOutput, OperatorContext, RheiBuffer, RheiBuilder,
-    RheiSchema,
+    BufferOutput, OperatorContext, RheiBuffer, RheiBuilder, RheiSchema, Sink, StreamFunction,
 };
-use rhei_core::connectors::batch::BatchVecSource;
+use rhei_core::connectors::batch::VecSource;
 use rhei_core::operators::batch::keyed_state::KeyedState;
 use rhei_runtime::controller::PipelineController;
 use rhei_runtime::dataflow::DataflowGraph;
@@ -194,7 +193,7 @@ impl RheiSchema for WordCount {
 struct BatchWordCounter;
 
 #[async_trait]
-impl BatchStreamFunction for BatchWordCounter {
+impl StreamFunction for BatchWordCounter {
     type Input = WordEvent;
     type Output = WordCount;
 
@@ -243,7 +242,7 @@ struct WordCountSink {
 }
 
 #[async_trait]
-impl BatchSink for WordCountSink {
+impl Sink for WordCountSink {
     type Input = WordCount;
 
     async fn write_batch(&mut self, input: RheiBuffer<WordCount>) -> anyhow::Result<()> {
@@ -276,7 +275,7 @@ async fn checkpoint_restart_preserves_state() {
     let collected_run1: Arc<Mutex<Vec<(String, u64)>>> = Arc::new(Mutex::new(Vec::new()));
     {
         let events = make_word_events(&["a", "b", "c", "a", "b"]);
-        let source = BatchVecSource::new(events).with_batch_size(10);
+        let source = VecSource::new(events).with_batch_size(10);
 
         let graph = DataflowGraph::new();
         graph
@@ -306,7 +305,7 @@ async fn checkpoint_restart_preserves_state() {
     let collected_run2: Arc<Mutex<Vec<(String, u64)>>> = Arc::new(Mutex::new(Vec::new()));
     {
         let events = make_word_events(&["a", "c", "d"]);
-        let source = BatchVecSource::new(events).with_batch_size(10);
+        let source = VecSource::new(events).with_batch_size(10);
 
         let graph = DataflowGraph::new();
         graph

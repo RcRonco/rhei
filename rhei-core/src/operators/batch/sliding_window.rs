@@ -13,7 +13,7 @@ use serde::de::DeserializeOwned;
 
 use super::keyed_state::KeyedState;
 use crate::arrow::{
-    BatchStreamFunction, BufferOutput, OperatorContext, RheiBuffer, RheiBuilder, RheiSchema,
+    BufferOutput, OperatorContext, RheiBuffer, RheiBuilder, RheiSchema, StreamFunction,
 };
 
 /// Batch sliding window operator.
@@ -27,7 +27,7 @@ use crate::arrow::{
 /// - `TF` — timestamp extraction: `Fn(I::View<'_>) -> u64`
 /// - `AF` — accumulation: `Fn(&mut Acc, I::View<'_>)`
 /// - `FF` — finish: `Fn(&str, u64, u64, &Acc) -> O`
-pub struct BatchSlidingWindow<I, O, Acc, KF, TF, AF, FF> {
+pub struct SlidingWindow<I, O, Acc, KF, TF, AF, FF> {
     window_size: u64,
     slide: u64,
     key_fn: KF,
@@ -41,7 +41,7 @@ pub struct BatchSlidingWindow<I, O, Acc, KF, TF, AF, FF> {
 }
 
 impl<I, O, Acc, KF: Clone, TF: Clone, AF: Clone, FF: Clone> Clone
-    for BatchSlidingWindow<I, O, Acc, KF, TF, AF, FF>
+    for SlidingWindow<I, O, Acc, KF, TF, AF, FF>
 {
     fn clone(&self) -> Self {
         Self {
@@ -59,9 +59,9 @@ impl<I, O, Acc, KF: Clone, TF: Clone, AF: Clone, FF: Clone> Clone
     }
 }
 
-impl<I, O, Acc, KF, TF, AF, FF> fmt::Debug for BatchSlidingWindow<I, O, Acc, KF, TF, AF, FF> {
+impl<I, O, Acc, KF, TF, AF, FF> fmt::Debug for SlidingWindow<I, O, Acc, KF, TF, AF, FF> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("BatchSlidingWindow")
+        f.debug_struct("SlidingWindow")
             .field("window_size", &self.window_size)
             .field("slide", &self.slide)
             .field("allowed_lateness", &self.allowed_lateness)
@@ -69,7 +69,7 @@ impl<I, O, Acc, KF, TF, AF, FF> fmt::Debug for BatchSlidingWindow<I, O, Acc, KF,
     }
 }
 
-impl<I, O, Acc, KF, TF, AF, FF> BatchSlidingWindow<I, O, Acc, KF, TF, AF, FF> {
+impl<I, O, Acc, KF, TF, AF, FF> SlidingWindow<I, O, Acc, KF, TF, AF, FF> {
     /// Creates a new sliding window with the given size and slide interval.
     pub fn new(
         window_size: u64,
@@ -130,8 +130,7 @@ struct ActiveWindows {
 }
 
 #[async_trait]
-impl<I, O, Acc, KF, TF, AF, FF> BatchStreamFunction
-    for BatchSlidingWindow<I, O, Acc, KF, TF, AF, FF>
+impl<I, O, Acc, KF, TF, AF, FF> StreamFunction for SlidingWindow<I, O, Acc, KF, TF, AF, FF>
 where
     I: RheiSchema,
     O: RheiSchema,
@@ -500,7 +499,7 @@ mod tests {
     }
 
     #[allow(clippy::type_complexity)]
-    fn make_window() -> BatchSlidingWindow<
+    fn make_window() -> SlidingWindow<
         Event,
         WinOut,
         u64,
@@ -509,7 +508,7 @@ mod tests {
         impl for<'a> Fn(&mut u64, <Event as RheiSchemaTrait>::View<'a>) + Send + Sync,
         impl Fn(&str, u64, u64, &u64) -> WinOut + Send + Sync,
     > {
-        BatchSlidingWindow::new(
+        SlidingWindow::new(
             10,
             5,
             |view: EventView<'_>| view.key.to_string(),

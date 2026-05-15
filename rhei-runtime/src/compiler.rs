@@ -67,13 +67,13 @@ pub(crate) fn compile_graph(nodes: Vec<GraphNode>) -> anyhow::Result<CompiledGra
     // Classify nodes.
     let source_ids: Vec<NodeId> = nodes
         .iter()
-        .filter(|n| matches!(n.kind, NodeKind::BatchSource(_)))
+        .filter(|n| matches!(n.kind, NodeKind::Source(_)))
         .map(|n| n.id)
         .collect();
 
     let sink_ids: Vec<NodeId> = nodes
         .iter()
-        .filter(|n| matches!(n.kind, NodeKind::BatchSink(_)))
+        .filter(|n| matches!(n.kind, NodeKind::Sink(_)))
         .map(|n| n.id)
         .collect();
 
@@ -153,10 +153,10 @@ fn extract_topology(nodes: &[GraphNode]) -> ApiTopology {
 
     for node in nodes {
         let (kind, name) = match &node.kind {
-            NodeKind::BatchSource(_) => ("source", format!("Source_{}", node.id.0)),
+            NodeKind::Source(_) => ("source", format!("Source_{}", node.id.0)),
             NodeKind::BatchTransform(_) => ("transform", format!("Transform_{}", node.id.0)),
             NodeKind::BatchOperator { name, .. } => ("operator", name.clone()),
-            NodeKind::BatchSink(_) => ("sink", format!("Sink_{}", node.id.0)),
+            NodeKind::Sink(_) => ("sink", format!("Sink_{}", node.id.0)),
             NodeKind::BatchKeyBy(_) => ("key_by", format!("KeyBy_{}", node.id.0)),
             NodeKind::BatchMerge => ("merge", format!("Merge_{}", node.id.0)),
         };

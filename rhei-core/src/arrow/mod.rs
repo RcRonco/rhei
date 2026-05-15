@@ -19,4 +19,4 @@ pub use builder::RheiBuilder;
 pub use context::{OperatorContext, OperatorMetrics};
 pub use iter::RheiIter;
 pub use schema::RheiSchema;
-pub use traits::{BatchSink, BatchSource, BatchStreamFunction};
+pub use traits::{Sink, Source, StreamFunction};

@@ -74,7 +74,7 @@ pub(crate) fn expand(item: ItemFn) -> Result<TokenStream, Error> {
         struct #struct_name;
 
         #[::rhei::__private::async_trait]
-        impl ::rhei::BatchStreamFunction for #struct_name {
+        impl ::rhei::StreamFunction for #struct_name {
             type Input = #input_type;
             type Output = #output_type;
 

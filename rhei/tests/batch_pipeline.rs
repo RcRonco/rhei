@@ -4,11 +4,11 @@
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use rhei::arrow::{BatchSink, RheiBuffer, RheiSchema};
+use rhei::arrow::{RheiBuffer, RheiSchema, Sink};
 use rhei::{
-    BatchCountWindow, BatchReduceOp, BatchRollingAggregateOp, BatchSessionWindow,
-    BatchSlidingWindow, BatchTemporalJoin, BatchTumblingWindow, BatchVecSource, DataflowGraph,
-    PipelineController, RheiSchema as RheiSchemaDerive, Side, col, lit_f64,
+    CountWindow, DataflowGraph, PipelineController, ReduceOp, RheiSchema as RheiSchemaDerive,
+    RollingAggregateOp, SessionWindow, Side, SlidingWindow, TemporalJoin, TumblingWindow,
+    VecSource, col, lit_f64,
 };
 
 // ── Schema types ────────────────────────────────────────────────────
@@ -32,7 +32,7 @@ struct CollectSink {
 }
 
 #[async_trait]
-impl BatchSink for CollectSink {
+impl Sink for CollectSink {
     type Input = Doubled;
 
     async fn write_batch(&mut self, input: RheiBuffer<Doubled>) -> anyhow::Result<()> {
@@ -59,7 +59,7 @@ async fn batch_source_map_filter_sink() {
         })
         .collect();
 
-    let source = BatchVecSource::new(events).with_batch_size(8);
+    let source = VecSource::new(events).with_batch_size(8);
     let collected: Arc<Mutex<Vec<(i64, f64)>>> = Arc::new(Mutex::new(Vec::new()));
 
     let graph = DataflowGraph::new();
@@ -121,7 +121,7 @@ struct WindowCollectSink {
 }
 
 #[async_trait]
-impl BatchSink for WindowCollectSink {
+impl Sink for WindowCollectSink {
     type Input = WindowResult;
 
     async fn write_batch(&mut self, input: RheiBuffer<WindowResult>) -> anyhow::Result<()> {
@@ -179,10 +179,10 @@ async fn batch_tumbling_window_pipeline() {
         },
     ];
 
-    let source = BatchVecSource::new(events).with_batch_size(10);
+    let source = VecSource::new(events).with_batch_size(10);
     let collected: Arc<Mutex<Vec<(String, u64, u64, u64)>>> = Arc::new(Mutex::new(Vec::new()));
 
-    let window = BatchTumblingWindow::new(
+    let window = TumblingWindow::new(
         10,
         |view: <TimedEvent as RheiSchema>::View<'_>| view.key.to_string(),
         |view: <TimedEvent as RheiSchema>::View<'_>| view.ts,
@@ -240,7 +240,7 @@ async fn batch_filter_expr_pipeline() {
         })
         .collect();
 
-    let source = BatchVecSource::new(events).with_batch_size(8);
+    let source = VecSource::new(events).with_batch_size(8);
     let collected: Arc<Mutex<Vec<(i64, f64)>>> = Arc::new(Mutex::new(Vec::new()));
 
     let graph = DataflowGraph::new();
@@ -296,10 +296,10 @@ async fn batch_sliding_window_pipeline() {
         },
     ];
 
-    let source = BatchVecSource::new(events).with_batch_size(10);
+    let source = VecSource::new(events).with_batch_size(10);
     let collected: Arc<Mutex<Vec<(String, u64, u64, u64)>>> = Arc::new(Mutex::new(Vec::new()));
 
-    let window = BatchSlidingWindow::new(
+    let window = SlidingWindow::new(
         10,
         5,
         |view: <TimedEvent as RheiSchema>::View<'_>| view.key.to_string(),
@@ -368,10 +368,10 @@ async fn batch_session_window_pipeline() {
         },
     ];
 
-    let source = BatchVecSource::new(events).with_batch_size(10);
+    let source = VecSource::new(events).with_batch_size(10);
     let collected: Arc<Mutex<Vec<(String, u64, u64, u64)>>> = Arc::new(Mutex::new(Vec::new()));
 
-    let window = BatchSessionWindow::new(
+    let window = SessionWindow::new(
         5,
         |view: <TimedEvent as RheiSchema>::View<'_>| view.key.to_string(),
         |view: <TimedEvent as RheiSchema>::View<'_>| view.ts,
@@ -423,7 +423,7 @@ struct CountCollectSink {
 }
 
 #[async_trait]
-impl BatchSink for CountCollectSink {
+impl Sink for CountCollectSink {
     type Input = CountResult;
 
     async fn write_batch(&mut self, input: RheiBuffer<CountResult>) -> anyhow::Result<()> {
@@ -485,10 +485,10 @@ async fn batch_count_window_pipeline() {
         },
     ];
 
-    let source = BatchVecSource::new(events).with_batch_size(10);
+    let source = VecSource::new(events).with_batch_size(10);
     let collected: Arc<Mutex<Vec<(String, u64)>>> = Arc::new(Mutex::new(Vec::new()));
 
-    let window = BatchCountWindow::new(
+    let window = CountWindow::new(
         3,
         |view: <TimedEvent as RheiSchema>::View<'_>| view.key.to_string(),
         |acc: &mut u64, _view: <TimedEvent as RheiSchema>::View<'_>| *acc += 1,
@@ -532,7 +532,7 @@ struct SumCollectSink {
 }
 
 #[async_trait]
-impl BatchSink for SumCollectSink {
+impl Sink for SumCollectSink {
     type Input = SumResult;
 
     async fn write_batch(&mut self, input: RheiBuffer<SumResult>) -> anyhow::Result<()> {
@@ -568,10 +568,10 @@ async fn batch_reduce_pipeline() {
         },
     ];
 
-    let source = BatchVecSource::new(events).with_batch_size(10);
+    let source = VecSource::new(events).with_batch_size(10);
     let collected: Arc<Mutex<Vec<(String, f64)>>> = Arc::new(Mutex::new(Vec::new()));
 
-    let op = BatchReduceOp::new(
+    let op = ReduceOp::new(
         |view: <TimedEvent as RheiSchema>::View<'_>| view.key.to_string(),
         |view: <TimedEvent as RheiSchema>::View<'_>| SumResult {
             key: view.key.to_string(),
@@ -630,10 +630,10 @@ async fn batch_rolling_aggregate_pipeline() {
         },
     ];
 
-    let source = BatchVecSource::new(events).with_batch_size(10);
+    let source = VecSource::new(events).with_batch_size(10);
     let collected: Arc<Mutex<Vec<(String, f64)>>> = Arc::new(Mutex::new(Vec::new()));
 
-    let op = BatchRollingAggregateOp::<TimedEvent, SumResult, f64, _, _, _>::new(
+    let op = RollingAggregateOp::<TimedEvent, SumResult, f64, _, _, _>::new(
         |view: <TimedEvent as RheiSchema>::View<'_>| view.key.to_string(),
         |acc: &mut f64, view: <TimedEvent as RheiSchema>::View<'_>| *acc += view.value,
         |key: &str, acc: &f64| SumResult {
@@ -683,7 +683,7 @@ struct JoinCollectSink {
 }
 
 #[async_trait]
-impl BatchSink for JoinCollectSink {
+impl Sink for JoinCollectSink {
     type Input = JoinResult;
 
     async fn write_batch(&mut self, input: RheiBuffer<JoinResult>) -> anyhow::Result<()> {
@@ -725,10 +725,10 @@ async fn batch_temporal_join_pipeline() {
         },
     ];
 
-    let source = BatchVecSource::new(events).with_batch_size(10);
+    let source = VecSource::new(events).with_batch_size(10);
     let collected: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
 
-    let op = BatchTemporalJoin::<JoinEvent, JoinResult, _, _, _, _, _>::new(
+    let op = TemporalJoin::<JoinEvent, JoinResult, _, _, _, _, _>::new(
         |view: <JoinEvent as RheiSchema>::View<'_>| view.key.to_string(),
         |view: <JoinEvent as RheiSchema>::View<'_>| {
             if view.side == 0 {

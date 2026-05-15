@@ -3,7 +3,7 @@
 //!
 //! Pipeline with 2 workers:
 //! ```text
-//! BatchVecSource(events) → key_by(|v| v.key) → WordCounter(KeyedState) → CollectSink
+//! VecSource(events) → key_by(|v| v.key) → WordCounter(KeyedState) → CollectSink
 //! ```
 //! Verify: all events for the same key are processed by a single worker,
 //! producing correct cumulative counts.
@@ -13,10 +13,9 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use rhei_core::arrow::{
-    BatchSink, BatchStreamFunction, BufferOutput, OperatorContext, RheiBuffer, RheiBuilder,
-    RheiSchema,
+    BufferOutput, OperatorContext, RheiBuffer, RheiBuilder, RheiSchema, Sink, StreamFunction,
 };
-use rhei_core::connectors::batch::BatchVecSource;
+use rhei_core::connectors::batch::VecSource;
 use rhei_core::operators::batch::keyed_state::KeyedState;
 use rhei_runtime::controller::PipelineController;
 use rhei_runtime::dataflow::DataflowGraph;
@@ -193,7 +192,7 @@ impl RheiSchema for KeyCount {
 struct KeyCounter;
 
 #[async_trait]
-impl BatchStreamFunction for KeyCounter {
+impl StreamFunction for KeyCounter {
     type Input = KeyedEvent;
     type Output = KeyCount;
 
@@ -240,7 +239,7 @@ struct CollectSink {
 }
 
 #[async_trait]
-impl BatchSink for CollectSink {
+impl Sink for CollectSink {
     type Input = KeyCount;
 
     async fn write_batch(&mut self, input: RheiBuffer<KeyCount>) -> anyhow::Result<()> {
@@ -273,12 +272,12 @@ async fn key_by_exchange_routes_same_key_to_same_worker() {
     let checkpoint_dir = tempfile::tempdir().unwrap();
     let collected = Arc::new(Mutex::new(Vec::<(String, u64)>::new()));
 
-    let source = BatchVecSource::new(events).with_batch_size(8);
+    let source = VecSource::new(events).with_batch_size(8);
 
     let graph = DataflowGraph::new();
     graph
         .batch_source(source)
-        .key_by(|view: &<KeyedEvent as RheiSchema>::View<'_>| view.key.to_string())
+        .key_by(|view: &KeyedEventView<'_>| view.key.to_string())
         .operator("key_counter", KeyCounter)
         .sink(CollectSink {
             collected: collected.clone(),

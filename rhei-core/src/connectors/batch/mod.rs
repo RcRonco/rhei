@@ -13,13 +13,13 @@ pub mod kafka_sink;
 #[cfg(feature = "kafka")]
 pub mod kafka_source;
 
-pub use partitioned_vec_source::BatchPartitionedVecSource;
-pub use print_sink::BatchPrintSink;
-pub use vec_source::BatchVecSource;
+pub use partitioned_vec_source::PartitionedVecSource;
+pub use print_sink::PrintSink;
+pub use vec_source::VecSource;
 
 #[cfg(feature = "kafka")]
 pub use kafka_dlq::KafkaDlqSink;
 #[cfg(feature = "kafka")]
-pub use kafka_sink::BatchKafkaSink;
+pub use kafka_sink::KafkaSink;
 #[cfg(feature = "kafka")]
-pub use kafka_source::BatchKafkaSource;
+pub use kafka_source::KafkaSource;

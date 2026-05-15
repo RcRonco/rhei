@@ -13,7 +13,7 @@ use arrow_array::types::{Float64Type, Int64Type, UInt64Type};
 use arrow_array::{Array, BooleanArray, RecordBatch, StringArray};
 use async_trait::async_trait;
 
-use crate::arrow::{BatchStreamFunction, BufferOutput, OperatorContext, RheiBuffer, RheiSchema};
+use crate::arrow::{BufferOutput, OperatorContext, RheiBuffer, RheiSchema, StreamFunction};
 
 /// A scalar value for comparison predicates.
 #[derive(Clone, Debug)]
@@ -334,20 +334,20 @@ pub fn eval_predicate(expr: &Expr, batch: &RecordBatch) -> anyhow::Result<Boolea
 ///
 /// Evaluates an `Expr` against the input batch columns, producing a
 /// `BooleanArray` mask that is composed with any existing selection vector.
-pub struct BatchFilterExprOp<T> {
+pub struct FilterExprOp<T> {
     expr: Expr,
     _phantom: PhantomData<fn(T)>,
 }
 
-impl<T> fmt::Debug for BatchFilterExprOp<T> {
+impl<T> fmt::Debug for FilterExprOp<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("BatchFilterExprOp")
+        f.debug_struct("FilterExprOp")
             .field("expr", &self.expr)
             .finish_non_exhaustive()
     }
 }
 
-impl<T> Clone for BatchFilterExprOp<T> {
+impl<T> Clone for FilterExprOp<T> {
     fn clone(&self) -> Self {
         Self {
             expr: self.expr.clone(),
@@ -356,7 +356,7 @@ impl<T> Clone for BatchFilterExprOp<T> {
     }
 }
 
-impl<T: RheiSchema> BatchFilterExprOp<T> {
+impl<T: RheiSchema> FilterExprOp<T> {
     /// Creates a new filter operator with the given predicate expression.
     pub fn new(expr: Expr) -> Self {
         Self {
@@ -367,7 +367,7 @@ impl<T: RheiSchema> BatchFilterExprOp<T> {
 }
 
 #[async_trait]
-impl<T: RheiSchema> BatchStreamFunction for BatchFilterExprOp<T> {
+impl<T: RheiSchema> StreamFunction for FilterExprOp<T> {
     type Input = T;
     type Output = T;
 
@@ -542,7 +542,7 @@ mod tests {
     #[tokio::test]
     async fn filter_gt_scalar() {
         let mut ctx = test_ctx();
-        let mut op = BatchFilterExprOp::<Sensor>::new(col("value").gt(lit_f64(20.0)));
+        let mut op = FilterExprOp::<Sensor>::new(col("value").gt(lit_f64(20.0)));
 
         let input = make_sensors();
         let result = op.process(input, &mut ctx).await.unwrap();
@@ -557,7 +557,7 @@ mod tests {
     #[tokio::test]
     async fn filter_eq_string() {
         let mut ctx = test_ctx();
-        let mut op = BatchFilterExprOp::<Sensor>::new(col("name").eq(lit_str("a")));
+        let mut op = FilterExprOp::<Sensor>::new(col("name").eq(lit_str("a")));
 
         let input = make_sensors();
         let result = op.process(input, &mut ctx).await.unwrap();
@@ -571,7 +571,7 @@ mod tests {
     async fn filter_and_compound() {
         let mut ctx = test_ctx();
         let expr = col("value").gt(lit_f64(10.0)).and(col("ts").lt(lit_u64(5)));
-        let mut op = BatchFilterExprOp::<Sensor>::new(expr);
+        let mut op = FilterExprOp::<Sensor>::new(expr);
 
         let input = make_sensors();
         let result = op.process(input, &mut ctx).await.unwrap();
@@ -588,7 +588,7 @@ mod tests {
         let expr = col("value")
             .lt(lit_f64(10.0))
             .or(col("value").gt(lit_f64(40.0)));
-        let mut op = BatchFilterExprOp::<Sensor>::new(expr);
+        let mut op = FilterExprOp::<Sensor>::new(expr);
 
         let input = make_sensors();
         let result = op.process(input, &mut ctx).await.unwrap();
@@ -602,7 +602,7 @@ mod tests {
     #[tokio::test]
     async fn filter_not() {
         let mut ctx = test_ctx();
-        let mut op = BatchFilterExprOp::<Sensor>::new(col("name").eq(lit_str("a")).negate());
+        let mut op = FilterExprOp::<Sensor>::new(col("name").eq(lit_str("a")).negate());
 
         let input = make_sensors();
         let result = op.process(input, &mut ctx).await.unwrap();
@@ -616,7 +616,7 @@ mod tests {
     #[tokio::test]
     async fn filter_all_excluded_returns_none() {
         let mut ctx = test_ctx();
-        let mut op = BatchFilterExprOp::<Sensor>::new(col("value").gt(lit_f64(1000.0)));
+        let mut op = FilterExprOp::<Sensor>::new(col("value").gt(lit_f64(1000.0)));
 
         let input = make_sensors();
         let result = op.process(input, &mut ctx).await.unwrap();
@@ -626,7 +626,7 @@ mod tests {
     #[tokio::test]
     async fn filter_empty_input() {
         let mut ctx = test_ctx();
-        let mut op = BatchFilterExprOp::<Sensor>::new(col("value").gt(lit_f64(0.0)));
+        let mut op = FilterExprOp::<Sensor>::new(col("value").gt(lit_f64(0.0)));
 
         let input: RheiBuffer<Sensor> = RheiBuffer::from_builder(Sensor::builder(0));
         let result = op.process(input, &mut ctx).await.unwrap();

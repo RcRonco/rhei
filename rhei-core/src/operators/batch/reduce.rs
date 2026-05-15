@@ -1,7 +1,7 @@
 //! Batch reduce and rolling aggregate operators.
 //!
-//! - `BatchReduceOp`: per-key stateful reduce that emits the updated value on every input.
-//! - `BatchRollingAggregateOp`: per-key rolling aggregate using an accumulator.
+//! - `ReduceOp`: per-key stateful reduce that emits the updated value on every input.
+//! - `RollingAggregateOp`: per-key rolling aggregate using an accumulator.
 
 use std::fmt;
 use std::marker::PhantomData;
@@ -12,7 +12,7 @@ use serde::de::DeserializeOwned;
 
 use super::keyed_state::KeyedState;
 use crate::arrow::{
-    BatchStreamFunction, BufferOutput, OperatorContext, RheiBuffer, RheiBuilder, RheiSchema,
+    BufferOutput, OperatorContext, RheiBuffer, RheiBuilder, RheiSchema, StreamFunction,
 };
 
 /// Batch per-key reduce operator.
@@ -20,14 +20,14 @@ use crate::arrow::{
 /// For each input row, loads the current value for the key, applies
 /// `reduce_fn(existing, view) -> O`, stores and emits the result.
 /// First element for a new key uses `init_fn(view)`.
-pub struct BatchReduceOp<I, O, KF, IF, RF> {
+pub struct ReduceOp<I, O, KF, IF, RF> {
     key_fn: KF,
     init_fn: IF,
     reduce_fn: RF,
     _phantom: PhantomData<fn(I) -> O>,
 }
 
-impl<I, O, KF: Clone, IF: Clone, RF: Clone> Clone for BatchReduceOp<I, O, KF, IF, RF> {
+impl<I, O, KF: Clone, IF: Clone, RF: Clone> Clone for ReduceOp<I, O, KF, IF, RF> {
     fn clone(&self) -> Self {
         Self {
             key_fn: self.key_fn.clone(),
@@ -38,13 +38,13 @@ impl<I, O, KF: Clone, IF: Clone, RF: Clone> Clone for BatchReduceOp<I, O, KF, IF
     }
 }
 
-impl<I, O, KF, IF, RF> fmt::Debug for BatchReduceOp<I, O, KF, IF, RF> {
+impl<I, O, KF, IF, RF> fmt::Debug for ReduceOp<I, O, KF, IF, RF> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("BatchReduceOp").finish_non_exhaustive()
+        f.debug_struct("ReduceOp").finish_non_exhaustive()
     }
 }
 
-impl<I, O, KF, IF, RF> BatchReduceOp<I, O, KF, IF, RF> {
+impl<I, O, KF, IF, RF> ReduceOp<I, O, KF, IF, RF> {
     /// Creates a new per-key reduce operator.
     pub fn new(key_fn: KF, init_fn: IF, reduce_fn: RF) -> Self {
         Self {
@@ -57,7 +57,7 @@ impl<I, O, KF, IF, RF> BatchReduceOp<I, O, KF, IF, RF> {
 }
 
 #[async_trait]
-impl<I, O, KF, IF, RF> BatchStreamFunction for BatchReduceOp<I, O, KF, IF, RF>
+impl<I, O, KF, IF, RF> StreamFunction for ReduceOp<I, O, KF, IF, RF>
 where
     I: RheiSchema,
     O: RheiSchema + Serialize + DeserializeOwned,
@@ -126,7 +126,7 @@ where
 ///
 /// For each input row, loads the accumulator for the key, accumulates,
 /// stores, and emits `finish_fn(key, &acc)`.
-pub struct BatchRollingAggregateOp<I, O, Acc, KF, AF, FF> {
+pub struct RollingAggregateOp<I, O, Acc, KF, AF, FF> {
     key_fn: KF,
     accumulate_fn: AF,
     finish_fn: FF,
@@ -134,7 +134,7 @@ pub struct BatchRollingAggregateOp<I, O, Acc, KF, AF, FF> {
 }
 
 impl<I, O, Acc, KF: Clone, AF: Clone, FF: Clone> Clone
-    for BatchRollingAggregateOp<I, O, Acc, KF, AF, FF>
+    for RollingAggregateOp<I, O, Acc, KF, AF, FF>
 {
     fn clone(&self) -> Self {
         Self {
@@ -146,14 +146,13 @@ impl<I, O, Acc, KF: Clone, AF: Clone, FF: Clone> Clone
     }
 }
 
-impl<I, O, Acc, KF, AF, FF> fmt::Debug for BatchRollingAggregateOp<I, O, Acc, KF, AF, FF> {
+impl<I, O, Acc, KF, AF, FF> fmt::Debug for RollingAggregateOp<I, O, Acc, KF, AF, FF> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("BatchRollingAggregateOp")
-            .finish_non_exhaustive()
+        f.debug_struct("RollingAggregateOp").finish_non_exhaustive()
     }
 }
 
-impl<I, O, Acc, KF, AF, FF> BatchRollingAggregateOp<I, O, Acc, KF, AF, FF> {
+impl<I, O, Acc, KF, AF, FF> RollingAggregateOp<I, O, Acc, KF, AF, FF> {
     /// Creates a new per-key rolling aggregate operator.
     pub fn new(key_fn: KF, accumulate_fn: AF, finish_fn: FF) -> Self {
         Self {
@@ -166,7 +165,7 @@ impl<I, O, Acc, KF, AF, FF> BatchRollingAggregateOp<I, O, Acc, KF, AF, FF> {
 }
 
 #[async_trait]
-impl<I, O, Acc, KF, AF, FF> BatchStreamFunction for BatchRollingAggregateOp<I, O, Acc, KF, AF, FF>
+impl<I, O, Acc, KF, AF, FF> StreamFunction for RollingAggregateOp<I, O, Acc, KF, AF, FF>
 where
     I: RheiSchema,
     O: RheiSchema,
@@ -413,7 +412,7 @@ mod tests {
     #[tokio::test]
     async fn rolling_aggregate_accumulates() {
         let mut ctx = test_ctx("ragg");
-        let mut op = BatchRollingAggregateOp::<Val, SumOut, i64, _, _, _>::new(
+        let mut op = RollingAggregateOp::<Val, SumOut, i64, _, _, _>::new(
             |v: ValView<'_>| v.key.to_string(),
             |acc: &mut i64, v: ValView<'_>| *acc += v.n,
             |key: &str, acc: &i64| SumOut {
@@ -440,7 +439,7 @@ mod tests {
     #[tokio::test]
     async fn reduce_emits_every_row() {
         let mut ctx = test_ctx("reduce");
-        let mut op = BatchReduceOp::<Val, SumOut, _, _, _>::new(
+        let mut op = ReduceOp::<Val, SumOut, _, _, _>::new(
             |v: ValView<'_>| v.key.to_string(),
             |v: ValView<'_>| SumOut {
                 key: v.key.to_string(),
