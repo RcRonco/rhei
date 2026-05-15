@@ -75,7 +75,7 @@ async fn main() -> anyhow::Result<()> {
 
     let graph = DataflowGraph::new();
     graph
-        .batch_source(source)
+        .source(source)
         .flat_map(|view: LineView<'_>| {
             view.text
                 .split_whitespace()

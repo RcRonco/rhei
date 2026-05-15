@@ -34,7 +34,7 @@ use rhei_core::arrow::{
     BufferOutput, OperatorContext, RheiBuffer, RheiBuilder, RheiSchema, Sink, StreamFunction,
 };
 use rhei_core::connectors::batch::KafkaSource;
-use rhei_core::operators::batch::keyed_state::KeyedState;
+use rhei_core::operators::keyed_state::KeyedState;
 use rhei_runtime::controller::PipelineController;
 use rhei_runtime::dataflow::DataflowGraph;
 use rhei_runtime::shutdown::ShutdownHandle;
@@ -417,7 +417,7 @@ async fn kafka_batch_aggregation_e2e() {
 
     let graph = DataflowGraph::new();
     graph
-        .batch_source(source)
+        .source(source)
         .map(
             |msg: <KafkaMsgType as RheiSchema>::View<'_>| -> OrderEvent {
                 let payload = if msg.payload_is_null {
@@ -533,7 +533,7 @@ async fn kafka_multi_partition_batch_e2e() {
 
     let graph = DataflowGraph::new();
     graph
-        .batch_source(source)
+        .source(source)
         .map(
             |msg: <KafkaMsgType as RheiSchema>::View<'_>| -> OrderEvent {
                 let payload = if msg.payload_is_null {

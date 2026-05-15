@@ -140,8 +140,8 @@ async fn merge_combines_two_sources() {
     let source2 = VecSource::new(make_events(&["x", "y", "z"])).with_batch_size(10);
 
     let graph = DataflowGraph::new();
-    let stream1 = graph.batch_source(source1);
-    let stream2 = graph.batch_source(source2);
+    let stream1 = graph.source(source1);
+    let stream2 = graph.source(source2);
 
     stream1.merge(stream2).sink(CollectSink {
         collected: collected.clone(),
@@ -180,8 +180,8 @@ async fn merge_works_with_multiple_workers() {
     let source2 = VecSource::new(make_events(&words2)).with_batch_size(5);
 
     let graph = DataflowGraph::new();
-    let stream1 = graph.batch_source(source1);
-    let stream2 = graph.batch_source(source2);
+    let stream1 = graph.source(source1);
+    let stream2 = graph.source(source2);
 
     stream1.merge(stream2).sink(CollectSink {
         collected: collected.clone(),

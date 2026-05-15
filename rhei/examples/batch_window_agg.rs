@@ -109,7 +109,7 @@ async fn main() -> anyhow::Result<()> {
 
     let graph = DataflowGraph::new();
     graph
-        .batch_source(source)
+        .source(source)
         .operator("sensor_window", window)
         .sink(PrintSink::<WindowResult>::new().with_prefix("output"));
 

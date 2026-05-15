@@ -72,7 +72,7 @@ pub(crate) struct ExecutorData {
     pub shutdown: Option<ShutdownHandle>,
     pub dlq_tx: Option<DlqSender>,
     // Batch (Arrow) fields
-    pub batch_source_rx: HashMap<NodeId, flume::Receiver<crate::bridge::SourceBatch>>,
+    pub source_rx: HashMap<NodeId, flume::Receiver<crate::bridge::SourceBatch>>,
     pub batch_transforms: HashMap<NodeId, BatchTransformFn>,
     pub batch_operators: HashMap<NodeId, (String, Box<dyn ErasedBatchOperator>)>,
     pub batch_contexts: HashMap<NodeId, OperatorContext>,
@@ -150,7 +150,7 @@ impl TaskManager {
 
         // ── Batch (Arrow) data extraction ────────────────────────────
         let (
-            mut per_worker_batch_source_rx,
+            mut per_worker_source_rx,
             mut per_worker_batch_transforms,
             mut per_worker_batch_operators,
             mut per_worker_batch_contexts,
@@ -179,7 +179,7 @@ impl TaskManager {
                 source_offsets: std::mem::take(&mut per_worker_source_offsets[idx]),
                 shutdown: shutdown.cloned(),
                 dlq_tx: dlq_senders[idx].take(),
-                batch_source_rx: std::mem::take(&mut per_worker_batch_source_rx[idx]),
+                source_rx: std::mem::take(&mut per_worker_source_rx[idx]),
                 batch_transforms: per_worker_batch_transforms[idx].take().unwrap_or_default(),
                 batch_operators: per_worker_batch_operators[idx].take().unwrap_or_default(),
                 batch_contexts: per_worker_batch_contexts[idx].take().unwrap_or_default(),
@@ -766,7 +766,7 @@ fn extract_batch_per_worker_data(
     Vec<JoinHandle<anyhow::Result<()>>>,
 )> {
     let rt = tokio::runtime::Handle::current();
-    let mut per_worker_batch_source_rx: Vec<
+    let mut per_worker_source_rx: Vec<
         HashMap<NodeId, flume::Receiver<crate::bridge::SourceBatch>>,
     > = (0..total_workers).map(|_| HashMap::new()).collect();
     let mut per_worker_batch_transforms: Vec<Option<HashMap<NodeId, BatchTransformFn>>> =
@@ -781,7 +781,7 @@ fn extract_batch_per_worker_data(
     let mut batch_sink_handles: Vec<JoinHandle<anyhow::Result<()>>> = Vec::new();
 
     // Collect batch node IDs by kind.
-    let batch_source_ids: Vec<NodeId> = graph
+    let source_ids: Vec<NodeId> = graph
         .topo_order
         .iter()
         .filter(|id| node_kinds[id] == NodeKindTag::Source)
@@ -813,8 +813,8 @@ fn extract_batch_per_worker_data(
         .collect();
 
     // Bridge batch sources: compile, create channel, spawn bridge task.
-    for &source_id in &batch_source_ids {
-        let source = extract_batch_source(&mut graph.nodes[source_id.0]);
+    for &source_id in &source_ids {
+        let source = extract_source(&mut graph.nodes[source_id.0]);
 
         if let Some(n_partitions) = source.partition_count() {
             // Partitioned source: distribute partitions across all workers.
@@ -836,14 +836,14 @@ fn extract_batch_per_worker_data(
                     Arc::new(std::sync::Mutex::new(HashMap::new()));
                 let wm: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
                 let shutdown_handle = shutdown.cloned();
-                rt.spawn(crate::bridge::local_batch_source_bridge(
+                rt.spawn(crate::bridge::local_source_bridge(
                     partition_source,
                     tx,
                     offsets.clone(),
                     wm.clone(),
                     shutdown_handle,
                 ));
-                per_worker_batch_source_rx[worker_idx].insert(source_id, rx);
+                per_worker_source_rx[worker_idx].insert(source_id, rx);
                 per_worker_source_wm[worker_idx].insert(source_id, wm.clone());
                 per_worker_source_offsets[worker_idx].insert(source_id, offsets.clone());
                 all_source_offsets.push(offsets);
@@ -857,14 +857,14 @@ fn extract_batch_per_worker_data(
                     Arc::new(std::sync::Mutex::new(HashMap::new()));
                 let wm: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
                 let shutdown_handle = shutdown.cloned();
-                rt.spawn(crate::bridge::local_batch_source_bridge(
+                rt.spawn(crate::bridge::local_source_bridge(
                     source,
                     tx,
                     offsets.clone(),
                     wm.clone(),
                     shutdown_handle,
                 ));
-                per_worker_batch_source_rx[0].insert(source_id, rx);
+                per_worker_source_rx[0].insert(source_id, rx);
                 per_worker_source_wm[0].insert(source_id, wm.clone());
                 per_worker_source_offsets[0].insert(source_id, offsets.clone());
                 all_source_offsets.push(offsets);
@@ -936,7 +936,7 @@ fn extract_batch_per_worker_data(
     }
 
     Ok((
-        per_worker_batch_source_rx,
+        per_worker_source_rx,
         per_worker_batch_transforms,
         per_worker_batch_operators,
         per_worker_batch_contexts,
@@ -958,7 +958,7 @@ fn placeholder_node_kind() -> NodeKind {
     })))
 }
 
-fn extract_batch_source(node: &mut crate::dataflow::GraphNode) -> Box<dyn ErasedSource> {
+fn extract_source(node: &mut crate::dataflow::GraphNode) -> Box<dyn ErasedSource> {
     let kind = std::mem::replace(&mut node.kind, placeholder_node_kind());
     match kind {
         NodeKind::Source(src) => src.compile(),

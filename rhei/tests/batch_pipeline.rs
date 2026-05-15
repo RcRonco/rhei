@@ -47,7 +47,7 @@ impl Sink for CollectSink {
 // ── Tests ─────────────────────────────────────────────────────────────
 
 #[tokio::test]
-async fn batch_source_map_filter_sink() {
+async fn source_map_filter_sink() {
     let dir = std::env::temp_dir().join(format!("rhei_batch_e2e_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
@@ -64,7 +64,7 @@ async fn batch_source_map_filter_sink() {
 
     let graph = DataflowGraph::new();
     graph
-        .batch_source(source)
+        .source(source)
         .map(|view: <Event as RheiSchema>::View<'_>| Doubled {
             id: view.id,
             doubled: view.value * 2.0,
@@ -197,7 +197,7 @@ async fn batch_tumbling_window_pipeline() {
 
     let graph = DataflowGraph::new();
     graph
-        .batch_source(source)
+        .source(source)
         .operator("tumbling_10s", window)
         .sink(WindowCollectSink {
             collected: collected.clone(),
@@ -245,7 +245,7 @@ async fn batch_filter_expr_pipeline() {
 
     let graph = DataflowGraph::new();
     graph
-        .batch_source(source)
+        .source(source)
         .filter(col("value").gt(lit_f64(14.0)))
         .map(|view: <Event as RheiSchema>::View<'_>| Doubled {
             id: view.id,
@@ -315,7 +315,7 @@ async fn batch_sliding_window_pipeline() {
 
     let graph = DataflowGraph::new();
     graph
-        .batch_source(source)
+        .source(source)
         .operator("sliding_10_5", window)
         .sink(WindowCollectSink {
             collected: collected.clone(),
@@ -386,7 +386,7 @@ async fn batch_session_window_pipeline() {
 
     let graph = DataflowGraph::new();
     graph
-        .batch_source(source)
+        .source(source)
         .operator("session_5", window)
         .sink(WindowCollectSink {
             collected: collected.clone(),
@@ -500,7 +500,7 @@ async fn batch_count_window_pipeline() {
 
     let graph = DataflowGraph::new();
     graph
-        .batch_source(source)
+        .source(source)
         .operator("count_3", window)
         .sink(CountCollectSink {
             collected: collected.clone(),
@@ -585,7 +585,7 @@ async fn batch_reduce_pipeline() {
 
     let graph = DataflowGraph::new();
     graph
-        .batch_source(source)
+        .source(source)
         .operator("reduce_sum", op)
         .sink(SumCollectSink {
             collected: collected.clone(),
@@ -644,7 +644,7 @@ async fn batch_rolling_aggregate_pipeline() {
 
     let graph = DataflowGraph::new();
     graph
-        .batch_source(source)
+        .source(source)
         .operator("rolling_sum", op)
         .sink(SumCollectSink {
             collected: collected.clone(),
@@ -747,7 +747,7 @@ async fn batch_temporal_join_pipeline() {
 
     let graph = DataflowGraph::new();
     graph
-        .batch_source(source)
+        .source(source)
         .operator("temporal_join", op)
         .sink(JoinCollectSink {
             collected: collected.clone(),

@@ -21,7 +21,7 @@ pub(crate) type SourceBatch = (ErasedBuffer, Option<u64>);
 /// Reads batches from the source and sends `(ErasedBuffer, watermark)` tuples
 /// through the flume channel. The watermark is committed by the Timely source
 /// operator after emitting items, ensuring it never races ahead of the data.
-pub(crate) async fn local_batch_source_bridge(
+pub(crate) async fn local_source_bridge(
     mut source: Box<dyn ErasedSource>,
     tx: flume::Sender<SourceBatch>,
     offsets_writer: Arc<Mutex<HashMap<String, String>>>,
@@ -144,7 +144,7 @@ mod tests {
         let offsets = Arc::new(Mutex::new(HashMap::new()));
         let wm = Arc::new(AtomicU64::new(0));
 
-        local_batch_source_bridge(Box::new(source), tx, offsets, wm.clone(), None).await;
+        local_source_bridge(Box::new(source), tx, offsets, wm.clone(), None).await;
 
         let _ = rx.try_recv();
         assert_eq!(

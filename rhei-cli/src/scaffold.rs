@@ -159,7 +159,7 @@ async fn main() -> anyhow::Result<()> {
 
     let graph = DataflowGraph::new();
     graph
-        .batch_source(VecSource::new(data))
+        .source(VecSource::new(data))
         .sink(PrintSink::<i64>::new());
 
     let executor = Executor::builder()

@@ -15,8 +15,8 @@ struct Upper {
     text: String,
 }
 
-#[rhei::op_batch]
-async fn batch_upper(
+#[rhei::op]
+async fn upper_op(
     input: RheiBuffer<Word>,
     _ctx: &mut OperatorContext,
 ) -> anyhow::Result<BufferOutput<Upper>> {
@@ -49,11 +49,11 @@ fn make_input(words: &[&str]) -> RheiBuffer<Word> {
 }
 
 #[tokio::test]
-async fn op_batch_process_batch() {
+async fn op_process_batch() {
     use rhei::StreamFunction;
 
     let mut ctx = test_ctx();
-    let mut op = BatchUpper;
+    let mut op = UpperOp;
 
     let input = make_input(&["hello", "world"]);
     let result = op.process(input, &mut ctx).await.unwrap();
@@ -68,11 +68,11 @@ async fn op_batch_process_batch() {
 }
 
 #[tokio::test]
-async fn op_batch_process_single() {
+async fn op_process_single() {
     use rhei::StreamFunction;
 
     let mut ctx = test_ctx();
-    let mut op = BatchUpper;
+    let mut op = UpperOp;
 
     let input = make_input(&["hello"]);
     let result = op.process(input, &mut ctx).await.unwrap();
@@ -85,8 +85,8 @@ async fn op_batch_process_single() {
 }
 
 #[test]
-fn op_batch_struct_is_clone_and_debug() {
-    let op = BatchUpper;
+fn op_struct_is_clone_and_debug() {
+    let op = UpperOp;
     let _cloned = op.clone();
     let _debug = format!("{op:?}");
 }

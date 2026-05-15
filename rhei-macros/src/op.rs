@@ -8,7 +8,7 @@ pub(crate) fn expand(item: ItemFn) -> Result<TokenStream, Error> {
     if item.sig.asyncness.is_none() {
         return Err(Error::new_spanned(
             item.sig.fn_token,
-            "#[op_batch] function must be async",
+            "#[op] function must be async",
         ));
     }
 
@@ -16,7 +16,7 @@ pub(crate) fn expand(item: ItemFn) -> Result<TokenStream, Error> {
     if params.len() != 2 {
         return Err(Error::new_spanned(
             &item.sig.inputs,
-            "#[op_batch] function must have exactly 2 parameters: \
+            "#[op] function must have exactly 2 parameters: \
              (input: RheiBuffer<I>, ctx: &mut OperatorContext)",
         ));
     }
@@ -26,7 +26,7 @@ pub(crate) fn expand(item: ItemFn) -> Result<TokenStream, Error> {
     let syn::FnArg::Typed(first_pat) = first_param else {
         return Err(Error::new_spanned(
             first_param,
-            "#[op_batch] function must not have a self parameter",
+            "#[op] function must not have a self parameter",
         ));
     };
     let input_buf_type = &*first_pat.ty;
@@ -35,7 +35,7 @@ pub(crate) fn expand(item: ItemFn) -> Result<TokenStream, Error> {
     let input_type = extract_generic_inner(input_buf_type, "RheiBuffer").ok_or_else(|| {
         Error::new_spanned(
             input_buf_type,
-            "#[op_batch] first parameter must be RheiBuffer<T>",
+            "#[op] first parameter must be RheiBuffer<T>",
         )
     })?;
 
@@ -44,7 +44,7 @@ pub(crate) fn expand(item: ItemFn) -> Result<TokenStream, Error> {
     let syn::FnArg::Typed(second_pat) = second_param else {
         return Err(Error::new_spanned(
             second_param,
-            "#[op_batch] function must not have a self parameter",
+            "#[op] function must not have a self parameter",
         ));
     };
     let ctx_pat = &*second_pat.pat;
@@ -54,14 +54,14 @@ pub(crate) fn expand(item: ItemFn) -> Result<TokenStream, Error> {
     let ReturnType::Type(_, ref return_ty) = item.sig.output else {
         return Err(Error::new_spanned(
             &item.sig,
-            "#[op_batch] function must return anyhow::Result<BufferOutput<T>>",
+            "#[op] function must return anyhow::Result<BufferOutput<T>>",
         ));
     };
 
     let output_type = extract_result_buffer_output_inner(return_ty).ok_or_else(|| {
         Error::new_spanned(
             return_ty,
-            "#[op_batch] function must return anyhow::Result<BufferOutput<T>>",
+            "#[op] function must return anyhow::Result<BufferOutput<T>>",
         )
     })?;
 

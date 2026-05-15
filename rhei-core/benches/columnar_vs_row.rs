@@ -9,7 +9,7 @@ use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_m
 use rhei_core::arrow::{
     BufferOutput, OperatorContext, RheiBuffer, RheiBuilder, RheiSchema, StreamFunction,
 };
-use rhei_core::operators::batch::{FilterFnOp, MapOp};
+use rhei_core::operators::{FilterFnOp, MapOp};
 use rhei_core::state::context::StateContext;
 use rhei_core::state::local_backend::LocalBackend;
 
@@ -257,8 +257,8 @@ fn bench_filter(c: &mut Criterion) {
 }
 
 fn bench_filter_expr(c: &mut Criterion) {
-    use rhei_core::operators::batch::filter_expr::eval_predicate;
-    use rhei_core::operators::batch::{col, lit_f64};
+    use rhei_core::operators::filter_expr::eval_predicate;
+    use rhei_core::operators::{col, lit_f64};
 
     let mut group = c.benchmark_group("filter_expr");
 
@@ -278,7 +278,7 @@ fn bench_filter_expr(c: &mut Criterion) {
 
         // Full operator (kernel + and_mask)
         group.bench_with_input(BenchmarkId::new("operator", size), &size, |b, &n| {
-            use rhei_core::operators::batch::FilterExprOp;
+            use rhei_core::operators::FilterExprOp;
             let rt = tokio::runtime::Runtime::new().unwrap();
             let buffer = make_buffer(n);
             b.iter(|| {

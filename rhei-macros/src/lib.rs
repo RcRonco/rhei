@@ -1,10 +1,10 @@
 //! Proc macros for the Rhei stream processing engine.
 //!
-//! Provides `#[op_batch]` and `#[pipeline]` attribute macros and
+//! Provides `#[op]` and `#[pipeline]` attribute macros and
 //! `#[derive(RheiSchema)]` to reduce boilerplate when defining operators
 //! and pipelines.
 
-mod op_batch;
+mod op;
 mod pipeline;
 mod rhei_schema;
 mod util;
@@ -12,22 +12,26 @@ mod util;
 use proc_macro::TokenStream;
 use syn::{DeriveInput, parse_macro_input};
 
-/// Define a batch stream operator from an async function.
+/// Define a stream operator from an async function.
 ///
 /// # Example
 ///
 /// ```ignore
-/// #[rhei::op_batch]
-/// async fn batch_upper(inputs: Vec<String>, ctx: &mut StateContext) -> anyhow::Result<Vec<String>> {
-///     Ok(inputs.into_iter().map(|s| s.to_uppercase()).collect())
+/// #[rhei::op]
+/// async fn upper(input: RheiBuffer<Word>, ctx: &mut OperatorContext) -> anyhow::Result<BufferOutput<Upper>> {
+///     let mut builder = Upper::builder(input.len());
+///     for view in &input {
+///         builder.append(Upper { text: view.text.to_uppercase() });
+///     }
+///     Ok(BufferOutput::Single(RheiBuffer::from_builder(builder)))
 /// }
 /// ```
 ///
-/// Generates a struct implementing `StreamFunction`.
+/// Generates a struct (`Upper`) implementing `StreamFunction`.
 #[proc_macro_attribute]
-pub fn op_batch(_attr: TokenStream, item: TokenStream) -> TokenStream {
+pub fn op(_attr: TokenStream, item: TokenStream) -> TokenStream {
     let item_fn = parse_macro_input!(item as syn::ItemFn);
-    match op_batch::expand(item_fn) {
+    match op::expand(item_fn) {
         Ok(tokens) => tokens.into(),
         Err(err) => err.to_compile_error().into(),
     }
@@ -40,7 +44,7 @@ pub fn op_batch(_attr: TokenStream, item: TokenStream) -> TokenStream {
 /// ```ignore
 /// #[rhei::pipeline]
 /// fn main(graph: &DataflowGraph) {
-///     graph.batch_source(VecSource::new(data))
+///     graph.source(VecSource::new(data))
 ///         .map(|e: EventView| Output { ... })
 ///         .sink(PrintSink::new());
 /// }

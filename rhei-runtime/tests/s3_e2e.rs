@@ -23,7 +23,7 @@ use rhei_core::arrow::{
     BufferOutput, OperatorContext, RheiBuffer, RheiBuilder, RheiSchema, Sink, StreamFunction,
 };
 use rhei_core::connectors::batch::VecSource;
-use rhei_core::operators::batch::keyed_state::KeyedState;
+use rhei_core::operators::keyed_state::KeyedState;
 use rhei_core::state::backend::StateBackend;
 use rhei_core::state::slatedb_backend::SlateDbBackend;
 use rhei_core::state::tiered_backend::TieredBackendConfig;
@@ -373,7 +373,7 @@ async fn s3_tiered_storage_e2e() {
 
     let graph = DataflowGraph::new();
     graph
-        .batch_source(source)
+        .source(source)
         .operator("word_counter", BatchWordCounter)
         .sink(CollectSink {
             collected: collected.clone(),

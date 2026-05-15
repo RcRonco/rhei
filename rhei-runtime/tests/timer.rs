@@ -357,7 +357,7 @@ async fn timer_fires_on_watermark_advance() {
 
     let graph = DataflowGraph::new();
     graph
-        .batch_source(source)
+        .source(source)
         .operator("delayed_emitter", DelayedEmitter)
         .sink(TimerFiredSink {
             collected: collected.clone(),
@@ -422,7 +422,7 @@ async fn timer_does_not_fire_early() {
 
     let graph = DataflowGraph::new();
     graph
-        .batch_source(source)
+        .source(source)
         .operator("delayed_emitter_early", DelayedEmitter)
         .sink(TimerFiredSink {
             collected: collected.clone(),

@@ -129,7 +129,7 @@ async fn inspect_does_not_modify_stream() {
     let source = VecSource::new(make_events(&[1, 2, 3, 4, 5])).with_batch_size(10);
     let graph = DataflowGraph::new();
     graph
-        .batch_source(source)
+        .source(source)
         .inspect(move |v| {
             inspected_clone.lock().unwrap().push(v.val);
         })
@@ -156,7 +156,7 @@ async fn limit_caps_output() {
 
     let source = VecSource::new(make_events(&[10, 20, 30, 40, 50])).with_batch_size(10);
     let graph = DataflowGraph::new();
-    graph.batch_source(source).limit(3).sink(CollectSink {
+    graph.source(source).limit(3).sink(CollectSink {
         collected: collected.clone(),
     });
 
@@ -178,7 +178,7 @@ async fn distinct_by_deduplicates() {
     let source = VecSource::new(make_events(&[1, 2, 2, 3, 3, 3])).with_batch_size(10);
     let graph = DataflowGraph::new();
     graph
-        .batch_source(source)
+        .source(source)
         .distinct_by(|v| v.val.to_string())
         .sink(CollectSink {
             collected: collected.clone(),
@@ -199,12 +199,9 @@ async fn name_does_not_affect_data() {
 
     let source = VecSource::new(make_events(&[7, 8, 9])).with_batch_size(10);
     let graph = DataflowGraph::new();
-    graph
-        .batch_source(source)
-        .name("my_stream")
-        .sink(CollectSink {
-            collected: collected.clone(),
-        });
+    graph.source(source).name("my_stream").sink(CollectSink {
+        collected: collected.clone(),
+    });
 
     let ctrl = PipelineController::new(checkpoint_dir.path().to_path_buf()).with_workers(1);
     ctrl.run(graph).await.unwrap();

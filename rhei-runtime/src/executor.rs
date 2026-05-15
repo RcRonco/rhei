@@ -224,12 +224,8 @@ impl DataflowExecutor {
 
             match kind {
                 NodeKindTag::Source => {
-                    let stream = self.build_batch_source(
-                        scope,
-                        node_id,
-                        &mut data.batch_source_rx,
-                        &mut data.source_wm,
-                    );
+                    let stream =
+                        self.build_source(scope, node_id, &mut data.source_rx, &mut data.source_wm);
                     batch_streams.insert(node_id, stream);
                 }
                 NodeKindTag::BatchTransform => {
@@ -276,11 +272,11 @@ impl DataflowExecutor {
     // ── Batch (Arrow) build methods ─────────────────────────────────
 
     /// Build a batch source operator that reads `ErasedBuffer` from a flume channel.
-    fn build_batch_source<'a, A: Allocate>(
+    fn build_source<'a, A: Allocate>(
         &self,
         scope: &mut Scope<'a, A>,
         node_id: NodeId,
-        batch_source_rx: &mut HashMap<NodeId, flume::Receiver<crate::bridge::SourceBatch>>,
+        source_rx: &mut HashMap<NodeId, flume::Receiver<crate::bridge::SourceBatch>>,
         source_watermarks: &mut HashMap<NodeId, Arc<AtomicU64>>,
     ) -> ErasedStream<'a, A> {
         use timely::dataflow::operators::generic::OutputBuilder;
@@ -295,7 +291,7 @@ impl DataflowExecutor {
         let activator = scope.activator_for(source_builder.operator_info().address);
         source_builder.set_notify(false);
 
-        let rx = batch_source_rx.remove(&node_id);
+        let rx = source_rx.remove(&node_id);
         let worker_label = self.worker_index.to_string();
         let all_wms = self.all_source_watermarks.clone();
         let per_source_wm = source_watermarks.remove(&node_id);

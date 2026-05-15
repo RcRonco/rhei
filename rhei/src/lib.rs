@@ -1,11 +1,11 @@
 //! Rhei stream processing engine — facade crate.
 //!
-//! Add `rhei = "0.1"` and use `#[rhei::op_batch]`, `#[rhei::pipeline]`, and
+//! Add `rhei = "0.1"` and use `#[rhei::op]`, `#[rhei::pipeline]`, and
 //! `#[derive(RheiSchema)]` to define operators and pipelines with minimal
 //! boilerplate.
 
 // Re-export macros
-pub use rhei_macros::{RheiSchema, op_batch, pipeline};
+pub use rhei_macros::{RheiSchema, op, pipeline};
 
 // Arrow primitives and batch traits
 pub use rhei_core::arrow::{
@@ -43,7 +43,7 @@ pub use rhei_core::connectors::batch::{KafkaSink, KafkaSource};
 pub use rhei_core::connectors::kafka::types::{KafkaHeader, KafkaMessage, KafkaRecord};
 
 // Batch operators
-pub use rhei_core::operators::batch::{
+pub use rhei_core::operators::{
     CountWindow, Expr, FilterExprOp, ReduceOp, RollingAggregateOp, SessionWindow, Side,
     SlidingWindow, TemporalJoin, TumblingWindow, col, lit_bool, lit_f64, lit_i64, lit_str, lit_u64,
 };
@@ -52,7 +52,7 @@ pub use rhei_core::operators::batch::{
 pub use rhei_core::connectors::batch::PartitionedVecSource;
 
 // KeyedState (used by stateful batch operators)
-pub use rhei_core::operators::batch::keyed_state::KeyedState;
+pub use rhei_core::operators::keyed_state::KeyedState;
 
 /// Items used by macro-generated code. Not part of the public API.
 #[doc(hidden)]

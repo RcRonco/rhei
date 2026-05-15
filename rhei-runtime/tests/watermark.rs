@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use rhei_core::arrow::{RheiBuffer, RheiBuilder, RheiSchema, Sink, Source};
-use rhei_core::operators::batch::TumblingWindow;
+use rhei_core::operators::TumblingWindow;
 use rhei_runtime::controller::PipelineController;
 use rhei_runtime::dataflow::DataflowGraph;
 
@@ -392,7 +392,7 @@ async fn watermark_triggers_window_closure() {
 
     let graph = DataflowGraph::new();
     graph
-        .batch_source(source)
+        .source(source)
         .operator("tumbling_10", window)
         .sink(WindowCollectSink {
             collected: collected.clone(),
@@ -494,7 +494,7 @@ async fn watermark_advance_closes_multiple_keys() {
 
     let graph = DataflowGraph::new();
     graph
-        .batch_source(source)
+        .source(source)
         .operator("tumbling_10_multi", window)
         .sink(WindowCollectSink {
             collected: collected.clone(),

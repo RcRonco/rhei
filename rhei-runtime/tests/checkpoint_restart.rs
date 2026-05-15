@@ -12,7 +12,7 @@ use rhei_core::arrow::{
     BufferOutput, OperatorContext, RheiBuffer, RheiBuilder, RheiSchema, Sink, StreamFunction,
 };
 use rhei_core::connectors::batch::VecSource;
-use rhei_core::operators::batch::keyed_state::KeyedState;
+use rhei_core::operators::keyed_state::KeyedState;
 use rhei_runtime::controller::PipelineController;
 use rhei_runtime::dataflow::DataflowGraph;
 
@@ -279,7 +279,7 @@ async fn checkpoint_restart_preserves_state() {
 
         let graph = DataflowGraph::new();
         graph
-            .batch_source(source)
+            .source(source)
             .operator("word_counter", BatchWordCounter)
             .sink(WordCountSink {
                 collected: collected_run1.clone(),
@@ -309,7 +309,7 @@ async fn checkpoint_restart_preserves_state() {
 
         let graph = DataflowGraph::new();
         graph
-            .batch_source(source)
+            .source(source)
             .operator("word_counter", BatchWordCounter)
             .sink(WordCountSink {
                 collected: collected_run2.clone(),

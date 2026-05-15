@@ -8,7 +8,7 @@
 //!
 //! ```ignore
 //! let graph = DataflowGraph::new();
-//! let orders = graph.batch_source(kafka_source);
+//! let orders = graph.source(kafka_source);
 //! orders
 //!     .map(parse)
 //!     .filter_fn(|o| o.is_valid())
@@ -157,7 +157,7 @@ pub(crate) struct GraphNode {
 
 /// The dataflow graph: a collection of nodes connected by edges.
 ///
-/// Build a graph by calling [`batch_source()`](Self::batch_source) to create
+/// Build a graph by calling [`source()`](Self::source) to create
 /// entry points, then chaining transforms and sinks on the returned
 /// [`Stream`] handles. Pass the finished graph to
 /// [`Executor::run()`](crate::executor::Executor::run) for execution.
@@ -187,7 +187,7 @@ impl DataflowGraph {
     }
 
     /// Add a batch (Arrow columnar) data source. Returns a [`Stream`] handle.
-    pub fn batch_source<S>(&self, source: S) -> Stream<'_, S::Output>
+    pub fn source<S>(&self, source: S) -> Stream<'_, S::Output>
     where
         S: Source + 'static,
         S::Output: Sync,
@@ -251,7 +251,7 @@ impl std::fmt::Display for ValidationError {
             Self::EmptyGraph => write!(f, "dataflow graph is empty — add at least one source"),
             Self::NoSources => write!(
                 f,
-                "dataflow graph has no sources — call graph.batch_source(...) to add one"
+                "dataflow graph has no sources — call graph.source(...) to add one"
             ),
             Self::NoSinks => write!(
                 f,
@@ -293,7 +293,7 @@ impl DataflowGraph {
     ///
     /// ```ignore
     /// let graph = DataflowGraph::new();
-    /// graph.batch_source(my_source)
+    /// graph.source(my_source)
     ///     .map(|x| x * 2);
     ///     // Oops — forgot .sink(...)
     ///
@@ -468,7 +468,7 @@ impl<'a, T: RheiSchema + 'static> Stream<'a, T> {
     }
 
     /// Expression-based zero-copy filter using Arrow compute kernels.
-    pub fn filter(self, expr: rhei_core::operators::batch::Expr) -> Stream<'a, T> {
+    pub fn filter(self, expr: rhei_core::operators::Expr) -> Stream<'a, T> {
         let node = LazyBatchTransformNode(Box::new(move || {
             let expr = expr.clone();
             Arc::new(move |buf: ErasedBuffer| {
@@ -483,14 +483,13 @@ impl<'a, T: RheiSchema + 'static> Stream<'a, T> {
                     return vec![];
                 }
                 let batch = typed.as_record_batch();
-                let mask =
-                    match rhei_core::operators::batch::filter_expr::eval_predicate(&expr, batch) {
-                        Ok(m) => m,
-                        Err(e) => {
-                            tracing::error!("batch filter eval failed: {e}");
-                            return vec![];
-                        }
-                    };
+                let mask = match rhei_core::operators::filter_expr::eval_predicate(&expr, batch) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        tracing::error!("batch filter eval failed: {e}");
+                        return vec![];
+                    }
+                };
                 let filtered = typed.and_mask(mask);
                 if filtered.is_empty() {
                     return vec![];

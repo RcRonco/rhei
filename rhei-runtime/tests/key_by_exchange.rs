@@ -16,7 +16,7 @@ use rhei_core::arrow::{
     BufferOutput, OperatorContext, RheiBuffer, RheiBuilder, RheiSchema, Sink, StreamFunction,
 };
 use rhei_core::connectors::batch::VecSource;
-use rhei_core::operators::batch::keyed_state::KeyedState;
+use rhei_core::operators::keyed_state::KeyedState;
 use rhei_runtime::controller::PipelineController;
 use rhei_runtime::dataflow::DataflowGraph;
 
@@ -276,7 +276,7 @@ async fn key_by_exchange_routes_same_key_to_same_worker() {
 
     let graph = DataflowGraph::new();
     graph
-        .batch_source(source)
+        .source(source)
         .key_by(|view: &KeyedEventView<'_>| view.key.to_string())
         .operator("key_counter", KeyCounter)
         .sink(CollectSink {

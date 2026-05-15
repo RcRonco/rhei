@@ -136,7 +136,7 @@ async fn partitioned_source_distributes_to_workers() {
     let source = PartitionedVecSource::new(items, 4).with_batch_size(5);
 
     let graph = DataflowGraph::new();
-    graph.batch_source(source).sink(CollectSink {
+    graph.source(source).sink(CollectSink {
         collected: collected.clone(),
     });
 
@@ -167,7 +167,7 @@ async fn partitioned_source_with_more_workers_than_partitions() {
     let source = PartitionedVecSource::new(items, 2).with_batch_size(10);
 
     let graph = DataflowGraph::new();
-    graph.batch_source(source).sink(CollectSink {
+    graph.source(source).sink(CollectSink {
         collected: collected.clone(),
     });
 
