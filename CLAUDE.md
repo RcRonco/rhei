@@ -18,30 +18,34 @@ CI uses [cargo-nextest](https://nexte.st/) with JUnit reporting for GitHub test 
 
 ## Workspace Structure
 
-Three crates:
+Five crates:
 
-- **rhei-core** — Traits (`StreamFunction`, `Source`, `Sink`), operator library (windows, joins, combinators), state backends (L1 memtable, L2 Foyer, L3 SlateDB), logical plan builder (`StreamGraph`), connectors (Kafka, Vec, Print).
-- **rhei-runtime** — Executor that materializes logical plans into Timely dataflows. `AsyncOperator` wraps `StreamFunction` with hot/cold path split. `TimelyAsyncOperator` adds capability tracking. `bridge.rs` bridges async Source/Sink to sync Timely channels. `pipeline.rs` provides the fluent builder API.
+- **rhei-core** — Traits (`StreamFunction`, `Source`, `Sink`), Arrow columnar buffer (`RheiBuffer<T>`, `RheiSchema`), operator library (windows, joins, combinators), state backends (L1 memtable, L2 Foyer, L3 SlateDB), connectors (Kafka, Vec, Print), DLQ (`DlqSink` trait).
+- **rhei-runtime** — Dataflow graph builder (`DataflowGraph`, `Stream<T>`), compiler, executor with Timely-backed multi-worker/multi-process execution. `ErasedBuffer` transports Arrow batches through Timely. `bridge.rs` bridges async Source/Sink to sync Timely channels. `task_manager.rs` orchestrates background services.
+- **rhei-macros** — Proc macros (`#[rhei::pipeline]`, `#[rhei::op]`).
+- **rhei** — Convenience crate re-exporting core types and macros.
 - **rhei-cli** — CLI (`rhei new`, `rhei run`, `rhei run --tui`). TUI dashboard with graph view, metrics, and log viewer.
 
 ## Architecture
 
-**Execution model:** Timely Dataflow runs on a blocking thread (`spawn_blocking`). Async sources/sinks are bridged via bounded `flume` channels. Each Timely worker gets a per-worker `current_thread` Tokio runtime for source I/O co-location. Clustering design in `CLUSTERING.md`.
+**Execution model:** Arrow columnar. Data flows as `RheiBuffer<T>` (typed `RecordBatch` + selection vector), type-erased to `ErasedBuffer` for Timely transport. Timely Dataflow runs on blocking threads (`spawn_blocking`). Async sources/sinks bridged via bounded `tokio::sync::mpsc` channels. Clustering design in `CLUSTERING.md`.
 
-**Hot/cold path:** `AsyncOperator` polls the `StreamFunction` future once synchronously. If it resolves (L1 cache hit), output is returned immediately. If pending (state miss), `block_in_place` drives the future on the Tokio runtime to fetch from L2/L3.
+**Data path:** Source produces `RheiBuffer<T>` → erased to `ErasedBuffer` → Timely operators (Pipeline/Exchange pact) → recovered to `RheiBuffer<T>` → `StreamFunction::process()` → output → Sink.
+
+**Exchange:** `key_by` uses two-stage Timely operator: (1) split rows by `seahash(key) % workers` into per-worker sub-buffers, (2) route via Exchange pact. Serialization is Arrow IPC.
 
 **State hierarchy:** L1 `HashMap` memtable (microseconds) → L2 Foyer `HybridCache` on NVMe (milliseconds) → L3 SlateDB on S3 (10s-100s ms). `PrefixedBackend` namespaces keys per operator as `{operator_name}/{user_key}`.
 
-**Checkpointing:** Triggered when Timely frontier advances and no pending futures remain. L1 dirty keys flush through to SlateDB/S3. Source offsets committed after checkpoint.
+**Checkpointing:** Triggered when Timely frontier advances. L1 dirty keys flush through to SlateDB/S3. Source offsets committed after checkpoint. Checkpoint manifest tracks operators and offsets.
 
-**`TimelyAsyncOperator` is `!Send`** due to `Rc` in Timely capabilities. It must be constructed inside the worker thread, not moved across threads. The `Mutex` wrapping pattern in `executor.rs` handles this.
+**Process layering:** Controller (config/lifecycle) → TaskManager (background services, bridging) → DataflowExecutor (per-worker Timely compilation). See `INPROC-ARCH.md`.
 
 ## Code Conventions
 
 - Rust edition 2024. `unsafe` code is forbidden workspace-wide.
 - Clippy `all` is deny, `pedantic` is warn.
 - `rustfmt.toml`: max_width=100, edition 2024.
-- Operator types implement `StreamFunction` (async trait with `Input`/`Output` associated types).
+- Operator types implement `StreamFunction` (async trait: `process(RheiBuffer<I>, &mut OperatorContext) -> BufferOutput<O>`).
 - State access goes through `StateContext` (or the typed `KeyedState<K, V>` wrapper).
 - Kafka integration is behind the `kafka` feature flag on `rhei-core`.
 

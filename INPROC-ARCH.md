@@ -100,7 +100,7 @@ One TaskManager per process (`task_manager.rs`). Owns all shared infrastructure 
 ```rust
 pub(crate) struct TaskManager {
     // ── Shared infrastructure ──────────────────────────────
-    sink_senders: Arc<HashMap<NodeId, mpsc::Sender<AnyItem>>>,
+    sink_senders: Arc<HashMap<NodeId, mpsc::Sender<ErasedBuffer>>>,
     global_watermark: Arc<AtomicU64>,
 
     // ── Graph metadata ─────────────────────────────────────
@@ -155,7 +155,7 @@ pub(crate) struct DataflowExecutor {
     data: Option<ExecutorData>,
 
     // ── Shared refs (cloned from TaskManager) ──────────────
-    sink_senders: Arc<HashMap<NodeId, mpsc::Sender<AnyItem>>>,
+    sink_senders: Arc<HashMap<NodeId, mpsc::Sender<ErasedBuffer>>>,
     topo_order: Arc<Vec<NodeId>>,
     node_inputs: Arc<HashMap<NodeId, Vec<NodeId>>>,
     node_kinds: Arc<HashMap<NodeId, NodeKindTag>>,

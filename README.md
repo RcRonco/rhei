@@ -21,7 +21,7 @@ cargo run -p rhei --example pipeline_macro
 ```
 
 ```rust
-use rhei::{KeyedState, PrintSink, StateContext, VecSource};
+use rhei::{KeyedState, PrintSink, StateContext, VecSource, DataflowGraph};
 
 #[rhei::op]
 async fn word_counter(input: String, ctx: &mut StateContext) -> anyhow::Result<Vec<String>> {
@@ -67,8 +67,7 @@ executor.run(graph).await?;
 ## Kafka Example
 
 ```rust
-use rhei_core::connectors::kafka::source::KafkaSource;
-use rhei_core::connectors::kafka::sink::KafkaSink;
+use rhei_core::connectors::batch::{KafkaSource, KafkaSink};
 
 let source = KafkaSource::new("localhost:9092", "my-group", &["events"])?
     .with_batch_size(200);
@@ -77,15 +76,14 @@ let sink = KafkaSink::new("localhost:9092", "alerts")?;
 
 graph
     .source(source)
-    .parse_json::<Event>()
-    .filter(|e: &Event| e.severity > 5)
-    .key_by(|e: &Event| e.device_id.clone())
+    .map(|msg| parse_event(msg))
+    .filter_fn(|e| e.severity > 5)
+    .key_by(|e| e.device_id.clone())
     .operator("alerter", Alerter)
-    .to_json()
     .sink(sink);
 ```
 
-Kafka sources support regex topic patterns, header read/write, per-partition parallel consumption, and checkpoint-based offset tracking.
+Kafka sources support per-partition parallel consumption, header read/write, watermark tracking, and checkpoint-based offset commits.
 
 ## Architecture
 
@@ -133,7 +131,7 @@ In multi-process mode, each process independently opens SlateDB against the same
 
 | Crate | Purpose |
 |-------|---------|
-| `rhei-core` | Traits (`StreamFunction`, `Source`, `Sink`), operator library (tumbling/sliding/session windows, temporal joins, combinators), state backends, connectors (Kafka, Vec, Print) |
+| `rhei-core` | Traits (`StreamFunction`, `Source`, `Sink`), Arrow columnar buffer (`RheiBuffer<T>`), operator library (tumbling/sliding/session windows, temporal joins, combinators), state backends, connectors (Kafka, Vec, Print), DLQ |
 | `rhei-runtime` | Dataflow graph builder, compiler, executor with Timely-backed multi-worker/multi-process execution, checkpoint coordination, async bridges, metrics, tracing |
 | `rhei-cli` | CLI (`rhei run`, `rhei run --tui --workers 4`), TUI dashboard with pipeline graph, live metrics, and per-worker logs |
 | `rhei` | Convenience crate with `#[rhei::pipeline]` and `#[rhei::op]` proc macros, re-exports core types |
@@ -147,7 +145,7 @@ Built-in operators in `rhei-core`:
 - **Combinators** — `Filter`, `Map`, `FlatMap`
 - **State** — `KeyedState<K, V>` typed wrapper with automatic serde over `StateContext`
 
-Custom operators implement the `StreamFunction` trait:
+Custom operators implement the `StreamFunction` trait, processing Arrow-columnar `RheiBuffer` batches:
 
 ```rust
 #[async_trait]
@@ -155,16 +153,21 @@ impl StreamFunction for MyOperator {
     type Input = Event;
     type Output = Alert;
 
-    async fn process(&mut self, input: Event, ctx: &mut StateContext) -> anyhow::Result<Vec<Alert>> {
-        let mut state = KeyedState::<String, u64>::new(ctx, "counts");
-        let count = state.get(&input.key).await?.unwrap_or(0) + 1;
-        state.put(&input.key, &count);
-
-        if count > threshold {
-            Ok(vec![Alert { key: input.key, count }])
-        } else {
-            Ok(vec![])
+    async fn process(
+        &mut self,
+        input: RheiBuffer<Event>,
+        ctx: &mut OperatorContext,
+    ) -> anyhow::Result<BufferOutput<Alert>> {
+        let mut builder = Alert::builder(input.len());
+        for view in &input {
+            let mut state = KeyedState::<String, u64>::new(&mut ctx.state, "counts");
+            let count = state.get(&view.key).await?.unwrap_or(0) + 1;
+            state.put(&view.key, &count);
+            if count > threshold {
+                builder.append(Alert { key: view.key.to_string(), count });
+            }
         }
+        Ok(BufferOutput::from_builder(builder))
     }
 }
 ```
@@ -215,7 +218,7 @@ cargo test --workspace
 cargo clippy --workspace --all-targets --no-deps -- -D warnings
 ```
 
-Kafka integration requires the `kafka` feature flag on `rhei-core` and `librdkafka` (built via cmake).
+Kafka integration requires the `kafka` feature flag on `rhei-core` and `librdkafka` (linked dynamically via Homebrew or system package).
 
 ## License
 
