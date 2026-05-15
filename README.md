@@ -21,39 +21,47 @@ cargo run -p rhei --example pipeline_macro
 ```
 
 ```rust
-use rhei::{KeyedState, PrintSink, StateContext, VecSource, DataflowGraph};
+use rhei::{DataflowGraph, KeyedState, PrintSink, VecSource};
+use rhei::arrow::{BufferOutput, OperatorContext, RheiBuffer, RheiBuilder, RheiSchema};
+
+#[derive(rhei::RheiSchema)]
+struct WordIn { text: String }
+
+#[derive(rhei::RheiSchema)]
+struct WordOut { text: String }
 
 #[rhei::op]
-async fn word_counter(input: String, ctx: &mut StateContext) -> anyhow::Result<Vec<String>> {
-    let mut outputs = Vec::new();
-    for word in input.split_whitespace() {
-        let key = word.to_string();
-        let mut state = KeyedState::<String, u64>::new(ctx, "count");
-        let count = state.get(&key).await.unwrap_or(None).unwrap_or(0) + 1;
-        state.put(&key, &count);
-        outputs.push(format!("{word}: {count}"));
+async fn word_counter(
+    input: RheiBuffer<WordIn>,
+    ctx: &mut OperatorContext,
+) -> anyhow::Result<BufferOutput<WordOut>> {
+    let mut builder = WordOut::builder(input.len());
+    for view in &input {
+        let mut state = KeyedState::<String, u64>::new(&mut ctx.state, "count");
+        let count = state.get(view.text).await?.unwrap_or(0) + 1;
+        state.put(view.text, &count);
+        builder.append(WordOut { text: format!("{}: {count}", view.text) });
     }
-    Ok(outputs)
+    Ok(BufferOutput::Single(RheiBuffer::from_builder(builder)))
 }
 
 #[rhei::pipeline]
 fn main(graph: &DataflowGraph) {
-    let lines = vec![
-        "hello world".to_string(),
-        "hello rhei".to_string(),
-        "rhei is a stream processor".to_string(),
+    let words = vec![
+        WordIn { text: "hello".into() },
+        WordIn { text: "world".into() },
+        WordIn { text: "hello".into() },
     ];
 
     graph
-        .source(VecSource::new(lines))
-        .flat_map(|line: String| line.split_whitespace().map(String::from).collect())
-        .key_by(|word: &String| word.clone())
+        .source(VecSource::new(words))
+        .key_by(|w| w.text.to_string())
         .operator("word_counter", WordCounter)
-        .sink(PrintSink::<String>::new());
+        .sink(PrintSink::<WordOut>::new());
 }
 ```
 
-`#[rhei::pipeline]` sets up the executor and tokio runtime. `#[rhei::op]` generates the `StreamFunction` impl from a plain async function. For full control, use the builder API directly:
+`#[rhei::pipeline]` sets up the executor and tokio runtime. `#[rhei::op]` generates the `StreamFunction` impl from an async function that takes `RheiBuffer<I>` and returns `BufferOutput<O>`. For full control, use the builder API directly:
 
 ```rust
 let executor = Executor::builder()
@@ -176,8 +184,11 @@ Or use the `#[rhei::op]` macro to skip the boilerplate:
 
 ```rust
 #[rhei::op]
-async fn my_operator(input: Event, ctx: &mut StateContext) -> anyhow::Result<Vec<Alert>> {
-    // same body as above
+async fn my_operator(
+    input: RheiBuffer<Event>,
+    ctx: &mut OperatorContext,
+) -> anyhow::Result<BufferOutput<Alert>> {
+    // same body as above — generates struct `MyOperator` implementing `StreamFunction`
 }
 ```
 
