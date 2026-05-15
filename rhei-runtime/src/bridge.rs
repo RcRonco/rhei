@@ -59,7 +59,7 @@ pub(crate) async fn local_source_bridge(
 ///
 /// Reads `ErasedBuffer` batches from the channel and writes them to the sink.
 /// Flushes when the channel closes.
-pub(crate) async fn batch_sink_drain(
+pub(crate) async fn sink_drain(
     mut sink: Box<dyn ErasedSink>,
     rx: flume::Receiver<ErasedBuffer>,
 ) -> anyhow::Result<()> {

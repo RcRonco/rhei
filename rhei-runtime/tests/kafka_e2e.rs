@@ -381,7 +381,7 @@ async fn produce_json<T: Serialize>(topic: &str, key: &[u8], value: &T, producer
 
 #[tokio::test]
 #[allow(clippy::too_many_lines)]
-async fn kafka_batch_aggregation_e2e() {
+async fn kafka_aggregation_e2e() {
     use rhei_core::connectors::kafka::types::KafkaMessage as KafkaMsgType;
 
     let _ = tracing_subscriber::fmt()
@@ -390,7 +390,7 @@ async fn kafka_batch_aggregation_e2e() {
         .try_init();
 
     // ── Setup topic ─────────────────────────────────────────────────
-    let orders_topic = unique_topic("batch_orders");
+    let orders_topic = unique_topic("orders");
     create_topic(&orders_topic, 1).await;
 
     // ── Generate and produce data ───────────────────────────────────
@@ -409,7 +409,7 @@ async fn kafka_batch_aggregation_e2e() {
     let checkpoint_dir = tempfile::tempdir().unwrap();
     let collected = Arc::new(Mutex::new(Vec::<(String, f64)>::new()));
 
-    let group_id = format!("rhei_batch_e2e_group_{}", std::process::id());
+    let group_id = format!("rhei_e2e_group_{}", std::process::id());
     let source = KafkaSource::new(&brokers(), &group_id, &[&orders_topic])
         .unwrap()
         .with_batch_size(50)
@@ -497,7 +497,7 @@ async fn kafka_batch_aggregation_e2e() {
 
 #[tokio::test]
 #[allow(clippy::too_many_lines)]
-async fn kafka_multi_partition_batch_e2e() {
+async fn kafka_multi_partition_e2e() {
     use rhei_core::connectors::kafka::types::KafkaMessage as KafkaMsgType;
 
     let _ = tracing_subscriber::fmt()
@@ -506,7 +506,7 @@ async fn kafka_multi_partition_batch_e2e() {
         .try_init();
 
     // ── Setup multi-partition topic ─────────────────────────────────
-    let orders_topic = unique_topic("batch_mp_orders");
+    let orders_topic = unique_topic("mp_orders");
     create_topic(&orders_topic, 4).await;
 
     // ── Generate and produce data ───────────────────────────────────
@@ -525,7 +525,7 @@ async fn kafka_multi_partition_batch_e2e() {
     let checkpoint_dir = tempfile::tempdir().unwrap();
     let collected = Arc::new(Mutex::new(Vec::<(String, f64)>::new()));
 
-    let group_id = format!("rhei_batch_mp_e2e_group_{}", std::process::id());
+    let group_id = format!("rhei_mp_e2e_group_{}", std::process::id());
     let source = KafkaSource::new(&brokers(), &group_id, &[&orders_topic])
         .unwrap()
         .with_batch_size(50)

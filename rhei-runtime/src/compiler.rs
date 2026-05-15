@@ -154,11 +154,11 @@ fn extract_topology(nodes: &[GraphNode]) -> ApiTopology {
     for node in nodes {
         let (kind, name) = match &node.kind {
             NodeKind::Source(_) => ("source", format!("Source_{}", node.id.0)),
-            NodeKind::BatchTransform(_) => ("transform", format!("Transform_{}", node.id.0)),
+            NodeKind::Transform(_) => ("transform", format!("Transform_{}", node.id.0)),
             NodeKind::BatchOperator { name, .. } => ("operator", name.clone()),
             NodeKind::Sink(_) => ("sink", format!("Sink_{}", node.id.0)),
-            NodeKind::BatchKeyBy(_) => ("key_by", format!("KeyBy_{}", node.id.0)),
-            NodeKind::BatchMerge => ("merge", format!("Merge_{}", node.id.0)),
+            NodeKind::KeyBy(_) => ("key_by", format!("KeyBy_{}", node.id.0)),
+            NodeKind::Merge => ("merge", format!("Merge_{}", node.id.0)),
         };
 
         api_nodes.push(ApiTopologyNode {

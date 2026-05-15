@@ -32,7 +32,7 @@ use rhei_core::arrow::{RheiSchema, Sink, Source, StreamFunction};
 use crate::erased_batch::{
     BatchOperatorWrapper, ErasedBatchOperator, ErasedSink, ErasedSource, SinkWrapper, SourceWrapper,
 };
-use crate::erased_buffer::{BatchKeyFn, ErasedBuffer};
+use crate::erased_buffer::{ErasedBuffer, KeyFn};
 
 // ── Node identity ────────────────────────────────────────────────────
 
@@ -109,10 +109,10 @@ impl LazyBatchTransformNode {
 }
 
 /// Deferred batch `key_by` node: stores a factory that produces the erased key function.
-pub(crate) struct LazyBatchKeyByNode(pub(crate) Box<dyn FnOnce() -> BatchKeyFn + Send>);
+pub(crate) struct LazyKeyByNode(pub(crate) Box<dyn FnOnce() -> KeyFn + Send>);
 
-impl LazyBatchKeyByNode {
-    pub fn compile(self) -> BatchKeyFn {
+impl LazyKeyByNode {
+    pub fn compile(self) -> KeyFn {
         (self.0)()
     }
 }
@@ -129,7 +129,7 @@ pub(crate) enum NodeKind {
     /// A batch data source producing `ErasedBuffer` batches.
     Source(Box<dyn SourceNode>),
     /// A batch stateless transform (`ErasedBuffer` → `Vec<ErasedBuffer>`).
-    BatchTransform(LazyBatchTransformNode),
+    Transform(LazyBatchTransformNode),
     /// A batch stateful operator.
     BatchOperator {
         /// Human-readable operator name (used for `OperatorContext` namespacing).
@@ -140,9 +140,9 @@ pub(crate) enum NodeKind {
     /// A batch data sink consuming `ErasedBuffer` batches.
     Sink(Box<dyn SinkNode>),
     /// Key-based exchange: partitions rows by key hash and routes to workers.
-    BatchKeyBy(LazyBatchKeyByNode),
+    KeyBy(LazyKeyByNode),
     /// Merges multiple streams into one (Timely Concatenate).
-    BatchMerge,
+    Merge,
 }
 
 /// A node in the dataflow graph.
@@ -337,12 +337,12 @@ impl DataflowGraph {
             .map(|node| {
                 let kind_label = match &node.kind {
                     NodeKind::Source(_) => "source".to_string(),
-                    NodeKind::BatchTransform(_) => "transform".to_string(),
+                    NodeKind::Transform(_) => "transform".to_string(),
                     NodeKind::BatchOperator { name, .. } => {
                         format!("operator \"{name}\"")
                     }
-                    NodeKind::BatchKeyBy(_) => "key_by".to_string(),
-                    NodeKind::BatchMerge => "merge".to_string(),
+                    NodeKind::KeyBy(_) => "key_by".to_string(),
+                    NodeKind::Merge => "merge".to_string(),
                     NodeKind::Sink(_) => unreachable!(),
                 };
                 (node.id.0, kind_label)
@@ -424,7 +424,7 @@ impl<'a, T: RheiSchema + 'static> Stream<'a, T> {
         }));
         let node_id = self
             .graph
-            .add_node(NodeKind::BatchTransform(node), vec![self.node_id]);
+            .add_node(NodeKind::Transform(node), vec![self.node_id]);
         Stream::new(self.graph, node_id)
     }
 
@@ -463,7 +463,7 @@ impl<'a, T: RheiSchema + 'static> Stream<'a, T> {
         }));
         let node_id = self
             .graph
-            .add_node(NodeKind::BatchTransform(node), vec![self.node_id]);
+            .add_node(NodeKind::Transform(node), vec![self.node_id]);
         Stream::new(self.graph, node_id)
     }
 
@@ -499,7 +499,7 @@ impl<'a, T: RheiSchema + 'static> Stream<'a, T> {
         }));
         let node_id = self
             .graph
-            .add_node(NodeKind::BatchTransform(node), vec![self.node_id]);
+            .add_node(NodeKind::Transform(node), vec![self.node_id]);
         Stream::new(self.graph, node_id)
     }
 
@@ -539,7 +539,7 @@ impl<'a, T: RheiSchema + 'static> Stream<'a, T> {
         }));
         let node_id = self
             .graph
-            .add_node(NodeKind::BatchTransform(node), vec![self.node_id]);
+            .add_node(NodeKind::Transform(node), vec![self.node_id]);
         Stream::new(self.graph, node_id)
     }
 
@@ -564,7 +564,7 @@ impl<'a, T: RheiSchema + 'static> Stream<'a, T> {
     where
         F: for<'v> Fn(&T::View<'v>) -> String + Send + Sync + 'static,
     {
-        let node = LazyBatchKeyByNode(Box::new(move || {
+        let node = LazyKeyByNode(Box::new(move || {
             Arc::new(move |batch: &arrow_array::RecordBatch, row_idx: usize| {
                 let view = T::view(batch, row_idx);
                 key_fn(&view)
@@ -572,7 +572,7 @@ impl<'a, T: RheiSchema + 'static> Stream<'a, T> {
         }));
         let node_id = self
             .graph
-            .add_node(NodeKind::BatchKeyBy(node), vec![self.node_id]);
+            .add_node(NodeKind::KeyBy(node), vec![self.node_id]);
         Stream::new(self.graph, node_id)
     }
 
@@ -580,7 +580,7 @@ impl<'a, T: RheiSchema + 'static> Stream<'a, T> {
     pub fn merge(self, other: Stream<'a, T>) -> Stream<'a, T> {
         let node_id = self
             .graph
-            .add_node(NodeKind::BatchMerge, vec![self.node_id, other.node_id]);
+            .add_node(NodeKind::Merge, vec![self.node_id, other.node_id]);
         Stream::new(self.graph, node_id)
     }
 
@@ -612,7 +612,7 @@ impl<'a, T: RheiSchema + 'static> Stream<'a, T> {
         }));
         let node_id = self
             .graph
-            .add_node(NodeKind::BatchTransform(node), vec![self.node_id]);
+            .add_node(NodeKind::Transform(node), vec![self.node_id]);
         Stream::new(self.graph, node_id)
     }
 
@@ -655,7 +655,7 @@ impl<'a, T: RheiSchema + 'static> Stream<'a, T> {
         }));
         let node_id = self
             .graph
-            .add_node(NodeKind::BatchTransform(node), vec![self.node_id]);
+            .add_node(NodeKind::Transform(node), vec![self.node_id]);
         Stream::new(self.graph, node_id)
     }
 
@@ -691,7 +691,7 @@ impl<'a, T: RheiSchema + 'static> Stream<'a, T> {
         }));
         let node_id = self
             .graph
-            .add_node(NodeKind::BatchTransform(node), vec![self.node_id]);
+            .add_node(NodeKind::Transform(node), vec![self.node_id]);
         Stream::new(self.graph, node_id)
     }
 
@@ -739,7 +739,7 @@ impl<'a, T: RheiSchema + 'static> Stream<'a, T> {
         }));
         let node_id = self
             .graph
-            .add_node(NodeKind::BatchTransform(node), vec![self.node_id]);
+            .add_node(NodeKind::Transform(node), vec![self.node_id]);
         Stream::new(self.graph, node_id)
     }
 

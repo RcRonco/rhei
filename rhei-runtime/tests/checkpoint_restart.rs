@@ -187,13 +187,13 @@ impl RheiSchema for WordCount {
     }
 }
 
-// ── Stateful operator: BatchWordCounter ─────────────────────────────
+// ── Stateful operator: WordCounter ─────────────────────────────
 
 #[derive(Clone)]
-struct BatchWordCounter;
+struct WordCounter;
 
 #[async_trait]
-impl StreamFunction for BatchWordCounter {
+impl StreamFunction for WordCounter {
     type Input = WordEvent;
     type Output = WordCount;
 
@@ -280,7 +280,7 @@ async fn checkpoint_restart_preserves_state() {
         let graph = DataflowGraph::new();
         graph
             .source(source)
-            .operator("word_counter", BatchWordCounter)
+            .operator("word_counter", WordCounter)
             .sink(WordCountSink {
                 collected: collected_run1.clone(),
             });
@@ -310,7 +310,7 @@ async fn checkpoint_restart_preserves_state() {
         let graph = DataflowGraph::new();
         graph
             .source(source)
-            .operator("word_counter", BatchWordCounter)
+            .operator("word_counter", WordCounter)
             .sink(WordCountSink {
                 collected: collected_run2.clone(),
             });

@@ -18,7 +18,7 @@ use rhei_core::arrow::{RheiBuffer, RheiSchema};
 
 /// Type-erased key extraction function: given a `RecordBatch` and row index,
 /// returns the key string for that row. Used by `key_by` exchange.
-pub(crate) type BatchKeyFn = Arc<dyn Fn(&RecordBatch, usize) -> String + Send + Sync>;
+pub(crate) type KeyFn = Arc<dyn Fn(&RecordBatch, usize) -> String + Send + Sync>;
 
 /// Type-erased Arrow buffer for flowing through Timely dataflow channels.
 ///
@@ -147,7 +147,7 @@ impl ErasedBuffer {
     #[allow(clippy::cast_possible_truncation)]
     pub(crate) fn partition_for_exchange(
         &self,
-        key_fn: &BatchKeyFn,
+        key_fn: &KeyFn,
         num_workers: usize,
     ) -> Vec<ErasedBuffer> {
         if num_workers <= 1 {
@@ -541,7 +541,7 @@ mod tests {
         let buf: RheiBuffer<TestRow> = RheiBuffer::from_builder(builder);
         let erased = ErasedBuffer::from_typed(buf);
 
-        let key_fn: BatchKeyFn = Arc::new(|batch: &RecordBatch, row_idx: usize| {
+        let key_fn: KeyFn = Arc::new(|batch: &RecordBatch, row_idx: usize| {
             use arrow_array::cast::AsArray;
             batch
                 .column(1)
@@ -567,7 +567,7 @@ mod tests {
         let buf: RheiBuffer<TestRow> = RheiBuffer::from_builder(builder);
         let erased = ErasedBuffer::from_typed(buf);
 
-        let key_fn: BatchKeyFn = Arc::new(|batch: &RecordBatch, row_idx: usize| {
+        let key_fn: KeyFn = Arc::new(|batch: &RecordBatch, row_idx: usize| {
             use arrow_array::cast::AsArray;
             batch
                 .column(1)
@@ -603,7 +603,7 @@ mod tests {
         let buf: RheiBuffer<TestRow> = RheiBuffer::from_builder(builder);
         let erased = ErasedBuffer::from_typed(buf);
 
-        let key_fn: BatchKeyFn = Arc::new(|batch: &RecordBatch, row_idx: usize| {
+        let key_fn: KeyFn = Arc::new(|batch: &RecordBatch, row_idx: usize| {
             use arrow_array::cast::AsArray;
             batch
                 .column(1)
@@ -638,8 +638,7 @@ mod tests {
         let buf: RheiBuffer<TestRow> = RheiBuffer::from_builder(builder);
         let erased = ErasedBuffer::from_typed(buf);
 
-        let key_fn: BatchKeyFn =
-            Arc::new(|_batch: &RecordBatch, _row_idx: usize| "any".to_string());
+        let key_fn: KeyFn = Arc::new(|_batch: &RecordBatch, _row_idx: usize| "any".to_string());
 
         let partitions = erased.partition_for_exchange(&key_fn, 1);
         assert_eq!(partitions.len(), 1);
@@ -660,7 +659,7 @@ mod tests {
         let masked = buf.with_mask(BooleanArray::from(vec![true, false, true, false]));
         let erased = ErasedBuffer::from_typed(masked);
 
-        let key_fn: BatchKeyFn = Arc::new(|batch: &RecordBatch, row_idx: usize| {
+        let key_fn: KeyFn = Arc::new(|batch: &RecordBatch, row_idx: usize| {
             use arrow_array::cast::AsArray;
             batch
                 .column(1)

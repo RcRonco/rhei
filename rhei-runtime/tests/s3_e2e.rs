@@ -231,10 +231,10 @@ impl RheiSchema for WordCount {
 // ── Stateful operator ──────────────────────────────────────────────
 
 #[derive(Clone)]
-struct BatchWordCounter;
+struct WordCounter;
 
 #[async_trait]
-impl StreamFunction for BatchWordCounter {
+impl StreamFunction for WordCounter {
     type Input = WordEvent;
     type Output = WordCount;
 
@@ -374,7 +374,7 @@ async fn s3_tiered_storage_e2e() {
     let graph = DataflowGraph::new();
     graph
         .source(source)
-        .operator("word_counter", BatchWordCounter)
+        .operator("word_counter", WordCounter)
         .sink(CollectSink {
             collected: collected.clone(),
         });

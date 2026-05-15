@@ -16,7 +16,7 @@ use timely::dataflow::scopes::Child;
 use timely::worker::Worker;
 
 use crate::dataflow::{NodeId, NodeKind};
-use crate::erased_buffer::BatchKeyFn;
+use crate::erased_buffer::KeyFn;
 use crate::task_manager::{DlqSender, ExecutorData};
 
 // Backward-compatible re-exports so `executor::Executor` still works.
@@ -66,22 +66,22 @@ pub fn partition_key(key: &str, n_workers: usize) -> usize {
 #[allow(clippy::enum_variant_names)] // all variants are batch-only after row API removal
 pub(crate) enum NodeKindTag {
     Source,
-    BatchTransform,
+    Transform,
     BatchOperator,
     Sink,
-    BatchKeyBy,
-    BatchMerge,
+    KeyBy,
+    Merge,
 }
 
 impl NodeKindTag {
     pub(crate) fn from_kind(kind: &NodeKind) -> Self {
         match kind {
             NodeKind::Source(_) => Self::Source,
-            NodeKind::BatchTransform(_) => Self::BatchTransform,
+            NodeKind::Transform(_) => Self::Transform,
             NodeKind::BatchOperator { .. } => Self::BatchOperator,
             NodeKind::Sink(_) => Self::Sink,
-            NodeKind::BatchKeyBy(_) => Self::BatchKeyBy,
-            NodeKind::BatchMerge => Self::BatchMerge,
+            NodeKind::KeyBy(_) => Self::KeyBy,
+            NodeKind::Merge => Self::Merge,
         }
     }
 }
@@ -95,7 +95,7 @@ impl NodeKindTag {
 /// Each `build_*` method constructs one category of Timely operator.
 #[allow(dead_code)] // some fields are reserved for future use
 pub(crate) struct DataflowExecutor {
-    batch_sink_senders: Arc<HashMap<NodeId, flume::Sender<crate::erased_buffer::ErasedBuffer>>>,
+    sink_senders: Arc<HashMap<NodeId, flume::Sender<crate::erased_buffer::ErasedBuffer>>>,
     topo_order: Arc<Vec<NodeId>>,
     node_inputs: Arc<HashMap<NodeId, Vec<NodeId>>>,
     node_kinds: Arc<HashMap<NodeId, NodeKindTag>>,
@@ -132,10 +132,10 @@ impl DataflowExecutor {
         data: ExecutorData,
         shutdown_barrier: Option<Arc<std::sync::Mutex<Option<std::sync::mpsc::Receiver<()>>>>>,
     ) -> Self {
-        let batch_sink_senders: HashMap<NodeId, flume::Sender<crate::erased_buffer::ErasedBuffer>> =
-            data.batch_sink_senders.clone();
+        let sink_senders: HashMap<NodeId, flume::Sender<crate::erased_buffer::ErasedBuffer>> =
+            data.sink_senders.clone();
         Self {
-            batch_sink_senders: Arc::new(batch_sink_senders),
+            sink_senders: Arc::new(sink_senders),
             topo_order,
             node_inputs,
             node_kinds,
@@ -215,7 +215,7 @@ impl DataflowExecutor {
         scope: &mut Scope<'_, A>,
         data: &mut ExecutorData,
     ) -> probe::Handle<u64> {
-        let mut batch_streams: HashMap<NodeId, ErasedStream<_>> = HashMap::new();
+        let mut streams: HashMap<NodeId, ErasedStream<_>> = HashMap::new();
         let probe = probe::Handle::new();
 
         for &node_id in self.topo_order.iter() {
@@ -226,41 +226,36 @@ impl DataflowExecutor {
                 NodeKindTag::Source => {
                     let stream =
                         self.build_source(scope, node_id, &mut data.source_rx, &mut data.source_wm);
-                    batch_streams.insert(node_id, stream);
+                    streams.insert(node_id, stream);
                 }
-                NodeKindTag::BatchTransform => {
-                    let input_stream = batch_streams[&inputs[0]].clone();
-                    let stream = self.build_batch_transform(
-                        node_id,
-                        input_stream,
-                        &mut data.batch_transforms,
-                    );
-                    batch_streams.insert(node_id, stream);
+                NodeKindTag::Transform => {
+                    let input_stream = streams[&inputs[0]].clone();
+                    let stream = self.build_transform(node_id, input_stream, &mut data.transforms);
+                    streams.insert(node_id, stream);
                 }
                 NodeKindTag::BatchOperator => {
-                    let input_stream = batch_streams[&inputs[0]].clone();
+                    let input_stream = streams[&inputs[0]].clone();
                     let stream = self.build_batch_operator(
                         node_id,
                         input_stream,
                         &mut data.batch_operators,
                         &mut data.batch_contexts,
                     );
-                    batch_streams.insert(node_id, stream);
+                    streams.insert(node_id, stream);
                 }
-                NodeKindTag::BatchKeyBy => {
-                    let input_stream = batch_streams[&inputs[0]].clone();
-                    let stream =
-                        self.build_batch_key_by(node_id, input_stream, &mut data.batch_key_fns);
-                    batch_streams.insert(node_id, stream);
+                NodeKindTag::KeyBy => {
+                    let input_stream = streams[&inputs[0]].clone();
+                    let stream = self.build_batch_key_by(node_id, input_stream, &mut data.key_fns);
+                    streams.insert(node_id, stream);
                 }
-                NodeKindTag::BatchMerge => {
+                NodeKindTag::Merge => {
                     let input_streams: Vec<_> =
-                        inputs.iter().map(|id| batch_streams[id].clone()).collect();
+                        inputs.iter().map(|id| streams[id].clone()).collect();
                     let stream = self.build_batch_merge(scope, input_streams);
-                    batch_streams.insert(node_id, stream);
+                    streams.insert(node_id, stream);
                 }
                 NodeKindTag::Sink => {
-                    let input_stream = batch_streams[&inputs[0]].clone();
+                    let input_stream = streams[&inputs[0]].clone();
                     self.build_batch_sink(node_id, input_stream, &probe);
                 }
             }
@@ -389,23 +384,23 @@ impl DataflowExecutor {
         stream
     }
 
-    /// Build a batch transform (stateless `map`/`filter`/`flat_map`).
+    /// Build a transform (stateless `map`/`filter`/`flat_map`).
     #[allow(clippy::unused_self)]
-    fn build_batch_transform<'a, A: Allocate>(
+    fn build_transform<'a, A: Allocate>(
         &self,
         node_id: NodeId,
         input_stream: ErasedStream<'a, A>,
-        batch_transforms: &mut HashMap<NodeId, crate::dataflow::BatchTransformFn>,
+        transforms: &mut HashMap<NodeId, crate::dataflow::BatchTransformFn>,
     ) -> ErasedStream<'a, A> {
         use timely::container::CapacityContainerBuilder;
         use timely::dataflow::channels::pact::Pipeline;
         use timely::dataflow::operators::generic::operator::Operator;
 
         #[allow(clippy::expect_used)]
-        let f = batch_transforms
+        let f = transforms
             .remove(&node_id)
-            .expect("missing batch transform for node");
-        let name = format!("BatchTransform_{}", node_id.0);
+            .expect("missing transform for node");
+        let name = format!("Transform_{}", node_id.0);
         input_stream
             .unary::<CapacityContainerBuilder<Vec<crate::erased_buffer::ErasedBuffer>>, _, _, _>(
                 Pipeline,
@@ -431,7 +426,7 @@ impl DataflowExecutor {
         &self,
         node_id: NodeId,
         input_stream: ErasedStream<'a, A>,
-        batch_key_fns: &mut HashMap<NodeId, BatchKeyFn>,
+        key_fns: &mut HashMap<NodeId, KeyFn>,
     ) -> ErasedStream<'a, A> {
         use timely::container::CapacityContainerBuilder;
         use timely::dataflow::channels::pact::Pipeline;
@@ -439,7 +434,7 @@ impl DataflowExecutor {
         use timely::dataflow::operators::generic::operator::Operator;
 
         #[allow(clippy::expect_used)]
-        let key_fn = batch_key_fns
+        let key_fn = key_fns
             .remove(&node_id)
             .expect("missing batch key_fn for node");
         let num_workers = self.num_workers;
@@ -638,9 +633,9 @@ impl DataflowExecutor {
 
         #[allow(clippy::expect_used)]
         let sink_tx = self
-            .batch_sink_senders
+            .sink_senders
             .get(&node_id)
-            .expect("missing batch sink sender")
+            .expect("missing sink sender")
             .clone();
 
         input_stream
