@@ -1,27 +1,22 @@
-//! Session window operator with pluggable aggregation.
+//! Batch session window operator.
 //!
-//! Groups elements into sessions separated by an inactivity gap. When an
-//! element arrives with a timestamp more than `gap` units after the last event
-//! in the current session, the session is closed and its aggregate is emitted.
+//! Groups events into sessions separated by an inactivity gap per key.
+//! Sessions close when a new event arrives past the gap or when the watermark
+//! advances past `last_event_time + gap + allowed_lateness`.
 
 use std::collections::HashSet;
 use std::fmt;
 use std::marker::PhantomData;
-use std::sync::Arc;
 
 use async_trait::async_trait;
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
-use crate::time::{TimeProvider, WallClockProvider};
-
-use crate::state::context::StateContext;
-use crate::traits::StreamFunction;
-
-use super::aggregator::Aggregator;
 use super::keyed_state::KeyedState;
-use super::tumbling_window::WindowOutput;
+use crate::arrow::{
+    BufferOutput, OperatorContext, RheiBuffer, RheiBuilder, RheiSchema, StreamFunction,
+};
 
-/// Internal session state stored per key.
 #[derive(Serialize, Deserialize)]
 struct SessionState<Acc> {
     session_start: u64,
@@ -29,304 +24,204 @@ struct SessionState<Acc> {
     accumulator: Acc,
 }
 
-/// A session window operator that groups events by inactivity gap.
+/// Batch session window operator.
 ///
 /// # Type Parameters
 ///
-/// - `T` — input element type
-/// - `A` — aggregator
-/// - `KF` — key extraction function `Fn(&T) -> String`
-/// - `TF` — timestamp extraction function `Fn(&T) -> u64`
-pub struct SessionWindow<T, A, KF, TF> {
+/// - `I` — input schema
+/// - `O` — output schema
+/// - `Acc` — accumulator
+/// - `KF` — key extraction
+/// - `TF` — timestamp extraction
+/// - `AF` — accumulate function
+/// - `FF` — finish function: `Fn(&str, u64, u64, &Acc) -> O` (key, `session_start`, `last_event`, acc)
+pub struct SessionWindow<I, O, Acc, KF, TF, AF, FF> {
     gap: u64,
     key_fn: KF,
     time_fn: TF,
-    aggregator: A,
-    /// In-memory set of keys with open sessions (for watermark-driven closure).
-    active_keys: HashSet<String>,
-    /// Configurable allowed lateness for late event detection (default: 0).
+    accumulate_fn: AF,
+    finish_fn: FF,
     allowed_lateness: u64,
-    /// Last seen watermark for late event detection.
     last_watermark: u64,
-    _phantom: PhantomData<T>,
+    active_keys: HashSet<String>,
+    _phantom: PhantomData<fn(I, Acc) -> O>,
 }
 
-impl<T, A: Clone, KF: Clone, TF: Clone> Clone for SessionWindow<T, A, KF, TF> {
+impl<I, O, Acc, KF: Clone, TF: Clone, AF: Clone, FF: Clone> Clone
+    for SessionWindow<I, O, Acc, KF, TF, AF, FF>
+{
     fn clone(&self) -> Self {
         Self {
             gap: self.gap,
             key_fn: self.key_fn.clone(),
             time_fn: self.time_fn.clone(),
-            aggregator: self.aggregator.clone(),
-            active_keys: HashSet::new(),
+            accumulate_fn: self.accumulate_fn.clone(),
+            finish_fn: self.finish_fn.clone(),
             allowed_lateness: self.allowed_lateness,
             last_watermark: 0,
+            active_keys: HashSet::new(),
             _phantom: PhantomData,
         }
     }
 }
 
-impl<T, A, KF, TF> fmt::Debug for SessionWindow<T, A, KF, TF> {
+impl<I, O, Acc, KF, TF, AF, FF> fmt::Debug for SessionWindow<I, O, Acc, KF, TF, AF, FF> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("SessionWindow")
             .field("gap", &self.gap)
+            .field("allowed_lateness", &self.allowed_lateness)
             .finish_non_exhaustive()
     }
 }
 
-impl<T, A, KF, TF> SessionWindow<T, A, KF, TF> {
-    /// Creates a new session window operator.
-    pub fn new(gap: u64, key_fn: KF, time_fn: TF, aggregator: A) -> Self {
+impl<I, O, Acc, KF, TF, AF, FF> SessionWindow<I, O, Acc, KF, TF, AF, FF> {
+    /// Creates a new session window with the given inactivity gap.
+    pub fn new(gap: u64, key_fn: KF, time_fn: TF, accumulate_fn: AF, finish_fn: FF) -> Self {
+        assert!(gap > 0, "gap must be > 0");
         Self {
             gap,
             key_fn,
             time_fn,
-            aggregator,
-            active_keys: HashSet::new(),
+            accumulate_fn,
+            finish_fn,
             allowed_lateness: 0,
             last_watermark: 0,
+            active_keys: HashSet::new(),
             _phantom: PhantomData,
         }
     }
-}
 
-impl<T> SessionWindow<T, (), (), ()> {
-    /// Returns a builder for constructing a `SessionWindow`.
-    pub fn builder() -> SessionWindowBuilder<T> {
-        SessionWindowBuilder {
-            gap: 0,
-            key_fn: (),
-            time_fn: (),
-            aggregator: (),
-            allowed_lateness: 0,
-            _phantom: PhantomData,
-        }
-    }
-}
-
-/// Builder for [`SessionWindow`].
-pub struct SessionWindowBuilder<T, A = (), KF = (), TF = ()> {
-    gap: u64,
-    key_fn: KF,
-    time_fn: TF,
-    aggregator: A,
-    allowed_lateness: u64,
-    _phantom: PhantomData<T>,
-}
-
-impl<T, A, KF, TF> fmt::Debug for SessionWindowBuilder<T, A, KF, TF> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("SessionWindowBuilder")
-            .field("gap", &self.gap)
-            .finish_non_exhaustive()
-    }
-}
-
-impl<T, A, KF, TF> SessionWindowBuilder<T, A, KF, TF> {
-    /// Sets the maximum inactivity gap before a session closes.
-    pub fn gap(mut self, gap: u64) -> Self {
-        self.gap = gap;
-        self
-    }
-
-    /// Sets the allowed lateness in timestamp units (default: 0).
-    pub fn allowed_lateness(mut self, lateness: u64) -> Self {
+    /// Sets the allowed lateness for late events.
+    pub fn with_allowed_lateness(mut self, lateness: u64) -> Self {
         self.allowed_lateness = lateness;
         self
-    }
-
-    /// Sets the key extraction function.
-    pub fn key_fn<KF2>(self, kf: KF2) -> SessionWindowBuilder<T, A, KF2, TF> {
-        SessionWindowBuilder {
-            gap: self.gap,
-            key_fn: kf,
-            time_fn: self.time_fn,
-            aggregator: self.aggregator,
-            allowed_lateness: self.allowed_lateness,
-            _phantom: PhantomData,
-        }
-    }
-
-    /// Sets the timestamp extraction function.
-    pub fn time_fn<TF2>(self, tf: TF2) -> SessionWindowBuilder<T, A, KF, TF2> {
-        SessionWindowBuilder {
-            gap: self.gap,
-            key_fn: self.key_fn,
-            time_fn: tf,
-            aggregator: self.aggregator,
-            allowed_lateness: self.allowed_lateness,
-            _phantom: PhantomData,
-        }
-    }
-
-    /// Sets the aggregator.
-    pub fn aggregator<A2>(self, agg: A2) -> SessionWindowBuilder<T, A2, KF, TF> {
-        SessionWindowBuilder {
-            gap: self.gap,
-            key_fn: self.key_fn,
-            time_fn: self.time_fn,
-            aggregator: agg,
-            allowed_lateness: self.allowed_lateness,
-            _phantom: PhantomData,
-        }
-    }
-}
-
-impl<T, A, KF> SessionWindowBuilder<T, A, KF, ()> {
-    /// Uses wall-clock (processing) time instead of event time.
-    ///
-    /// The timestamp extraction function is replaced by a closure that calls
-    /// [`WallClockProvider::current_time()`].
-    pub fn proc_time_fn(
-        self,
-    ) -> SessionWindowBuilder<T, A, KF, impl Fn(&T) -> u64 + Send + Sync + Clone> {
-        let provider = WallClockProvider;
-        self.time_fn(move |_: &T| provider.current_time())
-    }
-
-    /// Uses a custom [`TimeProvider`] for processing-time semantics.
-    ///
-    /// Pass a [`FixedClockProvider`](crate::time::FixedClockProvider) for
-    /// deterministic testing or replay.
-    pub fn proc_time_fn_with(
-        self,
-        provider: Arc<dyn TimeProvider>,
-    ) -> SessionWindowBuilder<T, A, KF, impl Fn(&T) -> u64 + Send + Sync + Clone> {
-        self.time_fn(move |_: &T| provider.current_time())
-    }
-}
-
-impl<T, A, KF, TF> SessionWindowBuilder<T, A, KF, TF>
-where
-    T: Send + Sync,
-    A: Aggregator<Input = T>,
-    A::Output: Send,
-    KF: Fn(&T) -> String + Send + Sync,
-    TF: Fn(&T) -> u64 + Send + Sync,
-{
-    /// Builds the `SessionWindow` operator.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `gap` is zero.
-    pub fn build(self) -> SessionWindow<T, A, KF, TF> {
-        assert!(self.gap > 0, "gap must be > 0");
-        SessionWindow {
-            gap: self.gap,
-            key_fn: self.key_fn,
-            time_fn: self.time_fn,
-            aggregator: self.aggregator,
-            active_keys: HashSet::new(),
-            allowed_lateness: self.allowed_lateness,
-            last_watermark: 0,
-            _phantom: PhantomData,
-        }
     }
 }
 
 #[async_trait]
-impl<T, A, KF, TF> StreamFunction for SessionWindow<T, A, KF, TF>
+impl<I, O, Acc, KF, TF, AF, FF> StreamFunction for SessionWindow<I, O, Acc, KF, TF, AF, FF>
 where
-    T: Clone + Send + Sync + std::fmt::Debug,
-    A: Aggregator<Input = T>,
-    A::Output: Clone + Send + std::fmt::Debug,
-    KF: Fn(&T) -> String + Send + Sync,
-    TF: Fn(&T) -> u64 + Send + Sync,
+    I: RheiSchema,
+    O: RheiSchema,
+    Acc: Serialize + DeserializeOwned + Default + Send + Sync,
+    KF: for<'a> Fn(I::View<'a>) -> String + Send + Sync,
+    TF: for<'a> Fn(I::View<'a>) -> u64 + Send + Sync,
+    AF: for<'a> Fn(&mut Acc, I::View<'a>) + Send + Sync,
+    FF: Fn(&str, u64, u64, &Acc) -> O + Send + Sync,
 {
-    type Input = T;
-    type Output = WindowOutput<A::Output>;
+    type Input = I;
+    type Output = O;
 
     async fn process(
         &mut self,
-        input: T,
-        ctx: &mut StateContext,
-    ) -> anyhow::Result<Vec<WindowOutput<A::Output>>> {
-        let key = (self.key_fn)(&input);
-        let timestamp = (self.time_fn)(&input);
-        let mut outputs = Vec::new();
-
-        // Track this key as active for watermark-driven closure.
-        self.active_keys.insert(key.clone());
-
-        // Load existing session state for this key
-        let session: Option<SessionState<A::Accumulator>> = {
-            let mut state = KeyedState::<String, SessionState<A::Accumulator>>::new(ctx, "session");
-            state.get(&key).await.unwrap_or(None)
-        };
-
-        let new_session = match session {
-            Some(s) if timestamp - s.last_event_time > self.gap => {
-                // Gap exceeded — close the old session and emit its result
-                outputs.push(WindowOutput {
-                    key: key.clone(),
-                    window_start: s.session_start,
-                    window_end: s.last_event_time,
-                    value: self.aggregator.finish(&s.accumulator),
-                });
-                // Start a new session
-                let mut acc = A::Accumulator::default();
-                self.aggregator.accumulate(&mut acc, &input);
-                SessionState {
-                    session_start: timestamp,
-                    last_event_time: timestamp,
-                    accumulator: acc,
-                }
-            }
-            Some(mut s) => {
-                // Within the gap — extend the session
-                s.last_event_time = timestamp;
-                self.aggregator.accumulate(&mut s.accumulator, &input);
-                s
-            }
-            None => {
-                // First event for this key — start a new session
-                let mut acc = A::Accumulator::default();
-                self.aggregator.accumulate(&mut acc, &input);
-                SessionState {
-                    session_start: timestamp,
-                    last_event_time: timestamp,
-                    accumulator: acc,
-                }
-            }
-        };
-
-        // Store updated session state
-        {
-            let mut state = KeyedState::<String, SessionState<A::Accumulator>>::new(ctx, "session");
-            state.put(&key, &new_session)?;
+        input: RheiBuffer<I>,
+        ctx: &mut OperatorContext,
+    ) -> anyhow::Result<BufferOutput<O>> {
+        if input.is_empty() {
+            return Ok(BufferOutput::None);
         }
 
-        Ok(outputs)
+        let row_data: Vec<(String, u64, usize)> = input
+            .iter()
+            .enumerate_physical()
+            .map(|(phys_idx, _)| {
+                let view_k = I::view(input.as_record_batch(), phys_idx);
+                let key = (self.key_fn)(view_k);
+                let view_t = I::view(input.as_record_batch(), phys_idx);
+                let ts = (self.time_fn)(view_t);
+                (key, ts, phys_idx)
+            })
+            .collect();
+
+        let batch = input.as_record_batch();
+        let mut outputs: Vec<O> = Vec::new();
+
+        for (key, timestamp, phys_idx) in &row_data {
+            self.active_keys.insert(key.clone());
+
+            let session: Option<SessionState<Acc>> = {
+                let mut state =
+                    KeyedState::<String, SessionState<Acc>>::new(&mut ctx.state, "sess");
+                state.get(key).await.unwrap_or(None)
+            };
+
+            let new_session = match session {
+                Some(s) if timestamp.saturating_sub(s.last_event_time) > self.gap => {
+                    outputs.push((self.finish_fn)(
+                        key,
+                        s.session_start,
+                        s.last_event_time,
+                        &s.accumulator,
+                    ));
+                    let mut acc = Acc::default();
+                    let view = I::view(batch, *phys_idx);
+                    (self.accumulate_fn)(&mut acc, view);
+                    SessionState {
+                        session_start: *timestamp,
+                        last_event_time: *timestamp,
+                        accumulator: acc,
+                    }
+                }
+                Some(mut s) => {
+                    s.last_event_time = *timestamp;
+                    let view = I::view(batch, *phys_idx);
+                    (self.accumulate_fn)(&mut s.accumulator, view);
+                    s
+                }
+                None => {
+                    let mut acc = Acc::default();
+                    let view = I::view(batch, *phys_idx);
+                    (self.accumulate_fn)(&mut acc, view);
+                    SessionState {
+                        session_start: *timestamp,
+                        last_event_time: *timestamp,
+                        accumulator: acc,
+                    }
+                }
+            };
+
+            let mut state = KeyedState::<String, SessionState<Acc>>::new(&mut ctx.state, "sess");
+            state.put(key, &new_session)?;
+        }
+
+        if outputs.is_empty() {
+            return Ok(BufferOutput::None);
+        }
+
+        let mut builder = O::builder(outputs.len());
+        for item in outputs {
+            builder.append(item);
+        }
+        Ok(BufferOutput::Single(RheiBuffer::from_builder(builder)))
     }
 
     async fn on_watermark(
         &mut self,
         watermark: u64,
-        ctx: &mut StateContext,
-    ) -> anyhow::Result<Vec<WindowOutput<A::Output>>> {
+        ctx: &mut OperatorContext,
+    ) -> anyhow::Result<BufferOutput<O>> {
         self.last_watermark = watermark;
-        let mut outputs = Vec::new();
-        let mut closed_keys = Vec::new();
+        let mut outputs: Vec<O> = Vec::new();
+        let mut closed_keys: Vec<String> = Vec::new();
 
         for key in &self.active_keys {
-            let session: Option<SessionState<A::Accumulator>> = {
+            let session: Option<SessionState<Acc>> = {
                 let mut state =
-                    KeyedState::<String, SessionState<A::Accumulator>>::new(ctx, "session");
+                    KeyedState::<String, SessionState<Acc>>::new(&mut ctx.state, "sess");
                 state.get(key).await.unwrap_or(None)
             };
 
             if let Some(s) = session
                 && s.last_event_time + self.gap + self.allowed_lateness <= watermark
             {
-                // Session timed out — close it.
-                outputs.push(WindowOutput {
-                    key: key.clone(),
-                    window_start: s.session_start,
-                    window_end: s.last_event_time,
-                    value: self.aggregator.finish(&s.accumulator),
-                });
+                outputs.push((self.finish_fn)(
+                    key,
+                    s.session_start,
+                    s.last_event_time,
+                    &s.accumulator,
+                ));
                 let mut state =
-                    KeyedState::<String, SessionState<A::Accumulator>>::new(ctx, "session");
+                    KeyedState::<String, SessionState<Acc>>::new(&mut ctx.state, "sess");
                 state.delete(key)?;
                 closed_keys.push(key.clone());
             }
@@ -336,133 +231,311 @@ where
             self.active_keys.remove(key);
         }
 
-        Ok(outputs)
+        if outputs.is_empty() {
+            return Ok(BufferOutput::None);
+        }
+
+        let mut builder = O::builder(outputs.len());
+        for item in outputs {
+            builder.append(item);
+        }
+        Ok(BufferOutput::Single(RheiBuffer::from_builder(builder)))
     }
 }
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
-    use std::sync::Arc;
-
     use super::*;
-    use crate::operators::aggregator::Count;
+    use crate::arrow::RheiSchema as RheiSchemaTrait;
     use crate::state::context::StateContext;
     use crate::state::local_backend::LocalBackend;
-    use crate::time::FixedClockProvider;
 
-    fn test_ctx(name: &str) -> StateContext {
-        let path =
-            std::env::temp_dir().join(format!("rhei_sess_test_{name}_{}", std::process::id()));
+    use arrow_array::builder::ArrayBuilder;
+
+    struct Event {
+        key: String,
+        ts: u64,
+    }
+    struct EventBuilder {
+        key: arrow_array::builder::StringBuilder,
+        ts: arrow_array::builder::PrimitiveBuilder<arrow_array::types::UInt64Type>,
+    }
+    struct EventView<'a> {
+        key: &'a str,
+        ts: u64,
+    }
+    struct EventCols<'a> {
+        #[allow(dead_code)]
+        key: &'a arrow_array::StringArray,
+    }
+
+    impl crate::arrow::RheiBuilder for EventBuilder {
+        type Item = Event;
+        fn append(&mut self, item: Event) {
+            self.key.append_value(&item.key);
+            self.ts.append_value(item.ts);
+        }
+        fn append_null(&mut self) {
+            self.key.append_null();
+            self.ts.append_null();
+        }
+        fn len(&self) -> usize {
+            self.key.len()
+        }
+        fn finish(mut self) -> arrow_array::RecordBatch {
+            use std::sync::Arc;
+            arrow_array::RecordBatch::try_new(
+                Event::arrow_schema(),
+                vec![Arc::new(self.key.finish()), Arc::new(self.ts.finish())],
+            )
+            .unwrap()
+        }
+    }
+
+    impl RheiSchemaTrait for Event {
+        type Builder = EventBuilder;
+        type View<'a> = EventView<'a>;
+        type Columns<'a> = EventCols<'a>;
+
+        fn arrow_schema() -> std::sync::Arc<arrow_schema::Schema> {
+            use std::sync::Arc;
+            Arc::new(arrow_schema::Schema::new(vec![
+                arrow_schema::Field::new("key", arrow_schema::DataType::Utf8, false),
+                arrow_schema::Field::new("ts", arrow_schema::DataType::UInt64, false),
+            ]))
+        }
+        fn builder(capacity: usize) -> Self::Builder {
+            EventBuilder {
+                key: arrow_array::builder::StringBuilder::with_capacity(capacity, capacity * 8),
+                ts: arrow_array::builder::PrimitiveBuilder::with_capacity(capacity),
+            }
+        }
+        fn view(batch: &arrow_array::RecordBatch, index: usize) -> Self::View<'_> {
+            use arrow_array::cast::AsArray;
+            use arrow_array::types::UInt64Type;
+            EventView {
+                key: batch.column(0).as_string::<i32>().value(index),
+                ts: batch.column(1).as_primitive::<UInt64Type>().value(index),
+            }
+        }
+        fn columns(batch: &arrow_array::RecordBatch) -> Self::Columns<'_> {
+            use arrow_array::cast::AsArray;
+            EventCols {
+                key: batch.column(0).as_string::<i32>(),
+            }
+        }
+    }
+
+    struct SessOut {
+        key: String,
+        start: u64,
+        end: u64,
+        count: u64,
+    }
+    struct SessOutBuilder {
+        key: arrow_array::builder::StringBuilder,
+        start: arrow_array::builder::PrimitiveBuilder<arrow_array::types::UInt64Type>,
+        end: arrow_array::builder::PrimitiveBuilder<arrow_array::types::UInt64Type>,
+        count: arrow_array::builder::PrimitiveBuilder<arrow_array::types::UInt64Type>,
+    }
+    #[allow(dead_code)]
+    struct SessOutView<'a> {
+        key: &'a str,
+        start: u64,
+        end: u64,
+        count: u64,
+    }
+    struct SessOutCols<'a> {
+        #[allow(dead_code)]
+        key: &'a arrow_array::StringArray,
+    }
+
+    impl crate::arrow::RheiBuilder for SessOutBuilder {
+        type Item = SessOut;
+        fn append(&mut self, item: SessOut) {
+            self.key.append_value(&item.key);
+            self.start.append_value(item.start);
+            self.end.append_value(item.end);
+            self.count.append_value(item.count);
+        }
+        fn append_null(&mut self) {
+            self.key.append_null();
+            self.start.append_null();
+            self.end.append_null();
+            self.count.append_null();
+        }
+        fn len(&self) -> usize {
+            self.key.len()
+        }
+        fn finish(mut self) -> arrow_array::RecordBatch {
+            use std::sync::Arc;
+            arrow_array::RecordBatch::try_new(
+                SessOut::arrow_schema(),
+                vec![
+                    Arc::new(self.key.finish()),
+                    Arc::new(self.start.finish()),
+                    Arc::new(self.end.finish()),
+                    Arc::new(self.count.finish()),
+                ],
+            )
+            .unwrap()
+        }
+    }
+
+    impl RheiSchemaTrait for SessOut {
+        type Builder = SessOutBuilder;
+        type View<'a> = SessOutView<'a>;
+        type Columns<'a> = SessOutCols<'a>;
+
+        fn arrow_schema() -> std::sync::Arc<arrow_schema::Schema> {
+            use std::sync::Arc;
+            Arc::new(arrow_schema::Schema::new(vec![
+                arrow_schema::Field::new("key", arrow_schema::DataType::Utf8, false),
+                arrow_schema::Field::new("start", arrow_schema::DataType::UInt64, false),
+                arrow_schema::Field::new("end", arrow_schema::DataType::UInt64, false),
+                arrow_schema::Field::new("count", arrow_schema::DataType::UInt64, false),
+            ]))
+        }
+        fn builder(capacity: usize) -> Self::Builder {
+            SessOutBuilder {
+                key: arrow_array::builder::StringBuilder::with_capacity(capacity, capacity * 8),
+                start: arrow_array::builder::PrimitiveBuilder::with_capacity(capacity),
+                end: arrow_array::builder::PrimitiveBuilder::with_capacity(capacity),
+                count: arrow_array::builder::PrimitiveBuilder::with_capacity(capacity),
+            }
+        }
+        fn view(batch: &arrow_array::RecordBatch, index: usize) -> Self::View<'_> {
+            use arrow_array::cast::AsArray;
+            use arrow_array::types::UInt64Type;
+            SessOutView {
+                key: batch.column(0).as_string::<i32>().value(index),
+                start: batch.column(1).as_primitive::<UInt64Type>().value(index),
+                end: batch.column(2).as_primitive::<UInt64Type>().value(index),
+                count: batch.column(3).as_primitive::<UInt64Type>().value(index),
+            }
+        }
+        fn columns(batch: &arrow_array::RecordBatch) -> Self::Columns<'_> {
+            use arrow_array::cast::AsArray;
+            SessOutCols {
+                key: batch.column(0).as_string::<i32>(),
+            }
+        }
+    }
+
+    fn test_ctx(name: &str) -> OperatorContext {
+        let path = std::env::temp_dir().join(format!(
+            "rhei_batch_sess_test_{name}_{}",
+            std::process::id()
+        ));
         let _ = std::fs::remove_file(&path);
         let backend = LocalBackend::new(path, None).unwrap();
-        StateContext::new(Box::new(backend))
+        OperatorContext::new(StateContext::new(Box::new(backend)))
     }
 
-    #[allow(clippy::type_complexity)]
-    fn make_session() -> SessionWindow<
-        (String, u64),
-        Count<(String, u64)>,
-        fn(&(String, u64)) -> String,
-        fn(&(String, u64)) -> u64,
-    > {
-        SessionWindow::new(
+    fn make_events(events: &[(&str, u64)]) -> RheiBuffer<Event> {
+        let mut builder = Event::builder(events.len());
+        for &(key, ts) in events {
+            builder.append(Event {
+                key: key.to_string(),
+                ts,
+            });
+        }
+        RheiBuffer::from_builder(builder)
+    }
+
+    #[tokio::test]
+    async fn gap_exceeded_closes_session() {
+        let mut ctx = test_ctx("gap_close");
+        let mut win = SessionWindow::new(
             10,
-            (|e: &(String, u64)| e.0.clone()) as fn(&(String, u64)) -> String,
-            (|e: &(String, u64)| e.1) as fn(&(String, u64)) -> u64,
-            Count::new(),
-        )
+            |v: EventView<'_>| v.key.to_string(),
+            |v: EventView<'_>| v.ts,
+            |acc: &mut u64, _v: EventView<'_>| *acc += 1,
+            |key: &str, start: u64, end: u64, acc: &u64| SessOut {
+                key: key.to_string(),
+                start,
+                end,
+                count: *acc,
+            },
+        );
+
+        let input = make_events(&[("a", 1), ("a", 5)]);
+        let result = win.process(input, &mut ctx).await.unwrap();
+        assert!(result.is_empty());
+
+        // ts=20 exceeds gap(10) from last(5): 20 - 5 = 15 > 10
+        let input = make_events(&[("a", 20)]);
+        let result = win.process(input, &mut ctx).await.unwrap();
+        let BufferOutput::Single(buf) = result else {
+            panic!("expected Single");
+        };
+        assert_eq!(buf.len(), 1);
+        let v = SessOut::view(buf.as_record_batch(), 0);
+        assert_eq!(v.key, "a");
+        assert_eq!(v.start, 1);
+        assert_eq!(v.end, 5);
+        assert_eq!(v.count, 2);
     }
 
     #[tokio::test]
-    async fn session_watermark_closes_session() {
+    async fn watermark_closes_session() {
         let mut ctx = test_ctx("wm_close");
-        let mut win = make_session();
+        let mut win = SessionWindow::new(
+            10,
+            |v: EventView<'_>| v.key.to_string(),
+            |v: EventView<'_>| v.ts,
+            |acc: &mut u64, _v: EventView<'_>| *acc += 1,
+            |key: &str, start: u64, end: u64, acc: &u64| SessOut {
+                key: key.to_string(),
+                start,
+                end,
+                count: *acc,
+            },
+        );
 
-        // Two events for key "a", last at ts=5
-        win.process(("a".into(), 1), &mut ctx).await.unwrap();
-        win.process(("a".into(), 5), &mut ctx).await.unwrap();
+        let input = make_events(&[("a", 1), ("a", 5)]);
+        win.process(input, &mut ctx).await.unwrap();
 
-        // Watermark at 16: last_event_time(5) + gap(10) + allowed_lateness(0) = 15 <= 16
-        let r = win.on_watermark(16, &mut ctx).await.unwrap();
-        assert_eq!(r.len(), 1);
-        assert_eq!(r[0].key, "a");
-        assert_eq!(r[0].window_start, 1);
-        assert_eq!(r[0].window_end, 5);
-        assert_eq!(r[0].value, 2);
+        // last_event(5) + gap(10) + lateness(0) = 15 <= 16
+        let result = win.on_watermark(16, &mut ctx).await.unwrap();
+        let BufferOutput::Single(buf) = result else {
+            panic!("expected Single");
+        };
+        assert_eq!(buf.len(), 1);
+        let v = SessOut::view(buf.as_record_batch(), 0);
+        assert_eq!(v.count, 2);
     }
 
     #[tokio::test]
-    async fn session_watermark_no_close_before_gap() {
-        let mut ctx = test_ctx("wm_no_close");
-        let mut win = make_session();
+    async fn within_gap_extends_session() {
+        let mut ctx = test_ctx("extend");
+        let mut win = SessionWindow::new(
+            10,
+            |v: EventView<'_>| v.key.to_string(),
+            |v: EventView<'_>| v.ts,
+            |acc: &mut u64, _v: EventView<'_>| *acc += 1,
+            |key: &str, start: u64, end: u64, acc: &u64| SessOut {
+                key: key.to_string(),
+                start,
+                end,
+                count: *acc,
+            },
+        );
 
-        // Event at ts=5
-        win.process(("a".into(), 5), &mut ctx).await.unwrap();
+        // All within gap of 10
+        let input = make_events(&[("a", 1), ("a", 5), ("a", 8)]);
+        let result = win.process(input, &mut ctx).await.unwrap();
+        assert!(result.is_empty());
 
-        // Watermark at 10: 5 + 10 + 0 = 15 > 10, no close
-        let r = win.on_watermark(10, &mut ctx).await.unwrap();
-        assert!(r.is_empty());
-    }
-
-    #[tokio::test]
-    async fn session_multiple_keys_watermark() {
-        let mut ctx = test_ctx("multi_key");
-        let mut win = make_session();
-
-        // Key "a" events
-        win.process(("a".into(), 1), &mut ctx).await.unwrap();
-        // Key "b" events at later time
-        win.process(("b".into(), 10), &mut ctx).await.unwrap();
-
-        // Watermark at 12: "a" session: 1+10+0 = 11 <= 12 → close
-        // "b" session: 10+10+0 = 20 > 12 → stay open
-        let r = win.on_watermark(12, &mut ctx).await.unwrap();
-        assert_eq!(r.len(), 1);
-        assert_eq!(r[0].key, "a");
-    }
-
-    #[tokio::test]
-    async fn session_proc_time_with_fixed_clock() {
-        let mut ctx = test_ctx("proc_fixed");
-        let clock = FixedClockProvider::new(100);
-
-        let mut win = SessionWindow::<String, _, _, _>::builder()
-            .gap(10)
-            .key_fn(|e: &String| e.clone())
-            .proc_time_fn_with(Arc::new(clock.clone()))
-            .aggregator(Count::new())
-            .build();
-
-        // First event at clock=100
-        let r = win.process("a".into(), &mut ctx).await.unwrap();
-        assert!(r.is_empty());
-
-        // Second event within gap (clock=105)
-        clock.set(105);
-        let r = win.process("a".into(), &mut ctx).await.unwrap();
-        assert!(r.is_empty());
-
-        // Third event past gap (clock=120, gap=10, last_event=105 → 120 - 105 > 10)
-        clock.set(120);
-        let r = win.process("a".into(), &mut ctx).await.unwrap();
-        assert_eq!(r.len(), 1);
-        assert_eq!(r[0].window_start, 100);
-        assert_eq!(r[0].window_end, 105);
-        assert_eq!(r[0].value, 2);
-    }
-
-    #[tokio::test]
-    async fn session_proc_time_fn_smoke() {
-        let mut ctx = test_ctx("proc_wall");
-        let mut win = SessionWindow::<String, _, _, _>::builder()
-            .gap(60_000)
-            .key_fn(|e: &String| e.clone())
-            .proc_time_fn()
-            .aggregator(Count::new())
-            .build();
-
-        let r = win.process("x".into(), &mut ctx).await.unwrap();
-        assert!(r.is_empty());
+        // Watermark closes: 8 + 10 + 0 = 18 <= 20
+        let result = win.on_watermark(20, &mut ctx).await.unwrap();
+        let BufferOutput::Single(buf) = result else {
+            panic!("expected Single");
+        };
+        let v = SessOut::view(buf.as_record_batch(), 0);
+        assert_eq!(v.count, 3);
+        assert_eq!(v.start, 1);
+        assert_eq!(v.end, 8);
     }
 }

@@ -22,6 +22,8 @@ remote-state = ["rhei-runtime/remote-state"]
 tokio = { workspace = true, features = ["full"] }
 tempfile.workspace = true
 serde.workspace = true
+arrow-array.workspace = true
+arrow-schema.workspace = true
 
 [lints]
 workspace = true

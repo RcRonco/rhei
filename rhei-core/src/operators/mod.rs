@@ -1,49 +1,25 @@
-//! Reusable stream processing operators.
+//! Batch (Arrow columnar) operator implementations.
 //!
-//! This module provides high-level [`StreamFunction`](crate::traits::StreamFunction)
-//! implementations so users don't have to write boilerplate for common patterns:
-//!
-//! - **Stateless combinators:** [`MapOp`], [`FlatMapOp`], [`FilterOp`]
-//! - **Typed state:** [`KeyedState`] — ergonomic wrapper over [`StateContext`](crate::state::context::StateContext)
-//! - **Aggregation:** [`Aggregator`] trait with built-in [`Count`], [`Sum`], [`Avg`]
-//! - **Rolling aggregation:** [`ReduceOp`], [`RollingAggregateOp`] — per-key stateful emit-on-every-input
-//! - **Windowing:** [`TumblingWindow`], [`SlidingWindow`], [`SessionWindow`], [`CountWindow`], [`LateEventWindow`]
-//! - **Joins:** [`TemporalJoin`] with [`JoinSide`], [`BroadcastJoin`] with [`BroadcastSide`], [`IntervalJoin`] with [`IntervalSide`]
-//! - **Side outputs:** [`WithSide`] — split operator output into main and side channels
-//! - **Async enrichment:** [`EnrichOp`] — bounded-concurrency async lookup
+//! These implement [`StreamFunction`] and operate on `RheiBuffer`
+//! batches rather than individual rows.
 
-pub mod aggregator;
-pub mod broadcast_join;
 pub mod count_window;
-pub mod enrich;
 pub mod filter;
-pub mod interval_join;
+pub mod filter_expr;
 pub mod keyed_state;
-pub mod late_event;
 pub mod map;
 pub mod reduce;
-pub mod retract;
-pub mod rolling_aggregate;
 pub mod session_window;
 pub mod sliding_window;
 pub mod temporal_join;
 pub mod tumbling_window;
-pub mod with_side;
 
-pub use aggregator::{Aggregator, Avg, Count, Sum};
-pub use broadcast_join::{BroadcastJoin, BroadcastSide};
-pub use count_window::{CountWindow, CountWindowOutput};
-pub use enrich::EnrichOp;
-pub use filter::FilterOp;
-pub use interval_join::{IntervalJoin, IntervalSide};
-pub use keyed_state::{BincodeEncoder, JsonEncoder, KeyEncoder, KeyedState};
-pub use late_event::LateEventWindow;
+pub use count_window::CountWindow;
+pub use filter::{FilterFnOp, FilterOp};
+pub use filter_expr::{Expr, FilterExprOp, col, lit_bool, lit_f64, lit_i64, lit_str, lit_u64};
 pub use map::{FlatMapOp, MapOp};
-pub use reduce::ReduceOp;
-pub use retract::{Retract, RetractOp};
-pub use rolling_aggregate::RollingAggregateOp;
+pub use reduce::{ReduceOp, RollingAggregateOp};
 pub use session_window::SessionWindow;
 pub use sliding_window::SlidingWindow;
-pub use temporal_join::{JoinSide, TemporalJoin};
-pub use tumbling_window::{TumblingWindow, WindowOutput};
-pub use with_side::WithSide;
+pub use temporal_join::{Side, TemporalJoin};
+pub use tumbling_window::TumblingWindow;

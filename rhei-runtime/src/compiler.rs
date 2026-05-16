@@ -13,6 +13,7 @@ use crate::dataflow::{GraphNode, NodeId, NodeKind};
 // ── Compiled graph ──────────────────────────────────────────────────
 
 /// A compiled DAG ready for execution.
+#[allow(dead_code)] // source_ids/sink_ids kept for diagnostic/checkpoint use
 pub(crate) struct CompiledGraph {
     /// Original nodes, indexed by `NodeId`.
     pub nodes: Vec<GraphNode>,
@@ -125,12 +126,9 @@ pub(crate) fn compile_graph(nodes: Vec<GraphNode>) -> anyhow::Result<CompiledGra
     // Extract sorted operator names.
     let mut operator_names: Vec<String> = nodes
         .iter()
-        .filter_map(|node| {
-            if let NodeKind::Operator { name, .. } = &node.kind {
-                Some(name.clone())
-            } else {
-                None
-            }
+        .filter_map(|node| match &node.kind {
+            NodeKind::BatchOperator { name, .. } => Some(name.clone()),
+            _ => None,
         })
         .collect();
     operator_names.sort();
@@ -157,10 +155,10 @@ fn extract_topology(nodes: &[GraphNode]) -> ApiTopology {
         let (kind, name) = match &node.kind {
             NodeKind::Source(_) => ("source", format!("Source_{}", node.id.0)),
             NodeKind::Transform(_) => ("transform", format!("Transform_{}", node.id.0)),
-            NodeKind::KeyBy(_) => ("key_by", format!("KeyBy_{}", node.id.0)),
-            NodeKind::Operator { name, .. } => ("operator", name.clone()),
-            NodeKind::Merge => ("merge", format!("Merge_{}", node.id.0)),
+            NodeKind::BatchOperator { name, .. } => ("operator", name.clone()),
             NodeKind::Sink(_) => ("sink", format!("Sink_{}", node.id.0)),
+            NodeKind::KeyBy(_) => ("key_by", format!("KeyBy_{}", node.id.0)),
+            NodeKind::Merge => ("merge", format!("Merge_{}", node.id.0)),
         };
 
         api_nodes.push(ApiTopologyNode {

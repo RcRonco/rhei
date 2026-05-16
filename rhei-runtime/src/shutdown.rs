@@ -41,6 +41,12 @@ impl ShutdownHandle {
     pub fn is_shutdown(&self) -> bool {
         *self.rx.borrow()
     }
+
+    /// Returns a new `watch::Receiver` that can be used with `tokio::select!`
+    /// to await shutdown notification.
+    pub fn subscribe(&self) -> watch::Receiver<bool> {
+        self.rx.clone()
+    }
 }
 
 /// Install signal handlers for `SIGINT` and `SIGTERM` and return a

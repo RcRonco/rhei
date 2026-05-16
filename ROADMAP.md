@@ -53,7 +53,7 @@
 - [x] Backpressure metrics (stash depth, pending future count, channel utilization)
 - [x] Throughput and latency metrics (batch/element counters, p50/p99 element duration)
 - [x] State size metrics (L1/L2/L3 hit rates, checkpoint duration)
-- [x] Dead-letter queue for failed/dropped elements (`ErrorPolicy::DeadLetterFile`)
+- [x] Dead-letter queue with pluggable `DlqSink` trait (`FileDlqSink`, `LogDlqSink`, `KafkaDlqSink`)
 - [x] Pipeline topology visualization (TUI graph view with exchange point rendering)
 - [x] TUI dashboard with worker count, per-worker log attribution
 - [x] Health check endpoint for liveness/readiness probes (`/healthz`, `/readyz`)
@@ -63,16 +63,15 @@
 
 ## Performance
 
-- [x] Batch-level processing in operators (process `Vec<Input>` instead of element-at-a-time)
+- [x] Arrow columnar execution model (full replacement of row-by-row processing)
+- [x] Zero-copy filtering via selection vectors (boolean masks, no data copying)
+- [x] Batch-level type erasure (`ErasedBuffer` with Arrow IPC serialization)
 - [x] Zero-copy state reads (`Bytes` instead of `Vec<u8>` cloning)
-- [ ] Reusable per-operator buffers to avoid repeated `Vec` allocation in batch processing
 - [x] Memtable compaction and eviction policies (bounded memory) (KI-7)
 - [ ] Async state prefetch — predict upcoming keys and warm L2/L3 cache
-- [ ] Columnar in-memory representation for windowed aggregations
+- [ ] DataFusion kernel integration for aggregate/join operators
 - [ ] Benchmark suite with throughput/latency targets
 - [ ] Profile and optimize the Timely ↔ Tokio bridge (channel sizing, wake strategy)
-- [ ] Batch-level type erasure (erase `Vec<T>` once per batch instead of per element)
-- [ ] Investigate `abomonation` or `flatbuffers` for Timely serialization instead of `bincode`
 - [ ] Sliding window eviction for closed active windows (KI-10)
 
 ## Stability
@@ -87,7 +86,7 @@
 - [x] Watermark propagation for out-of-order event handling (KI-13)
 - [x] Late-event policy: drop with metric and configurable `allowed_lateness` (KI-6 partial)
 - [ ] Late-event side-output routing (redirect late events to a separate stream)
-- [x] Operator-level error handling (skip or dead-letter file via `ErrorPolicy`)
+- [x] Operator-level error handling (`ErrorPolicy::Skip` or `ErrorPolicy::SendToDlq` with pluggable `DlqSink`)
 - [x] Propagate sink send errors instead of silently dropping (KI-1)
 - [x] Propagate DLQ write errors instead of silently dropping (KI-3)
 - [x] Propagate checkpoint failures in single-worker mode (KI-15)

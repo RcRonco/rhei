@@ -25,6 +25,12 @@ hex = "0.4"
 regex = "1"
 urlencoding = "2"
 seahash = "4"
+arrow.workspace = true
+arrow-schema.workspace = true
+arrow-array.workspace = true
+datafusion.workspace = true
+datafusion-expr.workspace = true
+datafusion-physical-expr.workspace = true
 core_affinity = "0.8"
 # rdkafka is an optional dep activated by the `kafka` feature so that
 # `cargo test --workspace` (without --features kafka) doesn't require
@@ -39,12 +45,12 @@ remote-state = ["dep:object_store"]
 [lints]
 workspace = true
 
-[[example]]
-name = "kafka_transform"
-required-features = ["kafka"]
-
 [dev-dependencies]
 tokio = { workspace = true, features = ["full"] }
 tempfile.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+rhei-macros = { path = "../rhei-macros" }
+arrow-array.workspace = true
+arrow-schema.workspace = true
+async-trait.workspace = true

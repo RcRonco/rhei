@@ -21,6 +21,11 @@ metrics.workspace = true
 moka.workspace = true
 hex = "0.4"
 toml.workspace = true
+arrow.workspace = true
+arrow-schema.workspace = true
+arrow-array.workspace = true
+arrow-buffer.workspace = true
+datafusion-physical-expr.workspace = true
 rdkafka = { workspace = true, optional = true }
 
 [features]
@@ -32,3 +37,8 @@ workspace = true
 [dev-dependencies]
 tokio = { workspace = true, features = ["full"] }
 tempfile.workspace = true
+criterion.workspace = true
+
+[[bench]]
+name = "columnar_vs_row"
+harness = false

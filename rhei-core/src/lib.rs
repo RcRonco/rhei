@@ -1,17 +1,18 @@
 //! Core abstractions for the Rhei stream processing engine.
 //!
 //! This crate provides the foundational types and traits for building
-//! stateful stream processing pipelines:
+//! stateful stream processing pipelines using Apache Arrow columnar execution:
 //!
-//! - [`traits::StreamFunction`] — stateful operator that transforms input elements
-//! - [`traits::Source`] — produces batches of elements into a pipeline
-//! - [`traits::Sink`] — consumes elements from a pipeline
+//! - [`arrow::StreamFunction`] — stateful operator that transforms Arrow buffers
+//! - [`arrow::Source`] — produces columnar batches into a pipeline
+//! - [`arrow::Sink`] — consumes columnar batches from a pipeline
 //! - [`state::context::StateContext`] — operator-scoped key-value state with tiered storage
-//! - [`graph::StreamGraph`] — fluent builder for constructing logical execution plans
-//! - [`connectors`] — built-in sources and sinks (`VecSource`, `PrintSink`)
+//! - [`connectors`] — built-in sources and sinks
 
 #![warn(missing_docs)]
 
+/// Apache Arrow columnar execution primitives.
+pub mod arrow;
 /// Checkpoint manifest for recording pipeline checkpoint metadata.
 pub mod checkpoint;
 /// TOML-based pipeline configuration with environment variable overrides.
@@ -26,57 +27,9 @@ pub mod error;
 pub mod event;
 /// Logical execution plan builder ([`StreamGraph`](graph::StreamGraph)).
 pub mod graph;
-/// Reusable stream processing operators ([`operators::MapOp`], [`operators::TumblingWindow`], etc.).
+/// Reusable stream processing operators.
 pub mod operators;
 /// Tiered state management (memtable, local, Foyer, `SlateDB`).
 pub mod state;
-/// Test harness: in-memory sources, collecting sinks, and assertion helpers.
-pub mod testing;
 /// Time providers for processing-time windowing and deterministic replay.
 pub mod time;
-/// Core stream processing traits ([`StreamFunction`](traits::StreamFunction),
-/// [`Source`](traits::Source), [`Sink`](traits::Sink)).
-pub mod traits;
-
-#[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
-mod compile_tests {
-    use async_trait::async_trait;
-
-    use crate::state::context::StateContext;
-    use crate::traits::StreamFunction;
-
-    /// Acceptance criteria from PLAN.md A-1: this code must compile.
-    struct MyOp;
-
-    #[async_trait]
-    impl StreamFunction for MyOp {
-        type Input = String;
-        type Output = String;
-
-        async fn process(
-            &mut self,
-            input: String,
-            ctx: &mut StateContext,
-        ) -> anyhow::Result<Vec<String>> {
-            let _ = ctx.get_raw(b"key").await;
-            Ok(vec![input])
-        }
-    }
-
-    #[tokio::test]
-    async fn my_op_compiles_and_runs() {
-        use crate::state::local_backend::LocalBackend;
-        let path = std::env::temp_dir().join(format!("rhei_compile_test_{}", std::process::id()));
-        let _ = std::fs::remove_file(&path);
-
-        let backend = LocalBackend::new(path.clone(), None).unwrap();
-        let mut ctx = StateContext::new(Box::new(backend));
-        let mut op = MyOp;
-
-        let result = op.process("hello".to_string(), &mut ctx).await.unwrap();
-        assert_eq!(result, vec!["hello".to_string()]);
-
-        let _ = std::fs::remove_file(&path);
-    }
-}

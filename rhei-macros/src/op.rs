@@ -2,10 +2,9 @@ use proc_macro2::TokenStream;
 use quote::quote;
 use syn::{Error, ItemFn, ReturnType};
 
-use crate::util::{extract_result_vec_inner, snake_to_pascal};
+use crate::util::{extract_generic_inner, extract_result_buffer_output_inner, snake_to_pascal};
 
 pub(crate) fn expand(item: ItemFn) -> Result<TokenStream, Error> {
-    // Must be async
     if item.sig.asyncness.is_none() {
         return Err(Error::new_spanned(
             item.sig.fn_token,
@@ -13,16 +12,16 @@ pub(crate) fn expand(item: ItemFn) -> Result<TokenStream, Error> {
         ));
     }
 
-    // Must have exactly 2 params (no self)
     let params: Vec<_> = item.sig.inputs.iter().collect();
     if params.len() != 2 {
         return Err(Error::new_spanned(
             &item.sig.inputs,
-            "#[op] function must have exactly 2 parameters: (input: T, ctx: &mut StateContext)",
+            "#[op] function must have exactly 2 parameters: \
+             (input: RheiBuffer<I>, ctx: &mut OperatorContext)",
         ));
     }
 
-    // Extract input type from first param
+    // Extract input type from first param — must be RheiBuffer<T>
     let first_param = &params[0];
     let syn::FnArg::Typed(first_pat) = first_param else {
         return Err(Error::new_spanned(
@@ -30,8 +29,15 @@ pub(crate) fn expand(item: ItemFn) -> Result<TokenStream, Error> {
             "#[op] function must not have a self parameter",
         ));
     };
-    let input_type = &*first_pat.ty;
-    let input_pat = &*first_pat.pat;
+    let input_buf_type = &*first_pat.ty;
+    let input_buf_pat = &*first_pat.pat;
+
+    let input_type = extract_generic_inner(input_buf_type, "RheiBuffer").ok_or_else(|| {
+        Error::new_spanned(
+            input_buf_type,
+            "#[op] first parameter must be RheiBuffer<T>",
+        )
+    })?;
 
     // Extract ctx param
     let second_param = &params[1];
@@ -44,32 +50,28 @@ pub(crate) fn expand(item: ItemFn) -> Result<TokenStream, Error> {
     let ctx_pat = &*second_pat.pat;
     let ctx_type = &*second_pat.ty;
 
-    // Extract return type — must be Result<Vec<T>>
+    // Extract return type — must be Result<BufferOutput<T>>
     let ReturnType::Type(_, ref return_ty) = item.sig.output else {
         return Err(Error::new_spanned(
             &item.sig,
-            "#[op] function must return anyhow::Result<Vec<T>>",
+            "#[op] function must return anyhow::Result<BufferOutput<T>>",
         ));
     };
 
-    let output_type = extract_result_vec_inner(return_ty).ok_or_else(|| {
+    let output_type = extract_result_buffer_output_inner(return_ty).ok_or_else(|| {
         Error::new_spanned(
             return_ty,
-            "#[op] function must return anyhow::Result<Vec<T>>",
+            "#[op] function must return anyhow::Result<BufferOutput<T>>",
         )
     })?;
 
     let return_type = &**return_ty;
-
-    // Generate struct name from function name
     let struct_name = snake_to_pascal(&item.sig.ident.to_string());
-    let vis = &item.vis;
-
     let body = &item.block;
 
     Ok(quote! {
         #[derive(Clone, Debug)]
-        #vis struct #struct_name;
+        struct #struct_name;
 
         #[::rhei::__private::async_trait]
         impl ::rhei::StreamFunction for #struct_name {
@@ -78,7 +80,7 @@ pub(crate) fn expand(item: ItemFn) -> Result<TokenStream, Error> {
 
             async fn process(
                 &mut self,
-                #input_pat: #input_type,
+                #input_buf_pat: #input_buf_type,
                 #ctx_pat: #ctx_type,
             ) -> #return_type {
                 #body

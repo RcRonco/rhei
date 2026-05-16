@@ -1,201 +1,43 @@
-use std::collections::HashMap;
+//! Timely-aware operator wrappers with capability management (batch/Arrow path).
 
-use rhei_core::state::context::StateContext;
-use rhei_core::traits::StreamFunction;
+use rhei_core::arrow::OperatorContext;
 
-use crate::any_item::AnyItem;
-use crate::async_operator::AsyncOperator;
-use crate::erased::ErasedOperator;
+use crate::erased_batch::ErasedBatchOperator;
+use crate::erased_buffer::ErasedBuffer;
 
-/// Wraps `AsyncOperator<F>` with Timely capability management.
-///
-/// Retains capabilities for epochs that have pending work, preventing Timely
-/// from advancing the frontier past stashed elements' epochs. When processing
-/// completes and caps are dropped, Timely progresses.
-///
-/// NOTE: This type is NOT `Send` because `Capability<u64>` uses `Rc` internally.
-/// It must be constructed inside the Timely worker thread.
-pub struct TimelyAsyncOperator<F: StreamFunction + 'static> {
-    inner: AsyncOperator<F>,
-    /// Capabilities retained per epoch. Dropped capabilities are tracked
-    /// via a `ChangeBatch` so Timely sees frontier updates.
-    retained_caps: HashMap<u64, CapabilityToken>,
+/// Wraps a type-erased [`ErasedBatchOperator`] + [`OperatorContext`] with
+/// frontier-based checkpoint tracking for the Arrow columnar execution path.
+pub(crate) struct TimelyBatchOperator {
+    op: Box<dyn ErasedBatchOperator>,
+    ctx: OperatorContext,
     last_checkpoint_epoch: Option<u64>,
 }
 
-impl<F: StreamFunction + 'static> std::fmt::Debug for TimelyAsyncOperator<F> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("TimelyAsyncOperator")
-            .field("retained_caps", &self.retained_caps)
-            .field("last_checkpoint_epoch", &self.last_checkpoint_epoch)
-            .finish_non_exhaustive()
-    }
-}
-
-/// Lightweight token tracking a retained epoch. We don't store an actual
-/// `timely::progress::Capability` here because `Capability` is `!Send`
-/// (contains `Rc`). Instead the caller manages capabilities externally
-/// and this struct just tracks which epochs are logically retained.
-#[derive(Debug)]
-pub struct CapabilityToken {
-    /// The epoch (logical timestamp) this token retains.
-    pub epoch: u64,
-}
-
-impl<F: StreamFunction + 'static> TimelyAsyncOperator<F> {
-    /// Wraps the given `AsyncOperator` with Timely capability tracking.
-    pub fn new(inner: AsyncOperator<F>) -> Self {
-        Self {
-            inner,
-            retained_caps: HashMap::new(),
-            last_checkpoint_epoch: None,
-        }
-    }
-
-    /// Process an input element, marking the epoch as retained.
-    /// Returns immediately-completed outputs and errors.
-    pub fn process(&mut self, input: F::Input, epoch: u64) -> (Vec<F::Output>, Vec<anyhow::Error>) {
-        self.retained_caps
-            .entry(epoch)
-            .or_insert(CapabilityToken { epoch });
-        self.inner.process_element(input, Some(epoch))
-    }
-
-    /// Poll pending futures and collect completed results.
-    pub fn poll_pending(&mut self) -> (Vec<F::Output>, Vec<anyhow::Error>) {
-        self.inner.poll_pending()
-    }
-
-    /// Returns true if there are pending futures or stashed elements.
-    pub fn has_pending(&self) -> bool {
-        self.inner.has_pending()
-    }
-
-    /// Release epoch tokens for epochs that the frontier has passed
-    /// and that have no pending work.
-    pub fn release_finished_epochs(&mut self, frontier: &[u64]) {
-        if !self.inner.has_pending() {
-            // No pending work — safe to release tokens for passed epochs
-            self.retained_caps.retain(|epoch, _| {
-                // Keep if frontier hasn't fully passed this epoch
-                frontier.iter().any(|f| f <= epoch)
-            });
-        }
-    }
-
-    /// Checkpoint state when frontier advances past last checkpoint epoch.
-    ///
-    /// Returns `Ok(())` on success or if no checkpoint was needed. Returns
-    /// `Err` if the checkpoint operation fails; the epoch is NOT advanced
-    /// on failure so the checkpoint will be retried.
-    pub fn maybe_checkpoint(
-        &mut self,
-        frontier: &[u64],
-        rt: &tokio::runtime::Handle,
-    ) -> anyhow::Result<()> {
-        let min_frontier = frontier.iter().copied().min();
-
-        let should_checkpoint = match (min_frontier, self.last_checkpoint_epoch) {
-            (Some(current), Some(last)) => current > last,
-            (Some(_), None) | (None, _) => true, // new or computation done
-        };
-
-        if should_checkpoint && !self.inner.has_pending() {
-            let ctx = self.inner.context_mut();
-            rt.block_on(ctx.checkpoint())?;
-            self.last_checkpoint_epoch = min_frontier;
-        }
-        Ok(())
-    }
-
-    /// Get mutable reference to the state context (for final checkpoint).
-    pub fn context_mut(&mut self) -> &mut StateContext {
-        self.inner.context_mut()
-    }
-}
-
-/// Wraps a type-erased `ErasedOperator` + `StateContext` with frontier-based
-/// checkpoint tracking for the dataflow graph execution path.
-///
-/// Analogous to [`TimelyAsyncOperator`] but for `Box<dyn ErasedOperator>`.
-///
-/// # Checkpoint guard
-///
-/// Like [`TimelyAsyncOperator`], `maybe_checkpoint` guards on `!has_pending()`
-/// to prevent checkpointing while items are still being processed. Currently
-/// the erased path is fully synchronous (`block_on`), so `has_pending()` is
-/// always `false` after `process_batch` returns. The guard is present for
-/// consistency and to prevent correctness regressions if the erased path
-/// becomes asynchronous in the future.
-pub(crate) struct TimelyErasedOperator {
-    op: Box<dyn ErasedOperator>,
-    ctx: StateContext,
-    last_checkpoint_epoch: Option<u64>,
-    /// Number of items currently being processed. Always 0 after
-    /// `process`/`process_batch` returns (synchronous `block_on`).
-    /// Tracked for defensive correctness — mirrors `AsyncOperator::has_pending()`.
-    pending_items: usize,
-}
-
-impl TimelyErasedOperator {
-    /// Create a new erased operator wrapper.
-    pub fn new(op: Box<dyn ErasedOperator>, ctx: StateContext) -> Self {
+impl TimelyBatchOperator {
+    /// Create a new batch operator wrapper.
+    pub fn new(op: Box<dyn ErasedBatchOperator>, ctx: OperatorContext) -> Self {
         Self {
             op,
             ctx,
             last_checkpoint_epoch: None,
-            pending_items: 0,
         }
     }
 
-    /// Returns `true` if there are items currently being processed.
+    /// Process a type-erased input buffer. Blocks on the Tokio runtime.
     ///
-    /// Always `false` after `process`/`process_batch` returns, since the
-    /// erased path uses synchronous `block_on`. Present for consistency
-    /// with [`TimelyAsyncOperator::has_pending`].
-    pub fn has_pending(&self) -> bool {
-        self.pending_items > 0
-    }
-
-    /// Process a type-erased input item. Blocks on the Tokio runtime since
-    /// we're running on a Timely worker thread (not a Tokio thread).
-    ///
-    /// Returns `(outputs, errors)`.
-    #[allow(dead_code)]
+    /// Returns `(output_buffers, errors)`.
     pub fn process(
         &mut self,
-        input: AnyItem,
+        input: ErasedBuffer,
         rt: &tokio::runtime::Handle,
-    ) -> (Vec<AnyItem>, Vec<anyhow::Error>) {
-        self.pending_items += 1;
-        let result = match rt.block_on(self.op.process(input, &mut self.ctx)) {
+    ) -> (Vec<ErasedBuffer>, Vec<anyhow::Error>) {
+        match rt.block_on(self.op.process(input, &mut self.ctx)) {
             Ok(results) => (results, vec![]),
             Err(e) => (vec![], vec![e]),
-        };
-        self.pending_items -= 1;
-        result
-    }
-
-    /// Process a batch of items with a single `block_on` call.
-    pub fn process_batch(
-        &mut self,
-        inputs: Vec<AnyItem>,
-        rt: &tokio::runtime::Handle,
-    ) -> (Vec<AnyItem>, Vec<anyhow::Error>) {
-        self.pending_items += inputs.len();
-        let result = match rt.block_on(self.op.process_batch(inputs, &mut self.ctx)) {
-            Ok(results) => (results, vec![]),
-            Err(e) => (vec![], vec![e]),
-        };
-        self.pending_items = 0;
-        result
+        }
     }
 
     /// Checkpoint state when frontier advances past last checkpoint epoch.
-    ///
-    /// Guards on `!has_pending()` to prevent checkpointing while items are
-    /// still being processed, matching the behavior of
-    /// [`TimelyAsyncOperator::maybe_checkpoint`].
     ///
     /// Returns `Some(epoch)` if a checkpoint was performed, `None` otherwise.
     pub fn maybe_checkpoint(
@@ -210,9 +52,9 @@ impl TimelyErasedOperator {
             (Some(_), None) | (None, _) => true,
         };
 
-        if should_checkpoint && !self.has_pending() {
+        if should_checkpoint {
             let ckpt_start = std::time::Instant::now();
-            rt.block_on(self.ctx.checkpoint())?;
+            rt.block_on(self.ctx.state.checkpoint())?;
             metrics::gauge!("executor_checkpoint_duration_seconds")
                 .set(ckpt_start.elapsed().as_secs_f64());
             self.last_checkpoint_epoch = min_frontier;
@@ -222,17 +64,16 @@ impl TimelyErasedOperator {
         }
     }
 
-    /// Process a watermark advancement. Delegates to the operator's `on_watermark`.
-    /// Returns any outputs produced (e.g. closed windows).
+    /// Process a watermark advancement. Returns any outputs produced.
     pub fn process_watermark(
         &mut self,
         watermark: u64,
         rt: &tokio::runtime::Handle,
-    ) -> Vec<AnyItem> {
+    ) -> Vec<ErasedBuffer> {
         match rt.block_on(self.op.on_watermark(watermark, &mut self.ctx)) {
             Ok(results) => results,
             Err(e) => {
-                tracing::error!("watermark processing failed: {e}");
+                tracing::error!("batch watermark processing failed: {e}");
                 vec![]
             }
         }
@@ -240,54 +81,48 @@ impl TimelyErasedOperator {
 
     /// Call the operator's `open` lifecycle hook.
     /// Also restores any persisted timer state from the backend.
-    ///
-    /// Returns an error if timer restoration or the operator's `open` hook
-    /// fails. Callers should log and handle the error appropriately — in
-    /// Timely closures, errors cannot propagate further but should be
-    /// counted via metrics.
     pub fn open(&mut self, rt: &tokio::runtime::Handle) -> anyhow::Result<()> {
-        rt.block_on(self.ctx.restore_timers())
+        rt.block_on(self.ctx.state.restore_timers())
             .map_err(|e| anyhow::anyhow!("timer restore failed: {e}"))?;
         rt.block_on(self.op.open(&mut self.ctx))
-            .map_err(|e| anyhow::anyhow!("operator open failed: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("batch operator open failed: {e}"))?;
         Ok(())
     }
 
     /// Call the operator's `close` lifecycle hook.
-    ///
-    /// Returns an error if the operator's `close` hook fails.
     pub fn close(&mut self, rt: &tokio::runtime::Handle) -> anyhow::Result<()> {
         rt.block_on(self.op.close())
-            .map_err(|e| anyhow::anyhow!("operator close failed: {e}"))
+            .map_err(|e| anyhow::anyhow!("batch operator close failed: {e}"))
     }
 
     /// Drain fired timers and call `on_timer` for each.
     /// Returns any outputs produced by timer callbacks.
-    pub fn process_timers(&mut self, watermark: u64, rt: &tokio::runtime::Handle) -> Vec<AnyItem> {
-        if !self.ctx.has_timers() {
+    pub fn process_timers(
+        &mut self,
+        watermark: u64,
+        rt: &tokio::runtime::Handle,
+    ) -> Vec<ErasedBuffer> {
+        if !self.ctx.state.has_timers() {
             return vec![];
         }
-        let fired = self.ctx.timers().drain_fired(watermark);
+        let fired = self.ctx.state.timers().drain_fired(watermark);
         let mut outputs = Vec::new();
         for (ts, key) in fired {
             match rt.block_on(self.op.on_timer(ts, &key, &mut self.ctx)) {
                 Ok(results) => outputs.extend(results),
-                Err(e) => tracing::error!("on_timer failed: {e}"),
+                Err(e) => tracing::error!("batch on_timer failed: {e}"),
             }
         }
         outputs
     }
 
     /// Advance the watermark and process fired timers in one call.
-    ///
-    /// If `frontier_wm > *last_watermark`, processes the watermark advancement
-    /// and then drains any fired timers. Returns all outputs combined.
     pub fn advance_time(
         &mut self,
         frontier_wm: u64,
         last_watermark: &mut u64,
         rt: &tokio::runtime::Handle,
-    ) -> Vec<AnyItem> {
+    ) -> Vec<ErasedBuffer> {
         let mut results = Vec::new();
         if frontier_wm > *last_watermark {
             *last_watermark = frontier_wm;
@@ -295,15 +130,5 @@ impl TimelyErasedOperator {
         }
         results.extend(self.process_timers(frontier_wm, rt));
         results
-    }
-
-    /// Force a checkpoint (for final flush).
-    #[allow(dead_code)]
-    pub fn checkpoint(&mut self, rt: &tokio::runtime::Handle) -> anyhow::Result<()> {
-        let ckpt_start = std::time::Instant::now();
-        rt.block_on(self.ctx.checkpoint())?;
-        metrics::gauge!("executor_checkpoint_duration_seconds")
-            .set(ckpt_start.elapsed().as_secs_f64());
-        Ok(())
     }
 }

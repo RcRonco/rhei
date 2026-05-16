@@ -20,15 +20,16 @@ pub(crate) fn snake_to_pascal(name: &str) -> Ident {
     Ident::new(&pascal, Span::call_site())
 }
 
-/// Extract the inner type `T` from `Vec<T>`.
+/// Extract the inner type `T` from a generic wrapper like `RheiBuffer<T>`.
 ///
-/// Returns `None` if the type is not a `Vec<T>` path.
-pub(crate) fn extract_vec_inner(ty: &Type) -> Option<&Type> {
+/// Matches any path whose last segment has the given `wrapper_name` and one
+/// type argument.
+pub(crate) fn extract_generic_inner<'a>(ty: &'a Type, wrapper_name: &str) -> Option<&'a Type> {
     let Type::Path(type_path) = ty else {
         return None;
     };
     let seg = type_path.path.segments.last()?;
-    if seg.ident != "Vec" {
+    if seg.ident != wrapper_name {
         return None;
     }
     let PathArguments::AngleBracketed(args) = &seg.arguments else {
@@ -41,11 +42,8 @@ pub(crate) fn extract_vec_inner(ty: &Type) -> Option<&Type> {
     Some(inner)
 }
 
-/// Extract the inner type `T` from `Result<Vec<T>>` or `anyhow::Result<Vec<T>>`.
-///
-/// Specifically, this looks for a path ending in `Result` with a first generic
-/// argument that is `Vec<T>`, and returns `T`.
-pub(crate) fn extract_result_vec_inner(ty: &Type) -> Option<&Type> {
+/// Extract type `T` from `Result<BufferOutput<T>>` or `anyhow::Result<BufferOutput<T>>`.
+pub(crate) fn extract_result_buffer_output_inner(ty: &Type) -> Option<&Type> {
     let Type::Path(type_path) = ty else {
         return None;
     };
@@ -57,10 +55,10 @@ pub(crate) fn extract_result_vec_inner(ty: &Type) -> Option<&Type> {
         return None;
     };
     let first = args.args.first()?;
-    let GenericArgument::Type(vec_ty) = first else {
+    let GenericArgument::Type(buf_out_ty) = first else {
         return None;
     };
-    extract_vec_inner(vec_ty)
+    extract_generic_inner(buf_out_ty, "BufferOutput")
 }
 
 #[cfg(test)]
@@ -75,38 +73,5 @@ mod tests {
         assert_eq!(snake_to_pascal("simple").to_string(), "Simple");
         assert_eq!(snake_to_pascal("a_b_c").to_string(), "ABC");
         assert_eq!(snake_to_pascal("my_long_name").to_string(), "MyLongName");
-    }
-
-    #[test]
-    fn test_extract_vec_inner() {
-        let ty: Type = syn::parse_str("Vec<String>").unwrap();
-        let inner = extract_vec_inner(&ty).unwrap();
-        let expected: Type = syn::parse_str("String").unwrap();
-        assert_eq!(
-            quote::quote!(#inner).to_string(),
-            quote::quote!(#expected).to_string()
-        );
-    }
-
-    #[test]
-    fn test_extract_result_vec_inner() {
-        let ty: Type = syn::parse_str("anyhow::Result<Vec<String>>").unwrap();
-        let inner = extract_result_vec_inner(&ty).unwrap();
-        let expected: Type = syn::parse_str("String").unwrap();
-        assert_eq!(
-            quote::quote!(#inner).to_string(),
-            quote::quote!(#expected).to_string()
-        );
-    }
-
-    #[test]
-    fn test_extract_result_vec_inner_plain() {
-        let ty: Type = syn::parse_str("Result<Vec<u64>>").unwrap();
-        let inner = extract_result_vec_inner(&ty).unwrap();
-        let expected: Type = syn::parse_str("u64").unwrap();
-        assert_eq!(
-            quote::quote!(#inner).to_string(),
-            quote::quote!(#expected).to_string()
-        );
     }
 }

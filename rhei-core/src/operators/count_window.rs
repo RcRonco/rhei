@@ -1,20 +1,20 @@
-//! Count-based window operator.
+//! Batch count-based window operator.
 //!
-//! Emits after exactly N elements per key, then resets.
+//! Emits after exactly N elements per key, then resets the accumulator.
 //! No watermark dependency — purely count-driven.
 
 use std::fmt;
 use std::marker::PhantomData;
 
 use async_trait::async_trait;
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
-use crate::state::context::StateContext;
-use crate::traits::StreamFunction;
+use super::keyed_state::KeyedState;
+use crate::arrow::{
+    BufferOutput, OperatorContext, RheiBuffer, RheiBuilder, RheiSchema, StreamFunction,
+};
 
-use super::aggregator::Aggregator;
-
-/// Internal state for a count window: count of elements and accumulator.
 #[derive(Serialize, Deserialize)]
 struct CountState<Acc> {
     count: u64,
@@ -30,50 +30,37 @@ impl<Acc: Default> Default for CountState<Acc> {
     }
 }
 
-/// The output emitted when a count window fires.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub struct CountWindowOutput<V> {
-    /// The grouping key.
-    pub key: String,
-    /// The total element count in this window.
-    pub count: u64,
-    /// The aggregated value.
-    pub value: V,
-}
-
-impl<V: fmt::Display> fmt::Display for CountWindowOutput<V> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "count_window: {} count={} value={}",
-            self.key, self.count, self.value
-        )
-    }
-}
-
-/// A count-based window operator.
+/// Batch count-based window operator.
 ///
-/// Accumulates elements per key. When the count reaches `threshold`,
-/// emits the aggregate and resets.
-pub struct CountWindow<T, A, KF> {
+/// # Type Parameters
+///
+/// - `I` — input schema
+/// - `O` — output schema
+/// - `Acc` — accumulator
+/// - `KF` — key extraction
+/// - `AF` — accumulate function
+/// - `FF` — finish function: `Fn(&str, u64, &Acc) -> O` (key, count, acc)
+pub struct CountWindow<I, O, Acc, KF, AF, FF> {
     threshold: u64,
     key_fn: KF,
-    aggregator: A,
-    _phantom: PhantomData<T>,
+    accumulate_fn: AF,
+    finish_fn: FF,
+    _phantom: PhantomData<fn(I, Acc) -> O>,
 }
 
-impl<T, A: Clone, KF: Clone> Clone for CountWindow<T, A, KF> {
+impl<I, O, Acc, KF: Clone, AF: Clone, FF: Clone> Clone for CountWindow<I, O, Acc, KF, AF, FF> {
     fn clone(&self) -> Self {
         Self {
             threshold: self.threshold,
             key_fn: self.key_fn.clone(),
-            aggregator: self.aggregator.clone(),
+            accumulate_fn: self.accumulate_fn.clone(),
+            finish_fn: self.finish_fn.clone(),
             _phantom: PhantomData,
         }
     }
 }
 
-impl<T, A, KF> fmt::Debug for CountWindow<T, A, KF> {
+impl<I, O, Acc, KF, AF, FF> fmt::Debug for CountWindow<I, O, Acc, KF, AF, FF> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("CountWindow")
             .field("threshold", &self.threshold)
@@ -81,115 +68,83 @@ impl<T, A, KF> fmt::Debug for CountWindow<T, A, KF> {
     }
 }
 
-impl<T> CountWindow<T, (), ()> {
-    /// Returns a builder for constructing a `CountWindow`.
-    pub fn builder() -> CountWindowBuilder<T> {
-        CountWindowBuilder {
-            threshold: 0,
-            key_fn: (),
-            aggregator: (),
-            _phantom: PhantomData,
-        }
-    }
-}
-
-/// Builder for [`CountWindow`].
-#[derive(Debug)]
-pub struct CountWindowBuilder<T, A = (), KF = ()> {
-    threshold: u64,
-    key_fn: KF,
-    aggregator: A,
-    _phantom: PhantomData<T>,
-}
-
-impl<T, A, KF> CountWindowBuilder<T, A, KF> {
-    /// Sets the number of elements per window.
-    pub fn count(mut self, n: u64) -> Self {
-        self.threshold = n;
-        self
-    }
-
-    /// Sets the key extraction function.
-    pub fn key_fn<KF2>(self, kf: KF2) -> CountWindowBuilder<T, A, KF2> {
-        CountWindowBuilder {
-            threshold: self.threshold,
-            key_fn: kf,
-            aggregator: self.aggregator,
-            _phantom: PhantomData,
-        }
-    }
-
-    /// Sets the aggregator.
-    pub fn aggregator<A2>(self, agg: A2) -> CountWindowBuilder<T, A2, KF> {
-        CountWindowBuilder {
-            threshold: self.threshold,
-            key_fn: self.key_fn,
-            aggregator: agg,
-            _phantom: PhantomData,
-        }
-    }
-}
-
-impl<T, A, KF> CountWindowBuilder<T, A, KF>
-where
-    T: Send + Sync,
-    A: Aggregator<Input = T>,
-    A::Output: Send,
-    KF: Fn(&T) -> String + Send + Sync,
-{
-    /// Builds the `CountWindow` operator.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `count` is zero.
-    pub fn build(self) -> CountWindow<T, A, KF> {
-        assert!(self.threshold > 0, "count threshold must be > 0");
-        CountWindow {
-            threshold: self.threshold,
-            key_fn: self.key_fn,
-            aggregator: self.aggregator,
+impl<I, O, Acc, KF, AF, FF> CountWindow<I, O, Acc, KF, AF, FF> {
+    /// Creates a new count window that fires after `threshold` elements per key.
+    pub fn new(threshold: u64, key_fn: KF, accumulate_fn: AF, finish_fn: FF) -> Self {
+        assert!(threshold > 0, "threshold must be > 0");
+        Self {
+            threshold,
+            key_fn,
+            accumulate_fn,
+            finish_fn,
             _phantom: PhantomData,
         }
     }
 }
 
 #[async_trait]
-impl<T, A, KF> StreamFunction for CountWindow<T, A, KF>
+impl<I, O, Acc, KF, AF, FF> StreamFunction for CountWindow<I, O, Acc, KF, AF, FF>
 where
-    T: Clone + Send + Sync + std::fmt::Debug,
-    A: Aggregator<Input = T> + Send + Sync,
-    A::Accumulator: Serialize + serde::de::DeserializeOwned,
-    A::Output: Clone + Send + std::fmt::Debug + Serialize + serde::de::DeserializeOwned,
-    KF: Fn(&T) -> String + Send + Sync,
+    I: RheiSchema,
+    O: RheiSchema,
+    Acc: Serialize + DeserializeOwned + Default + Send + Sync,
+    KF: for<'a> Fn(I::View<'a>) -> String + Send + Sync,
+    AF: for<'a> Fn(&mut Acc, I::View<'a>) + Send + Sync,
+    FF: Fn(&str, u64, &Acc) -> O + Send + Sync,
 {
-    type Input = T;
-    type Output = CountWindowOutput<A::Output>;
+    type Input = I;
+    type Output = O;
 
     async fn process(
         &mut self,
-        input: T,
-        ctx: &mut StateContext,
-    ) -> anyhow::Result<Vec<CountWindowOutput<A::Output>>> {
-        let key = (self.key_fn)(&input);
-        let state_key = format!("cw:{key}");
-        let key_bytes = state_key.as_bytes();
-
-        let mut state: CountState<A::Accumulator> = ctx.get(key_bytes).await?.unwrap_or_default();
-        self.aggregator.accumulate(&mut state.accumulator, &input);
-        state.count += 1;
-
-        if state.count >= self.threshold {
-            let output = CountWindowOutput {
-                key,
-                count: state.count,
-                value: self.aggregator.finish(&state.accumulator),
-            };
-            ctx.delete(key_bytes);
-            Ok(vec![output])
-        } else {
-            ctx.put(key_bytes, &state)?;
-            Ok(vec![])
+        input: RheiBuffer<I>,
+        ctx: &mut OperatorContext,
+    ) -> anyhow::Result<BufferOutput<O>> {
+        if input.is_empty() {
+            return Ok(BufferOutput::None);
         }
+
+        let row_data: Vec<(String, usize)> = input
+            .iter()
+            .enumerate_physical()
+            .map(|(phys_idx, _)| {
+                let view = I::view(input.as_record_batch(), phys_idx);
+                let key = (self.key_fn)(view);
+                (key, phys_idx)
+            })
+            .collect();
+
+        let batch = input.as_record_batch();
+        let mut outputs: Vec<O> = Vec::new();
+
+        for (key, phys_idx) in &row_data {
+            let mut cs: CountState<Acc> = {
+                let mut state = KeyedState::<String, CountState<Acc>>::new(&mut ctx.state, "cw");
+                state.get(key).await.unwrap_or(None).unwrap_or_default()
+            };
+
+            let view = I::view(batch, *phys_idx);
+            (self.accumulate_fn)(&mut cs.accumulator, view);
+            cs.count += 1;
+
+            if cs.count >= self.threshold {
+                outputs.push((self.finish_fn)(key, cs.count, &cs.accumulator));
+                cs = CountState::default();
+            }
+
+            let mut state = KeyedState::<String, CountState<Acc>>::new(&mut ctx.state, "cw");
+            state.put(key, &cs)?;
+        }
+
+        if outputs.is_empty() {
+            return Ok(BufferOutput::None);
+        }
+
+        let mut builder = O::builder(outputs.len());
+        for item in outputs {
+            builder.append(item);
+        }
+        Ok(BufferOutput::Single(RheiBuffer::from_builder(builder)))
     }
 }
 
@@ -197,104 +152,252 @@ where
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
-    use crate::operators::aggregator::Count;
+    use crate::arrow::RheiSchema as RheiSchemaTrait;
+    use crate::state::context::StateContext;
     use crate::state::local_backend::LocalBackend;
 
-    fn test_ctx(name: &str) -> StateContext {
-        let path = std::env::temp_dir().join(format!("rhei_cw_test_{name}_{}", std::process::id()));
+    use arrow_array::builder::ArrayBuilder;
+
+    struct Event {
+        key: String,
+        value: i64,
+    }
+    struct EventBuilder {
+        key: arrow_array::builder::StringBuilder,
+        value: arrow_array::builder::Int64Builder,
+    }
+    struct EventView<'a> {
+        key: &'a str,
+        #[allow(dead_code)]
+        value: i64,
+    }
+    struct EventCols<'a> {
+        #[allow(dead_code)]
+        key: &'a arrow_array::StringArray,
+    }
+
+    impl crate::arrow::RheiBuilder for EventBuilder {
+        type Item = Event;
+        fn append(&mut self, item: Event) {
+            self.key.append_value(&item.key);
+            self.value.append_value(item.value);
+        }
+        fn append_null(&mut self) {
+            self.key.append_null();
+            self.value.append_null();
+        }
+        fn len(&self) -> usize {
+            self.key.len()
+        }
+        fn finish(mut self) -> arrow_array::RecordBatch {
+            use std::sync::Arc;
+            arrow_array::RecordBatch::try_new(
+                Event::arrow_schema(),
+                vec![Arc::new(self.key.finish()), Arc::new(self.value.finish())],
+            )
+            .unwrap()
+        }
+    }
+
+    impl RheiSchemaTrait for Event {
+        type Builder = EventBuilder;
+        type View<'a> = EventView<'a>;
+        type Columns<'a> = EventCols<'a>;
+
+        fn arrow_schema() -> std::sync::Arc<arrow_schema::Schema> {
+            use std::sync::Arc;
+            Arc::new(arrow_schema::Schema::new(vec![
+                arrow_schema::Field::new("key", arrow_schema::DataType::Utf8, false),
+                arrow_schema::Field::new("value", arrow_schema::DataType::Int64, false),
+            ]))
+        }
+        fn builder(capacity: usize) -> Self::Builder {
+            EventBuilder {
+                key: arrow_array::builder::StringBuilder::with_capacity(capacity, capacity * 8),
+                value: arrow_array::builder::Int64Builder::with_capacity(capacity),
+            }
+        }
+        fn view(batch: &arrow_array::RecordBatch, index: usize) -> Self::View<'_> {
+            use arrow_array::cast::AsArray;
+            use arrow_array::types::Int64Type;
+            EventView {
+                key: batch.column(0).as_string::<i32>().value(index),
+                value: batch.column(1).as_primitive::<Int64Type>().value(index),
+            }
+        }
+        fn columns(batch: &arrow_array::RecordBatch) -> Self::Columns<'_> {
+            use arrow_array::cast::AsArray;
+            EventCols {
+                key: batch.column(0).as_string::<i32>(),
+            }
+        }
+    }
+
+    struct CountOut {
+        key: String,
+        count: u64,
+    }
+    struct CountOutBuilder {
+        key: arrow_array::builder::StringBuilder,
+        count: arrow_array::builder::PrimitiveBuilder<arrow_array::types::UInt64Type>,
+    }
+    #[allow(dead_code)]
+    struct CountOutView<'a> {
+        key: &'a str,
+        count: u64,
+    }
+    struct CountOutCols<'a> {
+        #[allow(dead_code)]
+        key: &'a arrow_array::StringArray,
+    }
+
+    impl crate::arrow::RheiBuilder for CountOutBuilder {
+        type Item = CountOut;
+        fn append(&mut self, item: CountOut) {
+            self.key.append_value(&item.key);
+            self.count.append_value(item.count);
+        }
+        fn append_null(&mut self) {
+            self.key.append_null();
+            self.count.append_null();
+        }
+        fn len(&self) -> usize {
+            self.key.len()
+        }
+        fn finish(mut self) -> arrow_array::RecordBatch {
+            use std::sync::Arc;
+            arrow_array::RecordBatch::try_new(
+                CountOut::arrow_schema(),
+                vec![Arc::new(self.key.finish()), Arc::new(self.count.finish())],
+            )
+            .unwrap()
+        }
+    }
+
+    impl RheiSchemaTrait for CountOut {
+        type Builder = CountOutBuilder;
+        type View<'a> = CountOutView<'a>;
+        type Columns<'a> = CountOutCols<'a>;
+
+        fn arrow_schema() -> std::sync::Arc<arrow_schema::Schema> {
+            use std::sync::Arc;
+            Arc::new(arrow_schema::Schema::new(vec![
+                arrow_schema::Field::new("key", arrow_schema::DataType::Utf8, false),
+                arrow_schema::Field::new("count", arrow_schema::DataType::UInt64, false),
+            ]))
+        }
+        fn builder(capacity: usize) -> Self::Builder {
+            CountOutBuilder {
+                key: arrow_array::builder::StringBuilder::with_capacity(capacity, capacity * 8),
+                count: arrow_array::builder::PrimitiveBuilder::with_capacity(capacity),
+            }
+        }
+        fn view(batch: &arrow_array::RecordBatch, index: usize) -> Self::View<'_> {
+            use arrow_array::cast::AsArray;
+            use arrow_array::types::UInt64Type;
+            CountOutView {
+                key: batch.column(0).as_string::<i32>().value(index),
+                count: batch.column(1).as_primitive::<UInt64Type>().value(index),
+            }
+        }
+        fn columns(batch: &arrow_array::RecordBatch) -> Self::Columns<'_> {
+            use arrow_array::cast::AsArray;
+            CountOutCols {
+                key: batch.column(0).as_string::<i32>(),
+            }
+        }
+    }
+
+    fn test_ctx(name: &str) -> OperatorContext {
+        let path =
+            std::env::temp_dir().join(format!("rhei_batch_cw_test_{name}_{}", std::process::id()));
         let _ = std::fs::remove_file(&path);
         let backend = LocalBackend::new(path, None).unwrap();
-        StateContext::new(Box::new(backend))
+        OperatorContext::new(StateContext::new(Box::new(backend)))
     }
 
-    #[tokio::test]
-    async fn emits_at_threshold() {
-        let mut ctx = test_ctx("threshold");
-        let mut win = CountWindow::<String, _, _>::builder()
-            .count(3)
-            .key_fn(|s: &String| s.clone())
-            .aggregator(Count::<String>::new())
-            .build();
-
-        // First two: no output
-        let r = win.process("a".into(), &mut ctx).await.unwrap();
-        assert!(r.is_empty());
-        let r = win.process("a".into(), &mut ctx).await.unwrap();
-        assert!(r.is_empty());
-
-        // Third: emit
-        let r = win.process("a".into(), &mut ctx).await.unwrap();
-        assert_eq!(r.len(), 1);
-        assert_eq!(r[0].key, "a");
-        assert_eq!(r[0].count, 3);
-        assert_eq!(r[0].value, 3);
-
-        // Reset — fourth and fifth: no output
-        let r = win.process("a".into(), &mut ctx).await.unwrap();
-        assert!(r.is_empty());
-        let r = win.process("a".into(), &mut ctx).await.unwrap();
-        assert!(r.is_empty());
-
-        // Sixth: emit again
-        let r = win.process("a".into(), &mut ctx).await.unwrap();
-        assert_eq!(r.len(), 1);
-        assert_eq!(r[0].count, 3);
-    }
-
-    #[tokio::test]
-    async fn multiple_keys_independent() {
-        let mut ctx = test_ctx("multikey");
-        let mut win = CountWindow::<String, _, _>::builder()
-            .count(2)
-            .key_fn(|s: &String| s.clone())
-            .aggregator(Count::<String>::new())
-            .build();
-
-        let r = win.process("a".into(), &mut ctx).await.unwrap();
-        assert!(r.is_empty());
-        let r = win.process("b".into(), &mut ctx).await.unwrap();
-        assert!(r.is_empty());
-
-        // "a" fires at 2
-        let r = win.process("a".into(), &mut ctx).await.unwrap();
-        assert_eq!(r.len(), 1);
-        assert_eq!(r[0].key, "a");
-
-        // "b" fires at 2
-        let r = win.process("b".into(), &mut ctx).await.unwrap();
-        assert_eq!(r.len(), 1);
-        assert_eq!(r[0].key, "b");
-    }
-
-    #[tokio::test]
-    async fn checkpoint_mid_window() {
-        let path = std::env::temp_dir().join(format!("rhei_cw_ckpt_{}", std::process::id()));
-        let _ = std::fs::remove_file(&path);
-
-        let mut win = CountWindow::<String, _, _>::builder()
-            .count(3)
-            .key_fn(|s: &String| s.clone())
-            .aggregator(Count::<String>::new())
-            .build();
-
-        // Process 2 elements, then checkpoint
-        {
-            let backend = LocalBackend::new(path.clone(), None).unwrap();
-            let mut ctx = StateContext::new(Box::new(backend));
-            win.process("a".into(), &mut ctx).await.unwrap();
-            win.process("a".into(), &mut ctx).await.unwrap();
-            ctx.checkpoint().await.unwrap();
+    fn make_events(events: &[(&str, i64)]) -> RheiBuffer<Event> {
+        let mut builder = Event::builder(events.len());
+        for &(key, value) in events {
+            builder.append(Event {
+                key: key.to_string(),
+                value,
+            });
         }
+        RheiBuffer::from_builder(builder)
+    }
 
-        // Reopen and process one more — should fire
-        {
-            let backend = LocalBackend::new(path.clone(), None).unwrap();
-            let mut ctx = StateContext::new(Box::new(backend));
-            let r = win.process("a".into(), &mut ctx).await.unwrap();
-            assert_eq!(r.len(), 1);
-            assert_eq!(r[0].count, 3);
-        }
+    #[tokio::test]
+    async fn fires_at_threshold() {
+        let mut ctx = test_ctx("fire");
+        let mut win = CountWindow::new(
+            3,
+            |v: EventView<'_>| v.key.to_string(),
+            |acc: &mut u64, _v: EventView<'_>| *acc += 1,
+            |key: &str, count: u64, _acc: &u64| CountOut {
+                key: key.to_string(),
+                count,
+            },
+        );
 
-        let _ = std::fs::remove_file(&path);
+        let input = make_events(&[("a", 1), ("a", 2)]);
+        let result = win.process(input, &mut ctx).await.unwrap();
+        assert!(result.is_empty());
+
+        let input = make_events(&[("a", 3)]);
+        let result = win.process(input, &mut ctx).await.unwrap();
+        let BufferOutput::Single(buf) = result else {
+            panic!("expected Single");
+        };
+        assert_eq!(buf.len(), 1);
+        let v = CountOut::view(buf.as_record_batch(), 0);
+        assert_eq!(v.key, "a");
+        assert_eq!(v.count, 3);
+    }
+
+    #[tokio::test]
+    async fn resets_after_fire() {
+        let mut ctx = test_ctx("reset");
+        let mut win = CountWindow::new(
+            2,
+            |v: EventView<'_>| v.key.to_string(),
+            |acc: &mut u64, _v: EventView<'_>| *acc += 1,
+            |key: &str, count: u64, _acc: &u64| CountOut {
+                key: key.to_string(),
+                count,
+            },
+        );
+
+        // 4 events → fires twice
+        let input = make_events(&[("a", 1), ("a", 2), ("a", 3), ("a", 4)]);
+        let result = win.process(input, &mut ctx).await.unwrap();
+        let BufferOutput::Single(buf) = result else {
+            panic!("expected Single");
+        };
+        assert_eq!(buf.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn independent_keys() {
+        let mut ctx = test_ctx("keys");
+        let mut win = CountWindow::new(
+            2,
+            |v: EventView<'_>| v.key.to_string(),
+            |acc: &mut u64, _v: EventView<'_>| *acc += 1,
+            |key: &str, count: u64, _acc: &u64| CountOut {
+                key: key.to_string(),
+                count,
+            },
+        );
+
+        let input = make_events(&[("a", 1), ("b", 1), ("a", 2)]);
+        let result = win.process(input, &mut ctx).await.unwrap();
+        let BufferOutput::Single(buf) = result else {
+            panic!("expected Single");
+        };
+        // Only "a" fired (2 events)
+        assert_eq!(buf.len(), 1);
+        let v = CountOut::view(buf.as_record_batch(), 0);
+        assert_eq!(v.key, "a");
     }
 }

@@ -6,7 +6,7 @@
 //!
 //! Pipeline topology:
 //! ```text
-//! VecSource(words) → key_by(first_char) → StatefulCounter → FileSink
+//! PartitionedVecSource(words) → key_by(first_char) → CharCounter → JsonFileSink
 //! ```
 //!
 //! Self-spawning pattern: the test binary re-invokes itself. When
@@ -16,12 +16,251 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
+use async_trait::async_trait;
+use rhei_core::arrow::{
+    BufferOutput, OperatorContext, RheiBuffer, RheiBuilder, RheiSchema, Sink, StreamFunction,
+};
 use rhei_core::checkpoint::CheckpointManifest;
+use rhei_core::connectors::batch::PartitionedVecSource;
+use rhei_core::operators::keyed_state::KeyedState;
+use rhei_runtime::controller::PipelineController;
+use rhei_runtime::dataflow::DataflowGraph;
+
+// ── Schema: WordEvent ───────────────────────────────────────────────
+
+#[derive(Clone)]
+struct WordEvent {
+    word: String,
+}
+
+struct WordEventBuilder {
+    word: arrow_array::builder::StringBuilder,
+}
+
+struct WordEventView<'a> {
+    word: &'a str,
+}
+
+struct WordEventColumns<'a> {
+    #[allow(dead_code)]
+    word: &'a arrow_array::StringArray,
+}
+
+impl RheiBuilder for WordEventBuilder {
+    type Item = WordEvent;
+
+    fn append(&mut self, item: WordEvent) {
+        self.word.append_value(&item.word);
+    }
+
+    fn append_null(&mut self) {
+        self.word.append_null();
+    }
+
+    fn len(&self) -> usize {
+        arrow_array::builder::ArrayBuilder::len(&self.word)
+    }
+
+    fn finish(mut self) -> arrow_array::RecordBatch {
+        use std::sync::Arc;
+        #[allow(clippy::expect_used)]
+        arrow_array::RecordBatch::try_new(
+            WordEvent::arrow_schema(),
+            vec![Arc::new(self.word.finish())],
+        )
+        .expect("infallible schema")
+    }
+}
+
+impl RheiSchema for WordEvent {
+    type Builder = WordEventBuilder;
+    type View<'a> = WordEventView<'a>;
+    type Columns<'a> = WordEventColumns<'a>;
+
+    fn arrow_schema() -> std::sync::Arc<arrow_schema::Schema> {
+        std::sync::Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+            "word",
+            arrow_schema::DataType::Utf8,
+            false,
+        )]))
+    }
+
+    fn builder(capacity: usize) -> Self::Builder {
+        WordEventBuilder {
+            word: arrow_array::builder::StringBuilder::with_capacity(capacity, capacity * 16),
+        }
+    }
+
+    fn view(batch: &arrow_array::RecordBatch, index: usize) -> Self::View<'_> {
+        use arrow_array::cast::AsArray;
+        WordEventView {
+            word: batch.column(0).as_string::<i32>().value(index),
+        }
+    }
+
+    fn columns(batch: &arrow_array::RecordBatch) -> Self::Columns<'_> {
+        use arrow_array::cast::AsArray;
+        WordEventColumns {
+            word: batch.column(0).as_string::<i32>(),
+        }
+    }
+}
+
+// ── Schema: WordCount output ────────────────────────────────────────
+
+struct WordCount {
+    text: String,
+}
+
+struct WordCountBuilder {
+    text: arrow_array::builder::StringBuilder,
+}
+
+struct WordCountView<'a> {
+    text: &'a str,
+}
+
+struct WordCountColumns<'a> {
+    #[allow(dead_code)]
+    text: &'a arrow_array::StringArray,
+}
+
+impl RheiBuilder for WordCountBuilder {
+    type Item = WordCount;
+
+    fn append(&mut self, item: WordCount) {
+        self.text.append_value(&item.text);
+    }
+
+    fn append_null(&mut self) {
+        self.text.append_null();
+    }
+
+    fn len(&self) -> usize {
+        arrow_array::builder::ArrayBuilder::len(&self.text)
+    }
+
+    fn finish(mut self) -> arrow_array::RecordBatch {
+        use std::sync::Arc;
+        #[allow(clippy::expect_used)]
+        arrow_array::RecordBatch::try_new(
+            WordCount::arrow_schema(),
+            vec![Arc::new(self.text.finish())],
+        )
+        .expect("infallible schema")
+    }
+}
+
+impl RheiSchema for WordCount {
+    type Builder = WordCountBuilder;
+    type View<'a> = WordCountView<'a>;
+    type Columns<'a> = WordCountColumns<'a>;
+
+    fn arrow_schema() -> std::sync::Arc<arrow_schema::Schema> {
+        std::sync::Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+            "text",
+            arrow_schema::DataType::Utf8,
+            false,
+        )]))
+    }
+
+    fn builder(capacity: usize) -> Self::Builder {
+        WordCountBuilder {
+            text: arrow_array::builder::StringBuilder::with_capacity(capacity, capacity * 16),
+        }
+    }
+
+    fn view(batch: &arrow_array::RecordBatch, index: usize) -> Self::View<'_> {
+        use arrow_array::cast::AsArray;
+        WordCountView {
+            text: batch.column(0).as_string::<i32>().value(index),
+        }
+    }
+
+    fn columns(batch: &arrow_array::RecordBatch) -> Self::Columns<'_> {
+        use arrow_array::cast::AsArray;
+        WordCountColumns {
+            text: batch.column(0).as_string::<i32>(),
+        }
+    }
+}
+
+// ── Stateful operator: CharCounter ─────────────────────────────────
+
+#[derive(Clone)]
+struct CharCounter;
+
+#[async_trait]
+impl StreamFunction for CharCounter {
+    type Input = WordEvent;
+    type Output = WordCount;
+
+    async fn process(
+        &mut self,
+        input: RheiBuffer<WordEvent>,
+        ctx: &mut OperatorContext,
+    ) -> anyhow::Result<BufferOutput<WordCount>> {
+        if input.is_empty() {
+            return Ok(BufferOutput::None);
+        }
+
+        let words: Vec<String> = input.iter().map(|v| v.word.to_string()).collect();
+        let mut builder = WordCount::builder(words.len());
+
+        for word in words {
+            let count: u64 = {
+                let mut state = KeyedState::<String, u64>::new(&mut ctx.state, "counts");
+                state.get(&word).await?.unwrap_or(0)
+            };
+            let new_count = count + 1;
+            {
+                let mut state = KeyedState::<String, u64>::new(&mut ctx.state, "counts");
+                state.put(&word, &new_count)?;
+            }
+            builder.append(WordCount {
+                text: format!("{word}:{new_count}"),
+            });
+        }
+
+        Ok(BufferOutput::Single(RheiBuffer::from_builder(builder)))
+    }
+}
+
+// ── File-writing sink (replaces the removed FileSink<String>) ───────
+
+struct JsonFileSink {
+    path: std::path::PathBuf,
+    file: Option<std::fs::File>,
+}
+
+impl JsonFileSink {
+    fn new(path: std::path::PathBuf) -> Self {
+        Self { path, file: None }
+    }
+}
+
+#[async_trait]
+impl Sink for JsonFileSink {
+    type Input = WordCount;
+
+    async fn write_batch(&mut self, input: RheiBuffer<WordCount>) -> anyhow::Result<()> {
+        use std::io::Write;
+        let file = self.file.get_or_insert_with(|| {
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&self.path)
+                .expect("failed to open output file")
+        });
+        for view in &input {
+            writeln!(file, "{}", serde_json::to_string(view.text).unwrap())?;
+        }
+        Ok(())
+    }
+}
 
 // ── Port allocation ─────────────────────────────────────────────────
 
-/// Allocate `n` free TCP ports by binding to :0, collecting ports, then
-/// dropping all listeners. TOCTOU race is acceptable for CI.
 fn allocate_ports(n: usize) -> Vec<u16> {
     let listeners: Vec<std::net::TcpListener> = (0..n)
         .map(|_| std::net::TcpListener::bind("127.0.0.1:0").expect("failed to bind ephemeral port"))
@@ -54,17 +293,14 @@ fn orchestrator_main() {
         .with_test_writer()
         .try_init();
 
-    // ── Allocate TCP ports for Timely cluster ───────────────────────
     let ports = allocate_ports(2);
     let peers = format!("127.0.0.1:{},127.0.0.1:{}", ports[0], ports[1]);
 
-    // ── Prepare output directory ────────────────────────────────────
     let output_dir = tempfile::tempdir().unwrap();
     let output_p0 = output_dir.path().join("output_p0.jsonl");
     let output_p1 = output_dir.path().join("output_p1.jsonl");
     let checkpoint_dir = tempfile::tempdir().unwrap();
 
-    // ── Spawn 2 child processes ─────────────────────────────────────
     let test_exe = std::env::current_exe().expect("failed to get current exe");
 
     let mut children = Vec::new();
@@ -87,7 +323,7 @@ fn orchestrator_main() {
         children.push((pid, child));
     }
 
-    // ── Wait for children with timeout ──────────────────────────────
+    // Wait for children with timeout
     let timeout = Duration::from_secs(30);
     let deadline = std::time::Instant::now() + timeout;
 
@@ -115,7 +351,6 @@ fn orchestrator_main() {
     let p0_output = std::fs::read_to_string(&output_p0).unwrap_or_default();
     let p1_output = std::fs::read_to_string(&output_p1).unwrap_or_default();
 
-    // FileSink<String> writes JSON-encoded strings, so parse each line as JSON.
     let p0_lines: Vec<String> = p0_output
         .lines()
         .filter(|l| !l.is_empty())
@@ -133,7 +368,6 @@ fn orchestrator_main() {
         .map(String::as_str)
         .collect();
 
-    // 1. Both processes produced output (proves cross-process exchange worked)
     assert!(
         !p0_lines.is_empty(),
         "process 0 produced no output — exchange may not be working"
@@ -143,7 +377,7 @@ fn orchestrator_main() {
         "process 1 produced no output — exchange may not be working"
     );
 
-    // 2. Parse output as "key:count" and verify counts
+    // Parse output as "key:count" and verify counts
     let mut final_counts: HashMap<String, u64> = HashMap::new();
     for line in &all_lines {
         if let Some((key, count_str)) = line.rsplit_once(':')
@@ -158,7 +392,7 @@ fn orchestrator_main() {
         "no valid key:count output found in combined output"
     );
 
-    // 3. Both partial manifests exist
+    // Both partial manifests exist
     let partial_p0 = CheckpointManifest::load_partial(checkpoint_dir.path(), 0);
     let partial_p1 = CheckpointManifest::load_partial(checkpoint_dir.path(), 1);
 
@@ -171,7 +405,7 @@ fn orchestrator_main() {
         "process 1 partial manifest should exist"
     );
 
-    // 4. Merged manifest exists with correct data
+    // Merged manifest exists
     let merged = CheckpointManifest::load(checkpoint_dir.path());
     assert!(merged.is_some(), "merged manifest should exist");
     let merged = merged.unwrap();
@@ -190,7 +424,6 @@ fn orchestrator_main() {
     );
 }
 
-/// Wait for a child process with a timeout. Returns `None` on timeout.
 fn wait_with_timeout(
     child: &mut std::process::Child,
     timeout: Duration,
@@ -212,34 +445,7 @@ fn wait_with_timeout(
 
 // ── Worker process ──────────────────────────────────────────────────
 
-// ── Stateful counter operator ──────────────────────────────────
-
-#[derive(Clone)]
-struct CharCounter;
-
-#[async_trait::async_trait]
-impl rhei_core::traits::StreamFunction for CharCounter {
-    type Input = String;
-    type Output = String;
-
-    async fn process(
-        &mut self,
-        input: String,
-        ctx: &mut rhei_core::state::context::StateContext,
-    ) -> anyhow::Result<Vec<String>> {
-        let key = input.as_bytes();
-        let count = ctx.get::<u64>(key).await?.unwrap_or(0) + 1;
-        ctx.put(key, &count)?;
-        Ok(vec![format!("{input}:{count}")])
-    }
-}
-
 async fn worker_main() {
-    use rhei_core::connectors::file_sink::FileSink;
-    use rhei_core::connectors::partitioned_vec_source::PartitionedVecSource;
-    use rhei_runtime::dataflow::DataflowGraph;
-    use rhei_runtime::executor::Executor;
-
     let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
 
     let output_path = std::path::PathBuf::from(
@@ -255,30 +461,29 @@ async fn worker_main() {
 
     eprintln!("coord worker process {process_id} starting");
 
-    // ── Build pipeline ─────────────────────────────────────────────
     // Generate words keyed by first character (26 distinct keys).
-    // Use PartitionedVecSource with 4 partitions (matching total workers)
-    // so that all processes produce data and register the AnyItem type.
-    let words: Vec<String> = ('a'..='z')
-        .flat_map(|c| (0..5).map(move |i| format!("{c}{i}")))
+    // Use PartitionedVecSource with 4 partitions (matching total workers).
+    let words: Vec<WordEvent> = ('a'..='z')
+        .flat_map(|c| {
+            (0..5).map(move |i| WordEvent {
+                word: format!("{c}{i}"),
+            })
+        })
         .collect();
 
     let source = PartitionedVecSource::new(words, 4);
-    let file_sink = FileSink::<String>::new(&output_path).unwrap();
+    let file_sink = JsonFileSink::new(output_path);
 
     let graph = DataflowGraph::new();
     graph
         .source(source)
-        .key_by(|w: &String| w.chars().next().unwrap_or('_').to_string())
+        .key_by(|w: &WordEventView<'_>| w.word.chars().next().unwrap_or('_').to_string())
         .operator("char_counter", CharCounter)
         .sink(file_sink);
 
-    // ── Run ─────────────────────────────────────────────────────────
-    // All processes share the same checkpoint directory so that partial
-    // manifests (manifest_p0.json, manifest_p1.json) are co-located for merging.
     std::fs::create_dir_all(&checkpoint_dir).ok();
 
-    let executor = Executor::builder()
+    let ctrl = PipelineController::builder()
         .checkpoint_dir(&checkpoint_dir)
         .from_env()
         .build()
@@ -286,11 +491,11 @@ async fn worker_main() {
 
     eprintln!(
         "coord worker process {process_id}: cluster={}, total_workers={}, local_range={:?}",
-        executor.is_cluster(),
-        executor.total_workers(),
-        executor.local_worker_range(),
+        ctrl.is_cluster(),
+        ctrl.total_workers(),
+        ctrl.local_worker_range(),
     );
 
-    executor.run(graph).await.unwrap();
+    ctrl.run(graph).await.unwrap();
     eprintln!("coord worker process {process_id} finished");
 }

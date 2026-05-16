@@ -145,36 +145,22 @@ log_level = "info"
     )
 }
 
-const MAIN_RS: &str = r#"use rhei_core::connectors::print_sink::PrintSink;
-use rhei_core::connectors::vec_source::VecSource;
+const MAIN_RS: &str = r#"use rhei_core::connectors::batch::{PrintSink, VecSource};
 use rhei_runtime::dataflow::DataflowGraph;
 use rhei_runtime::Executor;
 
-/// A minimal Rhei streaming pipeline.
+/// A minimal Rhei streaming pipeline using Arrow columnar processing.
 ///
-/// This example reads strings from an in-memory source, transforms them,
-/// and prints the results. Replace `VecSource` with `KafkaSource` for
-/// production use.
+/// This example reads i64 values from an in-memory source and prints them.
+/// Replace `VecSource` with `KafkaSource` for production use.
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let events = vec![
-        "sensor-1:23.5".to_string(),
-        "sensor-2:18.0".to_string(),
-        "sensor-1:24.1".to_string(),
-        "sensor-2:17.8".to_string(),
-    ];
+    let data: Vec<i64> = (0..10).collect();
 
     let graph = DataflowGraph::new();
     graph
-        .source(VecSource::new(events))
-        // Parse each line into a structured format
-        .map(|line: String| {
-            let mut parts = line.splitn(2, ':');
-            let sensor = parts.next().unwrap_or("unknown").to_string();
-            let value = parts.next().unwrap_or("0").to_string();
-            format!("[{sensor}] reading = {value}")
-        })
-        .sink(PrintSink::<String>::new());
+        .source(VecSource::new(data))
+        .sink(PrintSink::<i64>::new());
 
     let executor = Executor::builder()
         .checkpoint_dir("./checkpoints")

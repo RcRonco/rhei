@@ -1,34 +1,201 @@
-//! Temporal join example using the dataflow API.
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+//! Temporal join example using the batch Arrow dataflow API.
 //!
 //! Interleaved order and shipment events are joined by `order_id` using
 //! [`TemporalJoin`]. When both sides of a join arrive, a matched result is
-//! emitted. Unmatched events are buffered in operator state until their
-//! counterpart appears.
+//! emitted. Unmatched events are buffered in operator state.
 //!
 //! Run with: `cargo run -p rhei-runtime --example temporal_join`
 
-use rhei_core::connectors::print_sink::PrintSink;
-use rhei_core::connectors::vec_source::VecSource;
-use rhei_core::operators::{JoinSide, TemporalJoin};
-use rhei_runtime::dataflow::DataflowGraph;
-use rhei_runtime::executor::Executor;
-use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 
-/// An order event.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[allow(clippy::struct_field_names)]
-struct Order {
+use arrow_array::RecordBatch;
+use arrow_array::builder::ArrayBuilder;
+use arrow_array::cast::AsArray;
+use arrow_array::types::Int64Type;
+use arrow_schema::{DataType, Field, Schema};
+use rhei_core::arrow::{RheiBuilder, RheiSchema};
+use rhei_core::connectors::batch::{PrintSink, VecSource};
+use rhei_core::operators::TemporalJoin;
+use rhei_core::operators::temporal_join::Side;
+use rhei_runtime::Executor;
+use rhei_runtime::dataflow::DataflowGraph;
+
+// ── OrderEvent: combined tagged schema ──────────────────────────────
+// side: 0 = order (left), 1 = shipment (right)
+// Fields shared across both sides via a flat union layout.
+
+struct OrderEvent {
+    side: i64,
     order_id: String,
-    item: String,
-    amount: f64,
+    detail: String,
 }
 
-/// A shipment event.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct Shipment {
-    order_id: String,
-    carrier: String,
-    tracking: String,
+struct OrderEventBuilder {
+    side: arrow_array::builder::Int64Builder,
+    order_id: arrow_array::builder::StringBuilder,
+    detail: arrow_array::builder::StringBuilder,
+}
+
+#[derive(Debug)]
+struct OrderEventView<'a> {
+    side: i64,
+    order_id: &'a str,
+    detail: &'a str,
+}
+
+struct OrderEventCols<'a> {
+    #[allow(dead_code)]
+    side: &'a arrow_array::Int64Array,
+}
+
+impl RheiBuilder for OrderEventBuilder {
+    type Item = OrderEvent;
+    fn append(&mut self, item: OrderEvent) {
+        self.side.append_value(item.side);
+        self.order_id.append_value(&item.order_id);
+        self.detail.append_value(&item.detail);
+    }
+    fn append_null(&mut self) {
+        self.side.append_null();
+        self.order_id.append_null();
+        self.detail.append_null();
+    }
+    fn len(&self) -> usize {
+        self.side.len()
+    }
+    fn finish(mut self) -> RecordBatch {
+        RecordBatch::try_new(
+            OrderEvent::arrow_schema(),
+            vec![
+                Arc::new(self.side.finish()),
+                Arc::new(self.order_id.finish()),
+                Arc::new(self.detail.finish()),
+            ],
+        )
+        .expect("OrderEvent schema mismatch")
+    }
+}
+
+impl RheiSchema for OrderEvent {
+    type Builder = OrderEventBuilder;
+    type View<'a> = OrderEventView<'a>;
+    type Columns<'a> = OrderEventCols<'a>;
+
+    fn arrow_schema() -> Arc<Schema> {
+        Arc::new(Schema::new(vec![
+            Field::new("side", DataType::Int64, false),
+            Field::new("order_id", DataType::Utf8, false),
+            Field::new("detail", DataType::Utf8, false),
+        ]))
+    }
+    fn builder(capacity: usize) -> Self::Builder {
+        OrderEventBuilder {
+            side: arrow_array::builder::Int64Builder::with_capacity(capacity),
+            order_id: arrow_array::builder::StringBuilder::with_capacity(capacity, capacity * 16),
+            detail: arrow_array::builder::StringBuilder::with_capacity(capacity, capacity * 64),
+        }
+    }
+    fn view(batch: &RecordBatch, index: usize) -> Self::View<'_> {
+        OrderEventView {
+            side: batch.column(0).as_primitive::<Int64Type>().value(index),
+            order_id: batch.column(1).as_string::<i32>().value(index),
+            detail: batch.column(2).as_string::<i32>().value(index),
+        }
+    }
+    fn columns(batch: &RecordBatch) -> Self::Columns<'_> {
+        OrderEventCols {
+            side: batch.column(0).as_primitive::<Int64Type>(),
+        }
+    }
+}
+
+// ── JoinResult output schema ────────────────────────────────────────
+
+struct JoinResult {
+    result: String,
+}
+
+struct JoinResultBuilder {
+    result: arrow_array::builder::StringBuilder,
+}
+
+#[derive(Debug)]
+#[allow(dead_code)]
+struct JoinResultView<'a> {
+    result: &'a str,
+}
+
+struct JoinResultCols<'a> {
+    #[allow(dead_code)]
+    result: &'a arrow_array::StringArray,
+}
+
+impl RheiBuilder for JoinResultBuilder {
+    type Item = JoinResult;
+    fn append(&mut self, item: JoinResult) {
+        self.result.append_value(&item.result);
+    }
+    fn append_null(&mut self) {
+        self.result.append_null();
+    }
+    fn len(&self) -> usize {
+        self.result.len()
+    }
+    fn finish(mut self) -> RecordBatch {
+        RecordBatch::try_new(
+            JoinResult::arrow_schema(),
+            vec![Arc::new(self.result.finish())],
+        )
+        .expect("JoinResult schema mismatch")
+    }
+}
+
+impl RheiSchema for JoinResult {
+    type Builder = JoinResultBuilder;
+    type View<'a> = JoinResultView<'a>;
+    type Columns<'a> = JoinResultCols<'a>;
+
+    fn arrow_schema() -> Arc<Schema> {
+        Arc::new(Schema::new(vec![Field::new(
+            "result",
+            DataType::Utf8,
+            false,
+        )]))
+    }
+    fn builder(capacity: usize) -> Self::Builder {
+        JoinResultBuilder {
+            result: arrow_array::builder::StringBuilder::with_capacity(capacity, capacity * 64),
+        }
+    }
+    fn view(batch: &RecordBatch, index: usize) -> Self::View<'_> {
+        JoinResultView {
+            result: batch.column(0).as_string::<i32>().value(index),
+        }
+    }
+    fn columns(batch: &RecordBatch) -> Self::Columns<'_> {
+        JoinResultCols {
+            result: batch.column(0).as_string::<i32>(),
+        }
+    }
+}
+
+// ── Helpers ─────────────────────────────────────────────────────────
+
+fn order(order_id: &str, item: &str, amount: f64) -> OrderEvent {
+    OrderEvent {
+        side: 0,
+        order_id: order_id.into(),
+        detail: format!("{item} (${amount:.2})"),
+    }
+}
+
+fn shipment(order_id: &str, carrier: &str, tracking: &str) -> OrderEvent {
+    OrderEvent {
+        side: 1,
+        order_id: order_id.into(),
+        detail: format!("{carrier} [{tracking}]"),
+    }
 }
 
 #[tokio::main]
@@ -40,71 +207,32 @@ async fn main() -> anyhow::Result<()> {
     let graph = DataflowGraph::new();
 
     let source = VecSource::new(vec![
-        // ORD-001 arrives first, no shipment yet → buffered
-        JoinSide::Left(Order {
-            order_id: "ORD-001".into(),
-            item: "Laptop".into(),
-            amount: 999.99,
-        }),
-        // ORD-002 arrives, no shipment yet → buffered
-        JoinSide::Left(Order {
-            order_id: "ORD-002".into(),
-            item: "Keyboard".into(),
-            amount: 79.50,
-        }),
-        // Shipment for ORD-002 → matches → emit
-        JoinSide::Right(Shipment {
-            order_id: "ORD-002".into(),
-            carrier: "FedEx".into(),
-            tracking: "FX-100".into(),
-        }),
-        // Shipment for ORD-003 arrives first, no order yet → buffered
-        JoinSide::Right(Shipment {
-            order_id: "ORD-003".into(),
-            carrier: "UPS".into(),
-            tracking: "UP-200".into(),
-        }),
-        // Order for ORD-003 → matches buffered shipment → emit
-        JoinSide::Left(Order {
-            order_id: "ORD-003".into(),
-            item: "Mouse".into(),
-            amount: 29.99,
-        }),
-        // Shipment for ORD-001 → matches buffered order → emit
-        JoinSide::Right(Shipment {
-            order_id: "ORD-001".into(),
-            carrier: "DHL".into(),
-            tracking: "DH-300".into(),
-        }),
-        // ORD-004 has no matching shipment → stays buffered
-        JoinSide::Left(Order {
-            order_id: "ORD-004".into(),
-            item: "Monitor".into(),
-            amount: 549.00,
-        }),
+        order("ORD-001", "Laptop", 999.99),
+        order("ORD-002", "Keyboard", 79.50),
+        shipment("ORD-002", "FedEx", "FX-100"),
+        shipment("ORD-003", "UPS", "UP-200"),
+        order("ORD-003", "Mouse", 29.99),
+        shipment("ORD-001", "DHL", "DH-300"),
+        order("ORD-004", "Monitor", 549.00), // no matching shipment
     ]);
 
-    let op = TemporalJoin::builder()
-        .key_fn(|side: &JoinSide<Order, Shipment>| match side {
-            JoinSide::Left(o) => o.order_id.clone(),
-            JoinSide::Right(s) => s.order_id.clone(),
-        })
-        .join_fn(|order: Order, shipment: Shipment| {
-            format!(
-                "joined: {} | {} (${:.2}) shipped via {} [{}]",
-                order.order_id, order.item, order.amount, shipment.carrier, shipment.tracking
-            )
-        })
-        .build();
+    let op = TemporalJoin::new(
+        |v: OrderEventView<'_>| v.order_id.to_string(),
+        |v: OrderEventView<'_>| {
+            if v.side == 0 { Side::Left } else { Side::Right }
+        },
+        |v: OrderEventView<'_>| v.detail.to_string(),
+        |v: OrderEventView<'_>| v.detail.to_string(),
+        |key: &str, left: &String, right: &String| JoinResult {
+            result: format!("joined: {key} | {left} shipped via {right}"),
+        },
+    );
 
     let events = graph.source(source);
     events
-        .key_by(|side: &JoinSide<Order, Shipment>| match side {
-            JoinSide::Left(o) => o.order_id.clone(),
-            JoinSide::Right(s) => s.order_id.clone(),
-        })
+        .key_by(|v: &OrderEventView<'_>| v.order_id.to_string())
         .operator("temporal_join", op)
-        .sink(PrintSink::<String>::new().with_prefix("output"));
+        .sink(PrintSink::<JoinResult>::new().with_prefix("output"));
 
     let executor = Executor::builder().checkpoint_dir(&dir).build()?;
     executor.run(graph).await?;

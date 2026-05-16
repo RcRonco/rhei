@@ -2,7 +2,7 @@
 #![allow(clippy::struct_field_names)]
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-//! Multi-process cluster E2E test with Kafka.
+//! Multi-process cluster E2E test with Kafka (batch API).
 //!
 //! This test validates the `CommunicationConfig::Cluster` (TCP) path by
 //! spawning 2 OS processes, each running 2 Timely workers (4 total), connected
@@ -12,11 +12,11 @@
 //!
 //! ```text
 //! KafkaSource([orders:4part, payments:4part])
-//!   → map(parse → JoinSide<Order, Payment>)
-//!   → filter(amount > 50)
-//!   → key_by(user_id)           ← EXCHANGE #1 (TCP across processes)
+//!   → map(parse → JoinInput)
+//!   → filter_fn(amount > 50)
+//!   → key_by(user_id)              ← EXCHANGE #1 (TCP across processes)
 //!   → TemporalJoin(order_id)
-//!   → key_by(user_id)           ← EXCHANGE #2 (TCP across processes)
+//!   → key_by(user_id)              ← EXCHANGE #2 (TCP across processes)
 //!   → TumblingWindow(Sum(amount), 10s)
 //!   → FileSink (per-process output file)
 //! ```
@@ -26,23 +26,33 @@
 //! the worker process runs.
 
 use std::collections::HashMap;
+use std::io::Write;
+use std::sync::Arc;
 use std::time::Duration;
 
+use arrow_array::RecordBatch;
+use arrow_array::builder::{ArrayBuilder, PrimitiveBuilder, StringBuilder};
+use arrow_array::cast::AsArray;
+use arrow_array::types::{Float64Type, UInt64Type};
+use arrow_schema::{DataType, Field, Schema};
+use async_trait::async_trait;
 use rdkafka::ClientConfig;
 use rdkafka::admin::{AdminClient, AdminOptions, NewTopic, TopicReplication};
 use rdkafka::producer::{FutureProducer, FutureRecord};
-use rhei_core::connectors::file_sink::FileSink;
-use rhei_core::connectors::kafka::source::KafkaSource;
+use rhei_core::arrow::{
+    BufferOutput, OperatorContext, RheiBuffer, RheiBuilder, RheiSchema, Sink, StreamFunction,
+};
+use rhei_core::connectors::batch::KafkaSource;
 use rhei_core::connectors::kafka::types::KafkaMessage;
-use rhei_core::operators::Sum;
-use rhei_core::operators::temporal_join::{JoinSide, TemporalJoin};
-use rhei_core::operators::tumbling_window::{TumblingWindow, WindowOutput};
+use rhei_core::operators::keyed_state::KeyedState;
+use rhei_core::operators::temporal_join::{Side, TemporalJoin};
+use rhei_core::operators::tumbling_window::TumblingWindow;
+use rhei_runtime::controller::PipelineController;
 use rhei_runtime::dataflow::DataflowGraph;
-use rhei_runtime::executor::Executor;
 use rhei_runtime::shutdown::ShutdownHandle;
 use serde::{Deserialize, Serialize};
 
-// ── Domain types (same as kafka_e2e.rs) ─────────────────────────────
+// ── Domain types ───────────────────────────────────────────────────
 
 const USERS: [&str; 4] = ["alice", "bob", "charlie", "diana"];
 
@@ -62,16 +72,359 @@ struct Payment {
     timestamp: u64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct JoinedOrder {
+// ── JoinInput: combined schema for both sides ──────────────────────
+
+struct JoinInput {
+    side: u8, // 0 = order (left), 1 = payment (right)
     id: String,
     user_id: String,
     amount: f64,
-    payment_method: String,
+    method: String,
     timestamp: u64,
 }
 
-// ── Data generation (same as kafka_e2e.rs) ──────────────────────────
+struct JoinInputBuilder {
+    side: PrimitiveBuilder<arrow_array::types::UInt8Type>,
+    id: StringBuilder,
+    user_id: StringBuilder,
+    amount: PrimitiveBuilder<Float64Type>,
+    method: StringBuilder,
+    timestamp: PrimitiveBuilder<UInt64Type>,
+}
+
+struct JoinInputView<'a> {
+    side: u8,
+    id: &'a str,
+    user_id: &'a str,
+    amount: f64,
+    method: &'a str,
+    timestamp: u64,
+}
+
+struct JoinInputColumns<'a> {
+    #[allow(dead_code)]
+    user_id: &'a arrow_array::StringArray,
+}
+
+impl RheiBuilder for JoinInputBuilder {
+    type Item = JoinInput;
+
+    fn append(&mut self, item: JoinInput) {
+        self.side.append_value(item.side);
+        self.id.append_value(&item.id);
+        self.user_id.append_value(&item.user_id);
+        self.amount.append_value(item.amount);
+        self.method.append_value(&item.method);
+        self.timestamp.append_value(item.timestamp);
+    }
+
+    fn append_null(&mut self) {
+        self.side.append_null();
+        self.id.append_null();
+        self.user_id.append_null();
+        self.amount.append_null();
+        self.method.append_null();
+        self.timestamp.append_null();
+    }
+
+    fn len(&self) -> usize {
+        ArrayBuilder::len(&self.side)
+    }
+
+    fn finish(mut self) -> RecordBatch {
+        RecordBatch::try_new(
+            JoinInput::arrow_schema(),
+            vec![
+                Arc::new(self.side.finish()),
+                Arc::new(self.id.finish()),
+                Arc::new(self.user_id.finish()),
+                Arc::new(self.amount.finish()),
+                Arc::new(self.method.finish()),
+                Arc::new(self.timestamp.finish()),
+            ],
+        )
+        .unwrap()
+    }
+}
+
+impl RheiSchema for JoinInput {
+    type Builder = JoinInputBuilder;
+    type View<'a> = JoinInputView<'a>;
+    type Columns<'a> = JoinInputColumns<'a>;
+
+    fn arrow_schema() -> Arc<Schema> {
+        Arc::new(Schema::new(vec![
+            Field::new("side", DataType::UInt8, false),
+            Field::new("id", DataType::Utf8, false),
+            Field::new("user_id", DataType::Utf8, false),
+            Field::new("amount", DataType::Float64, false),
+            Field::new("method", DataType::Utf8, false),
+            Field::new("timestamp", DataType::UInt64, false),
+        ]))
+    }
+
+    fn builder(capacity: usize) -> Self::Builder {
+        JoinInputBuilder {
+            side: PrimitiveBuilder::with_capacity(capacity),
+            id: StringBuilder::with_capacity(capacity, capacity * 16),
+            user_id: StringBuilder::with_capacity(capacity, capacity * 16),
+            amount: PrimitiveBuilder::with_capacity(capacity),
+            method: StringBuilder::with_capacity(capacity, capacity * 16),
+            timestamp: PrimitiveBuilder::with_capacity(capacity),
+        }
+    }
+
+    fn view(batch: &RecordBatch, index: usize) -> Self::View<'_> {
+        JoinInputView {
+            side: batch
+                .column(0)
+                .as_primitive::<arrow_array::types::UInt8Type>()
+                .value(index),
+            id: batch.column(1).as_string::<i32>().value(index),
+            user_id: batch.column(2).as_string::<i32>().value(index),
+            amount: batch.column(3).as_primitive::<Float64Type>().value(index),
+            method: batch.column(4).as_string::<i32>().value(index),
+            timestamp: batch.column(5).as_primitive::<UInt64Type>().value(index),
+        }
+    }
+
+    fn columns(batch: &RecordBatch) -> Self::Columns<'_> {
+        JoinInputColumns {
+            user_id: batch.column(2).as_string::<i32>(),
+        }
+    }
+}
+
+// ── JoinedOrder: output of temporal join ───────────────────────────
+
+struct JoinedOrder {
+    user_id: String,
+    amount: f64,
+    timestamp: u64,
+}
+
+struct JoinedOrderBuilder {
+    user_id: StringBuilder,
+    amount: PrimitiveBuilder<Float64Type>,
+    timestamp: PrimitiveBuilder<UInt64Type>,
+}
+
+struct JoinedOrderView<'a> {
+    user_id: &'a str,
+    amount: f64,
+    timestamp: u64,
+}
+
+struct JoinedOrderColumns<'a> {
+    #[allow(dead_code)]
+    user_id: &'a arrow_array::StringArray,
+}
+
+impl RheiBuilder for JoinedOrderBuilder {
+    type Item = JoinedOrder;
+
+    fn append(&mut self, item: JoinedOrder) {
+        self.user_id.append_value(&item.user_id);
+        self.amount.append_value(item.amount);
+        self.timestamp.append_value(item.timestamp);
+    }
+
+    fn append_null(&mut self) {
+        self.user_id.append_null();
+        self.amount.append_null();
+        self.timestamp.append_null();
+    }
+
+    fn len(&self) -> usize {
+        ArrayBuilder::len(&self.user_id)
+    }
+
+    fn finish(mut self) -> RecordBatch {
+        RecordBatch::try_new(
+            JoinedOrder::arrow_schema(),
+            vec![
+                Arc::new(self.user_id.finish()),
+                Arc::new(self.amount.finish()),
+                Arc::new(self.timestamp.finish()),
+            ],
+        )
+        .unwrap()
+    }
+}
+
+impl RheiSchema for JoinedOrder {
+    type Builder = JoinedOrderBuilder;
+    type View<'a> = JoinedOrderView<'a>;
+    type Columns<'a> = JoinedOrderColumns<'a>;
+
+    fn arrow_schema() -> Arc<Schema> {
+        Arc::new(Schema::new(vec![
+            Field::new("user_id", DataType::Utf8, false),
+            Field::new("amount", DataType::Float64, false),
+            Field::new("timestamp", DataType::UInt64, false),
+        ]))
+    }
+
+    fn builder(capacity: usize) -> Self::Builder {
+        JoinedOrderBuilder {
+            user_id: StringBuilder::with_capacity(capacity, capacity * 16),
+            amount: PrimitiveBuilder::with_capacity(capacity),
+            timestamp: PrimitiveBuilder::with_capacity(capacity),
+        }
+    }
+
+    fn view(batch: &RecordBatch, index: usize) -> Self::View<'_> {
+        JoinedOrderView {
+            user_id: batch.column(0).as_string::<i32>().value(index),
+            amount: batch.column(1).as_primitive::<Float64Type>().value(index),
+            timestamp: batch.column(2).as_primitive::<UInt64Type>().value(index),
+        }
+    }
+
+    fn columns(batch: &RecordBatch) -> Self::Columns<'_> {
+        JoinedOrderColumns {
+            user_id: batch.column(0).as_string::<i32>(),
+        }
+    }
+}
+
+// ── WindowResult: output of tumbling window ────────────────────────
+
+#[derive(Serialize)]
+struct WindowResult {
+    key: String,
+    window_start: u64,
+    window_end: u64,
+    value: f64,
+}
+
+struct WindowResultBuilder {
+    key: StringBuilder,
+    window_start: PrimitiveBuilder<UInt64Type>,
+    window_end: PrimitiveBuilder<UInt64Type>,
+    value: PrimitiveBuilder<Float64Type>,
+}
+
+#[derive(Debug)]
+struct WindowResultView<'a> {
+    key: &'a str,
+    window_start: u64,
+    window_end: u64,
+    value: f64,
+}
+
+struct WindowResultColumns<'a> {
+    #[allow(dead_code)]
+    key: &'a arrow_array::StringArray,
+}
+
+impl RheiBuilder for WindowResultBuilder {
+    type Item = WindowResult;
+
+    fn append(&mut self, item: WindowResult) {
+        self.key.append_value(&item.key);
+        self.window_start.append_value(item.window_start);
+        self.window_end.append_value(item.window_end);
+        self.value.append_value(item.value);
+    }
+
+    fn append_null(&mut self) {
+        self.key.append_null();
+        self.window_start.append_null();
+        self.window_end.append_null();
+        self.value.append_null();
+    }
+
+    fn len(&self) -> usize {
+        ArrayBuilder::len(&self.key)
+    }
+
+    fn finish(mut self) -> RecordBatch {
+        RecordBatch::try_new(
+            WindowResult::arrow_schema(),
+            vec![
+                Arc::new(self.key.finish()),
+                Arc::new(self.window_start.finish()),
+                Arc::new(self.window_end.finish()),
+                Arc::new(self.value.finish()),
+            ],
+        )
+        .unwrap()
+    }
+}
+
+impl RheiSchema for WindowResult {
+    type Builder = WindowResultBuilder;
+    type View<'a> = WindowResultView<'a>;
+    type Columns<'a> = WindowResultColumns<'a>;
+
+    fn arrow_schema() -> Arc<Schema> {
+        Arc::new(Schema::new(vec![
+            Field::new("key", DataType::Utf8, false),
+            Field::new("window_start", DataType::UInt64, false),
+            Field::new("window_end", DataType::UInt64, false),
+            Field::new("value", DataType::Float64, false),
+        ]))
+    }
+
+    fn builder(capacity: usize) -> Self::Builder {
+        WindowResultBuilder {
+            key: StringBuilder::with_capacity(capacity, capacity * 16),
+            window_start: PrimitiveBuilder::with_capacity(capacity),
+            window_end: PrimitiveBuilder::with_capacity(capacity),
+            value: PrimitiveBuilder::with_capacity(capacity),
+        }
+    }
+
+    fn view(batch: &RecordBatch, index: usize) -> Self::View<'_> {
+        WindowResultView {
+            key: batch.column(0).as_string::<i32>().value(index),
+            window_start: batch.column(1).as_primitive::<UInt64Type>().value(index),
+            window_end: batch.column(2).as_primitive::<UInt64Type>().value(index),
+            value: batch.column(3).as_primitive::<Float64Type>().value(index),
+        }
+    }
+
+    fn columns(batch: &RecordBatch) -> Self::Columns<'_> {
+        WindowResultColumns {
+            key: batch.column(0).as_string::<i32>(),
+        }
+    }
+}
+
+// ── File sink (batch API) ──────────────────────────────────────────
+
+struct JsonFileSink {
+    file: std::fs::File,
+}
+
+impl JsonFileSink {
+    fn new(path: &std::path::Path) -> Self {
+        let file = std::fs::File::create(path).expect("failed to create output file");
+        Self { file }
+    }
+}
+
+#[async_trait]
+impl Sink for JsonFileSink {
+    type Input = WindowResult;
+
+    async fn write_batch(&mut self, input: RheiBuffer<WindowResult>) -> anyhow::Result<()> {
+        for view in &input {
+            let line = serde_json::json!({
+                "key": view.key,
+                "window_start": view.window_start,
+                "window_end": view.window_end,
+                "value": view.value,
+            });
+            writeln!(self.file, "{}", line)?;
+        }
+        self.file.flush()?;
+        Ok(())
+    }
+}
+
+// ── Data generation ────────────────────────────────────────────────
 
 fn generate_orders(n: usize) -> Vec<Order> {
     (0..n)
@@ -122,7 +475,7 @@ fn compute_expected_windows(orders: &[Order], window_size: u64) -> HashMap<(Stri
     window_sums
 }
 
-// ── Kafka helpers (same as kafka_e2e.rs) ────────────────────────────
+// ── Kafka helpers ──────────────────────────────────────────────────
 
 fn unique_topic(prefix: &str) -> String {
     format!(
@@ -163,10 +516,8 @@ async fn produce_json<T: Serialize>(topic: &str, key: &[u8], value: &T, producer
         .expect("produce failed");
 }
 
-// ── Port allocation ─────────────────────────────────────────────────
+// ── Port allocation ────────────────────────────────────────────────
 
-/// Allocate `n` free TCP ports by binding to :0, collecting ports, then
-/// dropping all listeners. TOCTOU race is acceptable for CI.
 fn allocate_ports(n: usize) -> Vec<u16> {
     let listeners: Vec<std::net::TcpListener> = (0..n)
         .map(|_| std::net::TcpListener::bind("127.0.0.1:0").expect("failed to bind ephemeral port"))
@@ -179,7 +530,7 @@ fn allocate_ports(n: usize) -> Vec<u16> {
     ports
 }
 
-// ── Test entry point ────────────────────────────────────────────────
+// ── Test entry point ───────────────────────────────────────────────
 
 #[tokio::test]
 #[allow(clippy::too_many_lines)]
@@ -191,7 +542,7 @@ async fn kafka_cluster_e2e() {
     }
 }
 
-// ── Orchestrator ────────────────────────────────────────────────────
+// ── Orchestrator ───────────────────────────────────────────────────
 
 async fn orchestrator_main() {
     let _ = tracing_subscriber::fmt()
@@ -199,14 +550,14 @@ async fn orchestrator_main() {
         .with_test_writer()
         .try_init();
 
-    // ── Setup topics (4 partitions each) ────────────────────────────
+    // ── Setup topics (4 partitions each) ───────────────────────────
     let orders_topic = unique_topic("cluster_orders");
     let payments_topic = unique_topic("cluster_payments");
 
     create_topic(&orders_topic, 4).await;
     create_topic(&payments_topic, 4).await;
 
-    // ── Generate and produce data ───────────────────────────────────
+    // ── Generate and produce data ──────────────────────────────────
     let orders = generate_orders(100);
     let payments = generate_payments(&orders);
 
@@ -228,18 +579,18 @@ async fn orchestrator_main() {
         .await;
     }
 
-    // ── Allocate TCP ports for Timely cluster ───────────────────────
+    // ── Allocate TCP ports for Timely cluster ──────────────────────
     let ports = allocate_ports(2);
     let peers = format!("127.0.0.1:{},127.0.0.1:{}", ports[0], ports[1]);
 
-    // ── Prepare output directory ────────────────────────────────────
+    // ── Prepare output directory ───────────────────────────────────
     let output_dir = tempfile::tempdir().unwrap();
     let output_p0 = output_dir.path().join("output_p0.jsonl");
     let output_p1 = output_dir.path().join("output_p1.jsonl");
     let checkpoint_dir = tempfile::tempdir().unwrap();
     let group_id = format!("rhei_cluster_e2e_group_{}", std::process::id());
 
-    // ── Spawn 2 child processes ─────────────────────────────────────
+    // ── Spawn 2 child processes ────────────────────────────────────
     let test_exe = std::env::current_exe().expect("failed to get current exe");
 
     let mut children = Vec::new();
@@ -266,7 +617,7 @@ async fn orchestrator_main() {
         children.push((pid, child));
     }
 
-    // ── Wait for children with timeout ──────────────────────────────
+    // ── Wait for children with timeout ─────────────────────────────
     let timeout = Duration::from_secs(45);
     let deadline = std::time::Instant::now() + timeout;
 
@@ -290,25 +641,33 @@ async fn orchestrator_main() {
         }
     }
 
-    // ── Merge and verify output ─────────────────────────────────────
+    // ── Merge and verify output ────────────────────────────────────
     let window_size = 10_000u64;
     let expected = compute_expected_windows(&orders, window_size);
 
     let p0_output = std::fs::read_to_string(&output_p0).unwrap_or_default();
     let p1_output = std::fs::read_to_string(&output_p1).unwrap_or_default();
 
-    let p0_windows: Vec<WindowOutput<f64>> = p0_output
+    #[derive(Deserialize)]
+    struct WindowOutputJson {
+        key: String,
+        window_start: u64,
+        window_end: u64,
+        value: f64,
+    }
+
+    let p0_windows: Vec<WindowOutputJson> = p0_output
         .lines()
         .filter(|l| !l.is_empty())
         .map(|line| serde_json::from_str(line).expect("invalid output JSON from p0"))
         .collect();
-    let p1_windows: Vec<WindowOutput<f64>> = p1_output
+    let p1_windows: Vec<WindowOutputJson> = p1_output
         .lines()
         .filter(|l| !l.is_empty())
         .map(|line| serde_json::from_str(line).expect("invalid output JSON from p1"))
         .collect();
 
-    let all_windows: Vec<&WindowOutput<f64>> = p0_windows.iter().chain(p1_windows.iter()).collect();
+    let all_windows: Vec<&WindowOutputJson> = p0_windows.iter().chain(p1_windows.iter()).collect();
 
     // 1. Non-empty combined output
     assert!(
@@ -412,7 +771,7 @@ fn wait_with_timeout(
     }
 }
 
-// ── Worker process ──────────────────────────────────────────────────
+// ── Worker process ─────────────────────────────────────────────────
 
 async fn worker_main() {
     let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
@@ -433,68 +792,107 @@ async fn worker_main() {
 
     eprintln!("worker process {process_id} starting");
 
-    // ── Build pipeline ──────────────────────────────────────────────
+    // ── Build pipeline ─────────────────────────────────────────────
     let source = KafkaSource::new(&brokers(), &group_id, &[&orders_topic, &payments_topic])
         .unwrap()
         .with_batch_size(50)
         .with_poll_timeout(Duration::from_millis(200));
 
-    let file_sink = FileSink::<WindowOutput<f64>>::new(&output_path).unwrap();
-
     let ot = orders_topic.clone();
 
-    let join_op = TemporalJoin::<Order, Payment, _, _>::new(
-        |side: &JoinSide<Order, Payment>| match side {
-            JoinSide::Left(o) => o.id.clone(),
-            JoinSide::Right(p) => p.id.clone(),
+    let join_op = TemporalJoin::new(
+        // key_fn: extract join key (order/payment ID)
+        |view: JoinInputView<'_>| view.id.to_string(),
+        // side_fn: determine left vs right
+        |view: JoinInputView<'_>| {
+            if view.side == 0 {
+                Side::Left
+            } else {
+                Side::Right
+            }
         },
-        |order: Order, payment: Payment| JoinedOrder {
-            id: order.id,
-            user_id: order.user_id,
-            amount: order.amount,
-            payment_method: payment.method,
-            timestamp: order.timestamp,
+        // left_fn: extract Order data for state
+        |view: JoinInputView<'_>| (view.user_id.to_string(), view.amount, view.timestamp),
+        // right_fn: extract Payment data for state
+        |view: JoinInputView<'_>| view.method.to_string(),
+        // join_fn: combine left + right into output
+        |_key: &str, left: &(String, f64, u64), _right: &String| JoinedOrder {
+            user_id: left.0.clone(),
+            amount: left.1,
+            timestamp: left.2,
         },
     );
 
     let window_size = 10_000u64;
-    let window_op = TumblingWindow::builder()
-        .window_size(window_size)
-        .key_fn(|j: &JoinedOrder| j.user_id.clone())
-        .time_fn(|j: &JoinedOrder| j.timestamp)
-        .aggregator(Sum::new(|j: &JoinedOrder| j.amount))
-        .build();
+    let window_op = TumblingWindow::new(
+        window_size,
+        // key_fn
+        |view: JoinedOrderView<'_>| view.user_id.to_string(),
+        // time_fn
+        |view: JoinedOrderView<'_>| view.timestamp,
+        // accumulate_fn
+        |acc: &mut f64, view: JoinedOrderView<'_>| {
+            *acc += view.amount;
+        },
+        // finish_fn
+        |key: &str, window_start: u64, window_end: u64, acc: &f64| WindowResult {
+            key: key.to_string(),
+            window_start,
+            window_end,
+            value: *acc,
+        },
+    );
+
+    let file_sink = JsonFileSink::new(&output_path);
 
     let graph = DataflowGraph::new();
     graph
         .source(source)
-        .map(move |msg: KafkaMessage| -> JoinSide<Order, Payment> {
-            let payload = msg.payload.expect("missing payload");
-            if msg.topic == ot {
-                JoinSide::Left(serde_json::from_slice(&payload).expect("bad order JSON"))
-            } else {
-                JoinSide::Right(serde_json::from_slice(&payload).expect("bad payment JSON"))
-            }
-        })
-        .filter(|side: &JoinSide<Order, Payment>| match side {
-            JoinSide::Left(o) => o.amount > 50.0,
-            JoinSide::Right(_) => true,
+        .map(
+            move |msg: <KafkaMessage as RheiSchema>::View<'_>| -> JoinInput {
+                let payload = if msg.payload_is_null {
+                    b"{}".as_slice()
+                } else {
+                    msg.payload
+                };
+                if msg.topic == ot {
+                    let order: Order =
+                        serde_json::from_slice(payload).expect("bad order JSON");
+                    JoinInput {
+                        side: 0,
+                        id: order.id,
+                        user_id: order.user_id,
+                        amount: order.amount,
+                        method: String::new(),
+                        timestamp: order.timestamp,
+                    }
+                } else {
+                    let payment: Payment =
+                        serde_json::from_slice(payload).expect("bad payment JSON");
+                    JoinInput {
+                        side: 1,
+                        id: payment.id,
+                        user_id: payment.user_id,
+                        amount: 0.0,
+                        method: payment.method,
+                        timestamp: payment.timestamp,
+                    }
+                }
+            },
+        )
+        .filter_fn(|view: &<JoinInput as RheiSchema>::View<'_>| {
+            // Pass through payments (right side) and filter orders by amount > 50
+            view.side == 1 || view.amount > 50.0
         })
         // Exchange #1: route by user_id across processes
-        .key_by(|side: &JoinSide<Order, Payment>| match side {
-            JoinSide::Left(o) => o.user_id.clone(),
-            JoinSide::Right(p) => p.user_id.clone(),
-        })
+        .key_by(|view: &<JoinInput as RheiSchema>::View<'_>| view.user_id.to_string())
         .operator("temporal_join", join_op)
         // Exchange #2: re-key by user_id after join
-        .key_by(|j: &JoinedOrder| j.user_id.clone())
+        .key_by(|view: &<JoinedOrder as RheiSchema>::View<'_>| view.user_id.to_string())
         .operator("tumbling_window", window_op)
         .sink(file_sink);
 
-    // ── Run with shutdown ───────────────────────────────────────────
-    // Instead of a fixed timer, wait for the output file to stabilize
-    // (no new data for 3s), indicating the pipeline has fully drained.
-    // This avoids flakiness when Kafka consumers are slow under CI load.
+    // ── Run with shutdown ──────────────────────────────────────────
     let (handle, trigger) = ShutdownHandle::new();
     let poll_path = output_path.clone();
     tokio::spawn(async move {
@@ -502,7 +900,6 @@ async fn worker_main() {
         let mut stable_since: Option<tokio::time::Instant> = None;
         let deadline = tokio::time::Instant::now() + Duration::from_secs(25);
 
-        // Wait at least 3s for first data to appear
         tokio::time::sleep(Duration::from_secs(3)).await;
 
         loop {
@@ -528,19 +925,19 @@ async fn worker_main() {
     let proc_checkpoint_dir = checkpoint_dir.join(format!("p{process_id}"));
     std::fs::create_dir_all(&proc_checkpoint_dir).ok();
 
-    let executor = Executor::builder()
-        .checkpoint_dir(&proc_checkpoint_dir)
+    let ctrl = PipelineController::builder()
+        .checkpoint_dir(proc_checkpoint_dir.clone())
         .from_env()
         .build()
         .unwrap();
 
     eprintln!(
         "worker process {process_id}: cluster={}, total_workers={}, local_range={:?}",
-        executor.is_cluster(),
-        executor.total_workers(),
-        executor.local_worker_range(),
+        ctrl.is_cluster(),
+        ctrl.total_workers(),
+        ctrl.local_worker_range(),
     );
 
-    executor.run_with_shutdown(graph, handle).await.unwrap();
+    ctrl.run_with_shutdown(graph, handle).await.unwrap();
     eprintln!("worker process {process_id} finished");
 }
