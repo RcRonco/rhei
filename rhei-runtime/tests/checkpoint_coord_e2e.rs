@@ -464,7 +464,11 @@ async fn worker_main() {
     // Generate words keyed by first character (26 distinct keys).
     // Use PartitionedVecSource with 4 partitions (matching total workers).
     let words: Vec<WordEvent> = ('a'..='z')
-        .flat_map(|c| (0..5).map(move |i| WordEvent { word: format!("{c}{i}") }))
+        .flat_map(|c| {
+            (0..5).map(move |i| WordEvent {
+                word: format!("{c}{i}"),
+            })
+        })
         .collect();
 
     let source = PartitionedVecSource::new(words, 4);

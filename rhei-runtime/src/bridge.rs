@@ -28,7 +28,29 @@ pub(crate) async fn local_source_bridge(
     wm_writer: Arc<AtomicU64>,
     shutdown: Option<ShutdownHandle>,
 ) {
-    while let Some(buf) = source.next_batch().await {
+    loop {
+        let batch = if let Some(ref handle) = shutdown {
+            if handle.is_shutdown() {
+                tracing::info!("shutdown requested, stopping batch source bridge");
+                return;
+            }
+            let mut rx = handle.subscribe();
+            tokio::select! {
+                biased;
+                _ = rx.changed() => {
+                    tracing::info!("shutdown requested, stopping batch source bridge");
+                    return;
+                }
+                batch = source.next_batch() => batch,
+            }
+        } else {
+            source.next_batch().await
+        };
+
+        let Some(buf) = batch else {
+            break;
+        };
+
         let offsets = source.current_offsets();
         if !offsets.is_empty() {
             *offsets_writer.lock().unwrap_or_else(|e| {
@@ -41,12 +63,6 @@ pub(crate) async fn local_source_bridge(
 
         if tx.send_async((buf, wm)).await.is_err() {
             break;
-        }
-        if let Some(ref handle) = shutdown
-            && handle.is_shutdown()
-        {
-            tracing::info!("shutdown requested, stopping batch source bridge");
-            return;
         }
     }
     wm_writer.store(

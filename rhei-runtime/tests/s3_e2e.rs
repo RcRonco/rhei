@@ -415,11 +415,14 @@ async fn s3_tiered_storage_e2e() {
         .await
         .expect("failed to reopen SlateDB on S3");
 
-    let prefix = b"word_counter_w0/";
     let verify_words = ["alpha", "beta", "cedar", "delta", "ember", "frost"];
     for word in &verify_words {
-        let mut key = prefix.to_vec();
-        key.extend_from_slice(word.as_bytes());
+        // KeyedState<String, u64> with JsonEncoder stores keys as:
+        //   PrefixedBackend prefix: "word_counter_w0/"
+        //   KeyedState key: "counts:" + serde_json::to_string(word)
+        let keyed_state_key = format!("counts:{}", serde_json::to_string(word).unwrap());
+        let mut key = b"word_counter_w0/".to_vec();
+        key.extend_from_slice(keyed_state_key.as_bytes());
 
         let val = l3_verify
             .get(&key)
@@ -433,7 +436,7 @@ async fn s3_tiered_storage_e2e() {
 
         let bytes = val.unwrap();
         let count: u64 =
-            bincode::deserialize(&bytes).expect("failed to deserialize persisted count");
+            serde_json::from_slice(&bytes).expect("failed to deserialize persisted count");
         assert_eq!(
             count, 5,
             "persisted count for '{word}': actual={count}, expected=5"

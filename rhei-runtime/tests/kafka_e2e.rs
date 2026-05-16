@@ -29,6 +29,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use rdkafka::ClientConfig;
 use rdkafka::admin::{AdminClient, AdminOptions, NewTopic, TopicReplication};
+use rdkafka::consumer::Consumer;
 use rdkafka::producer::{FutureProducer, FutureRecord};
 use rhei_core::arrow::{
     BufferOutput, OperatorContext, RheiBuffer, RheiBuilder, RheiSchema, Sink, StreamFunction,
@@ -410,10 +411,22 @@ async fn kafka_aggregation_e2e() {
     let collected = Arc::new(Mutex::new(Vec::<(String, f64)>::new()));
 
     let group_id = format!("rhei_e2e_group_{}", std::process::id());
-    let source = KafkaSource::new(&brokers(), &group_id, &[&orders_topic])
-        .unwrap()
+    let consumer: rdkafka::consumer::StreamConsumer = ClientConfig::new()
+        .set("bootstrap.servers", brokers())
+        .set("group.id", &group_id)
+        .set("enable.auto.commit", "false")
+        .set("auto.offset.reset", "earliest")
+        .set("session.timeout.ms", "6000")
+        .set("heartbeat.interval.ms", "1000")
+        .create()
+        .expect("consumer creation failed");
+    consumer
+        .subscribe(&[&orders_topic])
+        .expect("subscribe failed");
+
+    let source = KafkaSource::from_consumer(consumer)
         .with_batch_size(50)
-        .with_poll_timeout(Duration::from_millis(200));
+        .with_poll_timeout(Duration::from_millis(500));
 
     let graph = DataflowGraph::new();
     graph
@@ -441,8 +454,20 @@ async fn kafka_aggregation_e2e() {
 
     // ── Run with shutdown ───────────────────────────────────────────
     let (handle, trigger) = ShutdownHandle::new();
+    let collected_for_shutdown = collected.clone();
     tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_secs(10)).await;
+        // Wait until output appears or timeout after 30s.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            if !collected_for_shutdown.lock().unwrap().is_empty() {
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                break;
+            }
+        }
         trigger.shutdown();
     });
 
@@ -526,10 +551,22 @@ async fn kafka_multi_partition_e2e() {
     let collected = Arc::new(Mutex::new(Vec::<(String, f64)>::new()));
 
     let group_id = format!("rhei_mp_e2e_group_{}", std::process::id());
-    let source = KafkaSource::new(&brokers(), &group_id, &[&orders_topic])
-        .unwrap()
+    let consumer: rdkafka::consumer::StreamConsumer = ClientConfig::new()
+        .set("bootstrap.servers", brokers())
+        .set("group.id", &group_id)
+        .set("enable.auto.commit", "false")
+        .set("auto.offset.reset", "earliest")
+        .set("session.timeout.ms", "6000")
+        .set("heartbeat.interval.ms", "1000")
+        .create()
+        .expect("consumer creation failed");
+    consumer
+        .subscribe(&[&orders_topic])
+        .expect("subscribe failed");
+
+    let source = KafkaSource::from_consumer(consumer)
         .with_batch_size(50)
-        .with_poll_timeout(Duration::from_millis(200));
+        .with_poll_timeout(Duration::from_millis(500));
 
     let graph = DataflowGraph::new();
     graph
@@ -557,8 +594,19 @@ async fn kafka_multi_partition_e2e() {
 
     // ── Run with 2 workers ──────────────────────────────────────────
     let (handle, trigger) = ShutdownHandle::new();
+    let collected_for_shutdown = collected.clone();
     tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_secs(15)).await;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            if !collected_for_shutdown.lock().unwrap().is_empty() {
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                break;
+            }
+        }
         trigger.shutdown();
     });
 

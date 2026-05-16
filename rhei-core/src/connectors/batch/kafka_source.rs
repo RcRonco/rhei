@@ -176,24 +176,29 @@ impl Source for KafkaSource {
     type Output = KafkaMessage;
 
     async fn next_batch(&mut self) -> Option<RheiBuffer<KafkaMessage>> {
-        let messages = self.poll_messages().await;
-        if messages.is_empty() {
-            return None;
-        }
+        // Kafka is an unbounded source — never return None (which signals
+        // exhaustion). Retry empty polls until data arrives; the bridge's
+        // shutdown handle terminates the loop externally.
+        loop {
+            let messages = self.poll_messages().await;
+            if messages.is_empty() {
+                continue;
+            }
 
-        let count = messages.len();
-        let mut builder = KafkaMessage::builder(count);
-        for msg in messages {
-            builder.append(msg);
-        }
+            let count = messages.len();
+            let mut builder = KafkaMessage::builder(count);
+            for msg in messages {
+                builder.append(msg);
+            }
 
-        self.records_since_watermark += count;
-        if self.records_since_watermark >= self.watermark_interval {
-            self.watermark_pending = true;
-            self.records_since_watermark = 0;
-        }
+            self.records_since_watermark += count;
+            if self.records_since_watermark >= self.watermark_interval {
+                self.watermark_pending = true;
+                self.records_since_watermark = 0;
+            }
 
-        Some(RheiBuffer::from_builder(builder))
+            return Some(RheiBuffer::from_builder(builder));
+        }
     }
 
     fn should_emit_watermark(&self) -> bool {
