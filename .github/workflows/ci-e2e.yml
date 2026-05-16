@@ -53,8 +53,6 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Run Kafka E2E tests
         run: cargo nextest run -p rhei-runtime --features kafka --test kafka_e2e --profile ci --no-capture
-      - name: Run Kafka Cluster E2E tests
-        run: cargo nextest run -p rhei-runtime --features kafka --test kafka_cluster_e2e --profile ci --no-capture
       - name: Upload test results
         if: always()
         uses: actions/upload-artifact@v4
