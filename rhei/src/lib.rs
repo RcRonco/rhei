@@ -44,8 +44,9 @@ pub use rhei_core::connectors::kafka::types::{KafkaHeader, KafkaMessage, KafkaRe
 
 // Batch operators
 pub use rhei_core::operators::{
-    CountWindow, Expr, FilterExprOp, ReduceOp, RollingAggregateOp, SessionWindow, Side,
-    SlidingWindow, TemporalJoin, TumblingWindow, col, lit_bool, lit_f64, lit_i64, lit_str, lit_u64,
+    AfterMatch, CountWindow, Expr, FilterExprOp, MatchCtx, ReduceOp, RollingAggregateOp,
+    SequenceDetect, SessionWindow, Side, SlidingWindow, TemporalJoin, TumblingWindow, col,
+    lit_bool, lit_f64, lit_i64, lit_str, lit_u64,
 };
 
 // Batch connectors (partitioned)

@@ -7,6 +7,7 @@
   - [x] `TumblingWindow<T, A>` — fixed-size time windows with pluggable aggregator
   - [x] `SlidingWindow<T, A>` — overlapping time windows
   - [x] `SessionWindow<T, A>` — gap-based windows per key
+  - [x] `SequenceDetect` — ordered event sequence matching (MATCH_RECOGNIZE equivalent)
   - [x] `KeyedState<K, V>` — typed state wrapper over `StateContext` with automatic serde
   - [x] `Filter`, `Map`, `FlatMap` — stateless combinators
 - [x] Fluent pipeline builder API (`DataflowGraph` with `Stream<T>` / `KeyedStream<T>`)
@@ -70,6 +71,7 @@
 - [x] Memtable compaction and eviction policies (bounded memory) (KI-7)
 - [ ] Async state prefetch — predict upcoming keys and warm L2/L3 cache
 - [ ] DataFusion kernel integration for aggregate/join operators
+- [ ] Vectorized `SequenceDetect` predicates — evaluate step expressions as Arrow boolean masks via DataFusion kernels, feed pre-computed matches into NFA state machine
 - [ ] Benchmark suite with throughput/latency targets
 - [ ] Profile and optimize the Timely ↔ Tokio bridge (channel sizing, wake strategy)
 - [ ] Sliding window eviction for closed active windows (KI-10)
