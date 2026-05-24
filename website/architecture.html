@@ -1,0 +1,382 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Architecture — Rhei</title>
+  <meta name="description" content="How Rhei works: disaggregated state, Arrow columnar execution, Timely Dataflow runtime, and distributed clustering.">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+
+  <nav>
+    <a href="/" class="nav-logo">rhei</a>
+    <ul class="nav-links">
+      <li><a href="/examples.html">Examples</a></li>
+      <li><a href="/architecture.html">Architecture</a></li>
+      <li><a href="https://docs.rs/rhei" target="_blank">Docs</a></li>
+      <li><a href="https://github.com/RcRonco/rhei" target="_blank">GitHub</a></li>
+    </ul>
+  </nav>
+
+  <div class="page-with-sidebar">
+    <aside class="sidebar-nav">
+      <div class="sidebar-label">Architecture</div>
+      <ul>
+        <li><a href="#execution">Execution Model</a></li>
+        <li><a href="#state">State Management</a></li>
+        <li><a href="#checkpointing">Checkpointing</a></li>
+        <li><a href="#runtime">Runtime Bridge</a></li>
+        <li><a href="#clustering">Clustering</a></li>
+        <li><a href="#errors">Error Handling</a></li>
+      </ul>
+    </aside>
+
+    <div class="page-content">
+      <!-- Intro -->
+      <section class="tight" style="padding-top: 0; border-bottom: 1px solid var(--border);">
+        <span class="section-label">Architecture</span>
+        <h1 class="section-heading" style="font-size: 1.75rem;">How Rhei works</h1>
+        <p class="section-desc">
+          Shared-nothing, disaggregated-state streaming engine.
+          Compute scales independently from storage. All data flows as Arrow RecordBatch buffers — no row-by-row execution path.
+        </p>
+      </section>
+
+      <!-- Execution Model -->
+      <section id="execution" class="tight">
+        <div class="section-intro">
+          <span class="section-label">Execution Model</span>
+          <h2 class="section-heading">Arrow columnar, not row-by-row</h2>
+          <p class="section-desc">All data flows as Apache Arrow RecordBatch buffers. No deserialization on the hot path. Vectorized compute through the entire pipeline.</p>
+        </div>
+
+        <table class="tier-table">
+          <thead>
+            <tr>
+              <th>Concept</th>
+              <th>Type</th>
+              <th>Description</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><span class="tier-name">Schema</span></td>
+              <td><span class="tier-tech">RheiSchema trait</span></td>
+              <td>Defines Arrow schema, builder, zero-copy view, and column accessors</td>
+            </tr>
+            <tr>
+              <td><span class="tier-name">Typed buffer</span></td>
+              <td><span class="tier-tech">RheiBuffer&lt;T&gt;</span></td>
+              <td>RecordBatch + selection vector (boolean mask for zero-copy filtering)</td>
+            </tr>
+            <tr>
+              <td><span class="tier-name">Transport</span></td>
+              <td><span class="tier-tech">ErasedBuffer</span></td>
+              <td>Type-erased RecordBatch + mask + schema_id for Timely dataflow transport</td>
+            </tr>
+            <tr>
+              <td><span class="tier-name">Operator</span></td>
+              <td><span class="tier-tech">StreamFunction</span></td>
+              <td>Async trait: process(RheiBuffer&lt;I&gt;, ctx) → BufferOutput&lt;O&gt;</td>
+            </tr>
+            <tr>
+              <td><span class="tier-name">Exchange</span></td>
+              <td><span class="tier-tech">key_by + seahash</span></td>
+              <td>Two-stage: split rows by hash % workers → route via Timely Exchange pact</td>
+            </tr>
+            <tr>
+              <td><span class="tier-name">Serialization</span></td>
+              <td><span class="tier-tech">Arrow IPC</span></td>
+              <td>Cross-worker data transfer. Self-describing, columnar-native format.</td>
+            </tr>
+          </tbody>
+        </table>
+
+        <div class="ascii-diagram" style="margin-top: 2rem;">
+          <pre>
+<span class="node">Processing Granularities:</span>
+
+  <span class="teal">Row-level</span>     Iterate RheiBuffer&lt;T&gt; via zero-copy View&lt;'a&gt; references.
+               For custom stateful logic per-element.
+
+  <span class="teal">Batch-level</span>   Receive full RheiBuffer&lt;T&gt;. For windows, aggregations.
+               Amortize overhead across thousands of rows.
+
+  <span class="teal">Column-level</span>  Arrow compute kernels on column arrays.
+               Selection vectors enable zero-copy filter expressions.</pre>
+        </div>
+      </section>
+
+      <!-- State -->
+      <section id="state" class="tight">
+        <div class="section-intro">
+          <span class="section-label">State Management</span>
+          <h2 class="section-heading">Three-tier state hierarchy</h2>
+          <p class="section-desc">Hot state in RAM for active keys, warm cache on local NVMe, cold storage on S3. Each tier optimized for its access pattern. Workers are stateless — they read through the hierarchy.</p>
+        </div>
+
+        <table class="tier-table">
+          <thead>
+            <tr>
+              <th>Tier</th>
+              <th>Backend</th>
+              <th>Latency</th>
+              <th>Capacity</th>
+              <th>Behavior</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><span class="tier-name">L1</span></td>
+              <td><span class="tier-tech">HashMap&lt;Bytes, Bytes&gt;</span></td>
+              <td><span class="tier-latency">~1μs</span></td>
+              <td>RAM-bounded</td>
+              <td>Buffers writes. Dirty keys flushed to L3 on checkpoint. Compaction + eviction policies.</td>
+            </tr>
+            <tr>
+              <td><span class="tier-name">L2</span></td>
+              <td><span class="tier-tech">Foyer HybridCache</span></td>
+              <td><span class="tier-latency">~1ms</span></td>
+              <td>NVMe-bounded</td>
+              <td>Local read-through cache. Handles L1 misses without network. Admission control.</td>
+            </tr>
+            <tr>
+              <td><span class="tier-name">L3</span></td>
+              <td><span class="tier-tech">SlateDB on S3</span></td>
+              <td><span class="tier-latency">~50ms</span></td>
+              <td>Unlimited</td>
+              <td>Source of truth. SSTable uploads. Enables stateless autoscaling.</td>
+            </tr>
+          </tbody>
+        </table>
+
+        <div class="ascii-diagram" style="margin-top: 2rem;">
+          <pre>
+<span class="node">State Access Patterns:</span>
+
+  <span class="teal">Hot path</span> <span class="dim">(zero I/O)</span>
+    Batch arrives → operator processes → state read/write in L1 → output emitted
+    No blocking. No network. Microsecond latency.
+
+  <span class="teal">Cold path</span> <span class="dim">(async fetch)</span>
+    L1 miss → block_in_place → async fetch from L2/L3 → load into L1 → continue
+    Transparent to operator code. Same StateContext API.
+
+  <span class="teal">Checkpoint path</span>
+    Frontier advances → L1 dirty keys flush to SlateDB → SSTable upload to S3
+    → manifest written → source offsets committed → next epoch begins
+
+<span class="node">Key Isolation:</span>
+
+    State keys are prefixed: <span class="highlight">{operator_name}/{user_key}</span>
+    Multi-process:          <span class="highlight">p{pid}/w{idx}/{operator}/{key}</span>
+    No cross-operator interference. No cross-worker conflicts.</pre>
+        </div>
+      </section>
+
+      <!-- Checkpointing -->
+      <section id="checkpointing" class="tight">
+        <div class="section-intro">
+          <span class="section-label">Checkpointing</span>
+          <h2 class="section-heading">Consistent snapshots with offset tracking</h2>
+          <p class="section-desc">Checkpoint coordination triggered by Timely frontier advancement. Source offsets committed after state is durable.</p>
+        </div>
+
+        <div class="ascii-diagram">
+          <pre>
+<span class="node">Checkpoint Protocol:</span>
+
+  <span class="teal">1.</span> Timely frontier advances (all workers finish epoch N)
+  <span class="teal">2.</span> Each worker flushes L1 dirty keys → SlateDB → S3
+  <span class="teal">3.</span> Workers report readiness via checkpoint channel
+  <span class="teal">4.</span> Coordinator writes merged checkpoint manifest
+  <span class="teal">5.</span> Source offsets committed (Kafka consumer group)
+  <span class="teal">6.</span> Epoch N+1 begins
+
+<span class="node">Manifest contents:</span>
+
+  <span class="dim">├──</span> operator states (prefixed key ranges per worker)
+  <span class="dim">├──</span> source offsets (topic/partition → offset)
+  <span class="dim">├──</span> topology metadata (process count, workers per process)
+  <span class="dim">└──</span> epoch number
+
+<span class="node">Recovery:</span>
+
+  <span class="dim">$</span> cargo run -- --from-checkpoint s3://bucket/manifests/epoch-42.json
+  <span class="dim">→</span> Load manifest → seek Kafka to checkpointed offsets → resume processing</pre>
+        </div>
+      </section>
+
+      <!-- Async Bridge -->
+      <section id="runtime" class="tight">
+        <div class="section-intro">
+          <span class="section-label">Runtime</span>
+          <h2 class="section-heading">Async/sync bridge architecture</h2>
+          <p class="section-desc">Sources and sinks are async Tokio tasks. Timely Dataflow is synchronous and runs on blocking threads. Bounded channels bridge the two worlds.</p>
+        </div>
+
+        <div class="ascii-diagram">
+          <pre>
+<span class="dim">┌───────────────────────┐</span>           <span class="dim">┌───────────────────────┐</span>
+<span class="dim">│</span> <span class="teal">Tokio Runtime</span>         <span class="dim">│</span>           <span class="dim">│</span> <span class="teal">Timely Runtime</span>        <span class="dim">│</span>
+<span class="dim">│</span>                       <span class="dim">│</span>           <span class="dim">│</span>                       <span class="dim">│</span>
+<span class="dim">│</span> <span class="node">KafkaSource</span> (async)   <span class="dim">│</span>   mpsc    <span class="dim">│</span> <span class="node">Dataflow operators</span>   <span class="dim">│</span>
+<span class="dim">│</span>     <span class="dim">│</span>                 <span class="dim">│</span> ────────▶ <span class="dim">│</span>     <span class="dim">│</span>                 <span class="dim">│</span>
+<span class="dim">│</span>     <span class="dim">▼</span>                 <span class="dim">│</span>  bounded  <span class="dim">│</span>     <span class="dim">▼</span>                 <span class="dim">│</span>
+<span class="dim">│</span> <span class="node">produce RheiBuffer</span>    <span class="dim">│</span>           <span class="dim">│</span> <span class="node">consume ErasedBuffer</span>  <span class="dim">│</span>
+<span class="dim">│</span>                       <span class="dim">│</span>           <span class="dim">│</span>     <span class="dim">│</span>                 <span class="dim">│</span>
+<span class="dim">│</span> <span class="node">KafkaSink</span> (async)     <span class="dim">│</span>   mpsc    <span class="dim">│</span>     <span class="dim">▼</span>                 <span class="dim">│</span>
+<span class="dim">│</span>     <span class="dim">▲</span>                 <span class="dim">│</span> ◀──────── <span class="dim">│</span> <span class="node">emit ErasedBuffer</span>    <span class="dim">│</span>
+<span class="dim">│</span>     <span class="dim">│</span>                 <span class="dim">│</span>  bounded  <span class="dim">│</span>                       <span class="dim">│</span>
+<span class="dim">│</span> <span class="node">consume RheiBuffer</span>    <span class="dim">│</span>           <span class="dim">│</span> <span class="node">spawn_blocking</span>       <span class="dim">│</span>
+<span class="dim">│</span>                       <span class="dim">│</span>           <span class="dim">│</span>                       <span class="dim">│</span>
+<span class="dim">└───────────────────────┘</span>           <span class="dim">└───────────────────────┘</span>
+
+<span class="node">Process Layers:</span>
+
+  <span class="highlight">PipelineController</span>  →  config, lifecycle, CLI parsing
+       <span class="dim">│</span>
+       <span class="dim">▼</span>
+  <span class="highlight">TaskManager</span>         →  background services, source/sink bridging
+       <span class="dim">│</span>
+       <span class="dim">▼</span>
+  <span class="highlight">DataflowExecutor</span>    →  per-worker Timely DAG compilation and execution</pre>
+        </div>
+      </section>
+
+      <!-- Clustering -->
+      <section id="clustering" class="tight">
+        <div class="section-intro">
+          <span class="section-label">Clustering</span>
+          <h2 class="section-heading">From single thread to distributed</h2>
+          <p class="section-desc">Three deployment modes with the same pipeline code. Scale compute independently — state lives in S3.</p>
+        </div>
+
+        <table class="tier-table">
+          <thead>
+            <tr>
+              <th>Mode</th>
+              <th>Config</th>
+              <th>Communication</th>
+              <th>State</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><span class="tier-name">Multi-thread</span></td>
+              <td><span class="tier-tech">.with_workers(N)</span></td>
+              <td>In-process channels</td>
+              <td>Per-worker L1, shared L2/L3</td>
+            </tr>
+            <tr>
+              <td><span class="tier-name">Multi-process</span></td>
+              <td><span class="tier-tech">.from_env()</span></td>
+              <td>TCP (Timely networking)</td>
+              <td>Per-process SlateDB, shared S3 bucket</td>
+            </tr>
+            <tr>
+              <td><span class="tier-name">Dynamic cluster</span></td>
+              <td><span class="tier-tech">TBD</span></td>
+              <td>Chitchat gossip + gRPC</td>
+              <td>Repartitioned on topology change</td>
+            </tr>
+          </tbody>
+        </table>
+
+        <div class="ascii-diagram" style="margin-top: 2rem;">
+          <pre>
+<span class="node">Multi-process checkpoint coordination:</span>
+
+  <span class="dim">Process 0 (coordinator)</span>         <span class="dim">Process 1</span>         <span class="dim">Process N</span>
+       <span class="dim">│</span>                               <span class="dim">│</span>                 <span class="dim">│</span>
+       <span class="dim">│</span>◀── checkpoint ready ──────────<span class="dim">│</span>                 <span class="dim">│</span>
+       <span class="dim">│</span>◀── checkpoint ready ─────────────────────────────<span class="dim">│</span>
+       <span class="dim">│</span>
+       <span class="dim">▼</span>
+  <span class="highlight">merge manifests</span> → write to S3 → <span class="teal">commit offsets</span>
+       <span class="dim">│</span>
+       <span class="dim">│</span>──▶ epoch advanced ────────────▶<span class="dim">│</span>                 <span class="dim">│</span>
+       <span class="dim">│</span>──▶ epoch advanced ───────────────────────────────▶<span class="dim">│</span></pre>
+        </div>
+      </section>
+
+      <!-- Error Handling -->
+      <section id="errors" class="tight">
+        <div class="section-intro">
+          <span class="section-label">Error Handling</span>
+          <h2 class="section-heading">Graceful failure, not silent drops</h2>
+        </div>
+
+        <div class="features-list">
+          <div class="feature-row">
+            <span class="feature-name">ErrorPolicy::Skip</span>
+            <span class="feature-desc">Log warning, drop the failed element, continue processing. Default for non-critical paths.</span>
+          </div>
+          <div class="feature-row">
+            <span class="feature-name">ErrorPolicy::SendToDlq</span>
+            <span class="feature-desc">Route failed elements to a DlqSink. Errors are propagated, never silently swallowed.</span>
+          </div>
+          <div class="feature-row">
+            <span class="feature-name">DlqSink trait</span>
+            <span class="feature-desc">Pluggable backends: FileDlqSink, LogDlqSink, KafkaDlqSink. Implement your own.</span>
+          </div>
+          <div class="feature-row">
+            <span class="feature-name">on_error() hook</span>
+            <span class="feature-desc">Per-operator error recovery callback on StreamFunction. Custom retry or fallback logic.</span>
+          </div>
+          <div class="feature-row">
+            <span class="feature-name">Graceful shutdown</span>
+            <span class="feature-desc">Drain in-flight batches → flush state → write checkpoint → commit offsets → exit.</span>
+          </div>
+        </div>
+      </section>
+
+      <!-- Footer -->
+      <footer>
+        <div class="footer-content">
+          <div class="footer-left">rhei — stateful stream processing for Rust</div>
+          <ul class="footer-links">
+            <li><a href="https://github.com/RcRonco/rhei" target="_blank">GitHub</a></li>
+            <li><a href="https://crates.io/crates/rhei" target="_blank">crates.io</a></li>
+            <li><a href="https://docs.rs/rhei" target="_blank">docs.rs</a></li>
+            <li><a href="/">Home</a></li>
+          </ul>
+        </div>
+      </footer>
+    </div>
+  </div>
+
+  <script src="js/main.js"></script>
+  <script>
+    // Sidebar scroll spy
+    (() => {
+      const links = document.querySelectorAll('.sidebar-nav a');
+      const sections = [];
+      for (const link of links) {
+        const id = link.getAttribute('href')?.slice(1);
+        if (id) {
+          const el = document.getElementById(id);
+          if (el) sections.push({ el, link });
+        }
+      }
+      if (!sections.length) return;
+
+      function update() {
+        let current = sections[0];
+        for (const s of sections) {
+          if (s.el.getBoundingClientRect().top <= 120) current = s;
+        }
+        for (const s of sections) s.link.classList.remove('active');
+        current.link.classList.add('active');
+      }
+
+      window.addEventListener('scroll', update, { passive: true });
+      update();
+    })();
+  </script>
+</body>
+</html>

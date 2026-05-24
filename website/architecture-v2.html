@@ -1,0 +1,443 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Architecture — Rhei</title>
+  <meta name="description" content="How Rhei works: disaggregated state, Arrow columnar execution, Timely Dataflow runtime, and distributed clustering.">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="css/style.css">
+  <style>
+    .arch-content {
+      font-size: 0.9rem;
+      line-height: 1.8;
+      color: var(--text);
+    }
+    .arch-content p {
+      margin-bottom: 1.5rem;
+      max-width: 680px;
+    }
+    .arch-content a {
+      color: var(--accent);
+      text-decoration: underline;
+      text-decoration-color: rgba(255, 107, 74, 0.3);
+      text-underline-offset: 2px;
+    }
+    .arch-content a:hover {
+      text-decoration-color: var(--accent);
+    }
+    .arch-content code {
+      font-family: var(--font-mono);
+      font-size: 0.8rem;
+      background: var(--bg-raised);
+      padding: 0.12rem 0.4rem;
+      border-radius: 3px;
+      color: var(--white);
+    }
+    .arch-content .metric {
+      color: var(--teal);
+      font-family: var(--font-mono);
+      font-size: 0.82rem;
+    }
+    .arch-content .diagram {
+      margin: 2.5rem 0;
+      padding: 1.5rem 2rem;
+      background: var(--bg-raised);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      overflow-x: auto;
+    }
+    .arch-content .diagram pre {
+      font-family: var(--font-mono);
+      font-size: 0.7rem;
+      line-height: 1.45;
+      color: var(--muted);
+      white-space: pre;
+      margin: 0;
+    }
+    .arch-content .diagram .h { color: var(--accent); }
+    .arch-content .diagram .n { color: var(--white); }
+    .arch-content .diagram .d { color: #444455; }
+    .arch-content .diagram .t { color: var(--teal); }
+    .page-title {
+      font-size: 2rem;
+      font-weight: 700;
+      color: var(--white);
+      letter-spacing: -0.02em;
+      margin-bottom: 2rem;
+    }
+  </style>
+</head>
+<body>
+
+  <nav>
+    <a href="/" class="nav-logo">rhei</a>
+    <ul class="nav-links">
+      <li><a href="/examples.html">Examples</a></li>
+      <li><a href="/architecture-v2.html">Architecture</a></li>
+      <li><a href="https://docs.rs/rhei" target="_blank">Docs</a></li>
+      <li><a href="https://github.com/RcRonco/rhei" target="_blank">GitHub</a></li>
+    </ul>
+  </nav>
+
+  <div class="page-with-sidebar">
+    <aside class="sidebar-nav">
+      <div class="sidebar-label">Docs</div>
+      <ul>
+        <li><a href="/architecture-v2.html" class="active">Architecture</a></li>
+        <li><a href="/examples.html">Examples</a></li>
+      </ul>
+      <div class="sidebar-label">On this page</div>
+      <ul>
+        <li><a href="#top">Overview</a></li>
+        <li><a href="#execution">Execution model</a></li>
+        <li><a href="#state">State hierarchy</a></li>
+        <li><a href="#checkpointing">Checkpointing</a></li>
+        <li><a href="#bridge">Async bridge</a></li>
+        <li><a href="#clustering">Clustering</a></li>
+        <li><a href="#errors">Error handling</a></li>
+      </ul>
+    </aside>
+
+    <div class="page-content">
+      <div class="arch-content" id="top">
+        <h1 class="page-title">Architecture</h1>
+
+        <p>
+          Rhei is a shared-nothing, disaggregated-state streaming engine. A <code>#[rhei::pipeline]</code> compiles
+          to a <a href="https://github.com/TimelyDataflow/timely-dataflow">Timely Dataflow</a> graph that runs
+          on blocking threads, bridged to async Tokio sources and sinks via bounded <code>mpsc</code> channels.
+          All data flows as Apache Arrow <code>RecordBatch</code> buffers — there is no row-by-row execution path.
+        </p>
+
+        <p>
+          The core design principle is separation of compute from state. Workers are stateless: they read through
+          a tiered storage hierarchy (RAM → NVMe → S3) rather than owning local state. This means you can scale
+          compute up or down without migrating data, and any worker can resume from any checkpoint.
+        </p>
+
+        <div class="diagram" id="execution">
+          <pre>
+                     <span class="d">╔</span>═ <span class="n">Rhei Pipeline</span> ═══════════════════════════<span class="d">╗</span>   
+<span class="d">╔</span>════════════<span class="d">╗</span>       <span class="d">║</span>                                           <span class="d">║</span><span class="d">░</span>  
+<span class="d">║</span>            <span class="d">║</span><span class="d">░</span>      <span class="d">║</span>  <span class="d">┏</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">┓</span>   <span class="d">┏</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">┓</span>  <span class="d">║</span><span class="d">░</span>    
+<span class="d">║</span>  <span class="h">Kafka</span>     <span class="d">║</span><span class="d">░</span><span class="d">─</span>msg<span class="d">─</span><span class="d">▶</span><span class="d">║</span>  <span class="d">┃</span> <span class="n">Source</span>      <span class="d">┃</span><span class="d">─</span><span class="d">─</span><span class="d">▶</span><span class="d">┃</span> <span class="n">RheiBuffer&lt;T&gt;</span>    <span class="d">┃</span>  <span class="d">║</span><span class="d">░</span>   
+<span class="d">║</span>  <span class="h">Broker</span>    <span class="d">║</span><span class="d">░</span>      <span class="d">║</span>  <span class="d">┃</span> async task  <span class="d">┃</span>   <span class="d">┃</span> RecordBatch+sel  <span class="d">┃</span>  <span class="d">║</span><span class="d">░</span>   
+<span class="d">║</span>            <span class="d">║</span><span class="d">░</span>      <span class="d">║</span>  <span class="d">┗</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">┛</span>   <span class="d">┗</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">┯</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">┛</span>  <span class="d">║</span><span class="d">░</span>    
+<span class="d">╚</span>════════════<span class="d">╝</span><span class="d">░</span>      <span class="d">║</span>                            <span class="d">│</span>             <span class="d">║</span><span class="d">░</span>   
+ <span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span>      <span class="d">║</span>                     <span class="t">type-erase</span>           <span class="d">║</span><span class="d">░</span>   
+                     <span class="d">║</span>                            <span class="d">│</span>             <span class="d">║</span><span class="d">░</span>   
+                     <span class="d">║</span>                            <span class="d">▼</span>             <span class="d">║</span><span class="d">░</span>   
+                     <span class="d">║</span>  <span class="d">┏</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">┓</span>  <span class="d">║</span><span class="d">░</span>    
+                     <span class="d">║</span>  <span class="d">┃</span> <span class="n">Timely Dataflow</span> (sync, blocking)  <span class="d">┃</span>  <span class="d">║</span><span class="d">░</span>    
+                     <span class="d">║</span>  <span class="d">┃</span>                                   <span class="d">┃</span>  <span class="d">║</span><span class="d">░</span>    
+                     <span class="d">║</span>  <span class="d">┃</span> ErasedBuffer<span class="d">─</span><span class="d">▶</span><span class="h">Exchange</span><span class="d">─</span><span class="d">▶</span><span class="n">Operator</span>  <span class="d">┃</span>  <span class="d">║</span><span class="d">░</span>    
+                     <span class="d">║</span>  <span class="d">┃</span>               seahash%N  <span class="d">│</span>        <span class="d">┃</span>  <span class="d">║</span><span class="d">░</span>    
+                     <span class="d">║</span>  <span class="d">┃</span>               Arrow IPC  <span class="d">│</span>process <span class="d">┃</span>  <span class="d">║</span><span class="d">░</span>    
+                     <span class="d">║</span>  <span class="d">┃</span>                          <span class="d">▼</span>        <span class="d">┃</span>  <span class="d">║</span><span class="d">░</span>    
+                     <span class="d">║</span>  <span class="d">┃</span>                   <span class="n">BufferOutput&lt;O&gt;</span>  <span class="d">┃</span>  <span class="d">║</span><span class="d">░</span>   
+                     <span class="d">║</span>  <span class="d">┗</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">┯</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">┛</span>  <span class="d">║</span><span class="d">░</span>    
+                     <span class="d">║</span>                             <span class="d">│</span>            <span class="d">║</span><span class="d">░</span>   
+                     <span class="d">║</span>  <span class="d">┏</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">┓</span>             <span class="d">│</span>            <span class="d">║</span><span class="d">░</span>   
+<span class="d">╔</span>════════════<span class="d">╗</span>       <span class="d">║</span>  <span class="d">┃</span> <span class="n">Sink</span>        <span class="d">┃</span><span class="d">◀</span><span class="d">─</span><span class="d">─</span><span class="d">─</span><span class="d">─</span><span class="d">─</span><span class="d">─</span><span class="d">─</span><span class="d">─</span><span class="d">─</span><span class="d">─</span><span class="d">─</span><span class="d">┘</span>            <span class="d">║</span><span class="d">░</span>   
+<span class="d">║</span>            <span class="d">║</span><span class="d">░</span>      <span class="d">║</span>  <span class="d">┃</span> async task  <span class="d">┃</span>                         <span class="d">║</span><span class="d">░</span>   
+<span class="d">║</span>  <span class="h">Kafka</span>     <span class="d">║</span><span class="d">░</span><span class="d">◀</span>out<span class="d">─</span><span class="d">─</span><span class="d">║</span>  <span class="d">┃</span> Buffer&lt;O&gt;   <span class="d">┃</span>                         <span class="d">║</span><span class="d">░</span>   
+<span class="d">║</span>  <span class="h">Broker</span>    <span class="d">║</span><span class="d">░</span>      <span class="d">║</span>  <span class="d">┗</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">┛</span>                         <span class="d">║</span><span class="d">░</span>    
+<span class="d">║</span>            <span class="d">║</span><span class="d">░</span>      <span class="d">║</span>                                           <span class="d">║</span><span class="d">░</span>  
+<span class="d">╚</span>════════════<span class="d">╝</span><span class="d">░</span>      <span class="d">╚</span>═══════════════════════════════════════════<span class="d">╝</span><span class="d">░</span>  
+ <span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span>       <span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span>    </pre>
+        </div>
+
+        <p>
+          Data enters the pipeline through an async <code>Source</code> (Kafka, file, etc.) that produces typed
+          <code>RheiBuffer&lt;T&gt;</code> — an Arrow <code>RecordBatch</code> paired with a boolean selection vector
+          for zero-copy filtering. The buffer is type-erased to <code>ErasedBuffer</code> (schema ID + raw batch)
+          for transport through Timely’s dataflow graph, then recovered back to the typed buffer before reaching
+          your operator’s <code>process()</code> method.
+        </p>
+
+        <p>
+          When a pipeline calls <code>.key_by()</code>, Rhei splits each buffer’s rows by
+          <code>seahash(key) % num_workers</code> into per-worker sub-buffers, then routes them via Timely’s
+          Exchange pact. Cross-worker serialization uses Arrow IPC — self-describing and columnar-native, no
+          schema registry required.
+        </p>
+
+        <p>
+          Operators implement <code>StreamFunction</code>, an async trait:
+          <code>process(RheiBuffer&lt;I&gt;, &amp;mut OperatorContext) → BufferOutput&lt;O&gt;</code>. Three processing
+          granularities are supported: row-level iteration via zero-copy <code>View&lt;’a&gt;</code> references,
+          batch-level access to the full <code>RecordBatch</code> for windowed aggregations, and column-level
+          Arrow compute kernels with selection vectors for vectorized filter expressions.
+        </p>
+
+        <p id="state">
+          State is accessed through <code>OperatorContext</code>, which exposes a <code>StateContext</code>
+          backend and the typed <code>KeyedState&lt;K, V&gt;</code> wrapper. Under the hood, state reads walk a
+          three-tier hierarchy. The hot path — key present in the L1 memtable — completes in
+          <span class="metric">~1μs</span> with no I/O. An L1 miss falls through to the L2 Foyer HybridCache on
+          local NVMe (<span class="metric">~1ms</span>), avoiding a network round-trip. Only on a double miss does
+          the system reach L3 SlateDB backed by S3 (<span class="metric">~50ms</span>). This is transparent to
+          operator code: the same <code>state.get(key).await</code> call works regardless of which tier serves it.
+        </p>
+
+        <div class="diagram">
+          <pre>
+                      <span class="n">state.get(key).await</span>                           
+                              <span class="d">│</span>                                      
+                              <span class="d">▼</span>                                      
+<span class="d">╔</span>═ <span class="n">State Hierarchy</span> ════════════════════════════════════════════════<span class="d">╗</span> 
+<span class="d">║</span>                                                                  <span class="d">║</span><span class="d">░</span>
+<span class="d">║</span>  <span class="d">┏</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">┓</span>                                         <span class="d">║</span><span class="d">░</span>
+<span class="d">║</span>  <span class="d">┃</span> <span class="n">L1</span> — <span class="n">MemTable</span>        <span class="d">┃</span>  HashMap&lt;Bytes, Bytes&gt;                 <span class="d">║</span><span class="d">░</span>
+<span class="d">║</span>  <span class="d">┃</span>                      <span class="d">┃</span>  RAM-bounded, compaction + eviction    <span class="d">║</span><span class="d">░</span>
+<span class="d">║</span>  <span class="d">┃</span>  <span class="h">~1μs</span>   zero I/O    <span class="d">┃</span>  dirty keys tracked for checkpoint      <span class="d">║</span><span class="d">░</span>
+<span class="d">║</span>  <span class="d">┗</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">┯</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">┛</span>                                         <span class="d">║</span><span class="d">░</span>
+<span class="d">║</span>             <span class="d">│</span> miss                                               <span class="d">║</span><span class="d">░</span>
+<span class="d">║</span>             <span class="d">▼</span>                                                    <span class="d">║</span><span class="d">░</span>
+<span class="d">║</span>  <span class="d">┏</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">┓</span>                                         <span class="d">║</span><span class="d">░</span>
+<span class="d">║</span>  <span class="d">┃</span> <span class="n">L2</span> — <span class="n">NVMe Cache</span>     <span class="d">┃</span>  Foyer HybridCache                      <span class="d">║</span><span class="d">░</span>
+<span class="d">║</span>  <span class="d">┃</span>                      <span class="d">┃</span>  local disk, no network round-trip     <span class="d">║</span><span class="d">░</span>
+<span class="d">║</span>  <span class="d">┃</span>  <span class="h">~1ms</span>   disk I/O    <span class="d">┃</span>  admission control, LRU eviction        <span class="d">║</span><span class="d">░</span>
+<span class="d">║</span>  <span class="d">┗</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">┯</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">┛</span>                                         <span class="d">║</span><span class="d">░</span>
+<span class="d">║</span>             <span class="d">│</span> miss                                               <span class="d">║</span><span class="d">░</span>
+<span class="d">║</span>             <span class="d">▼</span>                                                    <span class="d">║</span><span class="d">░</span>
+<span class="d">║</span>  <span class="d">┏</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">┓</span>                                         <span class="d">║</span><span class="d">░</span>
+<span class="d">║</span>  <span class="d">┃</span> <span class="n">L3</span> — <span class="n">Object Storage</span> <span class="d">┃</span>  SlateDB on S3                          <span class="d">║</span><span class="d">░</span>
+<span class="d">║</span>  <span class="d">┃</span>                      <span class="d">┃</span>  source of truth, unlimited capacity   <span class="d">║</span><span class="d">░</span>
+<span class="d">║</span>  <span class="d">┃</span>  <span class="h">~50ms</span>  network     <span class="d">┃</span>  SSTable uploads, stateless scaling     <span class="d">║</span><span class="d">░</span>
+<span class="d">║</span>  <span class="d">┗</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">┛</span>                                         <span class="d">║</span><span class="d">░</span>
+<span class="d">║</span>                                                                  <span class="d">║</span><span class="d">░</span>
+<span class="d">╚</span>══════════════════════════════════════════════════════════════════<span class="d">╝</span><span class="d">░</span>
+ <span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span></pre>
+        </div>
+
+        <p>
+          State values are returned as <code>Bytes</code> — no cloning on the hot path. The L1 memtable is a
+          <code>HashMap&lt;Bytes, Bytes&gt;</code> with compaction and eviction policies to bound RAM usage.
+          Each operator’s state is namespaced with a prefix (<code>{operator_name}/{user_key}</code>, or
+          <code>p{pid}/w{idx}/{operator}/{key}</code> in multi-process mode) to prevent cross-operator interference.
+        </p>
+
+        <div class="diagram" id="checkpointing">
+          <pre>
+<span class="d">╔</span>═ <span class="n">Checkpoint Protocol</span> ════════════════════════════════════════════<span class="d">╗</span> 
+<span class="d">║</span>                                                                  <span class="d">║</span><span class="d">░</span>
+<span class="d">║</span>  Worker 0       Worker 1       Worker N       <span class="n">Coordinator</span>        <span class="d">║</span><span class="d">░</span>
+<span class="d">║</span>     <span class="d">│</span>              <span class="d">│</span>              <span class="d">│</span>              <span class="d">│</span>               <span class="d">║</span><span class="d">░</span>
+<span class="d">║</span>     <span class="d">│</span> frontier     <span class="d">│</span> frontier     <span class="d">│</span> frontier     <span class="d">│</span>               <span class="d">║</span><span class="d">░</span>
+<span class="d">║</span>     <span class="d">│</span> advances     <span class="d">│</span> advances     <span class="d">│</span> advances     <span class="d">│</span>               <span class="d">║</span><span class="d">░</span>
+<span class="d">║</span>     <span class="d">│</span>              <span class="d">│</span>              <span class="d">│</span>              <span class="d">│</span>               <span class="d">║</span><span class="d">░</span>
+<span class="d">║</span>     <span class="d">▼</span>              <span class="d">▼</span>              <span class="d">▼</span>              <span class="d">│</span>               <span class="d">║</span><span class="d">░</span>
+<span class="d">║</span>  <span class="h">flush L1</span>→S3   flush L1→S3   flush L1→S3       <span class="d">│</span>                 <span class="d">║</span><span class="d">░</span>
+<span class="d">║</span>     <span class="d">│</span>              <span class="d">│</span>              <span class="d">│</span>              <span class="d">│</span>               <span class="d">║</span><span class="d">░</span>
+<span class="d">║</span>     <span class="d">└</span><span class="d">─</span><span class="d">─</span> ready <span class="d">─</span><span class="d">─</span><span class="d">─</span><span class="d">─</span><span class="d">─</span><span class="d">┴</span><span class="d">─</span><span class="d">─</span><span class="d">─</span> ready <span class="d">─</span><span class="d">─</span><span class="d">─</span><span class="d">┘</span>              <span class="d">│</span>                <span class="d">║</span><span class="d">░</span>
+<span class="d">║</span>                         <span class="d">│</span>                       <span class="d">│</span>                <span class="d">║</span><span class="d">░</span>
+<span class="d">║</span>                         <span class="d">└</span><span class="d">─</span><span class="d">─</span><span class="d">─</span><span class="d">─</span><span class="d">─</span><span class="d">─</span><span class="d">─</span><span class="d">─</span><span class="d">─</span><span class="d">─</span><span class="d">─</span><span class="d">─</span><span class="d">─</span><span class="d">─</span><span class="d">─</span><span class="d">─</span><span class="d">─</span><span class="d">─</span><span class="d">─</span><span class="d">─</span><span class="d">─</span><span class="d">─</span><span class="d">─</span><span class="d">▶</span><span class="d">│</span>               <span class="d">║</span><span class="d">░</span>
+<span class="d">║</span>                                                 <span class="d">▼</span>                <span class="d">║</span><span class="d">░</span>
+<span class="d">║</span>                                          <span class="n">merge manifests</span>         <span class="d">║</span><span class="d">░</span>
+<span class="d">║</span>                                                 <span class="d">│</span>                <span class="d">║</span><span class="d">░</span>
+<span class="d">║</span>                                                 <span class="d">▼</span>                <span class="d">║</span><span class="d">░</span>
+<span class="d">║</span>             <span class="d">┏</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">┓</span>               <span class="d">║</span><span class="d">░</span>
+<span class="d">║</span>             <span class="d">┃</span>  <span class="n">write manifest</span> → S3                <span class="d">┃</span>              <span class="d">║</span><span class="d">░</span>
+<span class="d">║</span>             <span class="d">┃</span>  <span class="n">commit Kafka offsets</span>               <span class="d">┃</span>              <span class="d">║</span><span class="d">░</span>
+<span class="d">║</span>             <span class="d">┗</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">┛</span>               <span class="d">║</span><span class="d">░</span>
+<span class="d">║</span>                                                 <span class="d">│</span>                <span class="d">║</span><span class="d">░</span>
+<span class="d">║</span>     <span class="d">┌</span><span class="d">─</span><span class="d">─</span><span class="d">─</span><span class="d">─</span><span class="d">─</span><span class="d">─</span><span class="d">─</span><span class="d">─</span><span class="d">─</span><span class="d">─</span><span class="d">─</span><span class="d">─</span><span class="d">─</span><span class="d">─</span><span class="d">┬</span><span class="d">─</span><span class="d">─</span><span class="d">─</span><span class="d">─</span><span class="d">─</span><span class="d">─</span><span class="d">─</span><span class="d">─</span><span class="d">─</span><span class="d">─</span><span class="d">─</span><span class="d">─</span><span class="d">─</span><span class="d">─</span><span class="d">┐</span><span class="d">◀</span><span class="d">─</span><span class="d">─</span><span class="d">─</span><span class="d">─</span><span class="d">─</span><span class="d">─</span><span class="d">─</span><span class="d">─</span><span class="d">─</span><span class="d">─</span><span class="d">─</span><span class="d">─</span><span class="d">┘</span>                <span class="d">║</span><span class="d">░</span>
+<span class="d">║</span>     <span class="d">▼</span>              <span class="d">▼</span>              <span class="d">▼</span>                              <span class="d">║</span><span class="d">░</span>
+<span class="d">║</span>  <span class="t">epoch N+1</span>     epoch N+1     epoch N+1                           <span class="d">║</span><span class="d">░</span>
+<span class="d">║</span>                                                                  <span class="d">║</span><span class="d">░</span>
+<span class="d">╚</span>══════════════════════════════════════════════════════════════════<span class="d">╝</span><span class="d">░</span>
+ <span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span></pre>
+        </div>
+
+        <p>
+          Checkpointing is coordinated, not per-operator. When the Timely frontier advances past epoch N,
+          every worker flushes its dirty L1 keys down through SlateDB to S3, then signals readiness. The
+          coordinator (process 0 in multi-process mode) waits for all workers, merges their manifests, writes
+          the combined manifest to S3, and only then commits source offsets. This ensures exactly-once
+          delivery semantics: if a worker crashes after flushing state but before offset commit, the next
+          restart will re-process from the last committed offset against already-flushed state (idempotent).
+        </p>
+
+        <p>
+          Recovery is straightforward: <code>cargo run -- --from-checkpoint s3://bucket/checkpoints/epoch-42.json</code>
+          loads the manifest, seeks each Kafka partition to the checkpointed offset, and resumes processing.
+          The <code>--offset-delta</code> flag adjusts offsets for local replay against re-indexed test data.
+        </p>
+
+        <div class="diagram" id="bridge">
+          <pre>
+<span class="d">╔</span>═ <span class="n">Async/Sync Bridge</span> ══════════════════════════════════════════════<span class="d">╗</span> 
+<span class="d">║</span>                                                                  <span class="d">║</span><span class="d">░</span>
+<span class="d">║</span>  <span class="d">┏</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">┓</span>       <span class="d">┏</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">┓</span>       <span class="d">║</span><span class="d">░</span>
+<span class="d">║</span>  <span class="d">┃</span> <span class="n">Tokio Runtime</span>         <span class="d">┃</span>       <span class="d">┃</span> <span class="n">Timely Runtime</span>          <span class="d">┃</span>     <span class="d">║</span><span class="d">░</span>
+<span class="d">║</span>  <span class="d">┃</span> async, multi-threaded <span class="d">┃</span>       <span class="d">┃</span> sync, spawn_blocking    <span class="d">┃</span>     <span class="d">║</span><span class="d">░</span>
+<span class="d">║</span>  <span class="d">┃</span>                       <span class="d">┃</span>       <span class="d">┃</span>                         <span class="d">┃</span>     <span class="d">║</span><span class="d">░</span>
+<span class="d">║</span>  <span class="d">┃</span> <span class="n">KafkaSource</span>           <span class="d">┃</span>       <span class="d">┃</span> <span class="n">Dataflow Graph</span>          <span class="d">┃</span>     <span class="d">║</span><span class="d">░</span>
+<span class="d">║</span>  <span class="d">┃</span>   <span class="d">│</span>                   <span class="d">┃</span> <span class="h">mpsc</span>  <span class="d">┃</span>   <span class="d">│</span>                     <span class="d">┃</span>     <span class="d">║</span><span class="d">░</span>
+<span class="d">║</span>  <span class="d">┃</span>   <span class="d">│</span> poll              <span class="d">┃</span> bound <span class="d">┃</span>   <span class="d">│</span> operators           <span class="d">┃</span>     <span class="d">║</span><span class="d">░</span>
+<span class="d">║</span>  <span class="d">┃</span>   <span class="d">▼</span>                   <span class="d">┃</span>       <span class="d">┃</span>   <span class="d">▼</span>                     <span class="d">┃</span>     <span class="d">║</span><span class="d">░</span>
+<span class="d">║</span>  <span class="d">┃</span> <span class="n">RheiBuffer&lt;T&gt;</span> <span class="d">─</span><span class="d">─</span><span class="d">─</span><span class="d">─</span><span class="d">─</span><span class="d">─</span><span class="d">─</span><span class="d">─</span>╋<span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">▶</span>╋<span class="d">─</span><span class="d">▶</span> ErasedBuffer          <span class="d">┃</span>       <span class="d">║</span><span class="d">░</span>
+<span class="d">║</span>  <span class="d">┃</span>                       <span class="d">┃</span>       <span class="d">┃</span>     <span class="d">│</span>                   <span class="d">┃</span>     <span class="d">║</span><span class="d">░</span>
+<span class="d">║</span>  <span class="d">┃</span>                       <span class="d">┃</span>       <span class="d">┃</span> <span class="n">StreamFunction</span>          <span class="d">┃</span>     <span class="d">║</span><span class="d">░</span>
+<span class="d">║</span>  <span class="d">┃</span>                       <span class="d">┃</span>       <span class="d">┃</span>     <span class="d">│</span>                   <span class="d">┃</span>     <span class="d">║</span><span class="d">░</span>
+<span class="d">║</span>  <span class="d">┃</span> <span class="n">RheiBuffer&lt;O&gt;</span> <span class="d">◀</span><span class="d">─</span><span class="d">─</span><span class="d">─</span><span class="d">─</span><span class="d">─</span><span class="d">─</span><span class="d">─</span>╋<span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">◀</span>╋<span class="d">─</span><span class="d">◀</span> BufferOutput&lt;O&gt;       <span class="d">┃</span>       <span class="d">║</span><span class="d">░</span>
+<span class="d">║</span>  <span class="d">┃</span>   <span class="d">│</span>                   <span class="d">┃</span> <span class="h">mpsc</span>  <span class="d">┃</span>                         <span class="d">┃</span>     <span class="d">║</span><span class="d">░</span>
+<span class="d">║</span>  <span class="d">┃</span>   <span class="d">▼</span>                   <span class="d">┃</span> bound <span class="d">┃</span>                         <span class="d">┃</span>     <span class="d">║</span><span class="d">░</span>
+<span class="d">║</span>  <span class="d">┃</span> <span class="n">KafkaSink</span>             <span class="d">┃</span>       <span class="d">┃</span> backpressure: channel   <span class="d">┃</span>     <span class="d">║</span><span class="d">░</span>
+<span class="d">║</span>  <span class="d">┃</span>   <span class="d">│</span> flush             <span class="d">┃</span>       <span class="d">┃</span> full → source suspends  <span class="d">┃</span>     <span class="d">║</span><span class="d">░</span>
+<span class="d">║</span>  <span class="d">┃</span>   <span class="d">▼</span>                   <span class="d">┃</span>       <span class="d">┃</span>                         <span class="d">┃</span>     <span class="d">║</span><span class="d">░</span>
+<span class="d">║</span>  <span class="d">┃</span> <span class="h">Kafka Broker</span>          <span class="d">┃</span>       <span class="d">┃</span>                         <span class="d">┃</span>     <span class="d">║</span><span class="d">░</span>
+<span class="d">║</span>  <span class="d">┃</span>                       <span class="d">┃</span>       <span class="d">┃</span>                         <span class="d">┃</span>     <span class="d">║</span><span class="d">░</span>
+<span class="d">║</span>  <span class="d">┗</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">┛</span>       <span class="d">┗</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">┛</span>       <span class="d">║</span><span class="d">░</span>
+<span class="d">║</span>                                                                  <span class="d">║</span><span class="d">░</span>
+<span class="d">╚</span>══════════════════════════════════════════════════════════════════<span class="d">╝</span><span class="d">░</span>
+ <span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span>
+
+
+<span class="n">Process layers:</span>
+
+  <span class="h">PipelineController</span>  <span class="d">─</span><span class="d">─</span><span class="d">─</span> config, lifecycle, CLI (#[rhei::pipeline])
+       <span class="d">│</span>
+       <span class="d">▼</span>
+  <span class="h">TaskManager</span>         <span class="d">─</span><span class="d">─</span><span class="d">─</span> spawn sources/sinks, manage channels
+       <span class="d">│</span>
+       <span class="d">▼</span>
+  <span class="h">DataflowExecutor</span>    <span class="d">─</span><span class="d">─</span><span class="d">─</span> per-worker Timely DAG, spawn_blocking</pre>
+        </div>
+
+        <p>
+          Sources and sinks run as Tokio tasks — they’re inherently async (Kafka polling, HTTP flushes, file I/O).
+          Timely Dataflow, however, is a synchronous runtime that expects to own its threads. Rhei bridges the
+          two with bounded <code>tokio::sync::mpsc</code> channels: the source task produces
+          <code>RheiBuffer&lt;T&gt;</code> into a channel, Timely’s <code>spawn_blocking</code> thread consumes
+          from it. Backpressure propagates naturally — when the Timely side is slow, the channel fills, and the
+          async source suspends.
+        </p>
+
+        <p>
+          The <code>#[rhei::pipeline]</code> proc macro generates the full process scaffolding: a
+          <code>#[tokio::main]</code> entrypoint, a clap CLI with <code>--workers</code>,
+          <code>--from-checkpoint</code>, <code>--process-id</code>, <code>--peers</code>, and
+          <code>--metrics-addr</code> flags, environment variable integration, and the
+          PipelineController → TaskManager → DataflowExecutor construction. Your pipeline function just receives
+          a <code>&amp;DataflowGraph</code> reference and builds the topology.
+        </p>
+
+        <p id="clustering">
+          Clustering in Rhei has three modes, all using the same pipeline code. In multi-thread mode
+          (<code>.with_workers(4)</code>), Timely spawns N worker threads in a single process with in-memory
+          channels for exchange. In multi-process mode (<code>.from_env()</code>), N processes communicate over
+          TCP using Timely’s built-in networking layer. Each process independently opens SlateDB against the
+          same S3 bucket. Checkpoint coordination happens out-of-band: process 0 collects readiness signals
+          from all processes before writing the merged manifest.
+        </p>
+
+        <div class="diagram">
+          <pre>
+<span class="d">╔</span>═ <span class="n">Clustering Modes</span> ═══════════════════════════════════════════════<span class="d">╗</span> 
+<span class="d">║</span>                                                                  <span class="d">║</span><span class="d">░</span>
+<span class="d">║</span>  <span class="n">.with_workers(4)</span>                                                <span class="d">║</span><span class="d">░</span>
+<span class="d">║</span>                                                                  <span class="d">║</span><span class="d">░</span>
+<span class="d">║</span>  <span class="d">┏</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">┓</span>      <span class="d">║</span><span class="d">░</span>
+<span class="d">║</span>  <span class="d">┃</span> Single process                                          <span class="d">┃</span>     <span class="d">║</span><span class="d">░</span>
+<span class="d">║</span>  <span class="d">┃</span>                                                         <span class="d">┃</span>     <span class="d">║</span><span class="d">░</span>
+<span class="d">║</span>  <span class="d">┃</span> <span class="d">┌</span><span class="d">─</span><span class="d">─</span><span class="d">─</span><span class="d">─</span><span class="d">─</span><span class="d">─</span><span class="d">─</span><span class="d">─</span><span class="d">─</span><span class="d">┐</span> <span class="d">┌</span><span class="d">─</span><span class="d">─</span><span class="d">─</span><span class="d">─</span><span class="d">─</span><span class="d">─</span><span class="d">─</span><span class="d">─</span><span class="d">─</span><span class="d">┐</span> <span class="d">┌</span><span class="d">─</span><span class="d">─</span><span class="d">─</span><span class="d">─</span><span class="d">─</span><span class="d">─</span><span class="d">─</span><span class="d">─</span><span class="d">─</span><span class="d">┐</span> <span class="d">┌</span><span class="d">─</span><span class="d">─</span><span class="d">─</span><span class="d">─</span><span class="d">─</span><span class="d">─</span><span class="d">─</span><span class="d">─</span><span class="d">─</span><span class="d">┐</span>       <span class="d">┃</span>       <span class="d">║</span><span class="d">░</span>
+<span class="d">║</span>  <span class="d">┃</span> <span class="d">│</span>Worker 0 <span class="d">│</span> <span class="d">│</span>Worker 1 <span class="d">│</span> <span class="d">│</span>Worker 2 <span class="d">│</span> <span class="d">│</span>Worker 3 <span class="d">│</span>       <span class="d">┃</span>       <span class="d">║</span><span class="d">░</span>
+<span class="d">║</span>  <span class="d">┃</span> <span class="d">└</span><span class="d">─</span><span class="d">─</span><span class="d">─</span><span class="d">─</span><span class="d">┬</span><span class="d">─</span><span class="d">─</span><span class="d">─</span><span class="d">─</span><span class="d">┘</span> <span class="d">└</span><span class="d">─</span><span class="d">─</span><span class="d">─</span><span class="d">─</span><span class="d">┬</span><span class="d">─</span><span class="d">─</span><span class="d">─</span><span class="d">─</span><span class="d">┘</span> <span class="d">└</span><span class="d">─</span><span class="d">─</span><span class="d">─</span><span class="d">─</span><span class="d">┬</span><span class="d">─</span><span class="d">─</span><span class="d">─</span><span class="d">─</span><span class="d">┘</span> <span class="d">└</span><span class="d">─</span><span class="d">─</span><span class="d">─</span><span class="d">─</span><span class="d">┬</span><span class="d">─</span><span class="d">─</span><span class="d">─</span><span class="d">─</span><span class="d">┘</span>       <span class="d">┃</span>       <span class="d">║</span><span class="d">░</span>
+<span class="d">║</span>  <span class="d">┃</span>      <span class="d">└</span><span class="d">─</span><span class="d">─</span><span class="d">─</span><span class="d">─</span><span class="d">─</span><span class="d">─</span><span class="d">─</span><span class="d">─</span><span class="d">─</span><span class="d">─</span><span class="d">─</span><span class="d">─</span><span class="d">┴</span><span class="d">─</span><span class="d">─</span><span class="d">─</span><span class="d">─</span><span class="d">─</span><span class="d">─</span><span class="d">─</span><span class="d">─</span><span class="d">─</span><span class="d">─</span><span class="d">─</span><span class="d">─</span><span class="d">┴</span><span class="d">─</span><span class="d">─</span><span class="d">─</span><span class="d">─</span><span class="d">─</span><span class="d">─</span><span class="d">─</span><span class="d">─</span><span class="d">─</span><span class="d">─</span><span class="d">─</span><span class="d">─</span><span class="d">┘</span>           <span class="d">┃</span>     <span class="d">║</span><span class="d">░</span>
+<span class="d">║</span>  <span class="d">┃</span>                   in-memory channels                    <span class="d">┃</span>     <span class="d">║</span><span class="d">░</span>
+<span class="d">║</span>  <span class="d">┗</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">┛</span>      <span class="d">║</span><span class="d">░</span>
+<span class="d">║</span>                                                                  <span class="d">║</span><span class="d">░</span>
+<span class="d">║</span>  <span class="n">.from_env()</span>                                                     <span class="d">║</span><span class="d">░</span>
+<span class="d">║</span>                                                                  <span class="d">║</span><span class="d">░</span>
+<span class="d">║</span>  <span class="d">┏</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">┓</span>  <span class="d">┏</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">┓</span>  <span class="d">┏</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">┓</span>            <span class="d">║</span><span class="d">░</span>
+<span class="d">║</span>  <span class="d">┃</span> <span class="n">Process 0</span>     <span class="d">┃</span>  <span class="d">┃</span> <span class="n">Process 1</span>     <span class="d">┃</span>  <span class="d">┃</span> <span class="n">Process N</span>     <span class="d">┃</span>         <span class="d">║</span><span class="d">░</span>
+<span class="d">║</span>  <span class="d">┃</span> coordinator   <span class="d">┃</span><span class="d">◀</span><span class="d">▶</span><span class="d">┃</span> worker        <span class="d">┃</span><span class="d">◀</span><span class="d">▶</span><span class="d">┃</span> worker        <span class="d">┃</span>         <span class="d">║</span><span class="d">░</span>
+<span class="d">║</span>  <span class="d">┃</span> + workers     <span class="d">┃</span>  <span class="d">┃</span>               <span class="d">┃</span>  <span class="d">┃</span>               <span class="d">┃</span>         <span class="d">║</span><span class="d">░</span>
+<span class="d">║</span>  <span class="d">┗</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">┯</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">┛</span>  <span class="d">┗</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">┯</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">┛</span>  <span class="d">┗</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">┯</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">┛</span>            <span class="d">║</span><span class="d">░</span>
+<span class="d">║</span>         <span class="d">│</span> <span class="h">TCP</span>             <span class="d">│</span>                  <span class="d">│</span>                   <span class="d">║</span><span class="d">░</span>
+<span class="d">║</span>         <span class="d">│</span>(Timely net)     <span class="d">│</span>                  <span class="d">│</span>                   <span class="d">║</span><span class="d">░</span>
+<span class="d">║</span>         <span class="d">└</span><span class="d">─</span><span class="d">─</span><span class="d">─</span><span class="d">─</span><span class="d">─</span><span class="d">─</span><span class="d">─</span><span class="d">─</span><span class="d">─</span><span class="d">─</span><span class="d">─</span><span class="d">─</span><span class="d">─</span><span class="d">─</span><span class="d">─</span><span class="d">─</span><span class="d">─</span><span class="d">┴</span><span class="d">─</span><span class="d">─</span><span class="d">─</span><span class="d">─</span><span class="d">─</span><span class="d">─</span><span class="d">─</span><span class="d">─</span><span class="d">─</span><span class="d">─</span><span class="d">─</span><span class="d">─</span><span class="d">─</span><span class="d">─</span><span class="d">─</span><span class="d">─</span><span class="d">─</span><span class="d">─</span><span class="d">┘</span>                   <span class="d">║</span><span class="d">░</span>
+<span class="d">║</span>                           <span class="d">│</span>                                      <span class="d">║</span><span class="d">░</span>
+<span class="d">║</span>                           <span class="d">▼</span>                                      <span class="d">║</span><span class="d">░</span>
+<span class="d">║</span>       <span class="d">┏</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">┓</span>             <span class="d">║</span><span class="d">░</span>
+<span class="d">║</span>       <span class="d">┃</span>         <span class="h">S3</span> (shared state + checkpoints)     <span class="d">┃</span>            <span class="d">║</span><span class="d">░</span>
+<span class="d">║</span>       <span class="d">┗</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">━</span><span class="d">┛</span>             <span class="d">║</span><span class="d">░</span>
+<span class="d">║</span>                                                                  <span class="d">║</span><span class="d">░</span>
+<span class="d">║</span>  <span class="n">Key prefixing:</span>                                                  <span class="d">║</span><span class="d">░</span>
+<span class="d">║</span>                                                                  <span class="d">║</span><span class="d">░</span>
+<span class="d">║</span>  single:  <span class="h">{operator}/{key}</span>                                       <span class="d">║</span><span class="d">░</span>
+<span class="d">║</span>  multi:   <span class="h">p{pid}/w{idx}/{operator}/{key}</span>                         <span class="d">║</span><span class="d">░</span>
+<span class="d">║</span>                                                                  <span class="d">║</span><span class="d">░</span>
+<span class="d">╚</span>══════════════════════════════════════════════════════════════════<span class="d">╝</span><span class="d">░</span>
+ <span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span><span class="d">░</span></pre>
+        </div>
+
+        <p>
+          The third mode — dynamic clustering with Chitchat gossip for discovery and OpenRaft for consensus — is
+          planned but not yet implemented. It will add live topology changes (add/remove workers), automatic state
+          repartitioning, and leader election for the coordinator role.
+        </p>
+
+        <p id="errors">
+          Error handling is explicit and non-silent. Each operator has an <code>ErrorPolicy</code>: either
+          <code>Skip</code> (log and drop the failed element) or <code>SendToDlq</code> (route to a
+          <code>DlqSink</code> implementation). The <code>DlqSink</code> trait is pluggable — ship with
+          <code>FileDlqSink</code>, <code>LogDlqSink</code>, or <code>KafkaDlqSink</code>, or implement your own.
+          Critically, DLQ write errors and sink send errors are propagated, never silently swallowed. Operators
+          can also implement an <code>on_error()</code> hook for custom recovery logic.
+        </p>
+
+        <p>
+          Graceful shutdown follows a strict sequence: drain in-flight batches → flush L1 state → write final
+          checkpoint → commit source offsets → exit. This guarantees no data loss and enables clean restarts
+          without reprocessing.
+        </p>
+
+      </div>
+
+      <footer style="margin-top: 3rem;">
+        <div class="footer-content">
+          <div class="footer-left">rhei — stateful stream processing for Rust</div>
+          <ul class="footer-links">
+            <li><a href="https://github.com/RcRonco/rhei" target="_blank">GitHub</a></li>
+            <li><a href="https://crates.io/crates/rhei" target="_blank">crates.io</a></li>
+            <li><a href="https://docs.rs/rhei" target="_blank">docs.rs</a></li>
+            <li><a href="/">Home</a></li>
+          </ul>
+        </div>
+      </footer>
+    </div>
+  </div>
+
+  <script src="js/main.js"></script>
+  <script>
+    (() => {
+      const links = document.querySelectorAll('.sidebar-nav a[href^="#"]');
+      const anchors = [];
+      for (const link of links) {
+        const id = link.getAttribute('href').slice(1);
+        const el = document.getElementById(id);
+        if (el) anchors.push({ el, link });
+      }
+      if (!anchors.length) return;
+
+      function update() {
+        let current = anchors[0];
+        for (const a of anchors) {
+          if (a.el.getBoundingClientRect().top <= 140) current = a;
+        }
+        for (const a of anchors) a.link.classList.remove('active');
+        current.link.classList.add('active');
+      }
+
+      window.addEventListener('scroll', update, { passive: true });
+      update();
+    })();
+  </script>
+</body>
+</html>

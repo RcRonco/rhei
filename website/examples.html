@@ -1,0 +1,368 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Examples — Rhei</title>
+  <meta name="description" content="Code examples: windowed aggregation, temporal joins, session windows, sequence detection, and custom operators.">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="css/style.css">
+  <style>
+    .example-section {
+      padding: 3rem 0;
+      border-bottom: 1px solid var(--border);
+    }
+    .example-section:last-of-type {
+      border-bottom: none;
+    }
+    .example-header {
+      display: flex;
+      align-items: baseline;
+      gap: 1rem;
+      margin-bottom: 0.4rem;
+      flex-wrap: wrap;
+    }
+    .example-header h2 {
+      font-size: 1.1rem;
+      font-weight: 600;
+      color: var(--white);
+    }
+    .example-tags {
+      display: flex;
+      gap: 0.4rem;
+    }
+    .example-tag {
+      font-family: var(--font-mono);
+      font-size: 0.6rem;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      padding: 0.15rem 0.4rem;
+      border: 1px solid var(--border);
+      border-radius: 3px;
+      color: var(--muted);
+    }
+    .example-desc {
+      font-size: 0.85rem;
+      color: var(--muted);
+      margin-bottom: 1.25rem;
+      max-width: 600px;
+      line-height: 1.6;
+    }
+    .example-desc code {
+      font-family: var(--font-mono);
+      font-size: 0.75rem;
+      background: var(--bg-raised);
+      padding: 0.1rem 0.3rem;
+      border-radius: 3px;
+      color: var(--text);
+    }
+  </style>
+</head>
+<body>
+
+  <nav>
+    <a href="/" class="nav-logo">rhei</a>
+    <ul class="nav-links">
+      <li><a href="/examples.html">Examples</a></li>
+      <li><a href="/architecture.html">Architecture</a></li>
+      <li><a href="https://docs.rs/rhei" target="_blank">Docs</a></li>
+      <li><a href="https://github.com/RcRonco/rhei" target="_blank">GitHub</a></li>
+    </ul>
+  </nav>
+
+  <div class="page-with-sidebar">
+    <aside class="sidebar-nav">
+      <div class="sidebar-label">Examples</div>
+      <ul>
+        <li><a href="#word-count">Word Count</a></li>
+        <li><a href="#temporal-join">Temporal Join</a></li>
+        <li><a href="#sessions">Click Sessions</a></li>
+        <li><a href="#sequence">Fraud Detection</a></li>
+        <li><a href="#sliding">Rolling Metrics</a></li>
+        <li><a href="#custom-op">Custom Operator</a></li>
+      </ul>
+    </aside>
+
+    <div class="page-content">
+      <!-- Intro -->
+      <section class="tight" style="padding-top: 0; border-bottom: 1px solid var(--border);">
+        <span class="section-label">Examples</span>
+        <h1 class="section-heading" style="font-size: 1.75rem;">Learn by building</h1>
+        <p class="section-desc">Real pipeline patterns showing windows, joins, stateful processing, and pattern detection.</p>
+      </section>
+
+      <!-- Word Count -->
+      <div id="word-count" class="example-section">
+        <div class="example-header">
+          <h2>Windowed Word Count</h2>
+          <div class="example-tags">
+            <span class="example-tag">window</span>
+            <span class="example-tag">stateful</span>
+            <span class="example-tag">aggregation</span>
+          </div>
+        </div>
+        <p class="example-desc">Count word frequencies in 10-second tumbling windows. Demonstrates flat_map, key_by exchange, and windowed aggregation.</p>
+
+        <div class="code-block">
+          <div class="code-header">
+            <div class="code-dot"></div><div class="code-dot"></div><div class="code-dot"></div>
+            <span class="code-filename">word_count.rs</span>
+          </div>
+          <pre><code><span class="macro">#[rhei::pipeline]</span>
+<span class="kw">fn</span> <span class="fn">main</span>(graph: &amp;<span class="type">DataflowGraph</span>) {
+    graph.source(<span class="type">KafkaSource</span>::new(broker, group, &amp;[<span class="str">"text"</span>])?)
+        .flat_map(|msg| {
+            msg.text.split_whitespace()
+                .map(|w| w.to_lowercase())
+                .collect::&lt;<span class="type">Vec</span>&lt;_&gt;&gt;()
+        })
+        .key_by(|word| word.clone())
+        .window(<span class="type">TumblingWindow</span>::new(<span class="type">Duration</span>::from_secs(<span class="num">10</span>)))
+        .aggregate(<span class="type">CountAggregator</span>)
+        .sink(<span class="type">PrintSink</span>::new());
+}</code></pre>
+        </div>
+      </div>
+
+      <!-- Temporal Join -->
+      <div id="temporal-join" class="example-section">
+        <div class="example-header">
+          <h2>Order Enrichment (Temporal Join)</h2>
+          <div class="example-tags">
+            <span class="example-tag">join</span>
+            <span class="example-tag">stateful</span>
+            <span class="example-tag">multi-source</span>
+          </div>
+        </div>
+        <p class="example-desc">Join order events with customer data. Unmatched events are automatically evicted after the timeout — no manual state cleanup.</p>
+
+        <div class="code-block">
+          <div class="code-header">
+            <div class="code-dot"></div><div class="code-dot"></div><div class="code-dot"></div>
+            <span class="code-filename">order_enrichment.rs</span>
+          </div>
+          <pre><code><span class="macro">#[rhei::pipeline]</span>
+<span class="kw">fn</span> <span class="fn">main</span>(graph: &amp;<span class="type">DataflowGraph</span>) {
+    <span class="kw">let</span> orders = graph.source(
+        <span class="type">KafkaSource</span>::new(broker, group, &amp;[<span class="str">"orders"</span>])?
+    );
+    <span class="kw">let</span> customers = graph.source(
+        <span class="type">KafkaSource</span>::new(broker, group, &amp;[<span class="str">"customers"</span>])?
+    );
+
+    orders
+        .key_by(|o| o.customer_id.clone())
+        .temporal_join(
+            customers.key_by(|c| c.id.clone()),
+            <span class="type">Duration</span>::from_secs(<span class="num">30</span>),
+            |order, customer| <span class="type">EnrichedOrder</span> {
+                order_id: order.id,
+                customer_name: customer.name.clone(),
+                amount: order.amount,
+            },
+        )
+        .sink(<span class="type">KafkaSink</span>::new(broker, <span class="str">"enriched-orders"</span>)?);
+}</code></pre>
+        </div>
+      </div>
+
+      <!-- Session Window -->
+      <div id="sessions" class="example-section">
+        <div class="example-header">
+          <h2>Clickstream Sessions</h2>
+          <div class="example-tags">
+            <span class="example-tag">session</span>
+            <span class="example-tag">window</span>
+            <span class="example-tag">gap-based</span>
+          </div>
+        </div>
+        <p class="example-desc">Group user click events into sessions based on 5-minute inactivity gaps. Filter to sessions with meaningful engagement before sinking.</p>
+
+        <div class="code-block">
+          <div class="code-header">
+            <div class="code-dot"></div><div class="code-dot"></div><div class="code-dot"></div>
+            <span class="code-filename">click_sessions.rs</span>
+          </div>
+          <pre><code><span class="macro">#[rhei::pipeline]</span>
+<span class="kw">fn</span> <span class="fn">main</span>(graph: &amp;<span class="type">DataflowGraph</span>) {
+    graph.source(<span class="type">KafkaSource</span>::new(broker, group, &amp;[<span class="str">"clicks"</span>])?)
+        .key_by(|click| click.user_id.clone())
+        .window(<span class="type">SessionWindow</span>::new(
+            <span class="type">Duration</span>::from_secs(<span class="num">300</span>),  <span class="comment">// 5 min inactivity gap</span>
+        ))
+        .aggregate(<span class="type">SessionAggregator</span>)
+        .filter_fn(|session| session.click_count > <span class="num">3</span>)
+        .sink(<span class="type">KafkaSink</span>::new(broker, <span class="str">"sessions"</span>)?);
+}</code></pre>
+        </div>
+      </div>
+
+      <!-- Sequence Detection -->
+      <div id="sequence" class="example-section">
+        <div class="example-header">
+          <h2>Fraud Detection (Sequence Matching)</h2>
+          <div class="example-tags">
+            <span class="example-tag">sequence</span>
+            <span class="example-tag">pattern</span>
+            <span class="example-tag">nfa</span>
+          </div>
+        </div>
+        <p class="example-desc">Detect "small transaction followed by large transaction within 60 seconds" — a common card testing pattern. Uses NFA-based pattern matching, equivalent to SQL MATCH_RECOGNIZE.</p>
+
+        <div class="code-block">
+          <div class="code-header">
+            <div class="code-dot"></div><div class="code-dot"></div><div class="code-dot"></div>
+            <span class="code-filename">fraud_detection.rs</span>
+          </div>
+          <pre><code><span class="macro">#[rhei::pipeline]</span>
+<span class="kw">fn</span> <span class="fn">main</span>(graph: &amp;<span class="type">DataflowGraph</span>) {
+    graph.source(<span class="type">KafkaSource</span>::new(broker, group, &amp;[<span class="str">"transactions"</span>])?)
+        .key_by(|txn| txn.card_id.clone())
+        .operator(<span class="str">"fraud-detect"</span>, <span class="type">SequenceDetect</span>::builder()
+            .step(<span class="str">"probe"</span>, |t: &amp;<span class="type">Transaction</span>| t.amount &lt; <span class="num">10.0</span>)
+            .step(<span class="str">"exploit"</span>, |t: &amp;<span class="type">Transaction</span>| t.amount > <span class="num">5000.0</span>)
+            .within(<span class="type">Duration</span>::from_secs(<span class="num">60</span>))
+            .build()
+        )
+        .sink(<span class="type">KafkaSink</span>::new(broker, <span class="str">"fraud-alerts"</span>)?);
+}</code></pre>
+        </div>
+      </div>
+
+      <!-- Sliding Window -->
+      <div id="sliding" class="example-section">
+        <div class="example-header">
+          <h2>Rolling Metrics (Sliding Window)</h2>
+          <div class="example-tags">
+            <span class="example-tag">sliding</span>
+            <span class="example-tag">overlap</span>
+            <span class="example-tag">metrics</span>
+          </div>
+        </div>
+        <p class="example-desc">Compute 5-minute rolling average latency, emitting updated results every 30 seconds. Overlapping windows with configurable slide interval.</p>
+
+        <div class="code-block">
+          <div class="code-header">
+            <div class="code-dot"></div><div class="code-dot"></div><div class="code-dot"></div>
+            <span class="code-filename">rolling_metrics.rs</span>
+          </div>
+          <pre><code><span class="macro">#[rhei::pipeline]</span>
+<span class="kw">fn</span> <span class="fn">main</span>(graph: &amp;<span class="type">DataflowGraph</span>) {
+    graph.source(<span class="type">KafkaSource</span>::new(broker, group, &amp;[<span class="str">"requests"</span>])?)
+        .key_by(|req| req.service_name.clone())
+        .window(<span class="type">SlidingWindow</span>::new(
+            <span class="type">Duration</span>::from_secs(<span class="num">300</span>),  <span class="comment">// 5 min window</span>
+            <span class="type">Duration</span>::from_secs(<span class="num">30</span>),   <span class="comment">// 30s slide</span>
+        ))
+        .aggregate(<span class="type">LatencyAggregator</span>)
+        .filter_fn(|m| m.p99_ms > <span class="num">500.0</span>)  <span class="comment">// alert threshold</span>
+        .sink(<span class="type">KafkaSink</span>::new(broker, <span class="str">"latency-alerts"</span>)?);
+}</code></pre>
+        </div>
+      </div>
+
+      <!-- Custom Operator -->
+      <div id="custom-op" class="example-section">
+        <div class="example-header">
+          <h2>Custom Stateful Operator</h2>
+          <div class="example-tags">
+            <span class="example-tag">#[rhei::op]</span>
+            <span class="example-tag">KeyedState</span>
+            <span class="example-tag">custom</span>
+          </div>
+        </div>
+        <p class="example-desc">The <code>#[rhei::op]</code> proc macro generates a StreamFunction from an async function. Full control over batch iteration and typed state — without the trait boilerplate.</p>
+
+        <div class="code-block">
+          <div class="code-header">
+            <div class="code-dot"></div><div class="code-dot"></div><div class="code-dot"></div>
+            <span class="code-filename">running_total.rs</span>
+          </div>
+          <pre><code><span class="kw">use</span> rhei::prelude::*;
+
+<span class="macro">#[rhei::op]</span>
+<span class="kw">async fn</span> <span class="fn">running_total</span>(
+    input: <span class="type">RheiBuffer</span>&lt;<span class="type">Purchase</span>&gt;,
+    ctx: &amp;<span class="kw">mut</span> <span class="type">OperatorContext</span>,
+) -> anyhow::Result&lt;<span class="type">BufferOutput</span>&lt;<span class="type">UserSpend</span>&gt;&gt; {
+    <span class="kw">let mut</span> builder = <span class="type">UserSpend</span>::builder(input.len());
+
+    <span class="kw">for</span> (phys_idx, _) <span class="kw">in</span> input.iter().enumerate_physical() {
+        <span class="kw">let</span> view = <span class="type">Purchase</span>::view(input.as_record_batch(), phys_idx);
+
+        <span class="kw">let mut</span> state = <span class="type">KeyedState</span>::&lt;<span class="type">String</span>, <span class="type">f64</span>&gt;::new(
+            &amp;<span class="kw">mut</span> ctx.state, <span class="str">"totals"</span>
+        );
+        <span class="kw">let</span> prev = state.get(&amp;view.user_id.to_string()).<span class="kw">await</span>?
+            .unwrap_or(<span class="num">0.0</span>);
+        <span class="kw">let</span> new_total = prev + view.amount;
+        state.put(&amp;view.user_id.to_string(), &amp;new_total)?;
+
+        builder.append(<span class="type">UserSpend</span> {
+            user_id: view.user_id.to_string(),
+            total: new_total,
+        });
+    }
+
+    Ok(<span class="type">BufferOutput</span>::Single(<span class="type">RheiBuffer</span>::from_builder(builder)))
+}
+
+<span class="comment">// Use it in a pipeline:</span>
+<span class="macro">#[rhei::pipeline]</span>
+<span class="kw">fn</span> <span class="fn">main</span>(graph: &amp;<span class="type">DataflowGraph</span>) {
+    graph.source(<span class="type">KafkaSource</span>::new(broker, group, &amp;[<span class="str">"purchases"</span>])?)
+        .key_by(|p| p.user_id.clone())
+        .operator(<span class="str">"running-total"</span>, <span class="type">RunningTotal</span>)
+        .filter_fn(|spend| spend.total > <span class="num">1000.0</span>)
+        .sink(<span class="type">KafkaSink</span>::new(broker, <span class="str">"high-spenders"</span>)?);
+}</code></pre>
+        </div>
+      </div>
+
+      <!-- Footer -->
+      <footer>
+        <div class="footer-content">
+          <div class="footer-left">rhei — stateful stream processing for Rust</div>
+          <ul class="footer-links">
+            <li><a href="https://github.com/RcRonco/rhei" target="_blank">GitHub</a></li>
+            <li><a href="https://crates.io/crates/rhei" target="_blank">crates.io</a></li>
+            <li><a href="https://docs.rs/rhei" target="_blank">docs.rs</a></li>
+            <li><a href="/architecture.html">Architecture</a></li>
+          </ul>
+        </div>
+      </footer>
+    </div>
+  </div>
+
+  <script src="js/main.js"></script>
+  <script>
+    // Sidebar scroll spy
+    (() => {
+      const links = document.querySelectorAll('.sidebar-nav a');
+      const sections = [];
+      for (const link of links) {
+        const id = link.getAttribute('href')?.slice(1);
+        if (id) {
+          const el = document.getElementById(id);
+          if (el) sections.push({ el, link });
+        }
+      }
+      if (!sections.length) return;
+
+      function update() {
+        let current = sections[0];
+        for (const s of sections) {
+          if (s.el.getBoundingClientRect().top <= 120) current = s;
+        }
+        for (const s of sections) s.link.classList.remove('active');
+        current.link.classList.add('active');
+      }
+
+      window.addEventListener('scroll', update, { passive: true });
+      update();
+    })();
+  </script>
+</body>
+</html>

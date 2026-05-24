@@ -1,0 +1,292 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Rhei — Stateful Stream Processing for Rust</title>
+  <meta name="description" content="Rhei is a Rust framework for stateful, distributed stream processing with Arrow columnar execution and disaggregated state.">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+
+  <nav>
+    <a href="/" class="nav-logo">rhei</a>
+    <ul class="nav-links">
+      <li><a href="/examples.html">Examples</a></li>
+      <li><a href="/architecture.html">Architecture</a></li>
+      <li><a href="https://docs.rs/rhei" target="_blank">Docs</a></li>
+      <li><a href="https://github.com/RcRonco/rhei" target="_blank">GitHub</a></li>
+    </ul>
+  </nav>
+
+  <!-- Hero -->
+  <section class="hero">
+    <div class="container">
+      <h1>Rhei: stateful stream processing<br>for Rust, built on Arrow</h1>
+      <p class="hero-sub">
+        Rhei is a distributed streaming engine with columnar execution, tiered
+        disaggregated state, and first-class operational tooling.
+        Same pipeline code runs single-threaded on your laptop or multi-process on a cluster.
+      </p>
+      <div class="hero-cta">
+        <button class="cta-install" data-copy="cargo add rhei">
+          <span class="prompt">$</span>
+          <span>cargo add rhei</span>
+          <span class="copy-hint">copy</span>
+        </button>
+        <a href="/examples.html" class="cta-link">See examples →</a>
+      </div>
+
+      <div class="hero-stats">
+        <div class="hero-stat">
+          <span class="hero-stat-value">Columnar</span>
+          <span class="hero-stat-label">Arrow RecordBatch execution</span>
+        </div>
+        <div class="hero-stat">
+          <span class="hero-stat-value">~1μs</span>
+          <span class="hero-stat-label">hot state reads (L1 memtable)</span>
+        </div>
+        <div class="hero-stat">
+          <span class="hero-stat-value">Zero-copy</span>
+          <span class="hero-stat-label">selection vector filtering</span>
+        </div>
+        <div class="hero-stat">
+          <span class="hero-stat-value">Distributed</span>
+          <span class="hero-stat-label">multi-process over TCP</span>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Code -->
+  <section class="tight">
+    <div class="container">
+      <div class="section-intro">
+        <span class="section-label">The API</span>
+        <h2 class="section-heading">Define pipelines, not plumbing</h2>
+        <p class="section-desc">Rhei's builder API is fluent and type-safe. Source to sink validated at compile time. Windowing, joins, and stateful operators compose naturally.</p>
+      </div>
+
+      <div class="code-block">
+        <div class="code-header">
+          <div class="code-dot"></div>
+          <div class="code-dot"></div>
+          <div class="code-dot"></div>
+          <span class="code-filename">pipeline.rs</span>
+        </div>
+        <pre><code><span class="kw">use</span> rhei::prelude::*;
+
+<span class="macro">#[rhei::pipeline]</span>
+<span class="kw">fn</span> <span class="fn">main</span>(graph: &amp;<span class="type">DataflowGraph</span>) {
+    <span class="kw">let</span> orders = graph.source(<span class="type">KafkaSource</span>::new(broker, group, &amp;[<span class="str">"orders"</span>])?);
+
+    orders
+        .map(|msg| parse_order(msg))
+        .filter_fn(|o| o.amount > <span class="num">50.0</span>)
+        .key_by(|o| o.customer_id.clone())
+        .window(<span class="type">TumblingWindow</span>::new(<span class="type">Duration</span>::from_secs(<span class="num">60</span>)))
+        .aggregate(<span class="type">OrderAggregator</span>)
+        .sink(<span class="type">KafkaSink</span>::new(broker, <span class="str">"aggregated-orders"</span>)?);
+}</code></pre>
+      </div>
+    </div>
+  </section>
+
+  <!-- Developer Experience + Get Started -->
+  <section class="tight">
+    <div class="container">
+      <div class="section-intro">
+        <span class="section-label">Developer Experience</span>
+        <h2 class="section-heading">Built for the streaming developer</h2>
+        <p class="section-desc">Every design decision optimizes for the person writing and operating pipelines. Rhei gives you the tooling to develop, debug, and observe streaming systems without friction.</p>
+      </div>
+
+      <div class="devex-grid">
+        <div class="devex-card">
+          <h3><span class="icon">#</span> Proc macro entrypoint</h3>
+          <p><code>#[rhei::pipeline]</code> generates a full CLI with <code>--workers</code>, <code>--from-checkpoint</code>, <code>--metrics-addr</code>, and cluster flags. Zero boilerplate.</p>
+        </div>
+        <div class="devex-card">
+          <h3><span class="icon">$</span> TUI dashboard</h3>
+          <p><code>rhei run --tui</code> gives you a live terminal dashboard: pipeline graph, per-worker throughput, backpressure metrics, and structured logs.</p>
+        </div>
+        <div class="devex-card">
+          <h3><span class="icon">↻</span> Checkpoint fork</h3>
+          <p><code>--from-checkpoint &lt;s3-url&gt;</code> reproduces production state locally. Copy-on-write backend means safe debugging against real data without touching prod.</p>
+        </div>
+        <div class="devex-card">
+          <h3><span class="icon">→</span> Attach to running pipelines</h3>
+          <p><code>rhei run --attach &lt;url&gt;</code> connects to a live pipeline and streams health, metrics, and structured logs to your terminal in real time.</p>
+        </div>
+        <div class="devex-card">
+          <h3><span class="icon">⚡</span> Zero-config observability</h3>
+          <p>Prometheus at <code>/metrics</code>, health probes at <code>/healthz</code> and <code>/readyz</code>, JSON metrics API. Structured tracing spans per-operator, per-worker.</p>
+        </div>
+        <div class="devex-card">
+          <h3><span class="icon">✗</span> Dead letter queue</h3>
+          <p>Pluggable <code>DlqSink</code> trait routes failed records to file, Kafka, or custom backends. Per-operator error policies — skip or send to DLQ.</p>
+        </div>
+      </div>
+
+      <div class="get-started-inline">
+        <h3>Get started</h3>
+        <div class="code-block">
+          <div class="code-header">
+            <div class="code-dot"></div>
+            <div class="code-dot"></div>
+            <div class="code-dot"></div>
+            <span class="code-filename">terminal</span>
+          </div>
+          <pre><code><span class="comment"># New pipeline project</span>
+<span class="kw">$</span> cargo new my-pipeline && cd my-pipeline
+<span class="kw">$</span> cargo add rhei tokio --features tokio/full
+
+<span class="comment"># Run with live TUI dashboard</span>
+<span class="kw">$</span> cargo run -- --workers 4 --tui
+
+<span class="comment"># Fork production state locally for debugging</span>
+<span class="kw">$</span> cargo run -- --from-checkpoint s3://bucket/checkpoint --offset-delta 1000
+
+<span class="comment"># Attach to a running pipeline's metrics stream</span>
+<span class="kw">$</span> rhei run --attach http://pipeline-host:9090</code></pre>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Capabilities -->
+  <section class="tight">
+    <div class="container">
+      <div class="section-intro">
+        <span class="section-label">Operators</span>
+        <h2 class="section-heading">Built-in operators for common streaming patterns</h2>
+        <p class="section-desc">Compose them with the builder API or implement <code>StreamFunction</code> directly for full control over batch processing and state.</p>
+      </div>
+
+      <div class="features-list">
+        <div class="feature-row">
+          <span class="feature-name">TumblingWindow</span>
+          <span class="feature-desc">Fixed-size time windows with pluggable aggregators and watermark-based triggers</span>
+        </div>
+        <div class="feature-row">
+          <span class="feature-name">SlidingWindow</span>
+          <span class="feature-desc">Overlapping time windows for moving averages and rolling computations</span>
+        </div>
+        <div class="feature-row">
+          <span class="feature-name">SessionWindow</span>
+          <span class="feature-desc">Gap-based windows per key — group activity bursts with configurable inactivity timeout</span>
+        </div>
+        <div class="feature-row">
+          <span class="feature-name">TemporalJoin</span>
+          <span class="feature-desc">Key-based join with configurable timeout and automatic state eviction for unmatched events</span>
+        </div>
+        <div class="feature-row">
+          <span class="feature-name">SequenceDetect</span>
+          <span class="feature-desc">Ordered event pattern matching — MATCH_RECOGNIZE semantics without SQL. NFA-backed.</span>
+        </div>
+        <div class="feature-row">
+          <span class="feature-name">KeyedState&lt;K, V&gt;</span>
+          <span class="feature-desc">Typed state wrapper with automatic serde (JSON or bincode). Access via OperatorContext in any custom operator.</span>
+        </div>
+        <div class="feature-row">
+          <span class="feature-name">map / filter / flat_map</span>
+          <span class="feature-desc">Stateless combinators operating on Arrow batches with selection vectors (no data copying)</span>
+        </div>
+        <div class="feature-row">
+          <span class="feature-name">key_by / merge</span>
+          <span class="feature-desc">Hash-based exchange across workers (seahash % num_workers) and fan-in from multiple streams</span>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Architecture -->
+  <section class="tight">
+    <div class="container">
+      <div class="section-intro">
+        <span class="section-label">Architecture</span>
+        <h2 class="section-heading">Disaggregated state, columnar execution</h2>
+        <p class="section-desc">Rhei separates compute from storage. Workers are stateless — they read through a tiered state hierarchy. Scale compute up or down without migrating state.</p>
+      </div>
+
+      <table class="tier-table">
+        <thead>
+          <tr>
+            <th>Tier</th>
+            <th>Backend</th>
+            <th>Latency</th>
+            <th>Role</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><span class="tier-name">L1 — Hot</span></td>
+            <td><span class="tier-tech">HashMap memtable</span></td>
+            <td><span class="tier-latency">~1μs</span></td>
+            <td>Buffer writes and serve hot reads. Dirty keys flushed on checkpoint.</td>
+          </tr>
+          <tr>
+            <td><span class="tier-name">L2 — Warm</span></td>
+            <td><span class="tier-tech">Foyer HybridCache</span></td>
+            <td><span class="tier-latency">~1ms</span></td>
+            <td>Local NVMe cache. Serves L1 read misses without network round-trips.</td>
+          </tr>
+          <tr>
+            <td><span class="tier-name">L3 — Cold</span></td>
+            <td><span class="tier-tech">SlateDB on S3</span></td>
+            <td><span class="tier-latency">~50ms</span></td>
+            <td>Source of truth with infinite capacity. Enables stateless autoscaling.</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <p class="arch-link">Full details on the execution model, checkpoint protocol, and async bridge — <a href="/architecture.html">read the architecture guide</a>.</p>
+    </div>
+  </section>
+
+  <!-- Clustering -->
+  <section class="tight">
+    <div class="container">
+      <div class="section-intro">
+        <span class="section-label">Clustering</span>
+        <h2 class="section-heading">Same pipeline code, any deployment target</h2>
+      </div>
+
+      <div class="features-list">
+        <div class="feature-row">
+          <span class="feature-name">.with_workers(N)</span>
+          <span class="feature-desc">Multi-thread — N worker threads, shared-nothing state per worker, single process</span>
+        </div>
+        <div class="feature-row">
+          <span class="feature-name">.from_env()</span>
+          <span class="feature-desc">Multi-process — N processes over TCP, coordinated checkpoints via S3, independent state backends</span>
+        </div>
+        <div class="feature-row">
+          <span class="feature-name">TBD</span>
+          <span class="feature-desc">Dynamic cluster — Chitchat gossip discovery, OpenRaft consensus, auto-scaling with state repartitioning</span>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Footer -->
+  <footer>
+    <div class="container">
+      <div class="footer-content">
+        <div class="footer-left">rhei — stateful stream processing for Rust</div>
+        <ul class="footer-links">
+          <li><a href="https://github.com/RcRonco/rhei" target="_blank">GitHub</a></li>
+          <li><a href="https://crates.io/crates/rhei" target="_blank">crates.io</a></li>
+          <li><a href="https://docs.rs/rhei" target="_blank">docs.rs</a></li>
+          <li><a href="/architecture.html">Architecture</a></li>
+        </ul>
+      </div>
+    </div>
+  </footer>
+
+  <script src="js/main.js"></script>
+</body>
+</html>
