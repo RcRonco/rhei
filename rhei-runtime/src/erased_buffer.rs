@@ -18,7 +18,7 @@ use rhei_core::arrow::{RheiBuffer, RheiSchema};
 
 /// Type-erased key extraction function: given a `RecordBatch` and row index,
 /// returns the key string for that row. Used by `key_by` exchange.
-pub(crate) type KeyFn = Arc<dyn Fn(&RecordBatch, usize) -> String + Send + Sync>;
+pub type KeyFn = Arc<dyn Fn(&RecordBatch, usize) -> String + Send + Sync>;
 
 /// Type-erased Arrow buffer for flowing through Timely dataflow channels.
 ///

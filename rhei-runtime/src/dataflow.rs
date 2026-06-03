@@ -58,7 +58,7 @@ pub(crate) trait SinkNode: Send {
 }
 
 /// A batch-level transform: `ErasedBuffer` → `Vec<ErasedBuffer>`.
-pub(crate) type BatchTransformFn = Arc<dyn Fn(ErasedBuffer) -> Vec<ErasedBuffer> + Send + Sync>;
+pub type BatchTransformFn = Arc<dyn Fn(ErasedBuffer) -> Vec<ErasedBuffer> + Send + Sync>;
 
 // ── Typed batch node wrappers ───────────────────────────────────────
 
