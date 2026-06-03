@@ -277,6 +277,22 @@ impl DataflowGraph {
             vec![input.0],
         );
     }
+
+    /// Add a key-based exchange downstream of `input`: partitions rows by the
+    /// hash of `key_fn(batch, row)` and routes them so equal keys land on the
+    /// same worker. Returns the new [`ErasedHandle`].
+    pub fn add_key_by(&self, input: ErasedHandle, key_fn: KeyFn) -> ErasedHandle {
+        let node = LazyKeyByNode(Box::new(move || key_fn));
+        let id = self.add_node(NodeKind::KeyBy(node), vec![input.0]);
+        ErasedHandle(id)
+    }
+
+    /// Merge two erased streams of the same schema into one. Returns the new
+    /// [`ErasedHandle`].
+    pub fn add_merge(&self, a: ErasedHandle, b: ErasedHandle) -> ErasedHandle {
+        let id = self.add_node(NodeKind::Merge, vec![a.0, b.0]);
+        ErasedHandle(id)
+    }
 }
 
 impl Default for DataflowGraph {
