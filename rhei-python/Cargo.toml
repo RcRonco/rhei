@@ -1,0 +1,21 @@
+[package]
+name = "rhei-python"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+name = "rhei"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { version = "0.23", features = ["extension-module"] }
+arrow = { version = "54", features = ["pyarrow"] }
+arrow-array = "54"
+arrow-schema = "54"
+rhei-runtime = { path = "../rhei-runtime" }
+tokio = { version = "1", features = ["rt-multi-thread"] }
+anyhow = "1"
+
+[lints.rust]
+unsafe_code = "forbid"
