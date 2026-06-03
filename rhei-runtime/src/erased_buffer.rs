@@ -60,6 +60,22 @@ impl ErasedBuffer {
         }
     }
 
+    /// Construct an `ErasedBuffer` directly from its parts, without a
+    /// compile-time `RheiSchema` type.
+    ///
+    /// `schema_id` must be computed with [`schema_hash_of`] from an Arrow
+    /// [`Schema`] equal to `batch.schema()` for the buffer to be
+    /// [`downcast`](Self::downcast)-able to a typed `RheiBuffer<T>`. This is
+    /// the runtime-typed entry point used by dynamic graph builders.
+    pub fn from_parts(batch: RecordBatch, mask: Option<BooleanArray>, schema_id: u64) -> Self {
+        Self {
+            batch,
+            mask,
+            schema_id,
+            exchange_target: None,
+        }
+    }
+
     /// Downcast back to a typed `RheiBuffer<T>`.
     ///
     /// Returns `Err` if the `schema_id` doesn't match (type mismatch).
@@ -227,11 +243,22 @@ impl std::fmt::Display for ErasedBufferError {
 
 impl std::error::Error for ErasedBufferError {}
 
-/// Compute a stable hash for a `RheiSchema` type based on its Arrow schema.
-fn schema_hash<T: RheiSchema>() -> u64 {
-    let schema = T::arrow_schema();
+/// Compute the stable schema id for an Arrow [`Schema`].
+///
+/// This is the same hash [`ErasedBuffer::from_typed`] derives from a
+/// `RheiSchema` type, exposed for callers that only have a runtime
+/// [`Schema`] (e.g. dynamically-typed graph builders). A buffer built via
+/// [`ErasedBuffer::from_parts`] with `schema_hash_of(&schema)` will
+/// [`downcast`](ErasedBuffer::downcast) to any `T` whose
+/// `arrow_schema()` equals `schema`.
+pub fn schema_hash_of(schema: &Schema) -> u64 {
     let schema_str = format!("{schema:?}");
     seahash::hash(schema_str.as_bytes())
+}
+
+/// Compute a stable hash for a `RheiSchema` type based on its Arrow schema.
+fn schema_hash<T: RheiSchema>() -> u64 {
+    schema_hash_of(&T::arrow_schema())
 }
 
 // ── Serde for Timely Exchange ─────────────────────────────────────────
@@ -457,6 +484,45 @@ mod tests {
         let restored: RheiBuffer<TestRow> = erased.downcast().unwrap();
         assert_eq!(restored.len(), 2); // only unmasked rows
         assert_eq!(restored.physical_len(), 3);
+    }
+
+    #[test]
+    fn schema_hash_of_matches_typed_hash() {
+        // schema_hash_of(&T::arrow_schema()) must equal the id produced by from_typed::<T>.
+        let mut builder = TestRow::builder(1);
+        builder.append(TestRow {
+            id: 7,
+            name: "z".into(),
+        });
+        let buf: RheiBuffer<TestRow> = RheiBuffer::from_builder(builder);
+        let erased = ErasedBuffer::from_typed(buf);
+
+        let computed = super::schema_hash_of(&TestRow::arrow_schema());
+        assert_eq!(erased.schema_id(), computed);
+    }
+
+    #[test]
+    fn from_parts_roundtrips_via_downcast() {
+        // A buffer constructed from raw parts (no compile-time T) must downcast
+        // back to T when the schema_id is computed from T's schema.
+        let schema = TestRow::arrow_schema();
+        let id_array = arrow_array::Int64Array::from(vec![11_i64, 22]);
+        let name_array = arrow_array::StringArray::from(vec!["p", "q"]);
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(id_array), Arc::new(name_array)],
+        )
+        .unwrap();
+
+        let schema_id = super::schema_hash_of(&schema);
+        let erased = ErasedBuffer::from_parts(batch, None, schema_id);
+        assert_eq!(erased.num_rows(), 2);
+
+        let typed: RheiBuffer<TestRow> = erased.downcast().unwrap();
+        assert_eq!(typed.len(), 2);
+        let v = TestRow::view(typed.as_record_batch(), 1);
+        assert_eq!(v.id, 22);
+        assert_eq!(v.name, "q");
     }
 
     #[test]
