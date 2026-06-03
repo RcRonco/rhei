@@ -251,6 +251,14 @@ impl std::error::Error for ErasedBufferError {}
 /// [`ErasedBuffer::from_parts`] with `schema_hash_of(&schema)` will
 /// [`downcast`](ErasedBuffer::downcast) to any `T` whose
 /// `arrow_schema()` equals `schema`.
+///
+/// The hash is derived from the schema's full `Debug` representation, so
+/// **field nullability and schema/field metadata are part of the identity** —
+/// two otherwise structurally-identical schemas that differ only in a field's
+/// `nullable` flag or in attached metadata hash to *different* ids. Callers
+/// bridging an external schema (e.g. a `pyarrow.Schema`, where fields default
+/// to `nullable = true`) must reproduce the target `T`'s nullability and
+/// metadata exactly, or `downcast` will fail and the buffer will be dropped.
 pub fn schema_hash_of(schema: &Schema) -> u64 {
     let schema_str = format!("{schema:?}");
     seahash::hash(schema_str.as_bytes())
