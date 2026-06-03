@@ -5,9 +5,9 @@
 
 use std::sync::{Arc, Mutex};
 
-use async_trait::async_trait;
 use arrow_array::{Int64Array, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
+use async_trait::async_trait;
 
 use rhei_runtime::controller::PipelineController;
 use rhei_runtime::dataflow::{BatchTransformFn, DataflowGraph};

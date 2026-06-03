@@ -254,7 +254,10 @@ impl DataflowGraph {
     /// the caller supplies a `Box<dyn ErasedSource>` directly instead of a
     /// typed `Source`.
     pub fn add_erased_source(&self, source: Box<dyn ErasedSource>) -> ErasedHandle {
-        let id = self.add_node(NodeKind::Source(Box::new(PreErasedSourceNode(source))), vec![]);
+        let id = self.add_node(
+            NodeKind::Source(Box::new(PreErasedSourceNode(source))),
+            vec![],
+        );
         ErasedHandle(id)
     }
 
