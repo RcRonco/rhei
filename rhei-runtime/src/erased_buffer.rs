@@ -110,6 +110,15 @@ impl ErasedBuffer {
         &self.batch
     }
 
+    /// Returns the optional selection mask. Rows where the mask is `false` are
+    /// logically filtered out; consumers that read [`as_record_batch`] directly
+    /// must apply the mask (e.g. via `arrow::compute::filter_record_batch`).
+    ///
+    /// [`as_record_batch`]: Self::as_record_batch
+    pub fn mask(&self) -> Option<&BooleanArray> {
+        self.mask.as_ref()
+    }
+
     /// Set the exchange routing target (worker index).
     #[allow(dead_code)]
     pub(crate) fn with_exchange_target(mut self, target: u64) -> Self {
