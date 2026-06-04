@@ -9,9 +9,7 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
 use arrow::pyarrow::FromPyArrow;
-use arrow_array::RecordBatch;
-use arrow_array::cast::AsArray;
-use arrow_array::types::Int64Type;
+use arrow_array::{Int64Array, RecordBatch};
 use arrow_schema::Schema;
 use async_trait::async_trait;
 use pyo3::exceptions::PyRuntimeError;
@@ -73,16 +71,26 @@ struct CollectSink {
 impl ErasedSink for CollectSink {
     async fn write_batch(&mut self, buf: ErasedBuffer) -> anyhow::Result<()> {
         let batch = buf.as_record_batch();
-        if batch.num_columns() > 0 {
-            let col = batch.column(0).as_primitive::<Int64Type>();
-            let mut guard = self
-                .shared
-                .values
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            for i in 0..col.len() {
-                guard.push(col.value(i));
-            }
+        if batch.num_columns() == 0 {
+            return Ok(());
+        }
+        let column = batch.column(0);
+        let col = column
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "sink_collect requires an Int64 first column, got {:?}",
+                    column.data_type()
+                )
+            })?;
+        let mut guard = self
+            .shared
+            .values
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for i in 0..col.len() {
+            guard.push(col.value(i));
         }
         Ok(())
     }
@@ -139,54 +147,105 @@ impl PyCollectHandle {
     }
 }
 
+// ── Pipeline error reporting ─────────────────────────────────────────
+
+/// Shared slot recording the first fatal error raised inside a Python
+/// transform. The L0 `BatchTransformFn` signature has no error channel, so a
+/// transform that fails records its message here and returns no output; `run()`
+/// checks the slot after the pipeline drains and re-raises it as a Python
+/// exception. This turns a green run with silently-dropped batches into a loud
+/// failure.
+type ErrorSlot = Arc<Mutex<Option<String>>>;
+
+fn record_error(slot: &ErrorSlot, message: String) {
+    let mut guard = slot
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if guard.is_none() {
+        *guard = Some(message);
+    }
+}
+
+fn format_py_error(py: Python<'_>, context: &str, err: &PyErr) -> String {
+    let msg = err.value(py).str().map_or_else(
+        |_| "<unprintable Python error>".to_string(),
+        |s| s.to_string_lossy().into_owned(),
+    );
+    format!("{context}: {msg}")
+}
+
 // ── Python-callable transform ────────────────────────────────────────
 
 /// Build a `BatchTransformFn` that calls a Python `fn(Buffer) -> Buffer`.
 ///
-/// Acquires the GIL only while the Python callable runs; the resulting
-/// `ErasedBuffer` carries `out_schema_id` so it interoperates downstream.
-fn py_map_batches_transform(callable: Py<PyAny>, out_schema_id: u64) -> BatchTransformFn {
+/// Acquires the GIL only while the Python callable runs. The Python function
+/// MUST return a `rhei.Buffer` whose Arrow schema matches the `schema=` declared
+/// on `map_batches` (validated by schema id). Any failure — an exception, a
+/// wrong return type, or a schema mismatch — is recorded in `error_slot` and
+/// aborts the run, rather than silently dropping the batch.
+fn py_map_batches_transform(
+    callable: Py<PyAny>,
+    out_schema_id: u64,
+    error_slot: ErrorSlot,
+) -> BatchTransformFn {
     Arc::new(move |buf: ErasedBuffer| {
         Python::with_gil(|py| {
             let in_obj = match Py::new(py, PyBuffer::from_erased(buf)) {
                 Ok(o) => o,
                 Err(e) => {
-                    report_py_error(py, "map_batches: wrapping input", &e);
+                    record_error(
+                        &error_slot,
+                        format_py_error(py, "map_batches: wrapping input", &e),
+                    );
                     return vec![];
                 }
             };
             let result = match callable.bind(py).call1((in_obj,)) {
                 Ok(r) => r,
                 Err(e) => {
-                    report_py_error(py, "map_batches: Python callable raised", &e);
+                    record_error(
+                        &error_slot,
+                        format_py_error(py, "map_batches: Python callable raised", &e),
+                    );
                     return vec![];
                 }
             };
             let buf_obj = match result.downcast::<PyBuffer>() {
                 Ok(b) => b,
-                Err(e) => {
-                    report_py_error(
-                        py,
-                        "map_batches: return value was not a rhei.Buffer",
-                        &PyErr::from(e),
+                Err(_) => {
+                    record_error(
+                        &error_slot,
+                        format!(
+                            "map_batches: callable must return a rhei.Buffer, got {}",
+                            result
+                                .get_type()
+                                .name()
+                                .map_or_else(|_| "<unknown>".to_string(), |n| n.to_string())
+                        ),
                     );
                     return vec![];
                 }
             };
-            // Re-tag with the declared output schema id so downstream nodes
-            // (and the sink) can rely on it.
             let rb = buf_obj.borrow().inner.as_record_batch().clone();
+            // Validate the produced schema against the declared one. Tagging an
+            // ErasedBuffer with a schema id that doesn't match its real layout
+            // would let a downstream typed downcast misinterpret the data, so we
+            // reject the mismatch with an actionable error instead.
+            let actual_id = schema_hash_of(rb.schema_ref());
+            if actual_id != out_schema_id {
+                record_error(
+                    &error_slot,
+                    format!(
+                        "map_batches: returned batch schema {:?} does not match the declared \
+                         schema= (note: field nullability and metadata are significant)",
+                        rb.schema()
+                    ),
+                );
+                return vec![];
+            }
             vec![ErasedBuffer::from_parts(rb, None, out_schema_id)]
         })
     })
-}
-
-fn report_py_error(py: Python<'_>, context: &str, err: &PyErr) {
-    let msg = err.value(py).str().map_or_else(
-        |_| "<unprintable Python error>".to_string(),
-        |s| s.to_string_lossy().into_owned(),
-    );
-    eprintln!("rhei {context}: {msg}");
 }
 
 // ── PyDataflow / PyStream ────────────────────────────────────────────
@@ -200,6 +259,12 @@ fn report_py_error(py: Python<'_>, context: &str, err: &PyErr) {
 #[pyclass(name = "Dataflow", unsendable)]
 pub struct PyDataflow {
     graph: DataflowGraph,
+    /// Records the first fatal error from any Python transform, checked by
+    /// `run()`. Shared with every transform closure built on this dataflow.
+    error_slot: ErrorSlot,
+    /// Set once `run()` has consumed the graph, so a second `run()` fails with
+    /// a clear message instead of the misleading "empty graph" validation error.
+    has_run: bool,
 }
 
 #[pymethods]
@@ -208,6 +273,8 @@ impl PyDataflow {
     fn new() -> Self {
         Self {
             graph: DataflowGraph::new(),
+            error_slot: Arc::new(Mutex::new(None)),
+            has_run: false,
         }
     }
 
@@ -238,6 +305,12 @@ impl PyDataflow {
         workers: usize,
         checkpoint_dir: Option<String>,
     ) -> PyResult<()> {
+        if self.has_run {
+            return Err(PyRuntimeError::new_err(
+                "this Dataflow has already been run; build a new rhei.Dataflow() to run again",
+            ));
+        }
+        self.has_run = true;
         // DataflowGraph::run consumes the graph; swap in a fresh empty one.
         let graph = std::mem::replace(&mut self.graph, DataflowGraph::new());
         let dir = checkpoint_dir.unwrap_or_else(|| {
@@ -258,7 +331,17 @@ impl PyDataflow {
                     .await
                     .map_err(|e| PyRuntimeError::new_err(e.to_string()))
             })
-        })
+        })?;
+        // Surface the first error any Python transform recorded during the run.
+        if let Some(msg) = self
+            .error_slot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+        {
+            return Err(PyRuntimeError::new_err(msg));
+        }
+        Ok(())
     }
 }
 
@@ -284,13 +367,9 @@ impl PyStream {
     ) -> PyResult<PyStream> {
         let out_schema = Schema::from_pyarrow_bound(schema)?;
         let out_schema_id = schema_hash_of(&out_schema);
-        let transform = py_map_batches_transform(func, out_schema_id);
-        let new_handle = self
-            .df
-            .bind(py)
-            .borrow()
-            .graph
-            .add_erased_transform(self.handle, transform);
+        let df_ref = self.df.bind(py).borrow();
+        let transform = py_map_batches_transform(func, out_schema_id, df_ref.error_slot.clone());
+        let new_handle = df_ref.graph.add_erased_transform(self.handle, transform);
         Ok(PyStream {
             df: self.df.clone_ref(py),
             handle: new_handle,

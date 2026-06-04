@@ -1,6 +1,9 @@
+# Build into the shared workspace ../target (see .cargo/config.toml); the local
+# /target is only a fallback and should never be committed.
 /target
 *.so
 .venv/
 __pycache__/
 *.pyc
-Cargo.lock
+# Cargo.lock IS committed: rhei-python is a binary-like cdylib, so a pinned
+# lockfile gives reproducible builds.

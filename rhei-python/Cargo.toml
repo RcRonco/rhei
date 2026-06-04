@@ -4,8 +4,12 @@ version = "0.1.0"
 edition = "2024"
 publish = false
 
+# `name` is the Rust artifact name only; it must differ from the workspace
+# `rhei` crate because both build into the shared ../target dir. The Python
+# module name is set by `module-name = "rhei._rhei"` in pyproject.toml and the
+# `#[pymodule] fn _rhei` in src/lib.rs, independent of this.
 [lib]
-name = "rhei"
+name = "rhei_python"
 crate-type = ["cdylib"]
 
 [dependencies]
