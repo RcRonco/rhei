@@ -9,8 +9,8 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
 use arrow::pyarrow::FromPyArrow;
-use arrow_array::{Int64Array, RecordBatch};
-use arrow_schema::Schema;
+use arrow_array::{BooleanArray, Int64Array, RecordBatch};
+use arrow_schema::{Schema, SchemaRef};
 use async_trait::async_trait;
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
@@ -18,9 +18,10 @@ use pyo3::prelude::*;
 use rhei_runtime::controller::PipelineController;
 use rhei_runtime::dataflow::{BatchTransformFn, DataflowGraph, ErasedHandle};
 use rhei_runtime::erased_batch::{ErasedSink, ErasedSource};
-use rhei_runtime::erased_buffer::{ErasedBuffer, schema_hash_of};
+use rhei_runtime::erased_buffer::{ErasedBuffer, KeyFn, schema_hash_of};
 
 use crate::buffer::PyBuffer;
+use crate::codec::{batch_row_to_dict, dicts_to_batch};
 
 // ── Source: drains a fixed list of ErasedBuffers ─────────────────────
 
@@ -248,6 +249,228 @@ fn py_map_batches_transform(
     })
 }
 
+// ── Row-oriented transforms (codec-backed) ───────────────────────────
+
+/// Compact an `ErasedBuffer` to a plain `RecordBatch`, applying any selection
+/// mask so the row codec never sees logically-filtered rows.
+fn compact_to_batch(buf: &ErasedBuffer) -> RecordBatch {
+    let batch = buf.as_record_batch();
+    match buf.mask() {
+        Some(mask) => {
+            arrow::compute::filter_record_batch(batch, mask).unwrap_or_else(|_| batch.clone())
+        }
+        None => batch.clone(),
+    }
+}
+
+/// `map`: call a Python `fn(dict) -> dict` per row, build an output batch with
+/// the declared schema. Mirrors the typed `Stream::map`, type-erased.
+fn py_row_map_transform(
+    callable: Py<PyAny>,
+    out_schema: SchemaRef,
+    out_schema_id: u64,
+    error_slot: ErrorSlot,
+) -> BatchTransformFn {
+    Arc::new(move |buf: ErasedBuffer| {
+        let batch = compact_to_batch(&buf);
+        Python::with_gil(|py| {
+            let mut out_rows: Vec<Bound<'_, PyAny>> = Vec::with_capacity(batch.num_rows());
+            for row in 0..batch.num_rows() {
+                let dict = match batch_row_to_dict(py, &batch, row) {
+                    Ok(d) => d,
+                    Err(e) => {
+                        record_error(&error_slot, format_py_error(py, "map: reading row", &e));
+                        return vec![];
+                    }
+                };
+                match callable.bind(py).call1((dict,)) {
+                    Ok(r) => out_rows.push(r),
+                    Err(e) => {
+                        record_error(&error_slot, format_py_error(py, "map: callable raised", &e));
+                        return vec![];
+                    }
+                }
+            }
+            match dicts_to_batch(&out_rows, &out_schema) {
+                Ok(rb) => vec![ErasedBuffer::from_parts(rb, None, out_schema_id)],
+                Err(e) => {
+                    record_error(&error_slot, format_py_error(py, "map: building output", &e));
+                    vec![]
+                }
+            }
+        })
+    })
+}
+
+/// `filter`: call a Python `fn(dict) -> bool` per row; emit a compacted batch of
+/// the rows that passed (schema unchanged).
+fn py_row_filter_transform(callable: Py<PyAny>, error_slot: ErrorSlot) -> BatchTransformFn {
+    Arc::new(move |buf: ErasedBuffer| {
+        let batch = compact_to_batch(&buf);
+        let schema_id = buf.schema_id();
+        Python::with_gil(|py| {
+            let mut keep = vec![false; batch.num_rows()];
+            let mut any = false;
+            for (row, slot) in keep.iter_mut().enumerate() {
+                let dict = match batch_row_to_dict(py, &batch, row) {
+                    Ok(d) => d,
+                    Err(e) => {
+                        record_error(&error_slot, format_py_error(py, "filter: reading row", &e));
+                        return vec![];
+                    }
+                };
+                match callable
+                    .bind(py)
+                    .call1((dict,))
+                    .and_then(|r| r.extract::<bool>())
+                {
+                    Ok(b) => {
+                        *slot = b;
+                        any |= b;
+                    }
+                    Err(e) => {
+                        record_error(&error_slot, format_py_error(py, "filter: callable", &e));
+                        return vec![];
+                    }
+                }
+            }
+            if !any {
+                return vec![];
+            }
+            let mask = BooleanArray::from(keep);
+            match arrow::compute::filter_record_batch(&batch, &mask) {
+                Ok(rb) => vec![ErasedBuffer::from_parts(rb, None, schema_id)],
+                Err(e) => {
+                    record_error(&error_slot, format!("filter: applying mask: {e}"));
+                    vec![]
+                }
+            }
+        })
+    })
+}
+
+/// `flat_map`: call a Python `fn(dict) -> list[dict]` per row; flatten into one
+/// output batch with the declared schema.
+fn py_row_flat_map_transform(
+    callable: Py<PyAny>,
+    out_schema: SchemaRef,
+    out_schema_id: u64,
+    error_slot: ErrorSlot,
+) -> BatchTransformFn {
+    Arc::new(move |buf: ErasedBuffer| {
+        let batch = compact_to_batch(&buf);
+        Python::with_gil(|py| {
+            let mut out_rows: Vec<Bound<'_, PyAny>> = Vec::with_capacity(batch.num_rows());
+            for row in 0..batch.num_rows() {
+                let dict = match batch_row_to_dict(py, &batch, row) {
+                    Ok(d) => d,
+                    Err(e) => {
+                        record_error(
+                            &error_slot,
+                            format_py_error(py, "flat_map: reading row", &e),
+                        );
+                        return vec![];
+                    }
+                };
+                let produced = match callable.bind(py).call1((dict,)) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        record_error(&error_slot, format_py_error(py, "flat_map: callable", &e));
+                        return vec![];
+                    }
+                };
+                let iter = match produced.try_iter() {
+                    Ok(it) => it,
+                    Err(e) => {
+                        record_error(
+                            &error_slot,
+                            format_py_error(py, "flat_map: return value not iterable", &e),
+                        );
+                        return vec![];
+                    }
+                };
+                for item in iter {
+                    match item {
+                        Ok(d) => out_rows.push(d),
+                        Err(e) => {
+                            record_error(
+                                &error_slot,
+                                format_py_error(py, "flat_map: iterating", &e),
+                            );
+                            return vec![];
+                        }
+                    }
+                }
+            }
+            if out_rows.is_empty() {
+                return vec![];
+            }
+            match dicts_to_batch(&out_rows, &out_schema) {
+                Ok(rb) => vec![ErasedBuffer::from_parts(rb, None, out_schema_id)],
+                Err(e) => {
+                    record_error(
+                        &error_slot,
+                        format_py_error(py, "flat_map: building output", &e),
+                    );
+                    vec![]
+                }
+            }
+        })
+    })
+}
+
+/// `inspect`: call a Python `fn(dict)` per row for side effects; pass the buffer
+/// through unchanged.
+fn py_row_inspect_transform(callable: Py<PyAny>, error_slot: ErrorSlot) -> BatchTransformFn {
+    Arc::new(move |buf: ErasedBuffer| {
+        let batch = compact_to_batch(&buf);
+        let schema_id = buf.schema_id();
+        Python::with_gil(|py| {
+            for row in 0..batch.num_rows() {
+                let dict = match batch_row_to_dict(py, &batch, row) {
+                    Ok(d) => d,
+                    Err(e) => {
+                        record_error(&error_slot, format_py_error(py, "inspect: reading row", &e));
+                        return vec![];
+                    }
+                };
+                if let Err(e) = callable.bind(py).call1((dict,)) {
+                    record_error(&error_slot, format_py_error(py, "inspect: callable", &e));
+                    return vec![];
+                }
+            }
+            vec![ErasedBuffer::from_parts(batch, None, schema_id)]
+        })
+    })
+}
+
+/// Wrap a Python `fn(dict) -> str` as a `KeyFn` for `key_by`. A Python error
+/// routes the row to a sentinel key so the run can surface it rather than panic.
+fn py_key_fn(callable: Py<PyAny>, error_slot: ErrorSlot) -> KeyFn {
+    Arc::new(move |batch: &RecordBatch, row: usize| {
+        Python::with_gil(|py| {
+            let dict = match batch_row_to_dict(py, batch, row) {
+                Ok(d) => d,
+                Err(e) => {
+                    record_error(&error_slot, format_py_error(py, "key_by: reading row", &e));
+                    return "__rhei_key_error__".to_string();
+                }
+            };
+            match callable
+                .bind(py)
+                .call1((dict,))
+                .and_then(|r| r.extract::<String>())
+            {
+                Ok(k) => k,
+                Err(e) => {
+                    record_error(&error_slot, format_py_error(py, "key_by: callable", &e));
+                    "__rhei_key_error__".to_string()
+                }
+            }
+        })
+    })
+}
+
 // ── PyDataflow / PyStream ────────────────────────────────────────────
 
 /// A rhei dataflow graph builder.
@@ -355,6 +578,27 @@ pub struct PyStream {
     handle: ErasedHandle,
 }
 
+impl PyStream {
+    /// Clone the dataflow's shared error slot (for building transforms).
+    fn error_slot(&self, py: Python<'_>) -> ErrorSlot {
+        self.df.bind(py).borrow().error_slot.clone()
+    }
+
+    /// Attach a transform to the graph and return the downstream handle.
+    fn add_transform(&self, py: Python<'_>, transform: BatchTransformFn) -> PyStream {
+        let new_handle = self
+            .df
+            .bind(py)
+            .borrow()
+            .graph
+            .add_erased_transform(self.handle, transform);
+        PyStream {
+            df: self.df.clone_ref(py),
+            handle: new_handle,
+        }
+    }
+}
+
 #[pymethods]
 impl PyStream {
     /// Apply a Python `fn(Buffer) -> Buffer` to each batch. `schema` is the
@@ -367,9 +611,76 @@ impl PyStream {
     ) -> PyResult<PyStream> {
         let out_schema = Schema::from_pyarrow_bound(schema)?;
         let out_schema_id = schema_hash_of(&out_schema);
-        let df_ref = self.df.bind(py).borrow();
-        let transform = py_map_batches_transform(func, out_schema_id, df_ref.error_slot.clone());
-        let new_handle = df_ref.graph.add_erased_transform(self.handle, transform);
+        let transform = py_map_batches_transform(func, out_schema_id, self.error_slot(py));
+        Ok(self.add_transform(py, transform))
+    }
+
+    /// Apply a Python `fn(dict) -> dict` to each row. `schema` is the output
+    /// Arrow schema (a pyarrow `Schema`).
+    fn map(
+        &self,
+        py: Python<'_>,
+        func: Py<PyAny>,
+        schema: &Bound<'_, PyAny>,
+    ) -> PyResult<PyStream> {
+        let out_schema: SchemaRef = Arc::new(Schema::from_pyarrow_bound(schema)?);
+        let out_schema_id = schema_hash_of(&out_schema);
+        let transform = py_row_map_transform(func, out_schema, out_schema_id, self.error_slot(py));
+        Ok(self.add_transform(py, transform))
+    }
+
+    /// Keep rows for which a Python `fn(dict) -> bool` returns `True`.
+    fn filter(&self, py: Python<'_>, func: Py<PyAny>) -> PyResult<PyStream> {
+        let transform = py_row_filter_transform(func, self.error_slot(py));
+        Ok(self.add_transform(py, transform))
+    }
+
+    /// Apply a Python `fn(dict) -> list[dict]` to each row, flattening the
+    /// results. `schema` is the output Arrow schema (a pyarrow `Schema`).
+    fn flat_map(
+        &self,
+        py: Python<'_>,
+        func: Py<PyAny>,
+        schema: &Bound<'_, PyAny>,
+    ) -> PyResult<PyStream> {
+        let out_schema: SchemaRef = Arc::new(Schema::from_pyarrow_bound(schema)?);
+        let out_schema_id = schema_hash_of(&out_schema);
+        let transform =
+            py_row_flat_map_transform(func, out_schema, out_schema_id, self.error_slot(py));
+        Ok(self.add_transform(py, transform))
+    }
+
+    /// Call a Python `fn(dict)` for each row (side effects only); the stream is
+    /// unchanged.
+    fn inspect(&self, py: Python<'_>, func: Py<PyAny>) -> PyResult<PyStream> {
+        let transform = py_row_inspect_transform(func, self.error_slot(py));
+        Ok(self.add_transform(py, transform))
+    }
+
+    /// Repartition by a Python `fn(dict) -> str` key so equal keys land on the
+    /// same worker.
+    fn key_by(&self, py: Python<'_>, func: Py<PyAny>) -> PyResult<PyStream> {
+        let key_fn = py_key_fn(func, self.error_slot(py));
+        let new_handle = self
+            .df
+            .bind(py)
+            .borrow()
+            .graph
+            .add_key_by(self.handle, key_fn);
+        Ok(PyStream {
+            df: self.df.clone_ref(py),
+            handle: new_handle,
+        })
+    }
+
+    /// Merge this stream with another of the same schema into one.
+    fn merge(&self, py: Python<'_>, other: &PyStream) -> PyResult<PyStream> {
+        let new_handle = self
+            .df
+            .bind(py)
+            .borrow()
+            .graph
+            .add_merge(self.handle, other.handle);
         Ok(PyStream {
             df: self.df.clone_ref(py),
             handle: new_handle,

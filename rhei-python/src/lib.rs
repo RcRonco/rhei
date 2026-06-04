@@ -6,6 +6,7 @@
 use pyo3::prelude::*;
 
 mod buffer;
+mod codec;
 mod dataflow;
 
 use buffer::PyBuffer;
