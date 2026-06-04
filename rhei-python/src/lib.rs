@@ -5,11 +5,21 @@
 
 use pyo3::prelude::*;
 
+mod buffer;
+mod dataflow;
+
+use buffer::PyBuffer;
+use dataflow::{PyCollectHandle, PyDataflow, PyStream};
+
 /// The compiled extension module. Named `_rhei` to match
 /// `module-name = "rhei._rhei"` in `pyproject.toml`; the pure-Python
 /// `rhei` package re-exports from it.
 #[pymodule]
 fn _rhei(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
+    m.add_class::<PyBuffer>()?;
+    m.add_class::<PyDataflow>()?;
+    m.add_class::<PyStream>()?;
+    m.add_class::<PyCollectHandle>()?;
     Ok(())
 }
