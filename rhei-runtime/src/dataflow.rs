@@ -127,6 +127,15 @@ impl SinkNode for PreErasedSinkNode {
     }
 }
 
+/// Wraps an already-erased [`ErasedBatchOperator`] so it slots into an operator node.
+struct PreErasedBatchOperatorNode(Box<dyn ErasedBatchOperator>);
+
+impl BatchOperatorNode for PreErasedBatchOperatorNode {
+    fn compile(self: Box<Self>) -> Box<dyn ErasedBatchOperator> {
+        self.0
+    }
+}
+
 /// Deferred batch transform: stores a factory that produces the erased closure.
 pub(crate) struct LazyBatchTransformNode(pub(crate) Box<dyn FnOnce() -> BatchTransformFn + Send>);
 
@@ -279,6 +288,30 @@ impl DataflowGraph {
             NodeKind::Sink(Box::new(PreErasedSinkNode(sink))),
             vec![input.0],
         );
+    }
+
+    /// Add a pre-erased *stateful* batch operator downstream of `input`.
+    ///
+    /// The public, schema-erased counterpart to the typed `Stream::operator`:
+    /// the caller supplies a `Box<dyn ErasedBatchOperator>` directly. `name`
+    /// namespaces the operator's [`OperatorContext`] state for checkpointing.
+    /// Returns the new [`ErasedHandle`].
+    ///
+    /// [`OperatorContext`]: rhei_core::arrow::OperatorContext
+    pub fn add_erased_operator(
+        &self,
+        input: ErasedHandle,
+        name: &str,
+        op: Box<dyn ErasedBatchOperator>,
+    ) -> ErasedHandle {
+        let id = self.add_node(
+            NodeKind::BatchOperator {
+                name: name.to_string(),
+                op: Box::new(PreErasedBatchOperatorNode(op)),
+            },
+            vec![input.0],
+        );
+        ErasedHandle(id)
     }
 
     /// Add a key-based exchange downstream of `input`: partitions rows by the

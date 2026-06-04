@@ -148,8 +148,15 @@ where
 // ── Type-erased batch operator ────────────────────────────────────────
 
 /// Type-erased batch operator that processes [`ErasedBuffer`] → [`ErasedBuffer`].
+///
+/// This is the dynamic counterpart to a typed [`StreamFunction`]: it carries no
+/// compile-time schema type, so it can be implemented by callers (e.g. the
+/// Python bindings) that build operators against a runtime Arrow schema. Attach
+/// one to a graph with [`add_erased_operator`].
+///
+/// [`add_erased_operator`]: crate::dataflow::DataflowGraph::add_erased_operator
 #[async_trait]
-pub(crate) trait ErasedBatchOperator: Send {
+pub trait ErasedBatchOperator: Send {
     /// Process an input buffer and produce output buffers.
     async fn process(
         &mut self,

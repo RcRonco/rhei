@@ -9,9 +9,10 @@ use arrow_array::{Int64Array, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
 use async_trait::async_trait;
 
+use rhei_core::arrow::OperatorContext;
 use rhei_runtime::controller::PipelineController;
 use rhei_runtime::dataflow::{BatchTransformFn, DataflowGraph};
-use rhei_runtime::erased_batch::{ErasedSink, ErasedSource};
+use rhei_runtime::erased_batch::{ErasedBatchOperator, ErasedSink, ErasedSource};
 use rhei_runtime::erased_buffer::{ErasedBuffer, schema_hash_of};
 
 /// A single-Int64-column schema: `{ n: Int64 }`.
@@ -130,4 +131,96 @@ async fn erased_source_transform_sink_runs() {
         .clone();
     got.sort_unstable();
     assert_eq!(got, vec![2, 4, 6, 8, 10]);
+}
+
+/// A stateful erased operator: keeps a running sum in `ctx.state` and emits the
+/// cumulative total for each input value. Proves `add_erased_operator` wires an
+/// `ErasedBatchOperator` into the graph with working state access.
+struct RunningSumOp {
+    schema_id: u64,
+    schema: Arc<Schema>,
+}
+
+#[async_trait]
+impl ErasedBatchOperator for RunningSumOp {
+    async fn process(
+        &mut self,
+        input: ErasedBuffer,
+        ctx: &mut OperatorContext,
+    ) -> anyhow::Result<Vec<ErasedBuffer>> {
+        let mut running: i64 = ctx.state.get(b"sum").await?.unwrap_or(0);
+        let mut out = Vec::new();
+        for v in values_of(&input) {
+            running += v;
+            out.push(running);
+        }
+        ctx.state.put(b"sum", &running)?;
+        let col = Int64Array::from(out);
+        let batch = RecordBatch::try_new(self.schema.clone(), vec![Arc::new(col)])?;
+        Ok(vec![ErasedBuffer::from_parts(batch, None, self.schema_id)])
+    }
+    async fn on_watermark(
+        &mut self,
+        _watermark: u64,
+        _ctx: &mut OperatorContext,
+    ) -> anyhow::Result<Vec<ErasedBuffer>> {
+        Ok(vec![])
+    }
+    async fn open(&mut self, _ctx: &mut OperatorContext) -> anyhow::Result<()> {
+        Ok(())
+    }
+    async fn close(&mut self) -> anyhow::Result<()> {
+        Ok(())
+    }
+    async fn on_timer(
+        &mut self,
+        _timestamp: u64,
+        _key: &str,
+        _ctx: &mut OperatorContext,
+    ) -> anyhow::Result<Vec<ErasedBuffer>> {
+        Ok(vec![])
+    }
+    fn clone_erased(&self) -> Box<dyn ErasedBatchOperator> {
+        Box::new(RunningSumOp {
+            schema_id: self.schema_id,
+            schema: self.schema.clone(),
+        })
+    }
+}
+
+#[tokio::test]
+async fn erased_stateful_operator_runs() {
+    let checkpoint_dir = tempfile::tempdir().unwrap();
+    let collected = Arc::new(Mutex::new(Vec::<i64>::new()));
+
+    let source = ListSource {
+        batches: std::collections::VecDeque::from(vec![
+            erased_from(&[1, 2, 3]),
+            erased_from(&[4, 5]),
+        ]),
+    };
+    let schema = n_schema();
+    let op = RunningSumOp {
+        schema_id: schema_hash_of(&schema),
+        schema,
+    };
+    let sink = CollectSink {
+        out: collected.clone(),
+    };
+
+    let graph = DataflowGraph::new();
+    let src = graph.add_erased_source(Box::new(source));
+    let summed = graph.add_erased_operator(src, "running_sum", Box::new(op));
+    graph.add_erased_sink(summed, Box::new(sink));
+
+    // Single worker so the running sum sees all rows in order.
+    let ctrl = PipelineController::new(checkpoint_dir.path().to_path_buf()).with_workers(1);
+    ctrl.run(graph).await.unwrap();
+
+    let got = collected
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    // Cumulative sums of 1,2,3,4,5 = 1,3,6,10,15.
+    assert_eq!(got, vec![1, 3, 6, 10, 15]);
 }
