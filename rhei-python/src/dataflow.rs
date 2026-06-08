@@ -23,6 +23,9 @@ use rhei_runtime::erased_buffer::{ErasedBuffer, KeyFn, schema_hash_of};
 use crate::buffer::PyBuffer;
 use crate::codec::{batch_row_to_dict, dicts_to_batch};
 
+/// Monotonic counter making each implicit per-run checkpoint dir unique.
+static CHECKPOINT_DIR_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 // ── Source: drains a fixed list of ErasedBuffers ─────────────────────
 
 struct ListSource {
@@ -156,9 +159,9 @@ impl PyCollectHandle {
 /// checks the slot after the pipeline drains and re-raises it as a Python
 /// exception. This turns a green run with silently-dropped batches into a loud
 /// failure.
-type ErrorSlot = Arc<Mutex<Option<String>>>;
+pub(crate) type ErrorSlot = Arc<Mutex<Option<String>>>;
 
-fn record_error(slot: &ErrorSlot, message: String) {
+pub(crate) fn record_error(slot: &ErrorSlot, message: String) {
     let mut guard = slot
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -536,9 +539,14 @@ impl PyDataflow {
         self.has_run = true;
         // DataflowGraph::run consumes the graph; swap in a fresh empty one.
         let graph = std::mem::replace(&mut self.graph, DataflowGraph::new());
+        // With no explicit checkpoint_dir, use a fresh per-run directory so each
+        // run starts with clean state — implicitly recovering an unrelated prior
+        // run's state would be surprising. Pass checkpoint_dir= to opt into
+        // persistence and recovery across runs.
         let dir = checkpoint_dir.unwrap_or_else(|| {
+            let seq = CHECKPOINT_DIR_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             std::env::temp_dir()
-                .join("rhei-python-ckpt")
+                .join(format!("rhei-python-ckpt-{}-{}", std::process::id(), seq))
                 .to_string_lossy()
                 .into_owned()
         });
@@ -681,6 +689,22 @@ impl PyStream {
             .borrow()
             .graph
             .add_merge(self.handle, other.handle);
+        Ok(PyStream {
+            df: self.df.clone_ref(py),
+            handle: new_handle,
+        })
+    }
+
+    /// Attach a custom stateful operator (an instance of a `rhei.Operator`
+    /// subclass). `name` namespaces the operator's checkpointed state.
+    fn operator(&self, py: Python<'_>, name: &str, op: Py<PyAny>) -> PyResult<PyStream> {
+        let py_op = crate::operator::PyOperator::new(op, self.error_slot(py));
+        let new_handle =
+            self.df
+                .bind(py)
+                .borrow()
+                .graph
+                .add_erased_operator(self.handle, name, Box::new(py_op));
         Ok(PyStream {
             df: self.df.clone_ref(py),
             handle: new_handle,

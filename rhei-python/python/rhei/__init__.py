@@ -18,6 +18,43 @@ Build a pipeline over Arrow batches and run it on the rhei runtime:
     df.run(workers=1)
 """
 
-from ._rhei import Buffer, CollectHandle, Dataflow, Stream, __version__
+from ._rhei import Buffer, CollectHandle, Dataflow, State, Stream, __version__
 
-__all__ = ["Buffer", "CollectHandle", "Dataflow", "Stream", "__version__"]
+
+class Operator:
+    """Base class for custom stateful operators.
+
+    Subclass and implement ``process``; optionally override ``on_watermark``,
+    ``on_timer``, ``open``, and ``close``. Attach an instance with
+    ``stream.operator("name", MyOp())``.
+
+    Each method (except ``close``) receives a ``state`` handle exposing
+    ``get(key) -> bytes | None``, ``put(key, value)``, ``delete(key)``, and
+    ``register_timer(timestamp, key)``. The handle is valid only for the
+    duration of that call; do not store it. State is namespaced per operator
+    and survives checkpoint/restart.
+
+    Methods that emit downstream return a ``list`` of ``rhei.Buffer`` (or a
+    single ``Buffer``, or ``None`` for nothing).
+
+    Only the methods you define are called — the base class intentionally does
+    not provide no-op defaults for the optional hooks, so the runtime can detect
+    which you implemented.
+    """
+
+    def process(self, buffer, state):  # noqa: D401
+        """Handle an input ``Buffer``. Override this."""
+        raise NotImplementedError(
+            f"{type(self).__name__}.process(self, buffer, state) is not implemented"
+        )
+
+
+__all__ = [
+    "Buffer",
+    "CollectHandle",
+    "Dataflow",
+    "Operator",
+    "State",
+    "Stream",
+    "__version__",
+]

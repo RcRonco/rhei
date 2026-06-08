@@ -3815,7 +3815,9 @@ dependencies = [
  "arrow-array",
  "arrow-schema",
  "async-trait",
+ "futures",
  "pyo3",
+ "rhei-core",
  "rhei-runtime",
  "tokio",
 ]

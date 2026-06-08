@@ -8,9 +8,11 @@ use pyo3::prelude::*;
 mod buffer;
 mod codec;
 mod dataflow;
+mod operator;
 
 use buffer::PyBuffer;
 use dataflow::{PyCollectHandle, PyDataflow, PyStream};
+use operator::PyStateHandle;
 
 /// The compiled extension module. Named `_rhei` to match
 /// `module-name = "rhei._rhei"` in `pyproject.toml`; the pure-Python
@@ -22,5 +24,6 @@ fn _rhei(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyDataflow>()?;
     m.add_class::<PyStream>()?;
     m.add_class::<PyCollectHandle>()?;
+    m.add_class::<PyStateHandle>()?;
     Ok(())
 }

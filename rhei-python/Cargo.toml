@@ -18,7 +18,9 @@ arrow = { version = "54", features = ["pyarrow", "prettyprint"] }
 arrow-array = "54"
 arrow-schema = "54"
 rhei-runtime = { path = "../rhei-runtime" }
+rhei-core = { path = "../rhei-core" }
 tokio = { version = "1", features = ["rt-multi-thread"] }
+futures = "0.3"
 anyhow = "1"
 async-trait = "0.1"
 

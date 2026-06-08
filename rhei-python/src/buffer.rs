@@ -47,6 +47,12 @@ impl PyBuffer {
         self.inner.as_record_batch().to_pyarrow(py)
     }
 
+    /// Number of rows in the buffer.
+    #[getter]
+    fn num_rows(&self) -> usize {
+        self.inner.num_rows()
+    }
+
     fn __len__(&self) -> usize {
         self.inner.num_rows()
     }
