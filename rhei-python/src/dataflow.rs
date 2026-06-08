@@ -22,6 +22,7 @@ use rhei_runtime::erased_buffer::{ErasedBuffer, KeyFn, schema_hash_of};
 
 use crate::buffer::PyBuffer;
 use crate::codec::{batch_row_to_dict, dicts_to_batch};
+use crate::window::PyAgg;
 
 /// Monotonic counter making each implicit per-run checkpoint dir unique.
 static CHECKPOINT_DIR_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -170,7 +171,7 @@ pub(crate) fn record_error(slot: &ErrorSlot, message: String) {
     }
 }
 
-fn format_py_error(py: Python<'_>, context: &str, err: &PyErr) -> String {
+pub(crate) fn format_py_error(py: Python<'_>, context: &str, err: &PyErr) -> String {
     let msg = err.value(py).str().map_or_else(
         |_| "<unprintable Python error>".to_string(),
         |s| s.to_string_lossy().into_owned(),
@@ -705,6 +706,42 @@ impl PyStream {
                 .borrow()
                 .graph
                 .add_erased_operator(self.handle, name, Box::new(py_op));
+        Ok(PyStream {
+            df: self.df.clone_ref(py),
+            handle: new_handle,
+        })
+    }
+
+    /// Tumbling-window aggregation. `key_fn(row) -> str` groups rows,
+    /// `time_fn(row) -> int` extracts event time (millis), and `aggs` is a list
+    /// of `rhei.Agg` specs. Emits one row per `(key, window)` with the fixed
+    /// schema `[key, window_start, window_end, <agg columns>]` when the
+    /// watermark passes a window's end.
+    ///
+    /// Prefer `key_by(key_fn)` upstream so each key is aggregated on one worker.
+    fn tumbling_window(
+        &self,
+        py: Python<'_>,
+        window_size_ms: i64,
+        key_fn: Py<PyAny>,
+        time_fn: Py<PyAny>,
+        aggs: Vec<PyAgg>,
+    ) -> PyResult<PyStream> {
+        if window_size_ms <= 0 {
+            return Err(PyRuntimeError::new_err("window_size_ms must be positive"));
+        }
+        let op = crate::window::TumblingWindowAgg::new(
+            window_size_ms,
+            key_fn,
+            time_fn,
+            aggs,
+            self.error_slot(py),
+        );
+        let new_handle = self.df.bind(py).borrow().graph.add_erased_operator(
+            self.handle,
+            "tumbling_window",
+            Box::new(op),
+        );
         Ok(PyStream {
             df: self.df.clone_ref(py),
             handle: new_handle,

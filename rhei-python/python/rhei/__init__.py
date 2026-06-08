@@ -18,7 +18,7 @@ Build a pipeline over Arrow batches and run it on the rhei runtime:
     df.run(workers=1)
 """
 
-from ._rhei import Buffer, CollectHandle, Dataflow, State, Stream, __version__
+from ._rhei import Agg, Buffer, CollectHandle, Dataflow, State, Stream, __version__
 
 
 class Operator:
@@ -50,6 +50,7 @@ class Operator:
 
 
 __all__ = [
+    "Agg",
     "Buffer",
     "CollectHandle",
     "Dataflow",

@@ -104,16 +104,9 @@ def test_operator_delete_state():
     assert c.values() == [1, 2, 1]
 
 
-def test_operator_timer_fires_with_state_access():
-    """A registered timer fires (at the end-of-stream watermark) and on_timer
-    runs with full state access.
-
-    Note: emitting *new* downstream output from on_timer at end-of-stream is not
-    reliably delivered by the runtime (the source capability may already be
-    released), so this test asserts the timer's observable effects — it fired,
-    saw the right key/timestamp, and could read the accumulated state — via a
-    Python side channel rather than via emitted buffers.
-    """
+def test_operator_timer_fires_and_emits():
+    """A registered timer fires at the end-of-stream watermark; on_timer runs
+    with full state access AND its emitted output reaches the sink."""
     fired = []
 
     class SumThenFlush(rhei.Operator):
@@ -123,24 +116,28 @@ def test_operator_timer_fires_with_state_access():
                 total += v
             state.put(b"sum", _i64(total))
             state.register_timer(100, "flush")
-            return []
+            return []  # emit nothing during processing
 
         def on_timer(self, timestamp, key, state):
-            fired.append((timestamp, key, _from_i64(state.get(b"sum"))))
-            return []
+            total = _from_i64(state.get(b"sum"))
+            fired.append((timestamp, key, total))
+            col = pa.array([total], type=pa.int64())
+            return [rhei.Buffer.from_arrow(pa.record_batch([col], schema=INT))]
 
     df = rhei.Dataflow()
-    (
+    c = (
         df.source([_ints([1, 2, 3])[0], _ints([4, 5])[0]])
         .operator("sum_flush", SumThenFlush())
         .sink_collect()
     )
     df.run(workers=1)
 
-    # The timer fired at least once, saw its key, and read the grand total (15).
-    assert fired, "on_timer should have fired at end of stream"
+    # on_timer fired with the right key and read the grand total (15)...
+    assert fired
     assert all(key == "flush" for _ts, key, _total in fired)
     assert any(total == 15 for _ts, _key, total in fired)
+    # ...and its emitted buffer reached the sink.
+    assert 15 in c.values()
 
 
 def test_operator_on_watermark_hook():
