@@ -1,0 +1,28 @@
+[package]
+name = "rhei-python"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# `name` is the Rust artifact name only; it must differ from the workspace
+# `rhei` crate because both build into the shared ../target dir. The Python
+# module name is set by `module-name = "rhei._rhei"` in pyproject.toml and the
+# `#[pymodule] fn _rhei` in src/lib.rs, independent of this.
+[lib]
+name = "rhei_python"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { version = "0.23", features = ["extension-module"] }
+arrow = { version = "54", features = ["pyarrow", "prettyprint"] }
+arrow-array = "54"
+arrow-schema = "54"
+rhei-runtime = { path = "../rhei-runtime" }
+rhei-core = { path = "../rhei-core" }
+tokio = { version = "1", features = ["rt-multi-thread"] }
+futures = "0.3"
+anyhow = "1"
+async-trait = "0.1"
+
+[lints.rust]
+unsafe_code = "forbid"

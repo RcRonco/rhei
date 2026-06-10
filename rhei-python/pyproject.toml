@@ -1,0 +1,21 @@
+[build-system]
+requires = ["maturin>=1.7,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "rhei"
+version = "0.1.0"
+description = "Python bindings for the rhei stream-processing framework"
+requires-python = ">=3.9"
+dependencies = ["pyarrow>=14"]
+
+[dependency-groups]
+# Installed by `uv sync --dev` (see `just py-setup`).
+dev = ["maturin>=1.7,<2.0", "pytest>=8"]
+
+[tool.maturin]
+features = ["pyo3/extension-module"]
+python-source = "python"
+module-name = "rhei._rhei"
+# Ship the PEP 561 marker and type stubs in built wheels.
+include = ["python/rhei/py.typed", "python/rhei/*.pyi"]

@@ -14,7 +14,7 @@ use crate::erased_buffer::ErasedBuffer;
 
 /// Type-erased source that produces [`ErasedBuffer`] batches.
 #[async_trait]
-pub(crate) trait ErasedSource: Send {
+pub trait ErasedSource: Send {
     /// Pull the next batch. Returns `None` when exhausted.
     async fn next_batch(&mut self) -> Option<ErasedBuffer>;
     /// Called after a successful checkpoint.
@@ -120,7 +120,7 @@ impl<T: RheiSchema + Sync> ErasedSource for DynSourceWrapper<T> {
 
 /// Type-erased sink that consumes [`ErasedBuffer`] batches.
 #[async_trait]
-pub(crate) trait ErasedSink: Send {
+pub trait ErasedSink: Send {
     /// Write an erased buffer.
     async fn write_batch(&mut self, buf: ErasedBuffer) -> anyhow::Result<()>;
     /// Flush any buffered data.
@@ -148,8 +148,15 @@ where
 // ── Type-erased batch operator ────────────────────────────────────────
 
 /// Type-erased batch operator that processes [`ErasedBuffer`] → [`ErasedBuffer`].
+///
+/// This is the dynamic counterpart to a typed [`StreamFunction`]: it carries no
+/// compile-time schema type, so it can be implemented by callers (e.g. the
+/// Python bindings) that build operators against a runtime Arrow schema. Attach
+/// one to a graph with [`add_erased_operator`].
+///
+/// [`add_erased_operator`]: crate::dataflow::DataflowGraph::add_erased_operator
 #[async_trait]
-pub(crate) trait ErasedBatchOperator: Send {
+pub trait ErasedBatchOperator: Send {
     /// Process an input buffer and produce output buffers.
     async fn process(
         &mut self,

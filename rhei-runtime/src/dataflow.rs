@@ -40,6 +40,14 @@ use crate::erased_buffer::{ErasedBuffer, KeyFn};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct NodeId(pub(crate) usize);
 
+/// Opaque handle to a node when building a graph through the public
+/// erased-builder API ([`DataflowGraph::add_erased_source`] and friends).
+///
+/// Unlike [`Stream<T>`], an `ErasedHandle` carries no compile-time schema
+/// type — the buffers flowing through it are runtime-typed [`ErasedBuffer`]s.
+#[derive(Debug, Clone, Copy)]
+pub struct ErasedHandle(NodeId);
+
 // ── Batch (Arrow) compile traits ────────────────────────────────────
 
 /// A batch source node that produces `ErasedBuffer` batches.
@@ -58,7 +66,7 @@ pub(crate) trait SinkNode: Send {
 }
 
 /// A batch-level transform: `ErasedBuffer` → `Vec<ErasedBuffer>`.
-pub(crate) type BatchTransformFn = Arc<dyn Fn(ErasedBuffer) -> Vec<ErasedBuffer> + Send + Sync>;
+pub type BatchTransformFn = Arc<dyn Fn(ErasedBuffer) -> Vec<ErasedBuffer> + Send + Sync>;
 
 // ── Typed batch node wrappers ───────────────────────────────────────
 
@@ -96,6 +104,35 @@ where
 {
     fn compile(self: Box<Self>) -> Box<dyn ErasedSink> {
         Box::new(SinkWrapper(self.0))
+    }
+}
+
+// ── Pre-erased node adapters (for the public erased-builder API) ─────
+
+/// Wraps an already-erased [`ErasedSource`] so it slots into a `Source` node.
+struct PreErasedSourceNode(Box<dyn ErasedSource>);
+
+impl SourceNode for PreErasedSourceNode {
+    fn compile(self: Box<Self>) -> Box<dyn ErasedSource> {
+        self.0
+    }
+}
+
+/// Wraps an already-erased [`ErasedSink`] so it slots into a `Sink` node.
+struct PreErasedSinkNode(Box<dyn ErasedSink>);
+
+impl SinkNode for PreErasedSinkNode {
+    fn compile(self: Box<Self>) -> Box<dyn ErasedSink> {
+        self.0
+    }
+}
+
+/// Wraps an already-erased [`ErasedBatchOperator`] so it slots into an operator node.
+struct PreErasedBatchOperatorNode(Box<dyn ErasedBatchOperator>);
+
+impl BatchOperatorNode for PreErasedBatchOperatorNode {
+    fn compile(self: Box<Self>) -> Box<dyn ErasedBatchOperator> {
+        self.0
     }
 }
 
@@ -218,6 +255,79 @@ impl DataflowGraph {
     /// Consume the graph and return the raw node list for compilation.
     pub(crate) fn into_nodes(self) -> Vec<GraphNode> {
         self.nodes.into_inner()
+    }
+
+    /// Add a pre-erased data source. Returns an [`ErasedHandle`].
+    ///
+    /// The public, schema-erased counterpart to [`source`](Self::source):
+    /// the caller supplies a `Box<dyn ErasedSource>` directly instead of a
+    /// typed `Source`.
+    pub fn add_erased_source(&self, source: Box<dyn ErasedSource>) -> ErasedHandle {
+        let id = self.add_node(
+            NodeKind::Source(Box::new(PreErasedSourceNode(source))),
+            vec![],
+        );
+        ErasedHandle(id)
+    }
+
+    /// Add a stateless batch transform (`ErasedBuffer` → `Vec<ErasedBuffer>`)
+    /// downstream of `input`. Returns the new [`ErasedHandle`].
+    pub fn add_erased_transform(
+        &self,
+        input: ErasedHandle,
+        transform: BatchTransformFn,
+    ) -> ErasedHandle {
+        let node = LazyBatchTransformNode(Box::new(move || transform));
+        let id = self.add_node(NodeKind::Transform(node), vec![input.0]);
+        ErasedHandle(id)
+    }
+
+    /// Add a pre-erased sink consuming the stream at `input` (terminal).
+    pub fn add_erased_sink(&self, input: ErasedHandle, sink: Box<dyn ErasedSink>) {
+        self.add_node(
+            NodeKind::Sink(Box::new(PreErasedSinkNode(sink))),
+            vec![input.0],
+        );
+    }
+
+    /// Add a pre-erased *stateful* batch operator downstream of `input`.
+    ///
+    /// The public, schema-erased counterpart to the typed `Stream::operator`:
+    /// the caller supplies a `Box<dyn ErasedBatchOperator>` directly. `name`
+    /// namespaces the operator's [`OperatorContext`] state for checkpointing.
+    /// Returns the new [`ErasedHandle`].
+    ///
+    /// [`OperatorContext`]: rhei_core::arrow::OperatorContext
+    pub fn add_erased_operator(
+        &self,
+        input: ErasedHandle,
+        name: &str,
+        op: Box<dyn ErasedBatchOperator>,
+    ) -> ErasedHandle {
+        let id = self.add_node(
+            NodeKind::BatchOperator {
+                name: name.to_string(),
+                op: Box::new(PreErasedBatchOperatorNode(op)),
+            },
+            vec![input.0],
+        );
+        ErasedHandle(id)
+    }
+
+    /// Add a key-based exchange downstream of `input`: partitions rows by the
+    /// hash of `key_fn(batch, row)` and routes them so equal keys land on the
+    /// same worker. Returns the new [`ErasedHandle`].
+    pub fn add_key_by(&self, input: ErasedHandle, key_fn: KeyFn) -> ErasedHandle {
+        let node = LazyKeyByNode(Box::new(move || key_fn));
+        let id = self.add_node(NodeKind::KeyBy(node), vec![input.0]);
+        ErasedHandle(id)
+    }
+
+    /// Merge two erased streams of the same schema into one. Returns the new
+    /// [`ErasedHandle`].
+    pub fn add_merge(&self, a: ErasedHandle, b: ErasedHandle) -> ErasedHandle {
+        let id = self.add_node(NodeKind::Merge, vec![a.0, b.0]);
+        ErasedHandle(id)
     }
 }
 

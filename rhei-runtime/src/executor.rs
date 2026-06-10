@@ -582,10 +582,23 @@ impl DataflowExecutor {
                     let time_results =
                         timely_op.advance_time(wm, &mut last_watermark, &oc.rt);
                     emit(time_results, &retained_cap);
-                    if let Some(ref cap) = retained_cap
-                        && !frontier.less_equal(cap.time())
-                    {
-                        retained_cap = None;
+                    // Keep a capability alive for watermark/timer-driven output
+                    // (e.g. window emission) that fires *after* the data epoch
+                    // closes — including the final SourceExhausted watermark at
+                    // end of stream. Downgrade it to the current frontier so it
+                    // stays valid; only release it once the frontier is empty.
+                    if let Some(cap) = retained_cap.take() {
+                        let fr = frontier.frontier();
+                        if fr.is_empty() {
+                            // Stream finished: drop the capability.
+                        } else if let Some(&t) = fr.iter().min()
+                            && t > *cap.time()
+                        {
+                            // `delayed` requires a strictly-greater time.
+                            retained_cap = Some(cap.delayed(&t));
+                        } else {
+                            retained_cap = Some(cap);
+                        }
                     }
                     let fv: Vec<u64> = frontier.frontier().iter().copied().collect();
                     if let Some(epoch) = try_batch_checkpoint(

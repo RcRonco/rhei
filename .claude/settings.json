@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cargo clippy:*)",
+      "Bash(cargo check:*)",
+      "Bash(cargo nextest:*)",
+      "Bash(cargo fmt:*)",
+      "Bash(cargo deny:*)",
+      "Bash(cargo tree:*)",
+      "Bash(cargo metadata:*)",
+      "Bash(just lint)",
+      "mcp__notion__notion-fetch"
+    ]
+  }
+}

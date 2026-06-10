@@ -1,0 +1,6 @@
+# Share the workspace target dir so heavy deps (arrow, datafusion, rhei-runtime)
+# built for the workspace are reused, instead of compiling a second full copy
+# into rhei-python/target. rhei-python is excluded from the workspace, so it
+# does not get this dir automatically.
+[build]
+target-dir = "../target"

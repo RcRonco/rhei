@@ -24,7 +24,7 @@ pub mod controller;
 /// [`Stream<T>`](dataflow::Stream).
 pub mod dataflow;
 /// Type-erased batch operator/source/sink wrappers for Arrow columnar execution.
-pub(crate) mod erased_batch;
+pub mod erased_batch;
 /// Type-erased Arrow buffer for Timely dataflow channels.
 pub mod erased_buffer;
 /// Pure Timely DAG construction and execution.
