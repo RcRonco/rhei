@@ -74,6 +74,32 @@ e2e-s3:
 e2e-checkpoint:
     cargo test -p rhei-runtime --test checkpoint_coord_e2e -- --nocapture
 
+# ── Python bindings (rhei-python) ───────────────────────────────────
+
+py_dir := "rhei-python"
+
+# Create the venv (if missing) and install dev tooling (also builds via maturin)
+py-setup:
+    cd {{ py_dir }} && test -d .venv || uv venv
+    cd {{ py_dir }} && uv sync --dev
+
+# Recompile the extension into the venv (editable); runs py-setup first
+py-build: py-setup
+    # maturin directly, not `uv run` (which would re-sync and clobber the install)
+    cd {{ py_dir }} && VIRTUAL_ENV="$PWD/.venv" .venv/bin/maturin develop
+
+# Run the Python test suite (builds first)
+py-test: py-build
+    cd {{ py_dir }} && .venv/bin/python -m pytest tests/ -q
+
+# Lint the rhei-python crate (excluded from the workspace)
+py-clippy:
+    cd {{ py_dir }} && cargo clippy --no-deps -- -D warnings
+
+# Check formatting of the rhei-python crate
+py-fmt-check:
+    cd {{ py_dir }} && cargo fmt -- --check
+
 # ── CI (mirrors GitHub Actions) ─────────────────────────────────────
 
 # Run the full CI suite locally

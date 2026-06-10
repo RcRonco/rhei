@@ -131,11 +131,11 @@ jobs:
         run: cargo fmt -- --check
       - name: Run clippy
         run: cargo clippy --no-deps -- -D warnings
-      - name: Create venv and install tooling
+      - name: Create venv and install tooling (also builds via maturin)
         run: |
           uv venv
-          uv pip install maturin pyarrow pytest
-      - name: Build extension
-        run: uv run maturin develop
+          uv sync --dev
+      - name: Build extension (editable)
+        run: VIRTUAL_ENV="$PWD/.venv" .venv/bin/maturin develop
       - name: Run pytest
-        run: uv run pytest tests/ -q
+        run: .venv/bin/python -m pytest tests/ -q
