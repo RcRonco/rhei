@@ -523,14 +523,47 @@ impl PyDataflow {
         Ok(PyStream { df: slf, handle })
     }
 
+    /// Add a custom Python source (an instance of a `rhei.Source` subclass that
+    /// implements `next_batch() -> Buffer | None`). Returns a `Stream`.
+    fn from_source(slf: Py<Self>, py: Python<'_>, source: Py<PyAny>) -> PyResult<PyStream> {
+        let bound = slf.bind(py).borrow();
+        let py_source = crate::source::PySource::new(source, bound.error_slot.clone());
+        let handle = bound.graph.add_erased_source(Box::new(py_source));
+        drop(bound);
+        Ok(PyStream { df: slf, handle })
+    }
+
     /// Run the pipeline to completion (blocking). Owns the tokio runtime and
     /// releases the GIL while the pipeline executes.
-    #[pyo3(signature = (workers = 1, checkpoint_dir = None))]
+    ///
+    /// - `workers`: number of Timely workers.
+    /// - `checkpoint_dir`: persist/recover state here; omit for a fresh per-run
+    ///   directory (no implicit recovery).
+    /// - `metrics_addr`: if set (e.g. `"0.0.0.0:9090"`), serve Prometheus
+    ///   metrics over HTTP.
+    /// - `on_error`: `"skip"` (default — log and drop failing records) or
+    ///   `"dlq"` (route them to `dlq_path`).
+    /// - `dlq_path`: file path for the dead-letter queue when `on_error="dlq"`.
+    /// - `handle_sigint`: install a Ctrl-C handler that triggers a graceful
+    ///   drain + checkpoint (default `True`).
+    #[pyo3(signature = (
+        workers = 1,
+        checkpoint_dir = None,
+        metrics_addr = None,
+        on_error = "skip".to_string(),
+        dlq_path = None,
+        handle_sigint = true,
+    ))]
+    #[allow(clippy::too_many_arguments, clippy::fn_params_excessive_bools)]
     fn run(
         &mut self,
         py: Python<'_>,
         workers: usize,
         checkpoint_dir: Option<String>,
+        metrics_addr: Option<String>,
+        on_error: String,
+        dlq_path: Option<String>,
+        handle_sigint: bool,
     ) -> PyResult<()> {
         if self.has_run {
             return Err(PyRuntimeError::new_err(
@@ -551,17 +584,60 @@ impl PyDataflow {
                 .to_string_lossy()
                 .into_owned()
         });
+
+        let metrics_addr = match metrics_addr {
+            Some(s) => Some(
+                s.parse::<std::net::SocketAddr>()
+                    .map_err(|e| PyRuntimeError::new_err(format!("invalid metrics_addr: {e}")))?,
+            ),
+            None => None,
+        };
+
+        let error_policy = match on_error.as_str() {
+            "skip" => rhei_core::dlq::ErrorPolicy::Skip,
+            "dlq" => rhei_core::dlq::ErrorPolicy::SendToDlq,
+            other => {
+                return Err(PyRuntimeError::new_err(format!(
+                    "on_error must be \"skip\" or \"dlq\", got {other:?}"
+                )));
+            }
+        };
+        if matches!(error_policy, rhei_core::dlq::ErrorPolicy::SendToDlq) && dlq_path.is_none() {
+            return Err(PyRuntimeError::new_err(
+                "on_error=\"dlq\" requires dlq_path=",
+            ));
+        }
+
         py.allow_threads(move || -> PyResult<()> {
             let rt = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
             rt.block_on(async move {
-                let ctrl =
-                    PipelineController::new(std::path::PathBuf::from(dir)).with_workers(workers);
-                ctrl.run(graph)
-                    .await
-                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+                let mut builder = PipelineController::builder()
+                    .checkpoint_dir(std::path::PathBuf::from(dir))
+                    .workers(workers)
+                    .error_policy(error_policy);
+                if let Some(addr) = metrics_addr {
+                    builder = builder.metrics_addr(addr);
+                }
+                if let Some(path) = dlq_path {
+                    let sink = rhei_core::dlq::FileDlqSink::new(&path)
+                        .map_err(|e| PyRuntimeError::new_err(format!("opening DLQ {path}: {e}")))?;
+                    builder = builder.dlq_sink(sink);
+                }
+                let ctrl = builder
+                    .build()
+                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+
+                let result = if handle_sigint {
+                    // Graceful Ctrl-C: SIGINT/SIGTERM trips a drain + checkpoint.
+                    let shutdown = rhei_runtime::shutdown::shutdown_signal();
+                    ctrl.run_with_shutdown(graph, shutdown).await
+                } else {
+                    ctrl.run(graph).await
+                };
+                result.map_err(|e| PyRuntimeError::new_err(e.to_string()))
             })
         })?;
         // Surface the first error any Python transform recorded during the run.
@@ -770,5 +846,14 @@ impl PyStream {
             .borrow()
             .graph
             .add_erased_sink(self.handle, Box::new(PrintSink));
+    }
+
+    /// Terminal: write each batch to a custom Python sink (an instance of a
+    /// `rhei.Sink` subclass implementing `write_batch(buffer)`, optional
+    /// `flush()`).
+    fn sink(&self, py: Python<'_>, sink: Py<PyAny>) {
+        let bound = self.df.bind(py).borrow();
+        let py_sink = crate::source::PySink::new(sink, bound.error_slot.clone());
+        bound.graph.add_erased_sink(self.handle, Box::new(py_sink));
     }
 }

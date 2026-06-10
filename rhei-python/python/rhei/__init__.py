@@ -49,12 +49,43 @@ class Operator:
         )
 
 
+class Source:
+    """Base class for custom Python sources.
+
+    Subclass and implement ``next_batch(self) -> Buffer | None``, returning the
+    next batch or ``None`` to signal end of stream. Attach with
+    ``df.from_source(MySource())``.
+    """
+
+    def next_batch(self):  # noqa: D401
+        """Return the next ``Buffer``, or ``None`` when exhausted. Override this."""
+        raise NotImplementedError(
+            f"{type(self).__name__}.next_batch(self) is not implemented"
+        )
+
+
+class Sink:
+    """Base class for custom Python sinks.
+
+    Subclass and implement ``write_batch(self, buffer)``; optionally override
+    ``flush(self)``. Attach with ``stream.sink(MySink())``.
+    """
+
+    def write_batch(self, buffer):  # noqa: D401
+        """Consume one ``Buffer``. Override this."""
+        raise NotImplementedError(
+            f"{type(self).__name__}.write_batch(self, buffer) is not implemented"
+        )
+
+
 __all__ = [
     "Agg",
     "Buffer",
     "CollectHandle",
     "Dataflow",
     "Operator",
+    "Sink",
+    "Source",
     "State",
     "Stream",
     "__version__",

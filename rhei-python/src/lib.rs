@@ -9,6 +9,7 @@ mod buffer;
 mod codec;
 mod dataflow;
 mod operator;
+mod source;
 mod window;
 
 use buffer::PyBuffer;
