@@ -41,7 +41,17 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
       - name: Install system dependencies
-        run: sudo apt-get update && sudo apt-get install -y cmake build-essential
+        # rdkafka-sys (cmake-build) vendors and compiles librdkafka, whose CMake
+        # auto-enables CURL/SSL/SASL/ZSTD when those libraries are present on the
+        # runner. Because the vendored CMakeLists pins cmake_minimum_required 3.5
+        # (policy CMP0077 OLD), rdkafka-sys's -DWITH_*=0 flags are ignored, so the
+        # build needs the *dev headers* for everything the runner already has the
+        # shared libs for — otherwise it fails on e.g. `curl/curl.h: No such file`.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            cmake build-essential \
+            libcurl4-openssl-dev libssl-dev libsasl2-dev libzstd-dev zlib1g-dev
       - name: Install Rust (stable)
         uses: dtolnay/rust-toolchain@stable
       - name: Install nextest
