@@ -69,3 +69,63 @@ impl HealthState {
         self.status.store(status as u8, Ordering::Relaxed);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn from_u8_maps_known_variants() {
+        assert_eq!(PipelineStatus::from_u8(0), PipelineStatus::Starting);
+        assert_eq!(PipelineStatus::from_u8(1), PipelineStatus::Running);
+        assert_eq!(PipelineStatus::from_u8(2), PipelineStatus::Draining);
+        assert_eq!(PipelineStatus::from_u8(3), PipelineStatus::Stopped);
+    }
+
+    #[test]
+    fn from_u8_falls_back_to_stopped_for_unknown() {
+        // Any out-of-range byte is treated as Stopped (the safe terminal state).
+        assert_eq!(PipelineStatus::from_u8(4), PipelineStatus::Stopped);
+        assert_eq!(PipelineStatus::from_u8(255), PipelineStatus::Stopped);
+    }
+
+    #[test]
+    fn status_round_trips_through_u8() {
+        for status in [
+            PipelineStatus::Starting,
+            PipelineStatus::Running,
+            PipelineStatus::Draining,
+            PipelineStatus::Stopped,
+        ] {
+            assert_eq!(PipelineStatus::from_u8(status as u8), status);
+        }
+    }
+
+    #[test]
+    fn display_strings_are_stable() {
+        // These strings are consumed by readiness/liveness probes, so pin them.
+        assert_eq!(PipelineStatus::Starting.to_string(), "starting");
+        assert_eq!(PipelineStatus::Running.to_string(), "running");
+        assert_eq!(PipelineStatus::Draining.to_string(), "draining");
+        assert_eq!(PipelineStatus::Stopped.to_string(), "stopped");
+    }
+
+    #[test]
+    fn new_state_starts_in_starting() {
+        assert_eq!(HealthState::new().status(), PipelineStatus::Starting);
+        assert_eq!(HealthState::default().status(), PipelineStatus::Starting);
+    }
+
+    #[test]
+    fn set_status_is_observed_through_clones() {
+        let state = HealthState::new();
+        let clone = state.clone();
+
+        state.set_status(PipelineStatus::Running);
+        // Clones share the same atomic, so the update is visible everywhere.
+        assert_eq!(clone.status(), PipelineStatus::Running);
+
+        clone.set_status(PipelineStatus::Stopped);
+        assert_eq!(state.status(), PipelineStatus::Stopped);
+    }
+}

@@ -84,3 +84,51 @@ pub fn shutdown_signal() -> ShutdownHandle {
 
     ShutdownHandle { rx }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn handle_starts_not_shutdown() {
+        let (handle, _trigger) = ShutdownHandle::new();
+        assert!(!handle.is_shutdown());
+    }
+
+    #[test]
+    fn trigger_sets_shutdown() {
+        let (handle, trigger) = ShutdownHandle::new();
+        trigger.shutdown();
+        assert!(handle.is_shutdown());
+    }
+
+    #[test]
+    fn shutdown_is_visible_across_clones() {
+        let (handle, trigger) = ShutdownHandle::new();
+        let clone = handle.clone();
+        trigger.shutdown();
+        assert!(handle.is_shutdown());
+        assert!(clone.is_shutdown());
+    }
+
+    #[tokio::test]
+    async fn subscriber_is_notified_on_shutdown() {
+        let (handle, trigger) = ShutdownHandle::new();
+        let mut rx = handle.subscribe();
+        assert!(!*rx.borrow());
+
+        trigger.shutdown();
+
+        // The subscribed receiver observes the transition exactly once.
+        rx.changed().await.expect("sender still alive");
+        assert!(*rx.borrow());
+    }
+
+    #[test]
+    fn shutdown_is_idempotent() {
+        let (handle, trigger) = ShutdownHandle::new();
+        trigger.shutdown();
+        trigger.shutdown();
+        assert!(handle.is_shutdown());
+    }
+}
