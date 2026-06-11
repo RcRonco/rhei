@@ -39,6 +39,7 @@ tokio = { workspace = true, features = ["full"] }
 tempfile.workspace = true
 criterion.workspace = true
 proptest.workspace = true
+rstest = "0.26.1"
 
 [[bench]]
 name = "columnar_vs_row"
