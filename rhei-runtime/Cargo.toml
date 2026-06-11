@@ -54,3 +54,4 @@ rhei-macros = { path = "../rhei-macros" }
 arrow-array.workspace = true
 arrow-schema.workspace = true
 async-trait.workspace = true
+proptest.workspace = true
