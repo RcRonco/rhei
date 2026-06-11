@@ -757,3 +757,110 @@ mod tests {
         assert_eq!(total_rows, 2);
     }
 }
+
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::cast_possible_wrap,
+    clippy::cast_possible_truncation
+)]
+mod prop_tests {
+    use super::*;
+    use crate::executor::partition_key;
+    use arrow_array::Int64Array;
+    use arrow_array::cast::AsArray;
+    use arrow_array::types::Int64Type;
+    use arrow_schema::{DataType, Field};
+    use proptest::prelude::*;
+
+    fn n_schema() -> Arc<Schema> {
+        Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]))
+    }
+
+    fn make_erased(values: &[i64]) -> ErasedBuffer {
+        let schema = n_schema();
+        let col = Int64Array::from(values.to_vec());
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(col)]).unwrap();
+        ErasedBuffer::from_parts(batch, None, schema_hash_of(&schema))
+    }
+
+    fn value_key_fn() -> KeyFn {
+        Arc::new(|batch: &RecordBatch, idx: usize| {
+            batch
+                .column(0)
+                .as_primitive::<Int64Type>()
+                .value(idx)
+                .to_string()
+        })
+    }
+
+    fn erased_values(buf: &ErasedBuffer) -> Vec<i64> {
+        let batch = buf.as_record_batch();
+        let col = batch.column(0).as_primitive::<Int64Type>();
+        (0..col.len()).map(|i| col.value(i)).collect()
+    }
+
+    proptest! {
+        /// `partition_key` is total, in-range, and deterministic.
+        #[test]
+        fn partition_key_is_bounded_and_deterministic(
+            key in ".{0,32}",
+            n_workers in 1usize..16,
+        ) {
+            let p = partition_key(&key, n_workers);
+            prop_assert!(p < n_workers);
+            prop_assert_eq!(p, partition_key(&key, n_workers));
+        }
+
+        /// Exchange partitioning routes every logical row to exactly one worker:
+        /// the multiset of values across partitions equals the input.
+        #[test]
+        fn partition_for_exchange_conserves_rows(
+            values in prop::collection::vec(any::<i64>(), 0..64),
+            n_workers in 1usize..8,
+        ) {
+            let buf = make_erased(&values);
+            let parts = buf.partition_for_exchange(&value_key_fn(), n_workers);
+
+            let mut seen: Vec<i64> = parts.iter().flat_map(erased_values).collect();
+            let mut expected = values.clone();
+            seen.sort_unstable();
+            expected.sort_unstable();
+            prop_assert_eq!(seen, expected);
+        }
+
+        /// Each routed row lands on the worker its key hashes to, and every
+        /// sub-buffer's `exchange_target` is consistent with its rows.
+        #[test]
+        fn partition_for_exchange_routes_by_partition_key(
+            values in prop::collection::vec(any::<i64>(), 1..64),
+            n_workers in 2usize..8,
+        ) {
+            let buf = make_erased(&values);
+            let parts = buf.partition_for_exchange(&value_key_fn(), n_workers);
+
+            for part in &parts {
+                let target = part.exchange_target.unwrap() as usize;
+                prop_assert!(target < n_workers);
+                for v in erased_values(part) {
+                    prop_assert_eq!(partition_key(&v.to_string(), n_workers), target);
+                }
+            }
+        }
+
+        /// Arrow-IPC serde round-trip preserves rows and the schema id (the path
+        /// every batch takes across a Timely Exchange).
+        #[test]
+        fn serde_round_trip_preserves_rows_and_schema_id(
+            values in prop::collection::vec(any::<i64>(), 0..64),
+        ) {
+            let original = make_erased(&values);
+            let json = serde_json::to_string(&original).unwrap();
+            let restored: ErasedBuffer = serde_json::from_str(&json).unwrap();
+
+            prop_assert_eq!(restored.num_rows(), original.num_rows());
+            prop_assert_eq!(restored.schema_id, original.schema_id);
+            prop_assert_eq!(erased_values(&restored), values);
+        }
+    }
+}

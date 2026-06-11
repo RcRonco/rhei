@@ -177,3 +177,214 @@ fn extract_topology(nodes: &[GraphNode]) -> ApiTopology {
         edges,
     }
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use crate::dataflow::{BatchOperatorNode, GraphNode, NodeId, NodeKind, SinkNode, SourceNode};
+    use crate::erased_batch::{ErasedBatchOperator, ErasedSink, ErasedSource};
+
+    // Dummy node payloads. `compile_graph` only inspects `node.kind` for
+    // classification — it never calls `compile()` — so these bodies are
+    // unreachable in the compilation tests.
+
+    struct DummySource;
+    impl SourceNode for DummySource {
+        fn compile(self: Box<Self>) -> Box<dyn ErasedSource> {
+            unreachable!("compile() is not exercised by compiler tests")
+        }
+    }
+
+    struct DummySink;
+    impl SinkNode for DummySink {
+        fn compile(self: Box<Self>) -> Box<dyn ErasedSink> {
+            unreachable!("compile() is not exercised by compiler tests")
+        }
+    }
+
+    struct DummyOp;
+    impl BatchOperatorNode for DummyOp {
+        fn compile(self: Box<Self>) -> Box<dyn ErasedBatchOperator> {
+            unreachable!("compile() is not exercised by compiler tests")
+        }
+    }
+
+    fn source(id: usize) -> GraphNode {
+        GraphNode {
+            id: NodeId(id),
+            kind: NodeKind::Source(Box::new(DummySource)),
+            inputs: vec![],
+            label: None,
+        }
+    }
+
+    fn operator(id: usize, name: &str, inputs: &[usize]) -> GraphNode {
+        GraphNode {
+            id: NodeId(id),
+            kind: NodeKind::BatchOperator {
+                name: name.to_string(),
+                op: Box::new(DummyOp),
+            },
+            inputs: inputs.iter().map(|&i| NodeId(i)).collect(),
+            label: None,
+        }
+    }
+
+    fn merge(id: usize, inputs: &[usize]) -> GraphNode {
+        GraphNode {
+            id: NodeId(id),
+            kind: NodeKind::Merge,
+            inputs: inputs.iter().map(|&i| NodeId(i)).collect(),
+            label: None,
+        }
+    }
+
+    fn sink(id: usize, inputs: &[usize]) -> GraphNode {
+        GraphNode {
+            id: NodeId(id),
+            kind: NodeKind::Sink(Box::new(DummySink)),
+            inputs: inputs.iter().map(|&i| NodeId(i)).collect(),
+            label: None,
+        }
+    }
+
+    /// A node appears before all of its successors in `topo_order`.
+    fn assert_topologically_ordered(g: &CompiledGraph) {
+        let position: std::collections::HashMap<usize, usize> = g
+            .topo_order
+            .iter()
+            .enumerate()
+            .map(|(pos, id)| (id.0, pos))
+            .collect();
+        for node in &g.nodes {
+            for input in &node.inputs {
+                assert!(
+                    position[&input.0] < position[&node.id.0],
+                    "input {} must come before {}",
+                    input.0,
+                    node.id.0
+                );
+            }
+        }
+    }
+
+    // `CompiledGraph` is not `Debug`, so `unwrap_err()` is unavailable; pull
+    // the error out of the `Result` explicitly instead.
+    fn expect_err(result: anyhow::Result<CompiledGraph>) -> String {
+        match result {
+            Ok(_) => panic!("expected compilation to fail"),
+            Err(e) => e.to_string(),
+        }
+    }
+
+    #[test]
+    fn empty_graph_is_rejected() {
+        let err = expect_err(compile_graph(vec![]));
+        assert!(err.contains("empty"), "got: {err}");
+    }
+
+    #[test]
+    fn graph_without_source_is_rejected() {
+        // A lone sink: no node is classified as a source.
+        let err = expect_err(compile_graph(vec![sink(0, &[])]));
+        assert!(err.contains("no sources"), "got: {err}");
+    }
+
+    #[test]
+    fn graph_without_sink_is_rejected() {
+        let err = expect_err(compile_graph(vec![source(0)]));
+        assert!(err.contains("no sinks"), "got: {err}");
+    }
+
+    #[test]
+    fn linear_pipeline_compiles_in_order() {
+        // source(0) -> op(1) -> sink(2)
+        let nodes = vec![source(0), operator(1, "map", &[0]), sink(2, &[1])];
+        let g = compile_graph(nodes).unwrap();
+
+        assert_eq!(
+            g.topo_order.iter().map(|n| n.0).collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+        assert_eq!(g.source_ids, vec![NodeId(0)]);
+        assert_eq!(g.sink_ids, vec![NodeId(2)]);
+        assert_eq!(g.operator_names, vec!["map".to_string()]);
+        assert_topologically_ordered(&g);
+    }
+
+    #[test]
+    fn operator_names_are_sorted() {
+        // Two operators added out of alphabetical order must come back sorted,
+        // which is what the checkpoint manifest validation relies on.
+        let nodes = vec![
+            source(0),
+            operator(1, "zeta", &[0]),
+            operator(2, "alpha", &[1]),
+            sink(3, &[2]),
+        ];
+        let g = compile_graph(nodes).unwrap();
+        assert_eq!(
+            g.operator_names,
+            vec!["alpha".to_string(), "zeta".to_string()]
+        );
+    }
+
+    #[test]
+    fn fan_out_and_merge_topology() {
+        // source(0) fans out to op(1) and op(2), which merge(3) -> sink(4).
+        let nodes = vec![
+            source(0),
+            operator(1, "left", &[0]),
+            operator(2, "right", &[0]),
+            merge(3, &[1, 2]),
+            sink(4, &[3]),
+        ];
+        let g = compile_graph(nodes).unwrap();
+
+        assert_eq!(g.topo_order.len(), 5);
+        // Source must be first and sink last in any valid ordering.
+        assert_eq!(g.topo_order.first(), Some(&NodeId(0)));
+        assert_eq!(g.topo_order.last(), Some(&NodeId(4)));
+        assert_topologically_ordered(&g);
+
+        // Topology edges mirror the input wiring.
+        let mut edges = g.topology.edges.clone();
+        edges.sort_unstable();
+        assert_eq!(edges, vec![(0, 1), (0, 2), (1, 3), (2, 3), (3, 4)]);
+
+        // Merge node is tagged as such in the serialized topology.
+        let merge_node = g.topology.nodes.iter().find(|n| n.id == 3).unwrap();
+        assert_eq!(merge_node.kind, "merge");
+    }
+
+    #[test]
+    fn cycle_is_detected() {
+        // source(0) -> op(1) -> op(2) -> op(1) forms a 1<->2 cycle; sink(3)
+        // keeps the source/sink validation happy so we reach the cycle check.
+        let nodes = vec![
+            source(0),
+            operator(1, "a", &[0, 2]),
+            operator(2, "b", &[1]),
+            sink(3, &[2]),
+        ];
+        let err = expect_err(compile_graph(nodes));
+        assert!(err.contains("cycle"), "got: {err}");
+    }
+
+    #[test]
+    fn topology_tags_each_node_kind() {
+        let nodes = vec![source(0), operator(1, "op", &[0]), sink(2, &[1])];
+        let g = compile_graph(nodes).unwrap();
+
+        let kinds: std::collections::HashMap<usize, String> = g
+            .topology
+            .nodes
+            .iter()
+            .map(|n| (n.id, n.kind.clone()))
+            .collect();
+        assert_eq!(kinds[&0], "source");
+        assert_eq!(kinds[&1], "operator");
+        assert_eq!(kinds[&2], "sink");
+    }
+}

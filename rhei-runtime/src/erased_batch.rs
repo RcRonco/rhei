@@ -244,3 +244,117 @@ fn buffer_output_to_erased<T: RheiSchema>(output: BufferOutput<T>) -> Vec<Erased
         BufferOutput::Multi(bufs) => bufs.into_iter().map(ErasedBuffer::from_typed).collect(),
     }
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use arrow_array::builder::ArrayBuilder;
+    use arrow_array::{Int64Array, RecordBatch};
+    use arrow_schema::{DataType, Field, Schema};
+    use rhei_core::arrow::{RheiBuffer, RheiBuilder};
+    use std::sync::Arc;
+
+    // Minimal single-column schema for exercising the erase boundary.
+    struct N {
+        v: i64,
+    }
+
+    struct NBuilder {
+        v: arrow_array::builder::Int64Builder,
+    }
+
+    #[allow(dead_code)]
+    struct NView {
+        v: i64,
+    }
+
+    #[allow(dead_code)]
+    struct NCols<'a> {
+        v: &'a Int64Array,
+    }
+
+    impl RheiBuilder for NBuilder {
+        type Item = N;
+        fn append(&mut self, item: N) {
+            self.v.append_value(item.v);
+        }
+        fn append_null(&mut self) {
+            self.v.append_null();
+        }
+        fn len(&self) -> usize {
+            self.v.len()
+        }
+        fn finish(mut self) -> RecordBatch {
+            RecordBatch::try_new(N::arrow_schema(), vec![Arc::new(self.v.finish())]).unwrap()
+        }
+    }
+
+    impl RheiSchema for N {
+        type Builder = NBuilder;
+        type View<'a> = NView;
+        type Columns<'a> = NCols<'a>;
+
+        fn arrow_schema() -> Arc<Schema> {
+            Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]))
+        }
+        fn builder(capacity: usize) -> Self::Builder {
+            NBuilder {
+                v: arrow_array::builder::Int64Builder::with_capacity(capacity),
+            }
+        }
+        fn view(batch: &RecordBatch, index: usize) -> Self::View<'_> {
+            use arrow_array::cast::AsArray;
+            use arrow_array::types::Int64Type;
+            NView {
+                v: batch.column(0).as_primitive::<Int64Type>().value(index),
+            }
+        }
+        fn columns(batch: &RecordBatch) -> Self::Columns<'_> {
+            use arrow_array::cast::AsArray;
+            use arrow_array::types::Int64Type;
+            NCols {
+                v: batch.column(0).as_primitive::<Int64Type>(),
+            }
+        }
+    }
+
+    fn buf(values: &[i64]) -> RheiBuffer<N> {
+        let mut builder = N::builder(values.len());
+        for &v in values {
+            builder.append(N { v });
+        }
+        RheiBuffer::from_builder(builder)
+    }
+
+    #[test]
+    fn none_output_produces_no_batches() {
+        let out: Vec<ErasedBuffer> = buffer_output_to_erased(BufferOutput::<N>::None);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn single_output_produces_one_batch() {
+        let out = buffer_output_to_erased(BufferOutput::Single(buf(&[1, 2, 3])));
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].num_rows(), 3);
+    }
+
+    #[test]
+    fn multi_output_preserves_each_batch_and_order() {
+        let out = buffer_output_to_erased(BufferOutput::Multi(vec![
+            buf(&[1]),
+            buf(&[2, 3]),
+            buf(&[4, 5, 6]),
+        ]));
+        assert_eq!(out.len(), 3);
+        let row_counts: Vec<usize> = out.iter().map(ErasedBuffer::num_rows).collect();
+        assert_eq!(row_counts, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn empty_multi_produces_no_batches() {
+        let out: Vec<ErasedBuffer> = buffer_output_to_erased(BufferOutput::<N>::Multi(vec![]));
+        assert!(out.is_empty());
+    }
+}

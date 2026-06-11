@@ -1081,3 +1081,75 @@ pub(crate) fn merge_source_offsets(
     }
     combined
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+
+    // ── assign_partitions ───────────────────────────────────────────────
+
+    #[test]
+    fn partitions_round_robin_across_workers() {
+        // 5 partitions over 2 workers: 0,2,4 -> w0 and 1,3 -> w1.
+        assert_eq!(assign_partitions(5, 2), vec![vec![0, 2, 4], vec![1, 3]]);
+    }
+
+    #[test]
+    fn more_workers_than_partitions_leaves_some_idle() {
+        assert_eq!(
+            assign_partitions(2, 4),
+            vec![vec![0], vec![1], vec![], vec![]]
+        );
+    }
+
+    #[test]
+    fn single_worker_takes_all_partitions() {
+        assert_eq!(assign_partitions(3, 1), vec![vec![0, 1, 2]]);
+    }
+
+    #[test]
+    fn zero_partitions_yields_empty_assignments_per_worker() {
+        assert_eq!(assign_partitions(0, 3), vec![Vec::<usize>::new(); 3]);
+    }
+
+    #[test]
+    fn every_partition_is_assigned_exactly_once() {
+        let assignments = assign_partitions(10, 3);
+        let mut seen: Vec<usize> = assignments.into_iter().flatten().collect();
+        seen.sort_unstable();
+        assert_eq!(seen, (0..10).collect::<Vec<_>>());
+    }
+
+    // ── merge_source_offsets ────────────────────────────────────────────
+
+    fn offsets(pairs: &[(&str, &str)]) -> Arc<Mutex<HashMap<String, String>>> {
+        let map = pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect();
+        Arc::new(Mutex::new(map))
+    }
+
+    #[test]
+    fn merging_no_sources_yields_empty_map() {
+        assert!(merge_source_offsets(&[]).is_empty());
+    }
+
+    #[test]
+    fn merge_combines_disjoint_offset_maps() {
+        let merged =
+            merge_source_offsets(&[offsets(&[("topic-0", "10")]), offsets(&[("topic-1", "20")])]);
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged["topic-0"], "10");
+        assert_eq!(merged["topic-1"], "20");
+    }
+
+    #[test]
+    fn merge_lets_later_sources_override_same_key() {
+        // `extend` semantics: the last writer for a key wins.
+        let merged =
+            merge_source_offsets(&[offsets(&[("topic-0", "10")]), offsets(&[("topic-0", "99")])]);
+        assert_eq!(merged["topic-0"], "99");
+    }
+}
