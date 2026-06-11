@@ -132,3 +132,88 @@ impl Recorder for FanoutRecorder {
         }))
     }
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use metrics::Recorder;
+    use metrics_exporter_prometheus::PrometheusBuilder;
+
+    fn meta() -> Metadata<'static> {
+        Metadata::new("", metrics::Level::INFO, None)
+    }
+
+    /// Build a `FanoutRecorder` and return read handles for both backends.
+    fn fanout() -> (
+        FanoutRecorder,
+        metrics_exporter_prometheus::PrometheusHandle,
+        crate::metrics_snapshot::MetricsHandle,
+    ) {
+        let prometheus = PrometheusBuilder::new().build_recorder();
+        let prom_handle = prometheus.handle();
+        let (snapshot, snap_handle) = SnapshotRecorder::new();
+        (
+            FanoutRecorder::new(prometheus, snapshot),
+            prom_handle,
+            snap_handle,
+        )
+    }
+
+    #[test]
+    fn counter_increment_reaches_both_backends() {
+        let (recorder, prom_handle, snap_handle) = fanout();
+
+        // `executor_elements_total` is one of the keys SnapshotRecorder maps
+        // onto a structured field, so we can read it back from the snapshot.
+        let key = Key::from_name("executor_elements_total");
+        let counter = recorder.register_counter(&key, &meta());
+        counter.increment(42);
+
+        // Snapshot (JSON API) side saw it.
+        assert_eq!(snap_handle.snapshot().elements_total, 42);
+
+        // Prometheus (text /metrics) side saw it too.
+        let rendered = prom_handle.render();
+        assert!(
+            rendered.contains("executor_elements_total"),
+            "prometheus output missing metric: {rendered}"
+        );
+        assert!(
+            rendered.contains("42"),
+            "prometheus output missing value: {rendered}"
+        );
+    }
+
+    #[test]
+    fn counter_absolute_reaches_snapshot_backend() {
+        let (recorder, _prom_handle, snap_handle) = fanout();
+        let key = Key::from_name("executor_elements_total");
+        let counter = recorder.register_counter(&key, &meta());
+        counter.absolute(100);
+        assert_eq!(snap_handle.snapshot().elements_total, 100);
+    }
+
+    #[test]
+    fn register_gauge_and_histogram_do_not_panic() {
+        // Registration + emission must fan out cleanly even for metric types
+        // the snapshot side does not surface as named fields.
+        let (recorder, _prom_handle, _snap_handle) = fanout();
+
+        let gauge = recorder.register_gauge(&Key::from_name("some_gauge"), &meta());
+        gauge.set(1.5);
+        gauge.increment(0.5);
+        gauge.decrement(0.25);
+
+        let hist = recorder.register_histogram(&Key::from_name("some_hist"), &meta());
+        hist.record(3.0);
+    }
+
+    #[test]
+    fn describe_calls_fan_out_without_panicking() {
+        let (recorder, _prom_handle, _snap_handle) = fanout();
+        recorder.describe_counter("c".into(), None, "a counter".into());
+        recorder.describe_gauge("g".into(), None, "a gauge".into());
+        recorder.describe_histogram("h".into(), None, "a histogram".into());
+    }
+}

@@ -154,7 +154,10 @@ mod tests {
         sink.flush().await.unwrap();
 
         let contents = std::fs::read_to_string(&path).unwrap();
-        assert!(!contents.contains("stale"), "file must be truncated on open");
+        assert!(
+            !contents.contains("stale"),
+            "file must be truncated on open"
+        );
         assert_eq!(contents.lines().count(), 1);
     }
 

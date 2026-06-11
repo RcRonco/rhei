@@ -179,9 +179,7 @@ mod tests {
 
     #[test]
     fn masked_iteration_skips_invalid_rows() {
-        let buf = buffer(5).with_mask(BooleanArray::from(vec![
-            true, false, true, false, true,
-        ]));
+        let buf = buffer(5).with_mask(BooleanArray::from(vec![true, false, true, false, true]));
         let values: Vec<i64> = buf.iter().map(|view| view.v).collect();
         assert_eq!(values, vec![0, 2, 4]);
     }
@@ -190,8 +188,11 @@ mod tests {
     fn enumerate_physical_reports_physical_indices() {
         // Logical rows {1, 3} survive, but their *physical* positions are 1 and 3.
         let buf = buffer(4).with_mask(BooleanArray::from(vec![false, true, false, true]));
-        let pairs: Vec<(usize, i64)> =
-            buf.iter().enumerate_physical().map(|(i, view)| (i, view.v)).collect();
+        let pairs: Vec<(usize, i64)> = buf
+            .iter()
+            .enumerate_physical()
+            .map(|(i, view)| (i, view.v))
+            .collect();
         assert_eq!(pairs, vec![(1, 1), (3, 3)]);
     }
 

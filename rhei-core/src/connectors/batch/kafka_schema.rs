@@ -204,3 +204,123 @@ impl KafkaMessageView<'_> {
         serde_json::from_str(self.headers_json).unwrap_or_default()
     }
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    fn header(key: &str, value: &[u8]) -> KafkaHeader {
+        KafkaHeader {
+            key: key.to_string(),
+            value: value.to_vec(),
+        }
+    }
+
+    fn build(messages: Vec<KafkaMessage>) -> RecordBatch {
+        let mut builder = KafkaMessage::builder(messages.len());
+        for m in messages {
+            builder.append(m);
+        }
+        builder.finish()
+    }
+
+    #[test]
+    fn round_trips_a_fully_populated_message() {
+        let msg = KafkaMessage {
+            topic: "orders".to_string(),
+            partition: 3,
+            offset: 42,
+            key: Some(b"k1".to_vec()),
+            payload: Some(b"hello".to_vec()),
+            timestamp: Some(1_700_000_000_000),
+            headers: vec![header("trace", b"abc"), header("source", b"web")],
+        };
+        let batch = build(vec![msg]);
+        let view = KafkaMessage::view(&batch, 0);
+
+        assert_eq!(view.topic, "orders");
+        assert_eq!(view.partition, 3);
+        assert_eq!(view.offset, 42);
+        assert_eq!(view.key, b"k1");
+        assert!(!view.key_is_null);
+        assert_eq!(view.payload, b"hello");
+        assert!(!view.payload_is_null);
+        assert_eq!(view.timestamp, 1_700_000_000_000);
+        assert!(!view.timestamp_is_null);
+        assert_eq!(
+            view.headers(),
+            vec![header("trace", b"abc"), header("source", b"web")]
+        );
+    }
+
+    #[test]
+    fn round_trips_null_optionals() {
+        let msg = KafkaMessage {
+            topic: "t".to_string(),
+            partition: 0,
+            offset: 0,
+            key: None,
+            payload: None,
+            timestamp: None,
+            headers: vec![],
+        };
+        let batch = build(vec![msg]);
+        let view = KafkaMessage::view(&batch, 0);
+
+        // Null binary/timestamp fields surface as null flags with safe defaults.
+        assert!(view.key_is_null);
+        assert_eq!(view.key, b"");
+        assert!(view.payload_is_null);
+        assert_eq!(view.payload, b"");
+        assert!(view.timestamp_is_null);
+        assert_eq!(view.timestamp, 0);
+        assert!(view.headers().is_empty());
+    }
+
+    #[test]
+    fn empty_headers_serialize_to_empty_vec() {
+        let msg = KafkaMessage {
+            topic: "t".to_string(),
+            partition: 1,
+            offset: 5,
+            key: None,
+            payload: Some(b"x".to_vec()),
+            timestamp: None,
+            headers: vec![],
+        };
+        let batch = build(vec![msg]);
+        let view = KafkaMessage::view(&batch, 0);
+        assert!(view.headers().is_empty());
+    }
+
+    #[test]
+    fn columns_expose_metadata_for_all_rows() {
+        let batch = build(vec![
+            KafkaMessage {
+                topic: "a".to_string(),
+                partition: 0,
+                offset: 10,
+                key: None,
+                payload: None,
+                timestamp: None,
+                headers: vec![],
+            },
+            KafkaMessage {
+                topic: "b".to_string(),
+                partition: 2,
+                offset: 20,
+                key: None,
+                payload: None,
+                timestamp: None,
+                headers: vec![],
+            },
+        ]);
+        let cols = KafkaMessage::columns(&batch);
+        assert_eq!(cols.topic.value(0), "a");
+        assert_eq!(cols.topic.value(1), "b");
+        assert_eq!(cols.partition.value(1), 2);
+        assert_eq!(cols.offset.value(0), 10);
+        assert_eq!(cols.offset.value(1), 20);
+    }
+}
