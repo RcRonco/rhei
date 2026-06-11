@@ -24,7 +24,7 @@ use rhei_core::arrow::{
 };
 use rhei_core::connectors::batch::VecSource;
 use rhei_core::operators::keyed_state::KeyedState;
-use rhei_core::state::backend::StateBackend;
+use rhei_core::state::backend::{BatchOp, StateBackend};
 use rhei_core::state::slatedb_backend::SlateDbBackend;
 use rhei_core::state::tiered_backend::TieredBackendConfig;
 use rhei_runtime::controller::PipelineController;
@@ -463,4 +463,345 @@ async fn s3_tiered_storage_e2e() {
         "S3 objects verified: {} objects under '{slate_path}'",
         objects.len()
     );
+}
+
+// ════════════════════════════════════════════════════════════════════
+//  Extended coverage: restart recovery, multi-worker, spill, direct ops
+// ════════════════════════════════════════════════════════════════════
+
+// ── Shared helpers ──────────────────────────────────────────────────
+
+/// Compute the raw `SlateDB` key under which `KeyedState<String, u64>` (in the
+/// `"counts"` namespace) stores `word` for the given worker index.
+///
+/// Layout: `word_counter_w{worker}/` (`PrefixedBackend`) + `counts:`
+/// (`KeyedState` namespace) + JSON-encoded key.
+fn state_key(worker: usize, word: &str) -> Vec<u8> {
+    let keyed = format!("counts:{}", serde_json::to_string(word).unwrap());
+    let mut key = format!("word_counter_w{worker}/").into_bytes();
+    key.extend_from_slice(keyed.as_bytes());
+    key
+}
+
+/// Read the persisted count for `word` on `worker` directly from L3.
+async fn read_count(l3: &SlateDbBackend, worker: usize, word: &str) -> Option<u64> {
+    l3.get(&state_key(worker, word))
+        .await
+        .unwrap()
+        .map(|bytes| serde_json::from_slice(&bytes).unwrap())
+}
+
+/// Final (max) count per word across every emitted output row.
+fn final_counts(results: &[(String, u64)]) -> HashMap<String, u64> {
+    let mut counts: HashMap<String, u64> = HashMap::new();
+    for (word, count) in results {
+        let entry = counts.entry(word.clone()).or_insert(0);
+        *entry = (*entry).max(*count);
+    }
+    counts
+}
+
+/// `n_keys` distinct keys, each repeated `reps` times and interleaved so the
+/// same key recurs throughout the stream — forcing reads back through L2/L3
+/// after the small in-memory tier evicts them.
+fn generate_repeated_unique(n_keys: usize, reps: usize) -> Vec<WordEvent> {
+    let mut words = Vec::with_capacity(n_keys * reps);
+    for _ in 0..reps {
+        for i in 0..n_keys {
+            words.push(WordEvent {
+                word: format!("key_{i:06}"),
+            });
+        }
+    }
+    words
+}
+
+/// Run `VecSource(words) → [key_by] → WordCounter → CollectSink` over a tiered
+/// backend rooted at `slate_path` on S3, then close L3 and return every emitted
+/// `(word, running_count)` pair.
+///
+/// Reopening the same `slate_path` across calls exercises L3 recovery: a fresh
+/// process has empty L1/L2 tiers and must read prior state back from S3.
+async fn run_word_count_tiered(
+    s3: &Arc<dyn ObjectStore>,
+    slate_path: &str,
+    words: Vec<WordEvent>,
+    workers: usize,
+    foyer_memory_capacity: usize,
+) -> Vec<(String, u64)> {
+    let l3 = Arc::new(
+        SlateDbBackend::open(slate_path, s3.clone())
+            .await
+            .expect("failed to open SlateDB on S3"),
+    );
+
+    let foyer_dir = tempfile::tempdir().unwrap();
+    let checkpoint_dir = tempfile::tempdir().unwrap();
+    let foyer_config = TieredBackendConfig {
+        foyer_dir: foyer_dir.path().to_path_buf(),
+        foyer_memory_capacity,
+        foyer_disk_capacity: 16 * 1024 * 1024,
+        foyer_block_size: 256 * 1024,
+    };
+
+    let ctrl = PipelineController::new(checkpoint_dir.path().to_path_buf())
+        .with_workers(workers)
+        .with_tiered_storage(
+            checkpoint_dir.path().to_path_buf(),
+            l3.clone(),
+            foyer_config,
+        )
+        .await
+        .unwrap();
+
+    let collected = Arc::new(Mutex::new(Vec::<(String, u64)>::new()));
+    let source = VecSource::new(words).with_batch_size(50);
+    let graph = DataflowGraph::new();
+    let counted = if workers > 1 {
+        graph
+            .source(source)
+            .key_by(|v: &WordEventView<'_>| v.word.to_string())
+            .operator("word_counter", WordCounter)
+    } else {
+        graph.source(source).operator("word_counter", WordCounter)
+    };
+    counted.sink(CollectSink {
+        collected: collected.clone(),
+    });
+
+    ctrl.run(graph).await.expect("pipeline execution failed");
+    l3.close().await.expect("failed to close SlateDB");
+
+    collected.lock().unwrap().clone()
+}
+
+// ── Test: state recovers across a restart (L3 read-through) ──────────
+
+/// Two consecutive pipeline runs sharing one `SlateDB` path must accumulate
+/// state: run 2 starts with empty L1/L2 tiers and reads run 1's counts back
+/// from S3, so every word ends at twice its single-pass count.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn s3_state_recovers_across_restart() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("info")
+        .with_test_writer()
+        .try_init();
+
+    let s3 = build_s3_store();
+    let slate_path = unique_path("s3_restart");
+
+    // Run 1 establishes counts of 5 per word in S3.
+    let _ = run_word_count_tiered(&s3, &slate_path, generate_words(), 1, 4 * 1024 * 1024).await;
+
+    // Run 2 reopens the same path; counts must continue from L3.
+    let run2 = run_word_count_tiered(&s3, &slate_path, generate_words(), 1, 4 * 1024 * 1024).await;
+    assert!(!run2.is_empty(), "run 2 produced no output");
+
+    let finals = final_counts(&run2);
+    let expected = expected_counts(&generate_words());
+    for (word, base) in &expected {
+        let actual = finals.get(word).copied().unwrap_or(0);
+        assert_eq!(
+            actual,
+            base * 2,
+            "word {word} should accumulate across restart: actual={actual}, expected={}",
+            base * 2
+        );
+    }
+
+    // Verify the durable S3 state directly.
+    let l3 = SlateDbBackend::open(slate_path.as_str(), s3.clone())
+        .await
+        .expect("reopen for verification");
+    for word in ["alpha", "beta", "cedar", "delta"] {
+        assert_eq!(
+            read_count(&l3, 0, word).await,
+            Some(10),
+            "S3 count for '{word}' after restart"
+        );
+    }
+    l3.close().await.expect("close verify DB");
+
+    eprintln!(
+        "S3 restart recovery verified: {} words at 2x count",
+        expected.len()
+    );
+}
+
+// ── Test: multi-worker tiered persistence ───────────────────────────
+
+/// With 2 workers and a `key_by`, each word is owned by exactly one worker, and
+/// every worker's slice of state must persist to S3 under its own prefix.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn s3_tiered_multi_worker_persistence() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("info")
+        .with_test_writer()
+        .try_init();
+
+    let s3 = build_s3_store();
+    let slate_path = unique_path("s3_mw");
+
+    let results =
+        run_word_count_tiered(&s3, &slate_path, generate_words(), 2, 4 * 1024 * 1024).await;
+    assert!(
+        !results.is_empty(),
+        "multi-worker pipeline produced no output"
+    );
+
+    let finals = final_counts(&results);
+    let expected = expected_counts(&generate_words());
+    for (word, count) in &expected {
+        assert_eq!(
+            finals.get(word).copied().unwrap_or(0),
+            *count,
+            "final count mismatch for {word}"
+        );
+    }
+
+    // Each word must be persisted under exactly one worker prefix in S3.
+    let l3 = SlateDbBackend::open(slate_path.as_str(), s3.clone())
+        .await
+        .expect("reopen for verification");
+    for (word, count) in &expected {
+        let found: Vec<u64> = [
+            read_count(&l3, 0, word).await,
+            read_count(&l3, 1, word).await,
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        assert_eq!(
+            found.len(),
+            1,
+            "word '{word}' must live on exactly one worker, found {found:?}"
+        );
+        assert_eq!(found[0], *count, "persisted count for '{word}'");
+    }
+    l3.close().await.expect("close verify DB");
+
+    eprintln!(
+        "S3 multi-worker persistence verified: {} words across 2 workers",
+        expected.len()
+    );
+}
+
+// ── Test: large state spills L1 → L2 → L3 ───────────────────────────
+
+/// A tiny in-memory L2 capacity with many distinct keys forces eviction to
+/// disk and read-through to S3 mid-run. Counts must remain correct and all
+/// state must land in S3.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn s3_tiered_large_state_spills_to_l3() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("info")
+        .with_test_writer()
+        .try_init();
+
+    let s3 = build_s3_store();
+    let slate_path = unique_path("s3_spill");
+
+    let n_keys = 1500usize;
+    let reps = 3usize;
+    let words = generate_repeated_unique(n_keys, reps);
+
+    // 1 MiB L2 memory cannot hold all keys → forces eviction + L3 read-through.
+    let results = run_word_count_tiered(&s3, &slate_path, words, 1, 1024 * 1024).await;
+
+    let finals = final_counts(&results);
+    assert_eq!(
+        finals.len(),
+        n_keys,
+        "every distinct key must be counted exactly once in the output set"
+    );
+    for (word, count) in &finals {
+        assert_eq!(
+            *count, reps as u64,
+            "count for {word} must equal repetition count even after eviction"
+        );
+    }
+
+    // Spot-check durable S3 state across the key range.
+    let l3 = SlateDbBackend::open(slate_path.as_str(), s3.clone())
+        .await
+        .expect("reopen for verification");
+    for i in [0usize, n_keys / 2, n_keys - 1] {
+        let word = format!("key_{i:06}");
+        assert_eq!(
+            read_count(&l3, 0, &word).await,
+            Some(reps as u64),
+            "S3 count for spilled key '{word}'"
+        );
+    }
+    l3.close().await.expect("close verify DB");
+
+    eprintln!("S3 spill test verified: {n_keys} keys × {reps} reps through L1→L2→L3");
+}
+
+// ── Test: SlateDbBackend direct ops against real S3 ─────────────────
+
+/// Exercises `SlateDbBackend`'s `StateBackend` surface (put/get/delete/batch)
+/// and durability against a live S3 service — the unit tests only cover the
+/// in-memory object store.
+#[tokio::test]
+async fn s3_slatedb_backend_direct_ops() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("info")
+        .with_test_writer()
+        .try_init();
+
+    let s3 = build_s3_store();
+    let path = unique_path("s3_direct");
+
+    let backend = SlateDbBackend::open(path.as_str(), s3.clone())
+        .await
+        .expect("open SlateDB on S3");
+
+    // put / get
+    backend.put(b"k1", b"v1").await.unwrap();
+    assert_eq!(
+        backend.get(b"k1").await.unwrap().as_deref(),
+        Some(b"v1".as_slice())
+    );
+
+    // delete
+    backend.delete(b"k1").await.unwrap();
+    assert!(backend.get(b"k1").await.unwrap().is_none());
+
+    // atomic batch: put k2, put k3, delete k2 → only k3 survives
+    backend
+        .put_batch(vec![
+            BatchOp::Put {
+                key: b"k2".to_vec(),
+                value: b"v2".to_vec(),
+            },
+            BatchOp::Put {
+                key: b"k3".to_vec(),
+                value: b"v3".to_vec(),
+            },
+            BatchOp::Delete {
+                key: b"k2".to_vec(),
+            },
+        ])
+        .await
+        .unwrap();
+    assert!(backend.get(b"k2").await.unwrap().is_none());
+    assert_eq!(
+        backend.get(b"k3").await.unwrap().as_deref(),
+        Some(b"v3".as_slice())
+    );
+
+    backend.close().await.expect("close");
+
+    // Durability: reopen from S3 and confirm k3 survived.
+    let reopened = SlateDbBackend::open(path.as_str(), s3.clone())
+        .await
+        .expect("reopen SlateDB on S3");
+    assert_eq!(
+        reopened.get(b"k3").await.unwrap().as_deref(),
+        Some(b"v3".as_slice())
+    );
+    reopened.close().await.expect("close reopened");
+
+    eprintln!("SlateDB direct S3 ops verified");
 }
