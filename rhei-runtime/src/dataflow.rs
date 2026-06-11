@@ -864,3 +864,215 @@ impl<'a, T: RheiSchema + 'static> Stream<'a, T> {
         );
     }
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use async_trait::async_trait;
+    use rhei_core::arrow::OperatorContext;
+    use std::collections::HashMap;
+
+    // ── Minimal erased stubs (graph building never invokes their bodies) ──
+
+    struct NoopSource;
+    #[async_trait]
+    impl ErasedSource for NoopSource {
+        async fn next_batch(&mut self) -> Option<ErasedBuffer> {
+            None
+        }
+        async fn on_checkpoint_complete(&mut self) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn current_offsets(&self) -> HashMap<String, String> {
+            HashMap::new()
+        }
+        async fn restore_offsets(&mut self, _: &HashMap<String, String>) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn partition_count(&self) -> Option<usize> {
+            None
+        }
+        fn create_partition_source(&self, _: &[usize]) -> Option<Box<dyn ErasedSource>> {
+            None
+        }
+        fn current_watermark(&self) -> Option<u64> {
+            None
+        }
+    }
+
+    struct NoopSink;
+    #[async_trait]
+    impl ErasedSink for NoopSink {
+        async fn write_batch(&mut self, _: ErasedBuffer) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn flush(&mut self) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct NoopOp;
+    #[async_trait]
+    impl ErasedBatchOperator for NoopOp {
+        async fn process(
+            &mut self,
+            _: ErasedBuffer,
+            _: &mut OperatorContext,
+        ) -> anyhow::Result<Vec<ErasedBuffer>> {
+            Ok(vec![])
+        }
+        async fn on_watermark(
+            &mut self,
+            _: u64,
+            _: &mut OperatorContext,
+        ) -> anyhow::Result<Vec<ErasedBuffer>> {
+            Ok(vec![])
+        }
+        async fn open(&mut self, _: &mut OperatorContext) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn close(&mut self) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn on_timer(
+            &mut self,
+            _: u64,
+            _: &str,
+            _: &mut OperatorContext,
+        ) -> anyhow::Result<Vec<ErasedBuffer>> {
+            Ok(vec![])
+        }
+        fn clone_erased(&self) -> Box<dyn ErasedBatchOperator> {
+            Box::new(NoopOp)
+        }
+    }
+
+    /// A `SinkNode` used only to craft a source-less graph for the `NoSources`
+    /// validation path (which `add_erased_sink` can't produce, since it needs an
+    /// upstream handle). `compile()` is never reached.
+    struct StubSinkNode;
+    impl SinkNode for StubSinkNode {
+        fn compile(self: Box<Self>) -> Box<dyn ErasedSink> {
+            unreachable!("compile() is not exercised by graph-building tests")
+        }
+    }
+
+    fn add_src(g: &DataflowGraph) -> ErasedHandle {
+        g.add_erased_source(Box::new(NoopSource))
+    }
+
+    fn noop_key_fn() -> KeyFn {
+        Arc::new(|_batch, _idx| String::new())
+    }
+
+    // ── validate() ──────────────────────────────────────────────────────
+
+    #[test]
+    fn validate_rejects_empty_graph() {
+        let g = DataflowGraph::new();
+        assert!(matches!(g.validate(), Err(ValidationError::EmptyGraph)));
+    }
+
+    #[test]
+    fn validate_rejects_graph_without_sinks() {
+        let g = DataflowGraph::new();
+        add_src(&g);
+        assert!(matches!(g.validate(), Err(ValidationError::NoSinks)));
+    }
+
+    #[test]
+    fn validate_rejects_graph_without_sources() {
+        let g = DataflowGraph::new();
+        // A sink node with no upstream source.
+        g.add_node(NodeKind::Sink(Box::new(StubSinkNode)), vec![]);
+        assert!(matches!(g.validate(), Err(ValidationError::NoSources)));
+    }
+
+    #[test]
+    fn validate_flags_dangling_non_sink_leaf() {
+        let g = DataflowGraph::new();
+        let src = add_src(&g);
+        // One valid path source -> sink ...
+        g.add_erased_sink(src, Box::new(NoopSink));
+        // ... plus a dangling operator branch off the same source.
+        g.add_erased_operator(src, "dangler", Box::new(NoopOp));
+
+        let err = g.validate().unwrap_err();
+        let ValidationError::DanglingStreams(nodes) = err else {
+            panic!("expected DanglingStreams, got {err:?}");
+        };
+        assert_eq!(nodes.len(), 1);
+        assert!(nodes[0].1.contains("dangler"), "label was: {}", nodes[0].1);
+    }
+
+    #[test]
+    fn validate_accepts_linear_pipeline() {
+        let g = DataflowGraph::new();
+        let src = add_src(&g);
+        let op = g.add_erased_operator(src, "op", Box::new(NoopOp));
+        g.add_erased_sink(op, Box::new(NoopSink));
+        assert!(g.validate().is_ok());
+    }
+
+    // ── Node wiring (into_nodes) ────────────────────────────────────────
+
+    #[test]
+    fn node_ids_and_inputs_are_wired_in_insertion_order() {
+        let g = DataflowGraph::new();
+        let src = add_src(&g);
+        let op = g.add_erased_operator(src, "op", Box::new(NoopOp));
+        g.add_erased_sink(op, Box::new(NoopSink));
+
+        let nodes = g.into_nodes();
+        assert_eq!(nodes.len(), 3);
+        // Sequential ids.
+        assert_eq!(nodes[0].id, NodeId(0));
+        assert_eq!(nodes[1].id, NodeId(1));
+        assert_eq!(nodes[2].id, NodeId(2));
+        // Edges: source has none, op <- source, sink <- op.
+        assert!(nodes[0].inputs.is_empty());
+        assert_eq!(nodes[1].inputs, vec![NodeId(0)]);
+        assert_eq!(nodes[2].inputs, vec![NodeId(1)]);
+        // Kinds.
+        assert!(matches!(nodes[0].kind, NodeKind::Source(_)));
+        assert!(matches!(nodes[1].kind, NodeKind::BatchOperator { .. }));
+        assert!(matches!(nodes[2].kind, NodeKind::Sink(_)));
+    }
+
+    #[test]
+    fn merge_node_wires_both_inputs() {
+        let g = DataflowGraph::new();
+        let a = add_src(&g);
+        let b = add_src(&g);
+        let merged = g.add_merge(a, b);
+        g.add_erased_sink(merged, Box::new(NoopSink));
+
+        let nodes = g.into_nodes();
+        let merge = &nodes[2];
+        assert!(matches!(merge.kind, NodeKind::Merge));
+        assert_eq!(merge.inputs, vec![NodeId(0), NodeId(1)]);
+    }
+
+    #[test]
+    fn key_by_creates_key_by_node() {
+        let g = DataflowGraph::new();
+        let src = add_src(&g);
+        let keyed = g.add_key_by(src, noop_key_fn());
+        g.add_erased_sink(keyed, Box::new(NoopSink));
+
+        let nodes = g.into_nodes();
+        assert!(matches!(nodes[1].kind, NodeKind::KeyBy(_)));
+        assert_eq!(nodes[1].inputs, vec![NodeId(0)]);
+    }
+
+    #[test]
+    fn set_label_records_node_label() {
+        let g = DataflowGraph::new();
+        let src = add_src(&g);
+        g.set_label(src.0, "ingest".to_string());
+
+        let nodes = g.into_nodes();
+        assert_eq!(nodes[0].label.as_deref(), Some("ingest"));
+    }
+}
