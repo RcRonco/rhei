@@ -37,10 +37,19 @@ core_affinity = "0.8"
 # libcurl-dev / cmake to build librdkafka.
 rdkafka = { workspace = true, optional = true }
 object_store = { workspace = true, features = ["aws"], optional = true }
+# Optional allocators used ONLY to select the global allocator in the
+# `allocator` benchmark (benches/allocator.rs). Off by default — rhei never
+# imposes an allocator; embedders choose their own. See ADR/memory-allocator.md.
+mimalloc = { version = "0.1", default-features = false, optional = true }
+tikv-jemallocator = { version = "0.6", optional = true }
 
 [features]
 kafka = ["rhei-core/kafka", "dep:rdkafka"]
 remote-state = ["dep:object_store"]
+# Pick the global allocator for `cargo bench --bench allocator` (mutually
+# exclusive). With neither set, the platform default (glibc) is used.
+bench-mimalloc = ["dep:mimalloc"]
+bench-jemalloc = ["dep:tikv-jemallocator"]
 
 [lints]
 workspace = true
@@ -64,4 +73,8 @@ harness = false
 
 [[bench]]
 name = "exchange"
+harness = false
+
+[[bench]]
+name = "allocator"
 harness = false
