@@ -18,16 +18,6 @@ serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 tracing.workspace = true
-# mimalloc is registered as the global allocator for the `rhei` binary. It is
-# default-on but can be disabled with `--no-default-features` to A/B against
-# the system allocator. `default-features = false` skips mimalloc's "secure"
-# hardening build for max throughput. See ADR/memory-allocator.md.
-mimalloc = { version = "0.1", default-features = false, optional = true }
-
-[features]
-default = ["mimalloc"]
-# Use mimalloc as the process-wide global allocator (see src/main.rs).
-mimalloc = ["dep:mimalloc"]
 
 [lints]
 workspace = true
