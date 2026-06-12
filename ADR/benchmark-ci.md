@@ -61,7 +61,10 @@ Two jobs, deliberately split by trigger:
   `benchmark-action/github-action-benchmark`. Previous results are restored from
   an `actions/cache` data file (no `gh-pages` branch needed), the comparison is
   written to the job summary, and a >200% regression raises a non-blocking
-  alert.
+  alert. A second `jq` script (`.github/scripts/bench-summary.jq`) renders the
+  absolute median/mean/throughput numbers as a Markdown table in the same job
+  summary, so the raw results are visible at a glance alongside the
+  delta-vs-baseline comparison.
 
 Perf gating is intentionally **non-blocking** (`fail-on-alert: false`): shared
 GitHub runners are too variable to fail a build on, so the value is the trend

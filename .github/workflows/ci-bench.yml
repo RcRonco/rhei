@@ -60,6 +60,19 @@ jobs:
         run: cargo install cargo-criterion --locked
       - name: Run benchmarks (machine-readable output)
         run: cargo criterion --workspace --message-format=json > criterion-output.jsonl
+      - name: Write benchmark results to job summary
+        # Render an absolute median/mean/throughput table into the run summary.
+        # Complements the github-action-benchmark step below, which shows the
+        # delta-vs-baseline comparison rather than the raw numbers.
+        if: always()
+        run: |
+          if [ -s criterion-output.jsonl ]; then
+            jq -nr -f .github/scripts/bench-summary.jq criterion-output.jsonl \
+              >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "## Benchmark results" >> "$GITHUB_STEP_SUMMARY"
+            echo "_No criterion output was produced._" >> "$GITHUB_STEP_SUMMARY"
+          fi
       - name: Convert criterion output to benchmark-action format
         # Each `benchmark-complete` message carries `typical.estimate` in
         # nanoseconds. Normalize the unit to "ns" so historical comparisons
