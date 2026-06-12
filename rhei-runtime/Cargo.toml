@@ -56,3 +56,12 @@ arrow-schema.workspace = true
 async-trait.workspace = true
 proptest.workspace = true
 rstest = "0.26.1"
+criterion.workspace = true
+
+[[bench]]
+name = "pipeline_e2e"
+harness = false
+
+[[bench]]
+name = "exchange"
+harness = false

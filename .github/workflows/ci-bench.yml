@@ -1,0 +1,108 @@
+name: Benchmarks
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  # Fast guard on every PR: compile all benchmarks and run each one a single
+  # time (criterion's `--test` mode). This catches benchmark bit-rot and
+  # runtime panics without paying for full statistical sampling on noisy
+  # shared runners.
+  bench-smoke:
+    name: Bench smoke (compile + test-run)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+      - name: Cache dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: bench
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Compile benchmarks
+        run: cargo bench --workspace --no-run
+      - name: Test-run benchmarks (single iteration each)
+        run: cargo bench --workspace -- --test
+
+  # Full benchmark run with historical regression tracking. Only on main (and
+  # manual dispatch) to keep PRs fast and avoid polluting the trend line with
+  # noisy PR-runner numbers. Results are compared against the previous run via
+  # a cached data file (no gh-pages branch required) and surfaced in the job
+  # summary; large regressions raise an alert but do not fail the build, since
+  # shared runners are too noisy for hard perf gating.
+  bench-track:
+    name: Bench run + regression tracking
+    runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+      - name: Cache dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: bench
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Install cargo-criterion
+        run: cargo install cargo-criterion --locked
+      - name: Run benchmarks (machine-readable output)
+        run: cargo criterion --workspace --message-format=json > criterion-output.jsonl
+      - name: Convert criterion output to benchmark-action format
+        # Each `benchmark-complete` message carries `typical.estimate` in
+        # nanoseconds. Normalize the unit to "ns" so historical comparisons
+        # stay apples-to-apples even when criterion's human formatting flips
+        # between ns/µs/ms.
+        run: |
+          jq -s '[.[]
+            | select(.reason == "benchmark-complete")
+            | {name: .id, unit: "ns", value: .typical.estimate}]' \
+            criterion-output.jsonl > bench-results.json
+          echo "Parsed $(jq length bench-results.json) benchmarks"
+      - name: Restore previous benchmark data
+        uses: actions/cache/restore@v4
+        with:
+          path: ./bench-cache
+          key: benchmark-data-${{ github.run_id }}
+          restore-keys: |
+            benchmark-data-
+      - name: Compare and store benchmark results
+        uses: benchmark-action/github-action-benchmark@v1
+        with:
+          name: rhei benchmarks
+          tool: customSmallerIsBetter
+          output-file-path: bench-results.json
+          external-data-json-path: ./bench-cache/benchmark-data.json
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          summary-always: true
+          alert-threshold: "200%"
+          comment-on-alert: false
+          fail-on-alert: false
+          auto-push: false
+      - name: Save benchmark data
+        if: github.ref == 'refs/heads/main'
+        uses: actions/cache/save@v4
+        with:
+          path: ./bench-cache
+          key: benchmark-data-${{ github.run_id }}
+      - name: Upload criterion reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: criterion-reports
+          path: |
+            target/criterion/**
+            bench-results.json
+          if-no-files-found: ignore

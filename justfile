@@ -74,6 +74,20 @@ e2e-s3:
 e2e-checkpoint:
     cargo test -p rhei-runtime --test checkpoint_coord_e2e -- --nocapture
 
+# ── Benchmarks ──────────────────────────────────────────────────────
+
+# Run the full criterion benchmark suite
+bench:
+    cargo bench --workspace
+
+# Run benchmarks for a single crate (e.g. just bench-crate rhei-core)
+bench-crate crate:
+    cargo bench -p {{ crate }}
+
+# Compile + single-iteration test-run of all benchmarks (fast CI smoke check)
+bench-smoke:
+    cargo bench --workspace -- --test
+
 # ── Python bindings (rhei-python) ───────────────────────────────────
 
 py_dir := "rhei-python"
