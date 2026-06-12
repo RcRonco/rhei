@@ -7,6 +7,17 @@ use clap::{Parser, Subcommand};
 mod scaffold;
 mod tui;
 
+// Register mimalloc as the process-wide global allocator. Rhei runs many
+// threads (Timely workers + the tokio runtime + background services) with
+// high-churn, cross-thread allocation on the Arrow/Exchange hot path — a
+// profile that the system allocator (glibc ptmalloc2) handles poorly. The
+// allocator is owned by the binary, not the library crates, so embedders of
+// `rhei`/`rhei-core` keep their own choice. Disable with
+// `--no-default-features` to benchmark against the system allocator.
+#[cfg(feature = "mimalloc")]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 #[derive(Parser)]
 #[command(name = "rhei", about = "Rhei stream processing CLI")]
 struct Cli {
