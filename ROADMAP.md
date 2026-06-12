@@ -72,7 +72,7 @@
 - [ ] Async state prefetch — predict upcoming keys and warm L2/L3 cache
 - [ ] DataFusion kernel integration for aggregate/join operators
 - [ ] Vectorized `SequenceDetect` predicates — evaluate step expressions as Arrow boolean masks via DataFusion kernels, feed pre-computed matches into NFA state machine
-- [ ] Benchmark suite with throughput/latency targets
+- [x] Benchmark suite with throughput/latency targets — criterion benches for operators, state, exchange, and end-to-end pipelines, wired into CI (`.github/workflows/ci-bench.yml`) with regression tracking. See `ADR/benchmark-ci.md`.
 - [ ] Profile and optimize the Timely ↔ Tokio bridge (channel sizing, wake strategy)
 - [ ] Sliding window eviction for closed active windows (KI-10)
 

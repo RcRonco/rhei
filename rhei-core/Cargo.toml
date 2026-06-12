@@ -40,7 +40,18 @@ tempfile.workspace = true
 criterion.workspace = true
 proptest.workspace = true
 rstest = "0.26.1"
+# Benchmarks derive `RheiSchema` via the proc macro. rhei-macros has no
+# dependency on rhei-core, so this dev-only edge introduces no cycle.
+rhei-macros = { path = "../rhei-macros" }
 
 [[bench]]
 name = "columnar_vs_row"
+harness = false
+
+[[bench]]
+name = "operators"
+harness = false
+
+[[bench]]
+name = "state"
 harness = false
