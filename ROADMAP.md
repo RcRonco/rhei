@@ -33,10 +33,10 @@
   - [ ] Consumer group source with acknowledgment
   - [ ] Stream/pub-sub sink
   - [ ] Redis as lookup/enrichment source for joins
-- [ ] Amazon SQS source/sink
-  - [ ] Long-polling source with visibility timeout management
-  - [ ] Batched sink with message deduplication
-  - [ ] Dead-letter queue integration
+- [x] Amazon SQS source/sink (behind the `sqs` feature; see `ADR/sqs-connector.md`)
+  - [x] Long-polling source with visibility timeout management (`SqsSource`, checkpoint-coordinated deletion for at-least-once)
+  - [x] Batched sink with message deduplication (`SqsSink`, `SendMessageBatch` ≤10, FIFO group/dedup IDs)
+  - [x] Dead-letter queue integration (`SqsDlqSink` implementing `DlqSink`)
 - [ ] Google Pub/Sub source/sink
   - [ ] Streaming pull source with flow control
   - [ ] Batched publish sink with ordering keys

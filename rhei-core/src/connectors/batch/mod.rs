@@ -13,6 +13,15 @@ pub mod kafka_sink;
 #[cfg(feature = "kafka")]
 pub mod kafka_source;
 
+#[cfg(feature = "sqs")]
+pub mod sqs_dlq;
+#[cfg(feature = "sqs")]
+pub mod sqs_schema;
+#[cfg(feature = "sqs")]
+pub mod sqs_sink;
+#[cfg(feature = "sqs")]
+pub mod sqs_source;
+
 pub use partitioned_vec_source::PartitionedVecSource;
 pub use print_sink::PrintSink;
 pub use vec_source::VecSource;
@@ -23,3 +32,10 @@ pub use kafka_dlq::KafkaDlqSink;
 pub use kafka_sink::KafkaSink;
 #[cfg(feature = "kafka")]
 pub use kafka_source::KafkaSource;
+
+#[cfg(feature = "sqs")]
+pub use sqs_dlq::SqsDlqSink;
+#[cfg(feature = "sqs")]
+pub use sqs_sink::SqsSink;
+#[cfg(feature = "sqs")]
+pub use sqs_source::SqsSource;

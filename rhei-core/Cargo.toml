@@ -27,9 +27,12 @@ arrow-array.workspace = true
 arrow-buffer.workspace = true
 datafusion-physical-expr.workspace = true
 rdkafka = { workspace = true, optional = true }
+aws-config = { workspace = true, optional = true }
+aws-sdk-sqs = { workspace = true, optional = true }
 
 [features]
 kafka = ["rdkafka"]
+sqs = ["aws-sdk-sqs", "aws-config"]
 
 [lints]
 workspace = true
