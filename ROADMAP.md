@@ -71,15 +71,17 @@
 - [x] Memtable compaction and eviction policies (bounded memory) (KI-7)
 - [ ] Async state prefetch — predict upcoming keys and warm L2/L3 cache
 - [ ] DataFusion kernel integration for aggregate/join operators
+  - [x] `FilterOp` — DataFusion `PhysicalExpr`-based zero-copy filtering (`operators/filter.rs`, `operators/filter_expr.rs`)
+  - [ ] Aggregate/join operators (`reduce`, tumbling/sliding/session windows, `temporal_join`) still use closure-based accumulation, not DataFusion kernels
 - [ ] Vectorized `SequenceDetect` predicates — evaluate step expressions as Arrow boolean masks via DataFusion kernels, feed pre-computed matches into NFA state machine
 - [x] Benchmark suite with throughput/latency targets — criterion benches for operators, state, exchange, and end-to-end pipelines, wired into CI (`.github/workflows/ci-bench.yml`) with regression tracking. See `ADR/benchmark-ci.md`.
 - [ ] Profile and optimize the Timely ↔ Tokio bridge (channel sizing, wake strategy)
-- [ ] Sliding window eviction for closed active windows (KI-10)
+- [x] Sliding window eviction for closed active windows (KI-10)
 
 ## Stability
 
 - [ ] Exactly-once semantics with two-phase commit on source/sink
-- [ ] Checkpoint versioning and backward-compatible state migration
+- [ ] Checkpoint versioning and backward-compatible state migration — manifest carries a `version` field and v1 deserializes with serde defaults for newer fields, but there is no version-branching migration logic
 - [x] Graceful shutdown: drain in-flight, checkpoint, then exit
 - [x] Restart from checkpoint with offset tracking (Kafka consumer offsets)
   - [x] Checkpoint manifest with source offset persistence
@@ -94,10 +96,11 @@
 - [x] Propagate checkpoint failures in single-worker mode (KI-15)
 - [ ] Fix async stash ordering — pending elements can be overtaken by later L1 hits (KI-11)
 - [x] Configurable checkpoint interval via `Executor::builder().checkpoint_interval(n)` (KI-8)
-- [ ] Fuzz testing for state serialization and checkpoint restore
+- [x] Fuzz testing for state serialization and checkpoint restore — proptest model-based fuzz of memtable/timer/prefixed-backend (`tests/state_fuzz.rs`) and serde round-trips for events/encoders/timers/checkpoint manifests (`tests/serde_fuzz.rs`)
+  - [ ] Extend to full crash-then-restore cycle fuzzing (currently round-trip only)
 - [x] S3/MinIO E2E integration test for tiered storage backend
 - [ ] Integration tests with simulated failures (network partitions, slow backends)
-- [ ] Integration tests for backpressure, DLQ routing, late events, checkpoint recovery (KI-18)
+- [ ] Integration tests for backpressure, DLQ routing, late events, checkpoint recovery (KI-18) — `tests/backpressure.rs` and `tests/dlq_routing.rs` exist; late-event and recovery scenarios still uncovered
 
 ## Topology
 
@@ -128,13 +131,13 @@
 
 ### Phase 3: Dynamic control plane (chitchat + OpenRaft)
 - [ ] `PipelineController::reconfigure()` — update topology at runtime (new peers, worker count)
-- [ ] Checkpoint manifest topology metadata (track process count, workers per process)
-- [ ] Manifest merge with non-sequential process IDs (tolerate node replacement)
+- [x] Checkpoint manifest topology metadata (track process count, workers per process) — delivered by Manifest v2 (`checkpoint.rs`: `n_processes`, `workers_per_process`)
+- [ ] Manifest merge with non-sequential process IDs (tolerate node replacement) — `merge_partials()` exists but currently assumes sequential `0..n_processes`
 - [ ] State repartitioning strategy after topology changes
   - [ ] Decide approach: lazy migration (read-through old prefix) vs eager compaction
   - [ ] Decouple state prefix from `(process_id, worker_index)` pair
 - [ ] TaskManager rebuild path: checkpoint → build fresh TaskManager → restart Timely
-- [ ] Source partition rebalance on scale events (re-trigger Kafka consumer group)
+- [ ] Source partition rebalance on scale events (re-trigger Kafka consumer group) — partitions are assigned statically at startup (`assign_partitions()`); no runtime rebalance
 - [ ] Job Manager integration: chitchat gossip for failure detection, OpenRaft for coordination
 - [ ] Leader election and failure detection
 - [ ] Dynamic scaling: add/remove workers with state redistribution
