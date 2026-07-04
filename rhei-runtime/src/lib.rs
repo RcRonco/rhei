@@ -12,6 +12,8 @@
 
 #![warn(missing_docs)]
 
+/// Reusable per-batch bump arena for hot-path scratch allocations.
+pub mod arena;
 /// Async-to-sync channel bridges for Timely dataflow integration.
 pub mod bridge;
 /// Cross-process checkpoint coordination via lightweight TCP.

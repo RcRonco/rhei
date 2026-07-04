@@ -34,6 +34,7 @@ toml = "0.8"
 syn = { version = "2.0.117", features = ["full"] }
 quote = "1.0.45"
 proc-macro2 = "1"
+bumpalo = { version = "3.19", features = ["collections"] }
 arrow = { version = "54", features = ["prettyprint"] }
 arrow-schema = "54"
 arrow-array = "54"

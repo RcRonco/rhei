@@ -25,6 +25,7 @@ hex = "0.4"
 regex = "1"
 urlencoding = "2"
 seahash = "4"
+bumpalo.workspace = true
 arrow.workspace = true
 arrow-schema.workspace = true
 arrow-array.workspace = true

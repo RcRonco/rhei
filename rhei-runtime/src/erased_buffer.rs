@@ -13,8 +13,11 @@ use arrow::ipc::reader::StreamReader;
 use arrow::ipc::writer::StreamWriter;
 use arrow_array::{BooleanArray, RecordBatch};
 use arrow_schema::Schema;
+use bumpalo::collections::Vec as BumpVec;
 
 use rhei_core::arrow::{RheiBuffer, RheiSchema};
+
+use crate::arena::BatchArena;
 
 /// Type-erased key extraction function: given a `RecordBatch` and row index,
 /// returns the key string for that row. Used by `key_by` exchange.
@@ -169,11 +172,18 @@ impl ErasedBuffer {
     /// For each row, extracts the key via `key_fn`, hashes it with seahash,
     /// and assigns it to `hash % num_workers`. Returns one `ErasedBuffer` per
     /// non-empty partition, tagged with `exchange_target`.
+    ///
+    /// The per-worker row-routing lists are scratch that dies with the batch,
+    /// so they live in `arena` (recycled at the start of every call) instead
+    /// of hitting the global allocator once per worker per batch. Callers
+    /// keep one [`BatchArena`] per operator instance and pass it to every
+    /// invocation; only the returned Arrow sub-batches are heap-allocated.
     #[allow(clippy::cast_possible_truncation)]
-    pub(crate) fn partition_for_exchange(
+    pub fn partition_for_exchange(
         &self,
         key_fn: &KeyFn,
         num_workers: usize,
+        arena: &mut BatchArena,
     ) -> Vec<ErasedBuffer> {
         if num_workers <= 1 {
             return vec![self.clone()];
@@ -184,8 +194,17 @@ impl ErasedBuffer {
             return vec![];
         }
 
-        // Assign each logical row to a worker.
-        let mut worker_rows: Vec<Vec<usize>> = vec![vec![]; num_workers];
+        arena.reset();
+        let bump = arena.bump();
+
+        // Assign each logical row to a worker. The routing lists are freed
+        // wholesale on the next `reset`, so pushes never touch the global
+        // allocator once the arena's chunk is warm.
+        let mut worker_rows: BumpVec<'_, BumpVec<'_, u32>> =
+            BumpVec::with_capacity_in(num_workers, bump);
+        for _ in 0..num_workers {
+            worker_rows.push(BumpVec::new_in(bump));
+        }
         for row_idx in 0..num_rows {
             if let Some(ref mask) = self.mask
                 && !mask.value(row_idx)
@@ -194,17 +213,18 @@ impl ErasedBuffer {
             }
             let key = key_fn(&self.batch, row_idx);
             let target = (seahash::hash(key.as_bytes()) as usize) % num_workers;
-            worker_rows[target].push(row_idx);
+            worker_rows[target].push(row_idx as u32);
         }
 
-        // Build per-worker sub-buffers using Arrow take kernel.
+        // Build per-worker sub-buffers using Arrow take kernel. The index
+        // arrays and sub-batches outlive the batch, so they are ordinary
+        // heap allocations — only the routing scratch above is arena-backed.
         let mut result = Vec::with_capacity(num_workers);
-        for (worker_idx, rows) in worker_rows.into_iter().enumerate() {
+        for (worker_idx, rows) in worker_rows.iter().enumerate() {
             if rows.is_empty() {
                 continue;
             }
-            let indices =
-                arrow_array::UInt32Array::from(rows.iter().map(|&r| r as u32).collect::<Vec<_>>());
+            let indices = arrow_array::UInt32Array::from_iter_values(rows.iter().copied());
             let columns: Vec<Arc<dyn arrow_array::Array>> = self
                 .batch
                 .columns()
@@ -633,7 +653,8 @@ mod tests {
                 .to_string()
         });
 
-        let partitions = erased.partition_for_exchange(&key_fn, 3);
+        let mut arena = BatchArena::new();
+        let partitions = erased.partition_for_exchange(&key_fn, 3, &mut arena);
         let total_rows: usize = partitions.iter().map(ErasedBuffer::num_rows).sum();
         assert_eq!(total_rows, 6, "no rows should be lost during partitioning");
     }
@@ -659,8 +680,9 @@ mod tests {
                 .to_string()
         });
 
-        let p1 = erased.partition_for_exchange(&key_fn, 4);
-        let p2 = erased.partition_for_exchange(&key_fn, 4);
+        let mut arena = BatchArena::new();
+        let p1 = erased.partition_for_exchange(&key_fn, 4, &mut arena);
+        let p2 = erased.partition_for_exchange(&key_fn, 4, &mut arena);
         assert_eq!(
             p1.len(),
             p2.len(),
@@ -695,7 +717,8 @@ mod tests {
                 .to_string()
         });
 
-        let partitions = erased.partition_for_exchange(&key_fn, 4);
+        let mut arena = BatchArena::new();
+        let partitions = erased.partition_for_exchange(&key_fn, 4, &mut arena);
         for part in &partitions {
             let target = part.exchange_target().unwrap() as usize;
             // Verify every row in this partition hashes to the same target.
@@ -723,7 +746,8 @@ mod tests {
 
         let key_fn: KeyFn = Arc::new(|_batch: &RecordBatch, _row_idx: usize| "any".to_string());
 
-        let partitions = erased.partition_for_exchange(&key_fn, 1);
+        let mut arena = BatchArena::new();
+        let partitions = erased.partition_for_exchange(&key_fn, 1, &mut arena);
         assert_eq!(partitions.len(), 1);
         assert_eq!(partitions[0].num_rows(), 2);
     }
@@ -751,7 +775,8 @@ mod tests {
                 .to_string()
         });
 
-        let partitions = erased.partition_for_exchange(&key_fn, 4);
+        let mut arena = BatchArena::new();
+        let partitions = erased.partition_for_exchange(&key_fn, 4, &mut arena);
         let total_rows: usize = partitions.iter().map(ErasedBuffer::num_rows).sum();
         // Only 2 rows should be routed (masked rows excluded).
         assert_eq!(total_rows, 2);
@@ -820,7 +845,8 @@ mod prop_tests {
             n_workers in 1usize..8,
         ) {
             let buf = make_erased(&values);
-            let parts = buf.partition_for_exchange(&value_key_fn(), n_workers);
+            let mut arena = BatchArena::new();
+            let parts = buf.partition_for_exchange(&value_key_fn(), n_workers, &mut arena);
 
             let mut seen: Vec<i64> = parts.iter().flat_map(erased_values).collect();
             let mut expected = values.clone();
@@ -837,7 +863,8 @@ mod prop_tests {
             n_workers in 2usize..8,
         ) {
             let buf = make_erased(&values);
-            let parts = buf.partition_for_exchange(&value_key_fn(), n_workers);
+            let mut arena = BatchArena::new();
+            let parts = buf.partition_for_exchange(&value_key_fn(), n_workers, &mut arena);
 
             for part in &parts {
                 let target = part.exchange_target.unwrap() as usize;

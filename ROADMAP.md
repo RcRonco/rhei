@@ -69,6 +69,7 @@
 - [x] Batch-level type erasure (`ErasedBuffer` with Arrow IPC serialization)
 - [x] Zero-copy state reads (`Bytes` instead of `Vec<u8>` cloning)
 - [x] Memtable compaction and eviction policies (bounded memory) (KI-7)
+- [x] Bump-arena scratch buffering (`BatchArena` via bumpalo) for the `key_by` split hot path — per-batch routing scratch recycled instead of reallocated. See `ADR/bumpalo-batch-arena.md`.
 - [ ] Async state prefetch — predict upcoming keys and warm L2/L3 cache
 - [ ] DataFusion kernel integration for aggregate/join operators
 - [ ] Vectorized `SequenceDetect` predicates — evaluate step expressions as Arrow boolean masks via DataFusion kernels, feed pre-computed matches into NFA state machine
