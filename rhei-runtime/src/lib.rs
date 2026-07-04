@@ -48,6 +48,11 @@ pub mod timely_operator;
 /// Log capture layer for dashboards and log aggregation.
 pub mod tracing_capture;
 
+// Re-export bumpalo so downstream crates (e.g. rhei-python) can implement
+// [`erased_buffer::KeyFn`] — whose signature includes `bumpalo::Bump` — against
+// the exact version rhei-runtime was built with.
+pub use bumpalo;
+
 // Backward-compatible re-exports.
 #[doc(hidden)]
 pub use controller::PipelineController as Executor;

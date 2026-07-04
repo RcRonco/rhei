@@ -230,7 +230,7 @@ async fn main() -> anyhow::Result<()> {
 
     let events = graph.source(source);
     events
-        .key_by(|v: &OrderEventView<'_>| v.order_id.to_string())
+        .key_by_ref(|v: &OrderEventView<'_>, _| v.order_id)
         .operator("temporal_join", op)
         .sink(PrintSink::<JoinResult>::new().with_prefix("output"));
 

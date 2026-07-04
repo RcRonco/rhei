@@ -18,7 +18,7 @@ use pyo3::prelude::*;
 use rhei_runtime::controller::PipelineController;
 use rhei_runtime::dataflow::{BatchTransformFn, DataflowGraph, ErasedHandle};
 use rhei_runtime::erased_batch::{ErasedSink, ErasedSource};
-use rhei_runtime::erased_buffer::{ErasedBuffer, KeyFn, schema_hash_of};
+use rhei_runtime::erased_buffer::{ErasedBuffer, KeyFn, key_fn_from, schema_hash_of};
 
 use crate::buffer::PyBuffer;
 use crate::codec::{batch_row_to_dict, dicts_to_batch};
@@ -451,28 +451,31 @@ fn py_row_inspect_transform(callable: Py<PyAny>, error_slot: ErrorSlot) -> Batch
 /// Wrap a Python `fn(dict) -> str` as a `KeyFn` for `key_by`. A Python error
 /// routes the row to a sentinel key so the run can surface it rather than panic.
 fn py_key_fn(callable: Py<PyAny>, error_slot: ErrorSlot) -> KeyFn {
-    Arc::new(move |batch: &RecordBatch, row: usize| {
-        Python::with_gil(|py| {
-            let dict = match batch_row_to_dict(py, batch, row) {
-                Ok(d) => d,
-                Err(e) => {
-                    record_error(&error_slot, format_py_error(py, "key_by: reading row", &e));
-                    return "__rhei_key_error__".to_string();
+    key_fn_from(
+        move |batch: &RecordBatch, row: usize, bump: &rhei_runtime::bumpalo::Bump| {
+            let key = Python::with_gil(|py| {
+                let dict = match batch_row_to_dict(py, batch, row) {
+                    Ok(d) => d,
+                    Err(e) => {
+                        record_error(&error_slot, format_py_error(py, "key_by: reading row", &e));
+                        return "__rhei_key_error__".to_string();
+                    }
+                };
+                match callable
+                    .bind(py)
+                    .call1((dict,))
+                    .and_then(|r| r.extract::<String>())
+                {
+                    Ok(k) => k,
+                    Err(e) => {
+                        record_error(&error_slot, format_py_error(py, "key_by: callable", &e));
+                        "__rhei_key_error__".to_string()
+                    }
                 }
-            };
-            match callable
-                .bind(py)
-                .call1((dict,))
-                .and_then(|r| r.extract::<String>())
-            {
-                Ok(k) => k,
-                Err(e) => {
-                    record_error(&error_slot, format_py_error(py, "key_by: callable", &e));
-                    "__rhei_key_error__".to_string()
-                }
-            }
-        })
-    })
+            });
+            &*bump.alloc_str(&key)
+        },
+    )
 }
 
 // ── PyDataflow / PyStream ────────────────────────────────────────────

@@ -4657,6 +4657,7 @@ dependencies = [
  "async-trait",
  "axum",
  "bincode",
+ "bumpalo",
  "core_affinity",
  "criterion",
  "datafusion",

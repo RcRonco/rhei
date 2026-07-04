@@ -447,11 +447,17 @@ impl DataflowExecutor {
             &format!("KeyBy_Split_{}", node_id.0),
             move |_cap, _info| {
                 let key_fn = key_fn;
+                // Per-operator bump arena, reused (and reset) across batches so
+                // partitioning scratch never touches the global allocator in
+                // steady state. See ADR/bumpalo-exchange-arena.md.
+                let mut scratch = crate::erased_buffer::ExchangeScratch::new();
                 move |input, output| {
                     input.for_each(|cap, data| {
                         let mut session = output.session(&cap);
                         for buf in data.drain(..) {
-                            for sub_buf in buf.partition_for_exchange(&key_fn, num_workers) {
+                            for sub_buf in
+                                buf.partition_for_exchange(&key_fn, num_workers, &mut scratch)
+                            {
                                 session.give(sub_buf);
                             }
                         }

@@ -670,15 +670,56 @@ impl<'a, T: RheiSchema + 'static> Stream<'a, T> {
 
     /// Key-based exchange: partitions rows by key hash and routes them
     /// so that all rows with the same key land on the same worker.
+    ///
+    /// The closure returns an owned `String` per row. When the key is simply
+    /// a string field of the row, prefer [`key_by_ref`](Self::key_by_ref),
+    /// which borrows the key from the batch and skips the per-row allocation.
     pub fn key_by<F>(self, key_fn: F) -> Stream<'a, T>
     where
         F: for<'v> Fn(&T::View<'v>) -> String + Send + Sync + 'static,
     {
         let node = LazyKeyByNode(Box::new(move || {
-            Arc::new(move |batch: &arrow_array::RecordBatch, row_idx: usize| {
-                let view = T::view(batch, row_idx);
-                key_fn(&view)
-            })
+            crate::erased_buffer::key_fn_from(
+                move |batch: &arrow_array::RecordBatch, row_idx: usize, bump: &bumpalo::Bump| {
+                    let view = T::view(batch, row_idx);
+                    &*bump.alloc_str(&key_fn(&view))
+                },
+            )
+        }));
+        let node_id = self
+            .graph
+            .add_node(NodeKind::KeyBy(node), vec![self.node_id]);
+        Stream::new(self.graph, node_id)
+    }
+
+    /// Key-based exchange keyed by a borrowed `&str`, avoiding the per-row
+    /// `String` allocation of [`key_by`](Self::key_by).
+    ///
+    /// The closure receives the row view plus a [`bumpalo::Bump`] arena and
+    /// returns a `&str` borrowed from either one. Key on a string field
+    /// directly (zero allocation), or format a composite key into the arena:
+    ///
+    /// ```ignore
+    /// stream.key_by_ref(|v: &WordView<'_>, _| v.word);
+    /// stream.key_by_ref(|v: &EventView<'_>, bump| {
+    ///     bumpalo::format!(in bump, "{}/{}", v.tenant, v.user).into_bump_str()
+    /// });
+    /// ```
+    ///
+    /// The arena is scoped to the exchange operator and reset between
+    /// batches, so arena-formatted keys never touch the global allocator in
+    /// steady state.
+    pub fn key_by_ref<F>(self, key_fn: F) -> Stream<'a, T>
+    where
+        F: for<'v> Fn(&T::View<'v>, &'v bumpalo::Bump) -> &'v str + Send + Sync + 'static,
+    {
+        let node = LazyKeyByNode(Box::new(move || {
+            crate::erased_buffer::key_fn_from(
+                move |batch: &arrow_array::RecordBatch, row_idx: usize, bump: &bumpalo::Bump| {
+                    let view = T::view(batch, row_idx);
+                    key_fn(&view, bump)
+                },
+            )
         }));
         let node_id = self
             .graph
@@ -963,7 +1004,7 @@ mod tests {
     }
 
     fn noop_key_fn() -> KeyFn {
-        Arc::new(|_batch, _idx| String::new())
+        crate::erased_buffer::key_fn_from(|_batch, _idx, _bump| "")
     }
 
     // ── validate() ──────────────────────────────────────────────────────

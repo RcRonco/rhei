@@ -3833,6 +3833,7 @@ dependencies = [
  "async-trait",
  "axum",
  "bincode",
+ "bumpalo",
  "core_affinity",
  "datafusion",
  "datafusion-expr",

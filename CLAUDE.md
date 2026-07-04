@@ -32,7 +32,7 @@ Five crates:
 
 **Data path:** Source produces `RheiBuffer<T>` → erased to `ErasedBuffer` → Timely operators (Pipeline/Exchange pact) → recovered to `RheiBuffer<T>` → `StreamFunction::process()` → output → Sink.
 
-**Exchange:** `key_by` uses two-stage Timely operator: (1) split rows by `seahash(key) % workers` into per-worker sub-buffers, (2) route via Exchange pact. Serialization is Arrow IPC.
+**Exchange:** `key_by` uses two-stage Timely operator: (1) split rows by `seahash(key) % workers` into per-worker sub-buffers, (2) route via Exchange pact. Serialization is Arrow IPC. Split-stage scratch (per-row keys, row-index lists) lives in a per-operator bumpalo arena (`ExchangeScratch`), reset per batch — see `ADR/bumpalo-exchange-arena.md`.
 
 **State hierarchy:** L1 `HashMap` memtable (microseconds) → L2 Foyer `HybridCache` on NVMe (milliseconds) → L3 SlateDB on S3 (10s-100s ms). `PrefixedBackend` namespaces keys per operator as `{operator_name}/{user_key}`.
 

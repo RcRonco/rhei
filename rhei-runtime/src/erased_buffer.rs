@@ -13,12 +13,84 @@ use arrow::ipc::reader::StreamReader;
 use arrow::ipc::writer::StreamWriter;
 use arrow_array::{BooleanArray, RecordBatch};
 use arrow_schema::Schema;
+use bumpalo::Bump;
 
 use rhei_core::arrow::{RheiBuffer, RheiSchema};
 
-/// Type-erased key extraction function: given a `RecordBatch` and row index,
-/// returns the key string for that row. Used by `key_by` exchange.
-pub type KeyFn = Arc<dyn Fn(&RecordBatch, usize) -> String + Send + Sync>;
+/// Type-erased key extraction function: given a `RecordBatch`, a row index,
+/// and a bump arena, returns the key string for that row. Used by `key_by`
+/// exchange.
+///
+/// The returned `&str` may borrow from either input: implementations that key
+/// on a string column return a slice of the batch directly (zero allocation),
+/// while composite or computed keys are formatted into the arena (e.g. via
+/// [`Bump::alloc_str`] or `bumpalo::format!`). Either way, nothing hits the
+/// global allocator on the per-row path — the arena is reset in O(1) between
+/// batches by [`ExchangeScratch`].
+pub type KeyFn = Arc<dyn for<'k> Fn(&'k RecordBatch, usize, &'k Bump) -> &'k str + Send + Sync>;
+
+/// Build a [`KeyFn`] from a closure.
+///
+/// This helper pins the higher-ranked lifetime signature so callers can write
+/// plain closures without fighting inference on the `for<'k>` bound.
+pub fn key_fn_from<F>(f: F) -> KeyFn
+where
+    F: for<'k> Fn(&'k RecordBatch, usize, &'k Bump) -> &'k str + Send + Sync + 'static,
+{
+    Arc::new(f)
+}
+
+/// Reusable bump-arena scratch space for exchange partitioning.
+///
+/// Owned by each `key_by` split operator (one per worker) and reused across
+/// batches: per-row key strings and per-worker row-index lists are allocated
+/// in the arena, then the whole arena is reset in O(1) before the next batch.
+/// After warm-up the partitioning path performs no global-allocator traffic
+/// for its scratch data — see `ADR/bumpalo-exchange-arena.md`.
+pub struct ExchangeScratch {
+    bump: Bump,
+}
+
+impl ExchangeScratch {
+    /// Soft cap on arena memory retained across batches. A reset arena keeps
+    /// its largest chunk for reuse; if a pathological batch grew the arena
+    /// past this limit, the arena is dropped and rebuilt instead so one
+    /// outlier batch cannot pin memory for the pipeline's lifetime.
+    const RETAIN_LIMIT_BYTES: usize = 4 * 1024 * 1024;
+
+    /// Create an empty scratch arena. The first batch warms it up.
+    pub fn new() -> Self {
+        Self { bump: Bump::new() }
+    }
+
+    /// Reset the arena for the next batch, bounding retained capacity.
+    fn reset(&mut self) {
+        if self.bump.allocated_bytes() > Self::RETAIN_LIMIT_BYTES {
+            self.bump = Bump::new();
+        } else {
+            self.bump.reset();
+        }
+    }
+
+    /// Borrow the underlying arena.
+    fn bump(&self) -> &Bump {
+        &self.bump
+    }
+}
+
+impl Default for ExchangeScratch {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl std::fmt::Debug for ExchangeScratch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ExchangeScratch")
+            .field("allocated_bytes", &self.bump.allocated_bytes())
+            .finish()
+    }
+}
 
 /// Type-erased Arrow buffer for flowing through Timely dataflow channels.
 ///
@@ -169,12 +241,25 @@ impl ErasedBuffer {
     /// For each row, extracts the key via `key_fn`, hashes it with seahash,
     /// and assigns it to `hash % num_workers`. Returns one `ErasedBuffer` per
     /// non-empty partition, tagged with `exchange_target`.
+    ///
+    /// All per-row scratch data — key strings produced by `key_fn`, row
+    /// target assignments, and per-worker row-index lists — lives in
+    /// `scratch`'s bump arena, which is reset at the start of each call. The
+    /// returned sub-buffers own their data (Arrow allocations) and do not
+    /// borrow from the arena.
     #[allow(clippy::cast_possible_truncation)]
-    pub(crate) fn partition_for_exchange(
+    pub fn partition_for_exchange(
         &self,
         key_fn: &KeyFn,
         num_workers: usize,
+        scratch: &mut ExchangeScratch,
     ) -> Vec<ErasedBuffer> {
+        use bumpalo::collections::Vec as BumpVec;
+
+        // Sentinel for masked-out rows in the target assignment (row counts
+        // are bounded well below `u32::MAX` by batch sizing).
+        const MASKED: u32 = u32::MAX;
+
         if num_workers <= 1 {
             return vec![self.clone()];
         }
@@ -184,27 +269,43 @@ impl ErasedBuffer {
             return vec![];
         }
 
-        // Assign each logical row to a worker.
-        let mut worker_rows: Vec<Vec<usize>> = vec![vec![]; num_workers];
+        scratch.reset();
+        let bump = scratch.bump();
+
+        // Pass 1: assign each unmasked row to a worker; count rows per worker.
+        let mut targets = BumpVec::with_capacity_in(num_rows, bump);
+        let mut counts = BumpVec::from_iter_in(std::iter::repeat_n(0u32, num_workers), bump);
         for row_idx in 0..num_rows {
             if let Some(ref mask) = self.mask
                 && !mask.value(row_idx)
             {
+                targets.push(MASKED);
                 continue;
             }
-            let key = key_fn(&self.batch, row_idx);
+            let key = key_fn(&self.batch, row_idx, bump);
             let target = (seahash::hash(key.as_bytes()) as usize) % num_workers;
-            worker_rows[target].push(row_idx);
+            targets.push(target as u32);
+            counts[target] += 1;
+        }
+
+        // Pass 2: fill exact-capacity per-worker row-index lists.
+        let mut worker_rows = BumpVec::with_capacity_in(num_workers, bump);
+        for &count in &counts {
+            worker_rows.push(BumpVec::with_capacity_in(count as usize, bump));
+        }
+        for (row_idx, &target) in targets.iter().enumerate() {
+            if target != MASKED {
+                worker_rows[target as usize].push(row_idx as u32);
+            }
         }
 
         // Build per-worker sub-buffers using Arrow take kernel.
         let mut result = Vec::with_capacity(num_workers);
-        for (worker_idx, rows) in worker_rows.into_iter().enumerate() {
+        for (worker_idx, rows) in worker_rows.iter().enumerate() {
             if rows.is_empty() {
                 continue;
             }
-            let indices =
-                arrow_array::UInt32Array::from(rows.iter().map(|&r| r as u32).collect::<Vec<_>>());
+            let indices = arrow_array::UInt32Array::from_iter_values(rows.iter().copied());
             let columns: Vec<Arc<dyn arrow_array::Array>> = self
                 .batch
                 .columns()
@@ -624,16 +725,13 @@ mod tests {
         let buf: RheiBuffer<TestRow> = RheiBuffer::from_builder(builder);
         let erased = ErasedBuffer::from_typed(buf);
 
-        let key_fn: KeyFn = Arc::new(|batch: &RecordBatch, row_idx: usize| {
+        let key_fn: KeyFn = key_fn_from(|batch: &RecordBatch, row_idx: usize, _bump: &Bump| {
             use arrow_array::cast::AsArray;
-            batch
-                .column(1)
-                .as_string::<i32>()
-                .value(row_idx)
-                .to_string()
+            batch.column(1).as_string::<i32>().value(row_idx)
         });
 
-        let partitions = erased.partition_for_exchange(&key_fn, 3);
+        let mut scratch = ExchangeScratch::new();
+        let partitions = erased.partition_for_exchange(&key_fn, 3, &mut scratch);
         let total_rows: usize = partitions.iter().map(ErasedBuffer::num_rows).sum();
         assert_eq!(total_rows, 6, "no rows should be lost during partitioning");
     }
@@ -650,17 +748,14 @@ mod tests {
         let buf: RheiBuffer<TestRow> = RheiBuffer::from_builder(builder);
         let erased = ErasedBuffer::from_typed(buf);
 
-        let key_fn: KeyFn = Arc::new(|batch: &RecordBatch, row_idx: usize| {
+        let key_fn: KeyFn = key_fn_from(|batch: &RecordBatch, row_idx: usize, _bump: &Bump| {
             use arrow_array::cast::AsArray;
-            batch
-                .column(1)
-                .as_string::<i32>()
-                .value(row_idx)
-                .to_string()
+            batch.column(1).as_string::<i32>().value(row_idx)
         });
 
-        let p1 = erased.partition_for_exchange(&key_fn, 4);
-        let p2 = erased.partition_for_exchange(&key_fn, 4);
+        let mut scratch = ExchangeScratch::new();
+        let p1 = erased.partition_for_exchange(&key_fn, 4, &mut scratch);
+        let p2 = erased.partition_for_exchange(&key_fn, 4, &mut scratch);
         assert_eq!(
             p1.len(),
             p2.len(),
@@ -686,22 +781,20 @@ mod tests {
         let buf: RheiBuffer<TestRow> = RheiBuffer::from_builder(builder);
         let erased = ErasedBuffer::from_typed(buf);
 
-        let key_fn: KeyFn = Arc::new(|batch: &RecordBatch, row_idx: usize| {
+        let key_fn: KeyFn = key_fn_from(|batch: &RecordBatch, row_idx: usize, _bump: &Bump| {
             use arrow_array::cast::AsArray;
-            batch
-                .column(1)
-                .as_string::<i32>()
-                .value(row_idx)
-                .to_string()
+            batch.column(1).as_string::<i32>().value(row_idx)
         });
 
-        let partitions = erased.partition_for_exchange(&key_fn, 4);
+        let mut scratch = ExchangeScratch::new();
+        let partitions = erased.partition_for_exchange(&key_fn, 4, &mut scratch);
         for part in &partitions {
             let target = part.exchange_target().unwrap() as usize;
             // Verify every row in this partition hashes to the same target.
+            let bump = Bump::new();
             for row in 0..part.num_rows() {
-                let key = key_fn(part.as_record_batch(), row);
-                let expected = partition_key(&key, 4);
+                let key = key_fn(part.as_record_batch(), row, &bump);
+                let expected = partition_key(key, 4);
                 assert_eq!(target, expected, "key '{key}' routed to wrong worker");
             }
         }
@@ -721,11 +814,27 @@ mod tests {
         let buf: RheiBuffer<TestRow> = RheiBuffer::from_builder(builder);
         let erased = ErasedBuffer::from_typed(buf);
 
-        let key_fn: KeyFn = Arc::new(|_batch: &RecordBatch, _row_idx: usize| "any".to_string());
+        let key_fn: KeyFn =
+            key_fn_from(|_batch: &RecordBatch, _row_idx: usize, _bump: &Bump| "any");
 
-        let partitions = erased.partition_for_exchange(&key_fn, 1);
+        let mut scratch = ExchangeScratch::new();
+        let partitions = erased.partition_for_exchange(&key_fn, 1, &mut scratch);
         assert_eq!(partitions.len(), 1);
         assert_eq!(partitions[0].num_rows(), 2);
+    }
+
+    #[test]
+    fn exchange_scratch_reset_survives_oversized_batch() {
+        let mut scratch = ExchangeScratch::new();
+        // Grow the arena past the retain limit — reset must take the
+        // drop-and-rebuild branch and leave a usable, empty arena.
+        scratch
+            .bump()
+            .alloc_slice_fill_copy(ExchangeScratch::RETAIN_LIMIT_BYTES + 1, 0u8);
+        assert!(scratch.bump().allocated_bytes() > ExchangeScratch::RETAIN_LIMIT_BYTES);
+        scratch.reset();
+        assert_eq!(scratch.bump().allocated_bytes(), 0);
+        assert_eq!(scratch.bump().alloc_str("still works"), "still works");
     }
 
     #[test]
@@ -742,16 +851,13 @@ mod tests {
         let masked = buf.with_mask(BooleanArray::from(vec![true, false, true, false]));
         let erased = ErasedBuffer::from_typed(masked);
 
-        let key_fn: KeyFn = Arc::new(|batch: &RecordBatch, row_idx: usize| {
+        let key_fn: KeyFn = key_fn_from(|batch: &RecordBatch, row_idx: usize, _bump: &Bump| {
             use arrow_array::cast::AsArray;
-            batch
-                .column(1)
-                .as_string::<i32>()
-                .value(row_idx)
-                .to_string()
+            batch.column(1).as_string::<i32>().value(row_idx)
         });
 
-        let partitions = erased.partition_for_exchange(&key_fn, 4);
+        let mut scratch = ExchangeScratch::new();
+        let partitions = erased.partition_for_exchange(&key_fn, 4, &mut scratch);
         let total_rows: usize = partitions.iter().map(ErasedBuffer::num_rows).sum();
         // Only 2 rows should be routed (masked rows excluded).
         assert_eq!(total_rows, 2);
@@ -784,13 +890,12 @@ mod prop_tests {
         ErasedBuffer::from_parts(batch, None, schema_hash_of(&schema))
     }
 
+    /// Keys each row by its formatted `i64` value — a computed key, so it
+    /// exercises the arena-formatting path of [`KeyFn`].
     fn value_key_fn() -> KeyFn {
-        Arc::new(|batch: &RecordBatch, idx: usize| {
-            batch
-                .column(0)
-                .as_primitive::<Int64Type>()
-                .value(idx)
-                .to_string()
+        key_fn_from(|batch: &RecordBatch, idx: usize, bump: &Bump| {
+            let v = batch.column(0).as_primitive::<Int64Type>().value(idx);
+            bumpalo::format!(in bump, "{}", v).into_bump_str()
         })
     }
 
@@ -820,7 +925,8 @@ mod prop_tests {
             n_workers in 1usize..8,
         ) {
             let buf = make_erased(&values);
-            let parts = buf.partition_for_exchange(&value_key_fn(), n_workers);
+            let mut scratch = ExchangeScratch::new();
+            let parts = buf.partition_for_exchange(&value_key_fn(), n_workers, &mut scratch);
 
             let mut seen: Vec<i64> = parts.iter().flat_map(erased_values).collect();
             let mut expected = values.clone();
@@ -837,7 +943,8 @@ mod prop_tests {
             n_workers in 2usize..8,
         ) {
             let buf = make_erased(&values);
-            let parts = buf.partition_for_exchange(&value_key_fn(), n_workers);
+            let mut scratch = ExchangeScratch::new();
+            let parts = buf.partition_for_exchange(&value_key_fn(), n_workers, &mut scratch);
 
             for part in &parts {
                 let target = part.exchange_target.unwrap() as usize;

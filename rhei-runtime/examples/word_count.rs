@@ -294,7 +294,7 @@ async fn main() -> anyhow::Result<()> {
                     })
                     .collect()
             })
-            .key_by(|view: &WordView<'_>| view.word.to_string())
+            .key_by_ref(|view: &WordView<'_>, _| view.word)
             .operator("word_counter", WordCounter)
             .sink(PrintSink::<WordCount>::new());
 
@@ -317,7 +317,7 @@ async fn main() -> anyhow::Result<()> {
                     })
                     .collect()
             })
-            .key_by(|view: &WordView<'_>| view.word.to_string())
+            .key_by_ref(|view: &WordView<'_>, _| view.word)
             .operator("word_counter", WordCounter)
             .sink(PrintSink::<WordCount>::new());
 

@@ -294,7 +294,7 @@ async fn main() -> anyhow::Result<()> {
 
     let readings = graph.source(source);
     readings
-        .key_by(|v: &SensorReadingView<'_>| v.sensor_id.to_string())
+        .key_by_ref(|v: &SensorReadingView<'_>, _| v.sensor_id)
         .operator("tumbling_window", op)
         .sink(PrintSink::<WindowAvg>::new().with_prefix("output"));
 
