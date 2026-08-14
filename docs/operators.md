@@ -42,39 +42,41 @@ All of these live on `Stream<'a, T>` and take closures over **zero-copy views**.
 use rhei::{DataflowGraph, PrintSink, VecSource};
 
 #[derive(Clone, rhei::RheiSchema)]
-struct Event {
-    user: String,
+struct PageView {
+    user_id: String,
     path: String,
 }
 
 #[derive(Clone, rhei::RheiSchema)]
-struct Word {
-    user: String,
-    segment: String,
+struct Segment {
+    user_id: String,
+    name: String,
 }
 
 fn build(graph: &DataflowGraph) {
     graph
-        .source(VecSource::new(vec![Event {
-            user: "u1".into(),
-            path: "/a/b".into(),
+        .source(VecSource::new(vec![PageView {
+            user_id: "alice".into(),
+            path: "/product/shoes".into(),
         }]))
-        .inspect(|e| eprintln!("seen user={}", e.user))
-        .filter_fn(|e| !e.path.is_empty())
-        .flat_map(|e| {
-            e.path
+        .inspect(|v| eprintln!("seen user={}", v.user_id))
+        .filter_fn(|v| !v.path.is_empty())
+        // "/product/shoes" -> two segment rows
+        .flat_map(|v| {
+            v.path
                 .split('/')
                 .filter(|s| !s.is_empty())
-                .map(|s| Word {
-                    user: e.user.to_string(),
-                    segment: s.to_string(),
+                .map(|s| Segment {
+                    user_id: v.user_id.to_string(),
+                    name: s.to_string(),
                 })
                 .collect()
         })
-        .distinct_by(|w| format!("{}:{}", w.user, w.segment))
+        // Each user counts once per distinct segment.
+        .distinct_by(|s| format!("{}:{}", s.user_id, s.name))
         .limit(1_000)
         .name("segments")
-        .sink(PrintSink::<Word>::new());
+        .sink(PrintSink::<Segment>::new());
 }
 ```
 
@@ -89,23 +91,24 @@ Combinators: `gt`, `gt_eq`, `lt`, `lt_eq`, `eq`, `not_eq`, `and`, `or`, `negate`
 use rhei::{DataflowGraph, PrintSink, VecSource, col, lit_f64, lit_str};
 
 #[derive(Clone, rhei::RheiSchema)]
-struct Reading {
-    sensor_id: String,
-    celsius: f64,
+struct PageView {
+    user_id: String,
+    dwell_ms: f64,
 }
 
 fn build(graph: &DataflowGraph) {
     graph
-        .source(VecSource::new(vec![Reading {
-            sensor_id: "boiler-1".into(),
-            celsius: 91.0,
+        .source(VecSource::new(vec![PageView {
+            user_id: "alice".into(),
+            dwell_ms: 4_200.0,
         }]))
+        // Engaged views, excluding synthetic monitoring traffic.
         .filter(
-            col("celsius")
-                .gt(lit_f64(90.0))
-                .and(col("sensor_id").not_eq(lit_str("test-probe"))),
+            col("dwell_ms")
+                .gt(lit_f64(3_000.0))
+                .and(col("user_id").not_eq(lit_str("monitoring"))),
         )
-        .sink(PrintSink::<Reading>::new());
+        .sink(PrintSink::<PageView>::new());
 }
 ```
 
@@ -137,44 +140,43 @@ TumblingWindow::new(window_size, key_fn, time_fn, accumulate_fn, finish_fn)
 use rhei::{DataflowGraph, PrintSink, TumblingWindow, VecSource};
 
 #[derive(Clone, rhei::RheiSchema)]
-struct Reading {
-    sensor_id: String,
-    celsius: f64,
+struct PageView {
+    user_id: String,
     ts: u64,
 }
 
 #[derive(Clone, rhei::RheiSchema)]
-struct Stats {
-    sensor_id: String,
+struct PerMinute {
+    user_id: String,
     window_start: u64,
     window_end: u64,
-    max_celsius: f64,
+    views: u64,
 }
 
 fn build(graph: &DataflowGraph) {
+    // Page views per user per minute.
     let window = TumblingWindow::new(
         60_000,
-        |v: ReadingView<'_>| v.sensor_id.to_string(),
-        |v: ReadingView<'_>| v.ts,
-        |acc: &mut f64, v: ReadingView<'_>| *acc = acc.max(v.celsius),
-        |key: &str, start: u64, end: u64, acc: &f64| Stats {
-            sensor_id: key.to_string(),
+        |v: PageViewView<'_>| v.user_id.to_string(),
+        |v: PageViewView<'_>| v.ts,
+        |acc: &mut u64, _v: PageViewView<'_>| *acc += 1,
+        |user_id: &str, start: u64, end: u64, views: &u64| PerMinute {
+            user_id: user_id.to_string(),
             window_start: start,
             window_end: end,
-            max_celsius: *acc,
+            views: *views,
         },
     )
     .with_allowed_lateness(5_000);
 
     graph
-        .source(VecSource::new(vec![Reading {
-            sensor_id: "s1".into(),
-            celsius: 20.0,
-            ts: 1,
+        .source(VecSource::new(vec![PageView {
+            user_id: "alice".into(),
+            ts: 60_000,
         }]))
-        .key_by(|r| r.sensor_id.to_string())
+        .key_by(|v| v.user_id.to_string())
         .operator("tumble", window)
-        .sink(PrintSink::<Stats>::new());
+        .sink(PrintSink::<PerMinute>::new());
 }
 ```
 
@@ -193,38 +195,41 @@ Asserted at construction: `window_size > 0`, `slide > 0`, `slide <= window_size`
 use rhei::{DataflowGraph, PrintSink, SlidingWindow, VecSource};
 
 #[derive(Clone, rhei::RheiSchema)]
-struct Hit {
-    user: String,
+struct PageView {
+    user_id: String,
     ts: u64,
 }
 
 #[derive(Clone, rhei::RheiSchema)]
 struct Rate {
-    user: String,
+    user_id: String,
     window_start: u64,
     window_end: u64,
-    hits: u64,
+    views: u64,
 }
 
 fn build(graph: &DataflowGraph) {
-    // 5-minute window, advancing every minute.
+    // Trailing 5-minute view rate, refreshed every minute.
     let window = SlidingWindow::new(
         300_000,
         60_000,
-        |v: HitView<'_>| v.user.to_string(),
-        |v: HitView<'_>| v.ts,
-        |acc: &mut u64, _v: HitView<'_>| *acc += 1,
-        |key: &str, start: u64, end: u64, acc: &u64| Rate {
-            user: key.to_string(),
+        |v: PageViewView<'_>| v.user_id.to_string(),
+        |v: PageViewView<'_>| v.ts,
+        |acc: &mut u64, _v: PageViewView<'_>| *acc += 1,
+        |user_id: &str, start: u64, end: u64, views: &u64| Rate {
+            user_id: user_id.to_string(),
             window_start: start,
             window_end: end,
-            hits: *acc,
+            views: *views,
         },
     );
 
     graph
-        .source(VecSource::new(vec![Hit { user: "u1".into(), ts: 1 }]))
-        .key_by(|h| h.user.to_string())
+        .source(VecSource::new(vec![PageView {
+            user_id: "alice".into(),
+            ts: 60_000,
+        }]))
+        .key_by(|v| v.user_id.to_string())
         .operator("rate", window)
         .sink(PrintSink::<Rate>::new());
 }
@@ -247,37 +252,40 @@ SessionWindow::new(gap, key_fn, time_fn, accumulate_fn, finish_fn)
 use rhei::{DataflowGraph, PrintSink, SessionWindow, VecSource};
 
 #[derive(Clone, rhei::RheiSchema)]
-struct Click {
-    user: String,
+struct PageView {
+    user_id: String,
     ts: u64,
 }
 
 #[derive(Clone, rhei::RheiSchema)]
 struct Session {
-    user: String,
-    start: u64,
-    end: u64,
-    clicks: u64,
+    user_id: String,
+    started_at: u64,
+    ended_at: u64,
+    views: u64,
 }
 
 fn build(graph: &DataflowGraph) {
     // Close a session after 30 minutes of inactivity.
     let window = SessionWindow::new(
         1_800_000,
-        |v: ClickView<'_>| v.user.to_string(),
-        |v: ClickView<'_>| v.ts,
-        |acc: &mut u64, _v: ClickView<'_>| *acc += 1,
-        |key: &str, start: u64, end: u64, acc: &u64| Session {
-            user: key.to_string(),
-            start,
-            end,
-            clicks: *acc,
+        |v: PageViewView<'_>| v.user_id.to_string(),
+        |v: PageViewView<'_>| v.ts,
+        |acc: &mut u64, _v: PageViewView<'_>| *acc += 1,
+        |user_id: &str, started_at: u64, ended_at: u64, views: &u64| Session {
+            user_id: user_id.to_string(),
+            started_at,
+            ended_at,
+            views: *views,
         },
     );
 
     graph
-        .source(VecSource::new(vec![Click { user: "u1".into(), ts: 1 }]))
-        .key_by(|c| c.user.to_string())
+        .source(VecSource::new(vec![PageView {
+            user_id: "alice".into(),
+            ts: 60_000,
+        }]))
+        .key_by(|v| v.user_id.to_string())
         .operator("sessions", window)
         .sink(PrintSink::<Session>::new());
 }
@@ -304,38 +312,39 @@ fire, where the time windows report `window_start` and `window_end`.
 use rhei::{CountWindow, DataflowGraph, PrintSink, VecSource};
 
 #[derive(Clone, rhei::RheiSchema)]
-struct Sample {
-    device: String,
-    value: f64,
+struct PageView {
+    user_id: String,
+    dwell_ms: f64,
 }
 
 #[derive(Clone, rhei::RheiSchema)]
-struct Batch100 {
-    device: String,
-    rows: u64,
-    sum: f64,
+struct Every100 {
+    user_id: String,
+    views: u64,
+    total_dwell_ms: f64,
 }
 
 fn build(graph: &DataflowGraph) {
+    // Emit a summary every 100 views by the same user, regardless of time.
     let window = CountWindow::new(
         100,
-        |v: SampleView<'_>| v.device.to_string(),
-        |acc: &mut f64, v: SampleView<'_>| *acc += v.value,
-        |key: &str, count: u64, acc: &f64| Batch100 {
-            device: key.to_string(),
-            rows: count,
-            sum: *acc,
+        |v: PageViewView<'_>| v.user_id.to_string(),
+        |acc: &mut f64, v: PageViewView<'_>| *acc += v.dwell_ms,
+        |user_id: &str, views: u64, total: &f64| Every100 {
+            user_id: user_id.to_string(),
+            views,
+            total_dwell_ms: *total,
         },
     );
 
     graph
-        .source(VecSource::new(vec![Sample {
-            device: "d1".into(),
-            value: 1.0,
+        .source(VecSource::new(vec![PageView {
+            user_id: "alice".into(),
+            dwell_ms: 1_200.0,
         }]))
-        .key_by(|s| s.device.to_string())
+        .key_by(|v| v.user_id.to_string())
         .operator("every_100", window)
-        .sink(PrintSink::<Batch100>::new());
+        .sink(PrintSink::<Every100>::new());
 }
 ```
 
@@ -368,70 +377,81 @@ TemporalJoin::new(key_fn, side_fn, left_fn, right_fn, join_fn)
 use rhei::{DataflowGraph, PrintSink, Side, TemporalJoin, VecSource};
 use serde::{Deserialize, Serialize};
 
-// Both legs are carried in one schema, tagged by `is_order`.
+// Both legs share one schema, tagged by `kind`. An impression records that an
+// ad was shown; a click records that it was clicked.
 #[derive(Clone, rhei::RheiSchema)]
-struct Leg {
-    order_id: String,
-    is_order: bool,
-    amount: f64,
-    carrier: String,
+struct AdEvent {
+    impression_id: String,
+    kind: String, // "impression" | "click"
+    campaign: String,
+    ts: u64,
 }
 
 #[derive(Clone, rhei::RheiSchema)]
-struct Fulfilled {
-    order_id: String,
-    amount: f64,
-    carrier: String,
+struct Attributed {
+    impression_id: String,
+    campaign: String,
+    time_to_click_ms: u64,
 }
 
 #[derive(Serialize, Deserialize)]
-struct OrderPayload {
-    amount: f64,
+struct Shown {
+    campaign: String,
+    ts: u64,
 }
 
 #[derive(Serialize, Deserialize)]
-struct ShipmentPayload {
-    carrier: String,
+struct Clicked {
+    ts: u64,
 }
 
 fn build(graph: &DataflowGraph) {
     let join = TemporalJoin::new(
-        |v: LegView<'_>| v.order_id.to_string(),
-        |v: LegView<'_>| if v.is_order { Side::Left } else { Side::Right },
-        |v: LegView<'_>| OrderPayload { amount: v.amount },
-        |v: LegView<'_>| ShipmentPayload {
-            carrier: v.carrier.to_string(),
+        |v: AdEventView<'_>| v.impression_id.to_string(),
+        |v: AdEventView<'_>| {
+            if v.kind == "impression" {
+                Side::Left
+            } else {
+                Side::Right
+            }
         },
-        |key: &str, order: &OrderPayload, shipment: &ShipmentPayload| Fulfilled {
-            order_id: key.to_string(),
-            amount: order.amount,
-            carrier: shipment.carrier.clone(),
+        |v: AdEventView<'_>| Shown {
+            campaign: v.campaign.to_string(),
+            ts: v.ts,
+        },
+        |v: AdEventView<'_>| Clicked { ts: v.ts },
+        |impression_id: &str, shown: &Shown, clicked: &Clicked| Attributed {
+            impression_id: impression_id.to_string(),
+            campaign: shown.campaign.clone(),
+            time_to_click_ms: clicked.ts.saturating_sub(shown.ts),
         },
     )
-    .with_timeout(3_600_000); // give up after an hour of event time
+    // An unclicked impression is buffered no longer than the attribution
+    // window. Without this, every impression is retained forever.
+    .with_timeout(1_800_000);
 
-    let orders = graph.source(VecSource::new(vec![Leg {
-        order_id: "o1".into(),
-        is_order: true,
-        amount: 42.0,
-        carrier: String::new(),
+    let impressions = graph.source(VecSource::new(vec![AdEvent {
+        impression_id: "imp-1".into(),
+        kind: "impression".into(),
+        campaign: "spring-sale".into(),
+        ts: 60_000,
     }]));
-    let shipments = graph.source(VecSource::new(vec![Leg {
-        order_id: "o1".into(),
-        is_order: false,
-        amount: 0.0,
-        carrier: "dhl".into(),
+    let clicks = graph.source(VecSource::new(vec![AdEvent {
+        impression_id: "imp-1".into(),
+        kind: "click".into(),
+        campaign: String::new(),
+        ts: 64_000,
     }]));
 
-    orders
-        .merge(shipments)
-        .key_by(|l| l.order_id.to_string())
-        .operator("fulfilment_join", join)
-        .sink(PrintSink::<Fulfilled>::new());
+    impressions
+        .merge(clicks)
+        .key_by(|e| e.impression_id.to_string())
+        .operator("attribution_join", join)
+        .sink(PrintSink::<Attributed>::new());
 }
 ```
 
-The `merge` → `key_by` → `operator` sequence is mandatory: merge discards partitioning, so the `key_by` after it is what puts both legs of an order on the same worker.
+The `merge` → `key_by` → `operator` sequence is mandatory: merge discards partitioning, so the `key_by` after it is what puts an impression and its click on the same worker.
 
 ---
 
@@ -457,39 +477,40 @@ RollingAggregateOp::new(key_fn, accumulate_fn, finish_fn)
 use rhei::{DataflowGraph, PrintSink, RollingAggregateOp, VecSource};
 
 #[derive(Clone, rhei::RheiSchema)]
-struct Trade {
-    symbol: String,
-    price: f64,
+struct PageView {
+    user_id: String,
+    dwell_ms: f64,
 }
 
 #[derive(Clone, rhei::RheiSchema)]
-struct RunningMean {
-    symbol: String,
-    mean: f64,
+struct MeanDwell {
+    user_id: String,
+    mean_ms: f64,
 }
 
 fn build(graph: &DataflowGraph) {
+    // Running mean dwell time per user, emitted on every view.
     let agg = RollingAggregateOp::new(
-        |v: TradeView<'_>| v.symbol.to_string(),
-        |acc: &mut (u64, f64), v: TradeView<'_>| {
+        |v: PageViewView<'_>| v.user_id.to_string(),
+        |acc: &mut (u64, f64), v: PageViewView<'_>| {
             acc.0 += 1;
-            acc.1 += v.price;
+            acc.1 += v.dwell_ms;
         },
-        |key: &str, acc: &(u64, f64)| RunningMean {
-            symbol: key.to_string(),
+        |user_id: &str, acc: &(u64, f64)| MeanDwell {
+            user_id: user_id.to_string(),
             #[allow(clippy::cast_precision_loss)]
-            mean: if acc.0 == 0 { 0.0 } else { acc.1 / acc.0 as f64 },
+            mean_ms: if acc.0 == 0 { 0.0 } else { acc.1 / acc.0 as f64 },
         },
     );
 
     graph
-        .source(VecSource::new(vec![Trade {
-            symbol: "AAPL".into(),
-            price: 100.0,
+        .source(VecSource::new(vec![PageView {
+            user_id: "alice".into(),
+            dwell_ms: 1_200.0,
         }]))
-        .key_by(|t| t.symbol.to_string())
-        .operator("running_mean", agg)
-        .sink(PrintSink::<RunningMean>::new());
+        .key_by(|v| v.user_id.to_string())
+        .operator("mean_dwell", agg)
+        .sink(PrintSink::<MeanDwell>::new());
 }
 ```
 
@@ -523,45 +544,50 @@ use std::time::Duration;
 use rhei::{AfterMatch, DataflowGraph, MatchCtx, PrintSink, SequenceDetect, VecSource};
 
 #[derive(Clone, rhei::RheiSchema)]
-struct Auth {
-    account: String,
-    outcome: String,
+struct PageView {
+    user_id: String,
+    path: String,
     ts: u64,
 }
 
 #[derive(Clone, rhei::RheiSchema)]
-struct Suspicious {
-    account: String,
-    failures: u64,
+struct FunnelCompletion {
+    user_id: String,
+    product_views: u64,
     span_ms: u64,
 }
 
 fn build(graph: &DataflowGraph) {
-    // Three or more failures, then a success, within five minutes.
-    let detector = SequenceDetect::builder()
-        .key_fn(|v: AuthView<'_>| v.account.to_string())
-        .time_fn(|v: AuthView<'_>| v.ts)
-        .step("fail", |v: AuthView<'_>| v.outcome == "fail")
-        .at_least(3)
-        .step("success", |v: AuthView<'_>| v.outcome == "success")
-        .within(Duration::from_secs(300))
+    // The checkout funnel: browse one or more products, add to cart, check out
+    // — all within thirty minutes. The walkthrough builds the same logic by
+    // hand with KeyedState; this expresses it declaratively.
+    let funnel = SequenceDetect::builder()
+        .key_fn(|v: PageViewView<'_>| v.user_id.to_string())
+        .time_fn(|v: PageViewView<'_>| v.ts)
+        .step("browse", |v: PageViewView<'_>| v.path == "/product")
+        .at_least(1)
+        .step("cart", |v: PageViewView<'_>| v.path == "/cart")
+        .step("checkout", |v: PageViewView<'_>| v.path == "/checkout")
+        .within(Duration::from_secs(1_800))
+        // A user who converts starts a fresh funnel rather than continuing
+        // to match overlapping ones.
         .after_match(AfterMatch::SkipPastMatch)
-        .emit(|key: &str, ctx: &MatchCtx| Suspicious {
-            account: key.to_string(),
-            failures: ctx.step_count("fail") as u64,
+        .emit(|user_id: &str, ctx: &MatchCtx| FunnelCompletion {
+            user_id: user_id.to_string(),
+            product_views: ctx.step_count("browse") as u64,
             span_ms: ctx.duration(),
         })
         .build();
 
     graph
-        .source(VecSource::new(vec![Auth {
-            account: "a1".into(),
-            outcome: "fail".into(),
-            ts: 1,
+        .source(VecSource::new(vec![PageView {
+            user_id: "alice".into(),
+            path: "/product".into(),
+            ts: 60_000,
         }]))
-        .key_by(|a| a.account.to_string())
-        .operator("brute_force", detector)
-        .sink(PrintSink::<Suspicious>::new());
+        .key_by(|v| v.user_id.to_string())
+        .operator("checkout_funnel", funnel)
+        .sink(PrintSink::<FunnelCompletion>::new());
 }
 ```
 
@@ -587,29 +613,29 @@ use rhei::KeyedState;
 use rhei_core::operators::keyed_state::BincodeEncoder;
 
 #[derive(Clone, rhei::RheiSchema)]
-struct Event {
-    key: String,
+struct PageView {
+    user_id: String,
 }
 
 #[derive(Clone)]
-struct Op;
+struct CountViews;
 
 #[async_trait::async_trait]
-impl rhei::arrow::StreamFunction for Op {
-    type Input = Event;
-    type Output = Event;
+impl rhei::arrow::StreamFunction for CountViews {
+    type Input = PageView;
+    type Output = PageView;
 
     async fn process(
         &mut self,
-        input: RheiBuffer<Event>,
+        input: RheiBuffer<PageView>,
         ctx: &mut OperatorContext,
-    ) -> anyhow::Result<BufferOutput<Event>> {
+    ) -> anyhow::Result<BufferOutput<PageView>> {
         let mut state =
-            KeyedState::<String, u64, _>::with_encoder(&mut ctx.state, "counts", BincodeEncoder);
+            KeyedState::<String, u64, _>::with_encoder(&mut ctx.state, "views", BincodeEncoder);
         for view in &input {
-            let key = view.key.to_string();
-            let n = state.get(&key).await?.unwrap_or(0) + 1;
-            state.put(&key, &n)?;
+            let user_id = view.user_id.to_string();
+            let n = state.get(&user_id).await?.unwrap_or(0) + 1;
+            state.put(&user_id, &n)?;
         }
         Ok(BufferOutput::None)
     }
@@ -667,36 +693,38 @@ use rhei::arrow::{
 use rhei::KeyedState;
 
 #[derive(Clone, rhei::RheiSchema)]
-struct Ping {
-    device: String,
+struct PageView {
+    user_id: String,
     ts: u64,
 }
 
 #[derive(Clone, rhei::RheiSchema)]
-struct Offline {
-    device: String,
+struct Abandoned {
+    user_id: String,
     last_seen: u64,
 }
 
-/// Emits an `Offline` row for any device silent for `timeout` of event time.
+/// Emits an `Abandoned` row for any user idle for `timeout` of event time —
+/// the kind of "they left without converting" signal that has no triggering
+/// record, so it can only be produced when the watermark advances.
 #[derive(Clone)]
-struct OfflineDetector {
+struct AbandonmentDetector {
     timeout: u64,
 }
 
 #[async_trait::async_trait]
-impl StreamFunction for OfflineDetector {
-    type Input = Ping;
-    type Output = Offline;
+impl StreamFunction for AbandonmentDetector {
+    type Input = PageView;
+    type Output = Abandoned;
 
     async fn process(
         &mut self,
-        input: RheiBuffer<Ping>,
+        input: RheiBuffer<PageView>,
         ctx: &mut OperatorContext,
-    ) -> anyhow::Result<BufferOutput<Offline>> {
+    ) -> anyhow::Result<BufferOutput<Abandoned>> {
         let mut last = KeyedState::<String, u64>::new(&mut ctx.state, "last_seen");
         for view in &input {
-            last.put(&view.device.to_string(), &view.ts)?;
+            last.put(&view.user_id.to_string(), &view.ts)?;
         }
         // Nothing to emit on data arrival — emission is watermark-driven.
         Ok(BufferOutput::None)
@@ -706,17 +734,17 @@ impl StreamFunction for OfflineDetector {
         &mut self,
         watermark: u64,
         ctx: &mut OperatorContext,
-    ) -> anyhow::Result<BufferOutput<Offline>> {
-        let mut builder = Offline::builder(0);
+    ) -> anyhow::Result<BufferOutput<Abandoned>> {
+        let mut builder = Abandoned::builder(0);
         let mut last = KeyedState::<String, u64>::new(&mut ctx.state, "last_seen");
 
         // A real implementation would iterate the operator's owned key groups;
         // this shows the shape of watermark-driven emission.
-        if let Some(ts) = last.get(&"device-1".to_string()).await?
+        if let Some(ts) = last.get(&"alice".to_string()).await?
             && watermark.saturating_sub(ts) > self.timeout
         {
-            builder.append(Offline {
-                device: "device-1".to_string(),
+            builder.append(Abandoned {
+                user_id: "alice".to_string(),
                 last_seen: ts,
             });
         }
@@ -737,11 +765,12 @@ Operators must be `Clone` (one instance per worker) and `Send + Sync`. State is 
 | Drop rows by a column comparison | `filter` with an `Expr` |
 | Drop rows by arbitrary logic | `filter_fn` |
 | Reshape rows | `map` / `flat_map` |
-| Non-overlapping periodic aggregates | `TumblingWindow` |
-| Moving averages, overlapping periods | `SlidingWindow` |
-| Activity bursts with idle gaps | `SessionWindow` |
+| Views per user per minute | `TumblingWindow` |
+| A trailing rate that refreshes often | `SlidingWindow` |
+| Visits separated by idle gaps | `SessionWindow` |
 | Fire every N rows, ignore time | `CountWindow` |
-| Running total emitted per row | `RollingAggregateOp` / `ReduceOp` |
-| Correlate two streams on a key | `merge` → `key_by` → `TemporalJoin` |
-| "A then B then C within T" | `SequenceDetect` |
+| A running total emitted per row | `RollingAggregateOp` / `ReduceOp` |
+| Correlate two streams on a key (impression ↔ click) | `merge` → `key_by` → `TemporalJoin` |
+| "A then B then C within T" (a funnel) | `SequenceDetect` |
+| Emit when nothing arrives (abandonment, timeouts) | Your own `StreamFunction` with `on_watermark` |
 | Anything else stateful | Your own `StreamFunction` |

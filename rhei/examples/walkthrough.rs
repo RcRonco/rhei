@@ -1,10 +1,11 @@
 //! The finished pipeline from `docs/walkthrough.md`.
 //!
-//! Sensor readings are filtered, keyed by sensor, run through a stateful
-//! overheat detector that alerts on the *transition* past a threshold, and
-//! aggregated into per-sensor tumbling windows. Both the alerts and the window
-//! statistics are collected in memory and asserted at the end, so the example
-//! doubles as an end-to-end check.
+//! Clickstream analytics for a web property. Page views are filtered, keyed by
+//! user, and fanned out to two branches: a stateful funnel tracker that emits a
+//! conversion the first time a user reaches checkout having already visited the
+//! cart, and a session window that summarises each user's visit. Both branches
+//! are collected in memory and asserted at the end, so the example doubles as
+//! an end-to-end check.
 //!
 //! Run with: `cargo run -p rhei --example walkthrough`
 
@@ -13,70 +14,87 @@ use std::sync::{Arc, Mutex};
 use rhei::arrow::{
     BufferOutput, OperatorContext, RheiBuffer, RheiBuilder, RheiSchema, Sink, StreamFunction,
 };
-use rhei::{DataflowGraph, KeyedState, PipelineController, TumblingWindow, VecSource};
+use rhei::{DataflowGraph, KeyedState, PipelineController, SessionWindow, VecSource};
 
 // ── Schemas ─────────────────────────────────────────────────────────
 
 #[derive(Clone, rhei::RheiSchema)]
-struct Reading {
-    sensor_id: String,
-    celsius: f64,
-    timestamp: u64,
+struct PageView {
+    user_id: String,
+    path: String,
+    ts: u64,
 }
 
 #[derive(Clone, rhei::RheiSchema)]
-struct Alert {
-    sensor_id: String,
-    message: String,
-    timestamp: u64,
+struct Conversion {
+    user_id: String,
+    ts: u64,
 }
 
 #[derive(Clone, rhei::RheiSchema)]
-struct WindowStats {
-    sensor_id: String,
-    window_start: u64,
-    window_end: u64,
-    count: u64,
-    max_celsius: f64,
+struct SessionSummary {
+    user_id: String,
+    started_at: u64,
+    ended_at: u64,
+    views: u64,
 }
 
 // ── Stateful operator ───────────────────────────────────────────────
 
-/// Alerts the first time a sensor crosses `threshold`, not on every hot
-/// reading. The previous peak per sensor lives in keyed state, so the operator
-/// only fires on the transition.
+/// The checkout funnel: `/product` → `/cart` → `/checkout`.
+///
+/// Emits a `Conversion` the first time a user reaches the final step having
+/// already passed through the previous ones. The furthest step reached lives in
+/// keyed state, so a user who reloads `/checkout` converts once, not twice.
 #[derive(Clone)]
-struct OverheatDetector {
-    threshold: f64,
+struct FunnelTracker;
+
+impl FunnelTracker {
+    /// Position of a path in the funnel, or `None` if it is not a funnel step.
+    fn step(path: &str) -> Option<u8> {
+        match path {
+            "/product" => Some(1),
+            "/cart" => Some(2),
+            "/checkout" => Some(3),
+            _ => None,
+        }
+    }
+
+    const FINAL_STEP: u8 = 3;
 }
 
 #[async_trait::async_trait]
-impl StreamFunction for OverheatDetector {
-    type Input = Reading;
-    type Output = Alert;
+impl StreamFunction for FunnelTracker {
+    type Input = PageView;
+    type Output = Conversion;
 
     async fn process(
         &mut self,
-        input: RheiBuffer<Reading>,
+        input: RheiBuffer<PageView>,
         ctx: &mut OperatorContext,
-    ) -> anyhow::Result<BufferOutput<Alert>> {
-        let mut builder = Alert::builder(input.len());
-        let mut peaks = KeyedState::<String, f64>::new(&mut ctx.state, "peak");
+    ) -> anyhow::Result<BufferOutput<Conversion>> {
+        let mut builder = Conversion::builder(input.len());
+        let mut furthest = KeyedState::<String, u8>::new(&mut ctx.state, "funnel_step");
 
         for view in &input {
-            let sensor_id = view.sensor_id.to_string();
-            let previous_peak = peaks.get(&sensor_id).await?.unwrap_or(f64::MIN);
+            let Some(step) = Self::step(view.path) else {
+                continue;
+            };
 
-            if view.celsius > previous_peak {
-                peaks.put(&sensor_id, &view.celsius)?;
-            }
+            let user_id = view.user_id.to_string();
+            let reached = furthest.get(&user_id).await?.unwrap_or(0);
 
-            if view.celsius > self.threshold && previous_peak <= self.threshold {
-                builder.append(Alert {
-                    sensor_id,
-                    message: format!("crossed {:.1}C", self.threshold),
-                    timestamp: view.timestamp,
-                });
+            // Only advance one step at a time: jumping straight to /checkout
+            // without a cart is not a funnel completion.
+            if step == reached + 1 {
+                furthest.put(&user_id, &step)?;
+
+                if step == Self::FINAL_STEP {
+                    builder.append(Conversion {
+                        user_id,
+                        ts: view.ts,
+                    });
+                }
             }
         }
 
@@ -106,32 +124,32 @@ impl<T> CollectSink<T> {
 }
 
 #[async_trait::async_trait]
-impl Sink for CollectSink<(String, String)> {
-    type Input = Alert;
+impl Sink for CollectSink<String> {
+    type Input = Conversion;
 
-    async fn write_batch(&mut self, batch: RheiBuffer<Alert>) -> anyhow::Result<()> {
+    async fn write_batch(&mut self, batch: RheiBuffer<Conversion>) -> anyhow::Result<()> {
         let mut rows = self
             .rows
             .lock()
-            .map_err(|_| anyhow::anyhow!("alert sink lock poisoned"))?;
+            .map_err(|_| anyhow::anyhow!("conversion sink lock poisoned"))?;
         for view in &batch {
-            rows.push((view.sensor_id.to_string(), view.message.to_string()));
+            rows.push(view.user_id.to_string());
         }
         Ok(())
     }
 }
 
 #[async_trait::async_trait]
-impl Sink for CollectSink<(String, u64, f64)> {
-    type Input = WindowStats;
+impl Sink for CollectSink<(String, u64)> {
+    type Input = SessionSummary;
 
-    async fn write_batch(&mut self, batch: RheiBuffer<WindowStats>) -> anyhow::Result<()> {
+    async fn write_batch(&mut self, batch: RheiBuffer<SessionSummary>) -> anyhow::Result<()> {
         let mut rows = self
             .rows
             .lock()
-            .map_err(|_| anyhow::anyhow!("window sink lock poisoned"))?;
+            .map_err(|_| anyhow::anyhow!("session sink lock poisoned"))?;
         for view in &batch {
-            rows.push((view.sensor_id.to_string(), view.count, view.max_celsius));
+            rows.push((view.user_id.to_string(), view.views));
         }
         Ok(())
     }
@@ -139,33 +157,48 @@ impl Sink for CollectSink<(String, u64, f64)> {
 
 // ── Pipeline ────────────────────────────────────────────────────────
 
-fn readings() -> Vec<Reading> {
-    // Two sensors. boiler-1 crosses 90C once; boiler-2 never does.
+const MINUTE: u64 = 60_000;
+
+fn page_views() -> Vec<PageView> {
+    // alice walks the whole funnel and then reloads checkout.
+    // bob browses products but never converts.
+    // The health check is noise the pipeline filters out.
     vec![
-        Reading {
-            sensor_id: "boiler-1".into(),
-            celsius: 68.0,
-            timestamp: 1_000,
+        PageView {
+            user_id: "alice".into(),
+            path: "/product".into(),
+            ts: MINUTE,
         },
-        Reading {
-            sensor_id: "boiler-2".into(),
-            celsius: 55.0,
-            timestamp: 1_100,
+        PageView {
+            user_id: "bob".into(),
+            path: "/product".into(),
+            ts: 2 * MINUTE,
         },
-        Reading {
-            sensor_id: "boiler-1".into(),
-            celsius: 91.5,
-            timestamp: 2_000,
+        PageView {
+            user_id: "monitoring".into(),
+            path: "/health".into(),
+            ts: 3 * MINUTE,
         },
-        Reading {
-            sensor_id: "boiler-1".into(),
-            celsius: 93.0,
-            timestamp: 3_000,
+        PageView {
+            user_id: "alice".into(),
+            path: "/cart".into(),
+            ts: 4 * MINUTE,
         },
-        Reading {
-            sensor_id: "boiler-2".into(),
-            celsius: 61.0,
-            timestamp: 3_100,
+        PageView {
+            user_id: "bob".into(),
+            path: "/product".into(),
+            ts: 5 * MINUTE,
+        },
+        PageView {
+            user_id: "alice".into(),
+            path: "/checkout".into(),
+            ts: 6 * MINUTE,
+        },
+        // A reload: same page, already converted, must not convert again.
+        PageView {
+            user_id: "alice".into(),
+            path: "/checkout".into(),
+            ts: 7 * MINUTE,
         },
     ]
 }
@@ -176,44 +209,40 @@ async fn main() -> anyhow::Result<()> {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir)?;
 
-    let (alert_sink, alerts) = CollectSink::<(String, String)>::new();
-    let (window_sink, windows) = CollectSink::<(String, u64, f64)>::new();
+    let (conversion_sink, conversions) = CollectSink::<String>::new();
+    let (session_sink, sessions) = CollectSink::<(String, u64)>::new();
 
-    let window = TumblingWindow::new(
-        60_000,
-        |v: ReadingView<'_>| v.sensor_id.to_string(),
-        |v: ReadingView<'_>| v.timestamp,
-        |acc: &mut (u64, f64), v: ReadingView<'_>| {
-            acc.0 += 1;
-            acc.1 = acc.1.max(v.celsius);
+    // Sessions close after 30 minutes of inactivity for that user.
+    let session_window = SessionWindow::new(
+        30 * MINUTE,
+        |v: PageViewView<'_>| v.user_id.to_string(),
+        |v: PageViewView<'_>| v.ts,
+        |acc: &mut u64, _v: PageViewView<'_>| *acc += 1,
+        |user_id: &str, started_at: u64, ended_at: u64, views: &u64| SessionSummary {
+            user_id: user_id.to_string(),
+            started_at,
+            ended_at,
+            views: *views,
         },
-        |key: &str, window_start: u64, window_end: u64, acc: &(u64, f64)| WindowStats {
-            sensor_id: key.to_string(),
-            window_start,
-            window_end,
-            count: acc.0,
-            max_celsius: acc.1,
-        },
-    )
-    .with_allowed_lateness(5_000);
+    );
 
     let graph = DataflowGraph::new();
 
     // `Stream` is `Copy`, so reusing the keyed handle fans out to two branches.
     let keyed = graph
-        .source(VecSource::new(readings()))
-        .filter_fn(|r| r.celsius > 0.0) // drop obviously broken probes
-        .key_by(|r| r.sensor_id.to_string());
+        .source(VecSource::new(page_views()))
+        .filter_fn(|v| !v.path.starts_with("/health"))
+        .key_by(|v| v.user_id.to_string());
 
     keyed
-        .operator("overheat_detector", OverheatDetector { threshold: 90.0 })
-        .name("alerts")
-        .sink(alert_sink);
+        .operator("funnel_tracker", FunnelTracker)
+        .name("conversions")
+        .sink(conversion_sink);
 
     keyed
-        .operator("temp_window", window)
-        .name("windows")
-        .sink(window_sink);
+        .operator("session_window", session_window)
+        .name("sessions")
+        .sink(session_sink);
 
     PipelineController::builder()
         .checkpoint_dir(&dir)
@@ -224,34 +253,33 @@ async fn main() -> anyhow::Result<()> {
 
     // ── Results ─────────────────────────────────────────────────────
 
-    let alerts = alerts
+    let conversions = conversions
         .lock()
-        .map_err(|_| anyhow::anyhow!("alert lock poisoned"))?
+        .map_err(|_| anyhow::anyhow!("conversion lock poisoned"))?
         .clone();
-    let mut windows = windows
+    let mut sessions = sessions
         .lock()
-        .map_err(|_| anyhow::anyhow!("window lock poisoned"))?
+        .map_err(|_| anyhow::anyhow!("session lock poisoned"))?
         .clone();
-    windows.sort_by(|a, b| a.0.cmp(&b.0));
+    sessions.sort_by(|a, b| a.0.cmp(&b.0));
 
-    println!("alerts:");
-    for (sensor, message) in &alerts {
-        println!("  {sensor}: {message}");
+    println!("conversions:");
+    for user_id in &conversions {
+        println!("  {user_id} completed the funnel");
     }
 
-    println!("windows:");
-    for (sensor, count, max_celsius) in &windows {
-        println!("  {sensor}: {count} readings, max {max_celsius:.1}C");
+    println!("sessions:");
+    for (user_id, views) in &sessions {
+        println!("  {user_id}: {views} page views");
     }
 
-    // boiler-1 crosses the threshold exactly once, despite two hot readings.
-    assert_eq!(alerts.len(), 1, "expected exactly one transition alert");
-    assert_eq!(alerts[0].0, "boiler-1");
+    // alice converts exactly once, despite reloading /checkout.
+    assert_eq!(conversions, vec!["alice".to_string()]);
 
-    // All timestamps fall in the first 60s window, so one window per sensor.
-    assert_eq!(windows.len(), 2, "expected one window per sensor");
-    assert_eq!(windows[0], ("boiler-1".to_string(), 3, 93.0));
-    assert_eq!(windows[1], ("boiler-2".to_string(), 2, 61.0));
+    // The /health view was filtered out, so "monitoring" has no session at all.
+    assert_eq!(sessions.len(), 2, "expected one session per real user");
+    assert_eq!(sessions[0], ("alice".to_string(), 4));
+    assert_eq!(sessions[1], ("bob".to_string(), 2));
 
     let _ = std::fs::remove_dir_all(&dir);
     Ok(())

@@ -12,7 +12,7 @@ Every Rust example in these pages is compiled by CI as a doctest. Blocks that ca
 |-------|------|----------------|
 | 1 | [getting-started.md](getting-started.md) | Install, first pipeline, core API, troubleshooting |
 | 2 | [concepts.md](concepts.md) | Terminology and the mental model, with source references |
-| 3 | [walkthrough.md](walkthrough.md) | One pipeline built step by step: schemas → state → windows → tests → deploy |
+| 3 | [walkthrough.md](walkthrough.md) | One clickstream pipeline built step by step: schemas → state → session windows → tests → deploy |
 
 ## Reference
 
@@ -53,7 +53,7 @@ Runnable code, verified by `cargo check --workspace --all-targets`:
 | Example | Shows |
 |---------|-------|
 | [`rhei/examples/quickstart.rs`](../rhei/examples/quickstart.rs) | Minimal keyed stateful pipeline with the macros |
-| [`rhei/examples/walkthrough.rs`](../rhei/examples/walkthrough.rs) | The full walkthrough pipeline |
+| [`rhei/examples/walkthrough.rs`](../rhei/examples/walkthrough.rs) | The full walkthrough pipeline: funnel tracking plus session windows |
 | [`rhei/examples/batch_word_count.rs`](../rhei/examples/batch_word_count.rs) | `flat_map` into a tumbling window |
 | [`rhei/examples/batch_window_agg.rs`](../rhei/examples/batch_window_agg.rs) | Per-key windowed aggregation |
 | [`rhei-runtime/examples/word_count.rs`](../rhei-runtime/examples/word_count.rs) | Word count without the facade crate |

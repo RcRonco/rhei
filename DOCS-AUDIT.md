@@ -145,7 +145,7 @@ every claim traced to the code that implements it.
 |----------|----------|
 | `docs/README.md` | Documentation map, reading order, and a common-questions index |
 | `docs/concepts.md` | Terminology and mental model — buffers, views, epochs, frontiers, key groups, tiers — each entry pointing at the module that implements it, plus an explicit list of terms Rhei does *not* have |
-| `docs/walkthrough.md` | One pipeline built in eight steps, from schema definition through state, windows, testing, and deployment. Every step is a complete compiled program |
+| `docs/walkthrough.md` | One clickstream pipeline built in eight steps, from schema definition through keyed state, session windows, testing, and deployment. Every step is a complete compiled program |
 | `docs/operators.md` | Every built-in operator with its exact constructor, closure signatures, and a compiled example; plus a "choosing an operator" table and how to write your own |
 | `docs/time-and-watermarks.md` | The watermark path traced from `Source::current_watermark()` through the bridge, the epoch, Timely's frontier, and into `on_watermark`; when windows fire; lateness; why a stalled watermark also stalls checkpoints |
 | `docs/exchange-and-partitioning.md` | What `key_by` compiles to (a two-stage split/route), why routing goes through key groups instead of `hash(key) % workers`, the range-assignment math and why the ceiling matters, rescaling, and skew |
@@ -156,6 +156,12 @@ every claim traced to the code that implements it.
 Two compiled examples back the prose: `rhei/examples/quickstart.rs` (quoted
 verbatim by the README) and `rhei/examples/walkthrough.rs` (the finished
 walkthrough pipeline, which asserts its own output).
+
+The examples share one domain — web clickstream — across every page, so a
+reader who learns `PageView` in the tutorial meets the same type in the
+operator reference and the watermark discussion. Session windows, funnel
+sequences, and impression/click attribution are each illustrated with the
+operator they actually motivate.
 
 ### Made verifiable
 

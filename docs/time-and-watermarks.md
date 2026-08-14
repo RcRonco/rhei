@@ -140,27 +140,26 @@ Set it per operator:
 use rhei::TumblingWindow;
 
 #[derive(Clone, rhei::RheiSchema)]
-struct Reading {
-    sensor: String,
-    value: f64,
+struct PageView {
+    user_id: String,
     ts: u64,
 }
 
 #[derive(Clone, rhei::RheiSchema)]
-struct Out {
-    sensor: String,
-    total: f64,
+struct ViewsPerMinute {
+    user_id: String,
+    views: u64,
 }
 
-fn window() -> impl rhei::arrow::StreamFunction<Input = Reading, Output = Out> {
+fn window() -> impl rhei::arrow::StreamFunction<Input = PageView, Output = ViewsPerMinute> {
     TumblingWindow::new(
         60_000,
-        |v: ReadingView<'_>| v.sensor.to_string(),
-        |v: ReadingView<'_>| v.ts,
-        |acc: &mut f64, v: ReadingView<'_>| *acc += v.value,
-        |key: &str, _start: u64, _end: u64, acc: &f64| Out {
-            sensor: key.to_string(),
-            total: *acc,
+        |v: PageViewView<'_>| v.user_id.to_string(),
+        |v: PageViewView<'_>| v.ts,
+        |acc: &mut u64, _v: PageViewView<'_>| *acc += 1,
+        |user_id: &str, _start: u64, _end: u64, views: &u64| ViewsPerMinute {
+            user_id: user_id.to_string(),
+            views: *views,
         },
     )
     .with_allowed_lateness(30_000) // tolerate 30s of out-of-order arrival

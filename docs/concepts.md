@@ -6,7 +6,10 @@ If you are new to Rhei, read [getting-started.md](getting-started.md) first, the
 
 ---
 
-## The one-paragraph model
+## How Rhei works, in one paragraph
+
+Every bolded term below has its own entry further down this page. Read this
+paragraph for the shape of the system, then look up whichever term you need.
 
 You describe a pipeline as a **dataflow graph**: sources, transforms, stateful operators, sinks. Data moves through it as **Arrow record batches**, not individual rows. The graph is compiled into a **Timely Dataflow** program that runs on N **workers**. `key_by` is the only thing that moves rows between workers; it routes each row to the worker that owns its **key group**. Operators keep **keyed state** in a three-tier hierarchy backed by object storage. As Timely's **frontier** advances, the runtime takes a **checkpoint**: dirty state is flushed and source **offsets** are committed. Recovery replays from the last checkpoint, which makes delivery **at-least-once**.
 
@@ -21,8 +24,8 @@ The trait that makes a Rust struct a valid stream element. You never implement i
 ```rust,ignore
 // not-compiled: illustrative shape of what the derive generates.
 #[derive(Clone, rhei::RheiSchema)]
-struct Reading { sensor_id: String, value: f64 }
-// generates: ReadingBuilder, ReadingView<'a>, ReadingColumns<'a>
+struct PageView { user_id: String, path: String }
+// generates: PageViewBuilder, PageViewView<'a>, PageViewColumns<'a>
 ```
 
 Primitives are not stream elements. `String` does not implement `RheiSchema`; wrap it in a struct.
@@ -31,7 +34,7 @@ Primitives are not stream elements. `String` does not implement `RheiSchema`; wr
 
 ### View
 
-A **zero-copy row reference** borrowed directly out of an Arrow array — `ReadingView<'a>` above. Every closure you pass to `map`, `filter_fn`, `key_by`, `flat_map`, or `inspect` receives a view, not an owned value.
+A **zero-copy row reference** borrowed directly out of an Arrow array — `PageViewView<'a>` above. Every closure you pass to `map`, `filter_fn`, `key_by`, `flat_map`, or `inspect` receives a view, not an owned value.
 
 This is why doc examples call `.to_string()` on string fields: a `String` column reads back as `&'a str`. Copying it is *your* choice, made per field, rather than a cost paid on every row.
 

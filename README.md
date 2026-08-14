@@ -229,17 +229,20 @@ Window and join operators are constructed with `::new(...)`, taking key/time/acc
 use rhei::{DataflowGraph, PrintSink, VecSource};
 
 #[derive(Clone, rhei::RheiSchema)]
-struct Reading {
-    sensor_id: String,
-    value: f64,
+struct PageView {
+    user_id: String,
+    path: String,
 }
 
 fn build(graph: &DataflowGraph) {
     graph
-        .source(VecSource::new(vec![Reading { sensor_id: "a".into(), value: 1.0 }]))
-        .filter_fn(|r| r.value > 0.0)
-        .key_by(|r| r.sensor_id.to_string())
-        .sink(PrintSink::<Reading>::new());
+        .source(VecSource::new(vec![PageView {
+            user_id: "alice".into(),
+            path: "/checkout".into(),
+        }]))
+        .filter_fn(|v| !v.path.starts_with("/health"))
+        .key_by(|v| v.user_id.to_string())
+        .sink(PrintSink::<PageView>::new());
 }
 ```
 
@@ -351,7 +354,7 @@ Start at **[docs/README.md](docs/README.md)** for the full map.
 |----------|----------|
 | [docs/getting-started.md](docs/getting-started.md) | Install, first pipeline, core API, troubleshooting |
 | [docs/concepts.md](docs/concepts.md) | Terminology and mental model, with source references |
-| [docs/walkthrough.md](docs/walkthrough.md) | One pipeline built step by step: schemas → state → windows → tests → deploy |
+| [docs/walkthrough.md](docs/walkthrough.md) | One clickstream pipeline built step by step: schemas → state → session windows → tests → deploy |
 | [docs/operators.md](docs/operators.md) | Every operator, exact constructor, compiled example |
 | [docs/time-and-watermarks.md](docs/time-and-watermarks.md) | Event time, watermarks, frontiers, when windows fire, lateness |
 | [docs/exchange-and-partitioning.md](docs/exchange-and-partitioning.md) | `key_by`, key groups, `max_parallelism`, rescaling, skew |

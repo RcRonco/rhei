@@ -90,13 +90,15 @@ async fn main() -> anyhow::Result<()> {
 use rhei::{DataflowGraph, PrintSink, VecSource};
 
 #[derive(Clone, rhei::RheiSchema)]
-struct Reading {
-    value: f64,
+struct PageView {
+    user_id: String,
 }
 
 fn build(graph: &DataflowGraph) {
-    let readings = graph.source(VecSource::new(vec![Reading { value: 1.0 }]));
-    readings.sink(PrintSink::<Reading>::new());
+    let views = graph.source(VecSource::new(vec![PageView {
+        user_id: "alice".into(),
+    }]));
+    views.sink(PrintSink::<PageView>::new());
 }
 ```
 
@@ -124,9 +126,9 @@ Closures receive a **zero-copy view** of each row, not an owned value:
 use rhei::{DataflowGraph, PrintSink, VecSource, col, lit_f64};
 
 #[derive(Clone, rhei::RheiSchema)]
-struct Reading {
-    sensor_id: String,
-    value: f64,
+struct PageView {
+    user_id: String,
+    dwell_ms: f64,
 }
 
 #[derive(Clone, rhei::RheiSchema)]
@@ -135,21 +137,22 @@ struct Label {
 }
 
 fn build(graph: &DataflowGraph) {
-    let readings = graph.source(VecSource::new(vec![Reading {
-        sensor_id: "a".into(),
-        value: 1.0,
+    let views = graph.source(VecSource::new(vec![PageView {
+        user_id: "alice".into(),
+        dwell_ms: 4_200.0,
     }]));
 
     // Closure predicate.
-    let hot = readings.filter_fn(|r| r.value > 20.0);
+    let engaged = views.filter_fn(|v| v.dwell_ms > 3_000.0);
 
     // Column expression, evaluated with Arrow compute kernels.
-    let also_hot = readings.filter(col("value").gt(lit_f64(20.0)));
+    let also_engaged = views.filter(col("dwell_ms").gt(lit_f64(3_000.0)));
 
-    hot.map(|r| Label { text: r.sensor_id.to_string() })
+    engaged
+        .map(|v| Label { text: v.user_id.to_string() })
         .name("labels")
         .sink(PrintSink::<Label>::new());
-    also_hot.sink(PrintSink::<Reading>::new());
+    also_engaged.sink(PrintSink::<PageView>::new());
 }
 ```
 
