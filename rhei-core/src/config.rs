@@ -37,6 +37,16 @@
 //! | `metrics.json_logs`        | `RHEI_JSON_LOGS`         |
 //! | `cluster.process_id`       | `RHEI_PROCESS_ID`        |
 //! | `cluster.peers`            | `RHEI_PEERS`             |
+//! | `cluster.discovery`        | `RHEI_DISCOVERY`         |
+//! | `cluster.node_id`          | `RHEI_NODE_ID`           |
+//! | `cluster.cluster_id`       | `RHEI_CLUSTER_ID`        |
+//! | `cluster.gossip_addr`      | `RHEI_GOSSIP_ADDR`       |
+//! | `cluster.gossip_advertise_addr` | `RHEI_GOSSIP_ADVERTISE_ADDR` |
+//! | `cluster.data_addr`        | `RHEI_DATA_ADDR`         |
+//! | `cluster.seeds`            | `RHEI_SEEDS`             |
+//! | `cluster.max_parallelism`  | `RHEI_MAX_PARALLELISM`   |
+//! | `cluster.rescale_debounce_secs` | `RHEI_RESCALE_DEBOUNCE_SECS` |
+//! | `cluster.auto_rescale`     | `RHEI_AUTO_RESCALE`      |
 //!
 //! # Example
 //!
@@ -139,6 +149,15 @@ fn default_log_level() -> String {
 }
 
 /// Cluster mode settings.
+///
+/// Two modes, distinguished by whether `discovery` is set:
+///
+/// - **Static** (`process_id` + `peers`): the cluster shape is fixed at
+///   startup. This is the original multi-process mode and still works exactly
+///   as before.
+/// - **Dynamic** (`discovery = "gossip"`): nodes find each other via gossip and
+///   the pipeline rescales as membership changes. `process_id` and `peers` are
+///   ignored; `node_id`, `gossip_addr`, `data_addr` and `seeds` take over.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ClusterSection {
     /// Process ID for multi-process mode (0-based).
@@ -146,6 +165,60 @@ pub struct ClusterSection {
 
     /// Peer addresses for multi-process cluster mode.
     pub peers: Option<Vec<String>>,
+
+    /// Discovery backend: `"static"` (default) or `"gossip"`.
+    pub discovery: Option<String>,
+
+    /// Stable node identifier for gossip discovery.
+    ///
+    /// Must be stable across restarts — a node that picks a fresh ID each boot
+    /// looks like permanent join/leave churn to the rest of the cluster.
+    /// Defaults to the hostname when unset.
+    pub node_id: Option<String>,
+
+    /// Cluster name. Only nodes sharing this value gossip with each other.
+    pub cluster_id: Option<String>,
+
+    /// Address to bind the gossip (UDP) socket to, e.g. `"0.0.0.0:2201"`.
+    pub gossip_addr: Option<String>,
+
+    /// Address peers should gossip with, when it differs from `gossip_addr`
+    /// (NAT, containers, overlay networks).
+    pub gossip_advertise_addr: Option<String>,
+
+    /// Timely data-plane address advertised to peers, e.g. `"10.0.0.5:2101"`.
+    pub data_addr: Option<String>,
+
+    /// Seed nodes to contact on startup. Only one needs to be reachable;
+    /// membership propagates from there.
+    pub seeds: Option<Vec<String>>,
+
+    /// Number of key groups — the ceiling on parallelism the pipeline can ever
+    /// rescale to.
+    ///
+    /// Fixed for the pipeline's lifetime. Changing it re-partitions the whole
+    /// key space and invalidates every existing checkpoint, so it is recorded
+    /// in the manifest and validated on restore.
+    pub max_parallelism: Option<usize>,
+
+    /// Seconds membership must stay unchanged before a rescale is triggered.
+    ///
+    /// Prevents a rolling restart from restarting the pipeline once per node.
+    pub rescale_debounce_secs: Option<u64>,
+
+    /// Whether membership changes rescale the pipeline automatically
+    /// (default: `true` when discovery is enabled).
+    pub auto_rescale: Option<bool>,
+}
+
+impl ClusterSection {
+    /// Whether gossip-based discovery is requested.
+    #[must_use]
+    pub fn is_gossip(&self) -> bool {
+        self.discovery
+            .as_deref()
+            .is_some_and(|d| d.eq_ignore_ascii_case("gossip"))
+    }
 }
 
 impl PipelineConfig {
@@ -236,6 +309,47 @@ impl PipelineConfig {
             if !peers.is_empty() {
                 self.cluster.peers = Some(peers);
             }
+        }
+        if let Ok(val) = env("RHEI_DISCOVERY") {
+            self.cluster.discovery = Some(val);
+        }
+        if let Ok(val) = env("RHEI_NODE_ID") {
+            self.cluster.node_id = Some(val);
+        }
+        if let Ok(val) = env("RHEI_CLUSTER_ID") {
+            self.cluster.cluster_id = Some(val);
+        }
+        if let Ok(val) = env("RHEI_GOSSIP_ADDR") {
+            self.cluster.gossip_addr = Some(val);
+        }
+        if let Ok(val) = env("RHEI_GOSSIP_ADVERTISE_ADDR") {
+            self.cluster.gossip_advertise_addr = Some(val);
+        }
+        if let Ok(val) = env("RHEI_DATA_ADDR") {
+            self.cluster.data_addr = Some(val);
+        }
+        if let Ok(val) = env("RHEI_SEEDS") {
+            let seeds: Vec<String> = val
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            if !seeds.is_empty() {
+                self.cluster.seeds = Some(seeds);
+            }
+        }
+        if let Ok(val) = env("RHEI_MAX_PARALLELISM")
+            && let Ok(n) = val.parse::<usize>()
+        {
+            self.cluster.max_parallelism = Some(n);
+        }
+        if let Ok(val) = env("RHEI_RESCALE_DEBOUNCE_SECS")
+            && let Ok(n) = val.parse::<u64>()
+        {
+            self.cluster.rescale_debounce_secs = Some(n);
+        }
+        if let Ok(val) = env("RHEI_AUTO_RESCALE") {
+            self.cluster.auto_rescale = Some(val == "1" || val == "true");
         }
         self
     }

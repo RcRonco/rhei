@@ -9,6 +9,7 @@ use std::sync::Arc;
 use rhei_core::checkpoint::CheckpointManifest;
 use rhei_core::dlq::ErrorPolicy;
 use rhei_core::state::context::StateContext;
+use rhei_core::state::key_group_backend::KeyGroupBackend;
 use rhei_core::state::local_backend::LocalBackend;
 use rhei_core::state::memtable::MemTableConfig;
 use rhei_core::state::prefixed_backend::PrefixedBackend;
@@ -82,6 +83,43 @@ impl RemoteStateConfig {
     }
 }
 
+/// Forward the caller's shutdown signal into one generation's trigger.
+///
+/// Each generation gets its own [`ShutdownHandle`] so a rescale can stop it
+/// without disturbing the caller's; this task bridges the two, and is aborted
+/// when the generation ends.
+fn forward_shutdown(
+    outer: &ShutdownHandle,
+    trigger: Arc<crate::shutdown::ShutdownTrigger>,
+) -> tokio::task::JoinHandle<()> {
+    let mut rx = outer.subscribe();
+    tokio::spawn(async move {
+        // Check the current value first: shutdown may already have been
+        // requested before this generation started.
+        if *rx.borrow_and_update() {
+            trigger.shutdown();
+            return;
+        }
+        while rx.changed().await.is_ok() {
+            if *rx.borrow_and_update() {
+                trigger.shutdown();
+                return;
+            }
+        }
+    })
+}
+
+/// How one pipeline generation ended under [`PipelineController::run_dynamic`].
+enum GenerationOutcome {
+    /// The dataflow completed (or failed) on its own.
+    Finished(anyhow::Result<()>),
+    /// Membership changed; drain this generation and start the next.
+    Rescale {
+        next: rhei_core::cluster::ClusterTopology,
+        moved_key_groups: usize,
+    },
+}
+
 /// Materializes a [`DataflowGraph`] into an executable pipeline.
 ///
 /// Use [`PipelineController::builder()`] to configure execution parameters, build the
@@ -100,6 +138,37 @@ pub struct PipelineController {
     pub(crate) peers: Option<Vec<String>>,
     /// Bounded memtable configuration for L1 LRU eviction.
     pub(crate) memtable_config: MemTableConfig,
+    /// Number of key groups — the ceiling on parallelism this pipeline can
+    /// ever rescale to.
+    ///
+    /// Fixed for the pipeline's lifetime: it determines which key group every
+    /// key hashes into, so changing it invalidates all persisted state. It is
+    /// recorded in the checkpoint manifest and validated on restore.
+    pub(crate) max_parallelism: usize,
+    /// Cluster topology for the current generation, when running under dynamic
+    /// discovery.
+    ///
+    /// When set, this overrides the static `workers` / `process_id` / `peers`
+    /// fields — those describe the `--peers` startup configuration, while this
+    /// describes the cluster as currently discovered. Interior mutability lets
+    /// a rescale install a new generation without rebuilding the controller
+    /// (which owns non-cloneable resources like the DLQ sink and L2 cache).
+    pub(crate) active_topology: std::sync::Mutex<Option<rhei_core::cluster::ClusterTopology>>,
+    /// This node's identifier under dynamic discovery, used to find its own
+    /// process ID within [`Self::active_topology`].
+    pub(crate) node_id: std::sync::Mutex<Option<String>>,
+    /// One `LocalBackend` per operator, shared by every worker in this process.
+    ///
+    /// Key-group addressing means all workers now derive the *same* physical
+    /// keys, so they must also share one backing store. Handing each worker its
+    /// own `LocalBackend` over the same file would be silent data loss:
+    /// `LocalBackend` holds the whole map in memory and `checkpoint()` writes it
+    /// wholesale, so the last worker to flush would erase every other worker's
+    /// state.
+    ///
+    /// Sharing is also what makes in-process rescaling work — a worker that
+    /// inherits a key group finds it already present in the shared map.
+    local_backends: std::sync::Mutex<std::collections::HashMap<String, Arc<LocalBackend>>>,
     /// Serializable topology populated after graph compilation.
     topology: Arc<std::sync::Mutex<Option<ApiTopology>>>,
     /// HTTP metrics/API server bind address. If set, the HTTP server is started
@@ -143,6 +212,7 @@ pub struct PipelineControllerBuilder {
     process_id: Option<usize>,
     peers: Option<Vec<String>>,
     memtable_config: MemTableConfig,
+    max_parallelism: usize,
     metrics_addr: Option<std::net::SocketAddr>,
     pipeline_name: Option<String>,
     #[cfg(feature = "remote-state")]
@@ -196,6 +266,9 @@ impl PipelineControllerBuilder {
         }
         if let Some(ref peers) = config.cluster.peers {
             self.peers = Some(peers.clone());
+        }
+        if let Some(max_p) = config.cluster.max_parallelism {
+            self.max_parallelism = max_p;
         }
         self
     }
@@ -258,6 +331,19 @@ impl PipelineControllerBuilder {
     /// Set the memtable configuration for L1 LRU eviction.
     pub fn memtable_config(mut self, config: MemTableConfig) -> Self {
         self.memtable_config = config;
+        self
+    }
+
+    /// Set the number of key groups (default:
+    /// [`DEFAULT_MAX_PARALLELISM`](rhei_core::cluster::DEFAULT_MAX_PARALLELISM)).
+    ///
+    /// This is the ceiling on the parallelism the pipeline can ever rescale to
+    /// — a cluster with more workers than key groups leaves the surplus
+    /// workers idle. Pick it once, generously, when the pipeline is created:
+    /// every key's group is `hash(key) % max_parallelism`, so changing it later
+    /// rehashes the entire key space and invalidates all persisted state.
+    pub fn max_parallelism(mut self, n: usize) -> Self {
+        self.max_parallelism = n;
         self
     }
 
@@ -398,6 +484,10 @@ impl PipelineControllerBuilder {
             process_id: self.process_id,
             peers: self.peers,
             memtable_config: self.memtable_config,
+            max_parallelism: self.max_parallelism,
+            active_topology: std::sync::Mutex::new(None),
+            node_id: std::sync::Mutex::new(None),
+            local_backends: std::sync::Mutex::new(std::collections::HashMap::new()),
             topology: Arc::new(std::sync::Mutex::new(None)),
             metrics_addr: self.metrics_addr,
             pipeline_name: self.pipeline_name,
@@ -426,6 +516,7 @@ impl PipelineController {
             process_id: None,
             peers: None,
             memtable_config: MemTableConfig::default(),
+            max_parallelism: rhei_core::cluster::DEFAULT_MAX_PARALLELISM,
             metrics_addr: None,
             pipeline_name: None,
             #[cfg(feature = "remote-state")]
@@ -451,6 +542,10 @@ impl PipelineController {
             process_id: None,
             peers: None,
             memtable_config: MemTableConfig::default(),
+            max_parallelism: rhei_core::cluster::DEFAULT_MAX_PARALLELISM,
+            active_topology: std::sync::Mutex::new(None),
+            node_id: std::sync::Mutex::new(None),
+            local_backends: std::sync::Mutex::new(std::collections::HashMap::new()),
             topology: Arc::new(std::sync::Mutex::new(None)),
             metrics_addr: None,
             pipeline_name: None,
@@ -506,21 +601,91 @@ impl PipelineController {
         self.checkpoint_interval
     }
 
+    /// The discovered topology for the current generation, if running under
+    /// dynamic discovery.
+    fn active_topology(&self) -> Option<rhei_core::cluster::ClusterTopology> {
+        self.active_topology
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// This node's process ID within the active topology.
+    fn active_process_id(&self) -> Option<usize> {
+        let topology = self.active_topology()?;
+        let node_id = self
+            .node_id
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()?;
+        topology.process_id_of(&node_id)
+    }
+
+    /// Install a discovered topology as the one to execute next.
+    ///
+    /// # Errors
+    /// Returns an error if `node_id` is not a participant in `topology` — this
+    /// node would otherwise try to join a Timely cluster that has not reserved
+    /// a process slot for it.
+    pub fn set_active_topology(
+        &self,
+        topology: rhei_core::cluster::ClusterTopology,
+        node_id: &str,
+    ) -> anyhow::Result<()> {
+        let process_id = topology.process_id_of(node_id).ok_or_else(|| {
+            anyhow::anyhow!(
+                "node {node_id:?} is not a participant in the resolved topology \
+                 (members: {:?})",
+                topology
+                    .processes
+                    .iter()
+                    .map(|m| &m.node_id)
+                    .collect::<Vec<_>>()
+            )
+        })?;
+        tracing::info!(
+            node_id,
+            process_id,
+            topology = %topology.summary(),
+            fingerprint = topology.fingerprint(),
+            "installing cluster topology"
+        );
+        *self
+            .node_id
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(node_id.to_string());
+        *self
+            .active_topology
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(topology);
+        Ok(())
+    }
+
     /// Returns `true` when running in multi-process cluster mode.
     pub fn is_cluster(&self) -> bool {
-        self.peers.is_some()
+        self.active_topology().is_some_and(|t| t.n_processes() > 1) || self.peers.is_some()
     }
 
     /// Returns the configured process ID, if in cluster mode.
     pub fn process_id(&self) -> Option<usize> {
-        self.process_id
+        self.active_process_id().or(self.process_id)
+    }
+
+    /// Number of worker threads on this process.
+    fn effective_workers(&self) -> usize {
+        self.active_topology()
+            .map_or(self.workers, |t| t.workers_per_process)
     }
 
     /// Total number of workers across all processes.
     ///
-    /// In cluster mode: `workers * peers.len()`.
-    /// In single-process mode: `workers`.
+    /// Under dynamic discovery this is the current topology's worker count; it
+    /// changes as nodes join and leave. Otherwise it is `workers * peers.len()`
+    /// in cluster mode, or `workers` in single-process mode.
     pub fn total_workers(&self) -> usize {
+        if let Some(topology) = self.active_topology() {
+            return topology.total_workers();
+        }
         if let Some(ref peers) = self.peers {
             self.workers * peers.len()
         } else {
@@ -533,11 +698,12 @@ impl PipelineController {
     /// In cluster mode: `pid*workers .. pid*workers + workers`.
     /// In single-process mode: `0..workers`.
     pub fn local_worker_range(&self) -> std::ops::Range<usize> {
-        if let Some(pid) = self.process_id {
-            let start = pid * self.workers;
-            start..start + self.workers
+        let workers = self.effective_workers();
+        if let Some(pid) = self.process_id() {
+            let start = pid * workers;
+            start..start + workers
         } else {
-            0..self.workers
+            0..workers
         }
     }
 
@@ -546,6 +712,32 @@ impl PipelineController {
     /// # Errors
     /// Returns an error if in cluster mode but `process_id` is not set.
     pub(crate) fn timely_config(&self) -> anyhow::Result<timely::execute::Config> {
+        // A discovered topology takes precedence over the static peer list:
+        // it reflects the cluster as it is right now, not as it was at startup.
+        if let Some(topology) = self.active_topology() {
+            let pid = self.active_process_id().ok_or_else(|| {
+                anyhow::anyhow!("this node is not a participant in the active topology")
+            })?;
+            // A single-process topology has no peers to dial, so use the
+            // shared-memory allocator rather than standing up a TCP cluster
+            // against ourselves.
+            if topology.n_processes() == 1 {
+                return Ok(timely::execute::Config::process(
+                    topology.workers_per_process,
+                ));
+            }
+            return Ok(timely::execute::Config {
+                communication: timely::CommunicationConfig::Cluster {
+                    threads: topology.workers_per_process,
+                    process: pid,
+                    addresses: topology.addresses(),
+                    report: false,
+                    zerocopy: false,
+                    log_fn: Arc::new(|_| None),
+                },
+                worker: timely::WorkerConfig::default(),
+            });
+        }
         if let Some(ref peers) = self.peers {
             let pid = self
                 .process_id
@@ -588,6 +780,169 @@ impl PipelineController {
         graph.validate().map_err(|e| anyhow::anyhow!("{e}"))?;
         let _http_handle = self.maybe_start_http()?;
         run_graph(graph, self, None).await
+    }
+
+    /// Run a pipeline under dynamic cluster discovery, rescaling as membership
+    /// changes.
+    ///
+    /// `build_graph` is called once per topology generation: Timely fixes its
+    /// worker set when the dataflow starts, so changing the worker count means
+    /// building and running a fresh dataflow. Each generation resumes from the
+    /// checkpoint the previous one wrote.
+    ///
+    /// The rescale itself is cheap in the way that matters: because state is
+    /// addressed by key group rather than by worker, reassigning ownership
+    /// moves no bytes. A worker that gains a key group reads it from shared L3
+    /// storage on first access.
+    ///
+    /// Returns when the pipeline completes on its own (sources exhausted), when
+    /// `shutdown` fires, or when the membership provider shuts down.
+    ///
+    /// # Errors
+    /// Returns an error if the initial membership does not resolve to a viable
+    /// cluster, if this node is not a participant in the resolved topology, or
+    /// if a generation fails to execute.
+    ///
+    /// # Example
+    /// ```ignore
+    /// let provider = GossipMembership::join(gossip_config).await?;
+    /// let policy = RescalePolicy::new(controller.max_parallelism());
+    /// controller
+    ///     .run_dynamic(|| build_pipeline(), provider, policy, shutdown)
+    ///     .await?;
+    /// ```
+    pub async fn run_dynamic<F>(
+        &self,
+        mut build_graph: F,
+        provider: Arc<dyn rhei_core::cluster::MembershipProvider>,
+        policy: crate::cluster::RescalePolicy,
+        shutdown: Option<ShutdownHandle>,
+    ) -> anyhow::Result<()>
+    where
+        F: FnMut() -> DataflowGraph + Send,
+    {
+        use crate::cluster::{RescaleDecision, RescaleSupervisor};
+
+        anyhow::ensure!(
+            policy.max_parallelism == self.max_parallelism,
+            "rescale policy max_parallelism ({}) must match the controller's ({}); \
+             they determine the same key group space",
+            policy.max_parallelism,
+            self.max_parallelism
+        );
+
+        let node_id = provider.node_id().to_string();
+        let mut supervisor = RescaleSupervisor::new(provider.clone(), policy);
+        let mut topology = supervisor.initial_topology().await?;
+        let mut generation: u64 = 0;
+
+        loop {
+            self.set_active_topology(topology.clone(), &node_id)?;
+            supervisor.adopt(topology.clone());
+
+            let graph = build_graph();
+            graph.validate().map_err(|e| anyhow::anyhow!("{e}"))?;
+
+            // Each generation gets its own shutdown handle so a rescale can stop
+            // it without disturbing the caller's handle. The caller's shutdown
+            // is forwarded into it by a task that lives only as long as this
+            // generation.
+            let (gen_shutdown, gen_trigger) = ShutdownHandle::new();
+            let gen_trigger = Arc::new(gen_trigger);
+            let forwarder = shutdown
+                .as_ref()
+                .map(|outer| forward_shutdown(outer, gen_trigger.clone()));
+
+            tracing::info!(
+                node_id = %node_id,
+                generation,
+                topology = %topology.summary(),
+                "starting pipeline generation"
+            );
+            metrics::gauge!("rhei_cluster_generation").set(generation as f64);
+
+            let run = run_graph(graph, self, Some(gen_shutdown));
+            tokio::pin!(run);
+
+            let outcome = loop {
+                tokio::select! {
+                    // Bias toward the pipeline so a completed run is observed
+                    // before a concurrent membership change starts a rescale
+                    // of something that already finished.
+                    biased;
+
+                    result = &mut run => break GenerationOutcome::Finished(result),
+
+                    decision = supervisor.next_decision() => match decision {
+                        RescaleDecision::Rescale { topology: next, moved_key_groups } => {
+                            break GenerationOutcome::Rescale { next: *next, moved_key_groups };
+                        }
+                        // Keep running this generation and await the next decision.
+                        RescaleDecision::NoChange => {}
+                        RescaleDecision::NoQuorum(reason) => {
+                            // Holding the current topology is the right call: a
+                            // total membership loss is far more likely a partition
+                            // than a real cluster-wide shutdown.
+                            tracing::warn!(
+                                node_id = %node_id,
+                                reason = %reason,
+                                "no viable cluster in latest membership; holding current topology"
+                            );
+                        }
+                        RescaleDecision::ProviderClosed => {
+                            tracing::info!("membership provider closed; running to completion");
+                            break GenerationOutcome::Finished((&mut run).await);
+                        }
+                    },
+                }
+            };
+
+            if let Some(handle) = forwarder {
+                handle.abort();
+            }
+
+            match outcome {
+                GenerationOutcome::Finished(result) => {
+                    result?;
+                    tracing::info!(generation, "pipeline finished");
+                    return Ok(());
+                }
+                GenerationOutcome::Rescale {
+                    next,
+                    moved_key_groups,
+                } => {
+                    tracing::info!(
+                        node_id = %node_id,
+                        generation,
+                        from = %topology.summary(),
+                        to = %next.summary(),
+                        moved_key_groups,
+                        "rescaling: draining current generation to a checkpoint"
+                    );
+                    metrics::counter!("rhei_cluster_rescales_total").increment(1);
+                    metrics::counter!("rhei_cluster_key_groups_moved_total")
+                        .increment(moved_key_groups as u64);
+
+                    // Stop the dataflow gracefully. The executor checkpoints
+                    // operator state and commits source offsets on the way out,
+                    // so the next generation resumes exactly here.
+                    gen_trigger.shutdown();
+                    run.await.map_err(|e| {
+                        anyhow::anyhow!("failed to drain generation {generation} for rescale: {e}")
+                    })?;
+
+                    // If the caller asked to stop while we were draining, honour
+                    // that rather than starting another generation.
+                    if shutdown.as_ref().is_some_and(ShutdownHandle::is_shutdown) {
+                        tracing::info!("shutdown requested during rescale; stopping");
+                        return Ok(());
+                    }
+
+                    topology = next;
+                    generation += 1;
+                }
+            }
+        }
     }
 
     /// Compile and execute a [`DataflowGraph`] with graceful shutdown.
@@ -661,29 +1016,147 @@ impl PipelineController {
         Ok(self)
     }
 
+    /// The number of key groups configured for this pipeline.
+    pub fn max_parallelism(&self) -> usize {
+        self.max_parallelism
+    }
+
+    /// Node IDs participating in the active topology, for checkpoint metadata.
+    ///
+    /// Empty when not running under dynamic discovery.
+    pub fn cluster_member_ids(&self) -> Vec<String> {
+        self.active_topology().map_or_else(Vec::new, |t| {
+            t.processes.iter().map(|m| m.node_id.clone()).collect()
+        })
+    }
+
+    /// The key-group → worker assignment implied by the current topology.
+    ///
+    /// # Errors
+    /// Returns an error if `max_parallelism` is out of range.
+    pub fn key_group_assignment(&self) -> anyhow::Result<rhei_core::cluster::KeyGroupAssignment> {
+        let assignment = rhei_core::cluster::KeyGroupAssignment::new(
+            self.max_parallelism,
+            self.total_workers(),
+        )?;
+        if assignment.idle_workers() > 0 {
+            tracing::warn!(
+                max_parallelism = self.max_parallelism,
+                total_workers = self.total_workers(),
+                idle_workers = assignment.idle_workers(),
+                "cluster has more workers than key groups; surplus workers own no keyed state. \
+                 Raising max_parallelism requires a state-incompatible restart."
+            );
+        }
+        Ok(assignment)
+    }
+
     /// Create a per-worker `StateContext` for the given operator.
     ///
-    /// In single-process mode the context is namespaced as
-    /// `{operator_name}_w{worker_index}`.
-    /// In cluster mode it includes the process ID:
-    /// `p{process_id}/w{worker_index}/{operator_name}`.
+    /// State is addressed by **key group**, not by worker: the physical key is
+    /// `kg{group}/{operator_name}/{user_key}`. The `worker_index` argument is
+    /// therefore deliberately *not* part of the namespace — it only selects
+    /// which local L1/L2 caches front the shared store.
+    ///
+    /// This is what makes rescaling possible. The older scheme
+    /// (`p{process_id}/w{worker_index}/{operator_name}`) welded durable state
+    /// to the cluster layout, so changing the worker count left every key under
+    /// a prefix nobody would look up again. Now a worker that inherits a key
+    /// group issues exactly the reads its previous owner issued.
+    ///
+    /// **This requires shared L3 storage** (`remote_state`) to be useful across
+    /// processes: with a purely local backend, a key group that moves to another
+    /// *machine* has no path to its bytes. Within a process, moving between
+    /// worker threads works with any backend.
     pub fn create_context_for_worker(
         &self,
         operator_name: &str,
         worker_index: usize,
     ) -> anyhow::Result<StateContext> {
-        let namespaced = if let Some(pid) = self.process_id {
-            format!("p{pid}/w{worker_index}/{operator_name}")
-        } else {
-            format!("{operator_name}_w{worker_index}")
+        let _ = worker_index;
+        self.create_keyed_context(operator_name)
+    }
+
+    /// The process-wide `LocalBackend` for `operator_name`, creating it on first
+    /// use.
+    ///
+    /// Every worker in this process shares one instance. See
+    /// [`Self::local_backends`] for why separate instances over the same file
+    /// would silently lose state.
+    fn shared_local_backend(&self, operator_name: &str) -> anyhow::Result<Arc<LocalBackend>> {
+        let mut cache = self
+            .local_backends
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(existing) = cache.get(operator_name) {
+            return Ok(existing.clone());
+        }
+        let path = self
+            .checkpoint_dir
+            .join(format!("{operator_name}.checkpoint.json"));
+        let backend = Arc::new(LocalBackend::new(path, None)?);
+        cache.insert(operator_name.to_string(), backend.clone());
+        Ok(backend)
+    }
+
+    /// Create a key-group-addressed `StateContext` for the given operator.
+    ///
+    /// Identical to [`create_context`](Self::create_context) except that keys
+    /// are namespaced as `kg{group}/{operator_name}/{user_key}` rather than
+    /// `{operator_name}/{user_key}`, so ownership of a key can move between
+    /// workers without the bytes moving.
+    pub fn create_keyed_context(&self, operator_name: &str) -> anyhow::Result<StateContext> {
+        let max_p = self.max_parallelism;
+        let wrap = |inner: Box<dyn rhei_core::state::backend::StateBackend>| {
+            KeyGroupBackend::new(operator_name, max_p, inner)
         };
-        self.create_context(&namespaced)
+
+        let ctx = {
+            #[cfg(feature = "remote-state")]
+            {
+                let fork_l3 = self.fork_remote_l3.lock().unwrap_or_else(|e| {
+                    tracing::warn!("mutex poisoned in fork_remote_l3 lock, recovering inner data");
+                    e.into_inner()
+                });
+                if let Some(ref remote_l3) = *fork_l3 {
+                    let fork = rhei_core::state::fork_backend::ForkBackend::new(
+                        Box::new(self.shared_local_backend(operator_name)?),
+                        Box::new(remote_l3.clone()),
+                    );
+                    StateContext::new(Box::new(wrap(Box::new(fork))?))
+                } else if let Some(ref tiered) = self.tiered {
+                    let tiered_backend = tiered.shared_l2.create_tiered_backend(tiered.l3.clone());
+                    StateContext::new(Box::new(wrap(Box::new(tiered_backend))?))
+                } else {
+                    StateContext::new(Box::new(wrap(Box::new(
+                        self.shared_local_backend(operator_name)?,
+                    ))?))
+                }
+            }
+            #[cfg(not(feature = "remote-state"))]
+            {
+                if let Some(ref tiered) = self.tiered {
+                    let tiered_backend = tiered.shared_l2.create_tiered_backend(tiered.l3.clone());
+                    StateContext::new(Box::new(wrap(Box::new(tiered_backend))?))
+                } else {
+                    StateContext::new(Box::new(wrap(Box::new(
+                        self.shared_local_backend(operator_name)?,
+                    ))?))
+                }
+            }
+        };
+
+        Ok(ctx.with_memtable_config(self.memtable_config.clone()))
     }
 
     /// Create a `StateContext` for the given operator.
     ///
     /// When tiered storage is configured, produces a context backed by
     /// `PrefixedBackend(TieredBackend)`. Otherwise falls back to `LocalBackend`.
+    ///
+    /// This uses flat, operator-only namespacing. Keyed operators should use
+    /// [`create_keyed_context`](Self::create_keyed_context) so their state
+    /// survives a rescale.
     pub fn create_context(&self, operator_name: &str) -> anyhow::Result<StateContext> {
         let ctx = {
             #[cfg(feature = "remote-state")]
@@ -834,13 +1307,33 @@ async fn run_graph(
             if let Some(fork) = fork_data {
                 fork
             } else if let Some(manifest) = CheckpointManifest::load(&controller.checkpoint_dir) {
+                // A different key group count means every key hashes into a
+                // different group, so the stored state is unreadable. Fail loudly
+                // rather than silently resuming from what looks like empty state.
+                manifest.validate_compatible(controller.max_parallelism)?;
+
                 tracing::info!(
                     checkpoint_id = manifest.checkpoint_id,
                     timestamp_ms = manifest.timestamp_ms,
                     operators = ?manifest.operators,
                     source_offsets = ?manifest.source_offsets,
+                    max_parallelism = ?manifest.max_parallelism,
+                    prev_total_workers = ?manifest.total_workers,
                     "resuming from checkpoint #{}", manifest.checkpoint_id
                 );
+
+                // Resuming at a different worker count is normal — that is a
+                // rescale — but worth recording, since it is when key groups
+                // change owner.
+                if let Some(prev_workers) = manifest.total_workers
+                    && prev_workers != controller.total_workers()
+                {
+                    tracing::info!(
+                        from_workers = prev_workers,
+                        to_workers = controller.total_workers(),
+                        "resuming at a different parallelism; key groups will be reassigned"
+                    );
+                }
 
                 // Validate operator names.
                 let prev: std::collections::HashSet<&str> =
@@ -867,13 +1360,33 @@ async fn run_graph(
         #[cfg(not(feature = "remote-state"))]
         {
             if let Some(manifest) = CheckpointManifest::load(&controller.checkpoint_dir) {
+                // A different key group count means every key hashes into a
+                // different group, so the stored state is unreadable. Fail loudly
+                // rather than silently resuming from what looks like empty state.
+                manifest.validate_compatible(controller.max_parallelism)?;
+
                 tracing::info!(
                     checkpoint_id = manifest.checkpoint_id,
                     timestamp_ms = manifest.timestamp_ms,
                     operators = ?manifest.operators,
                     source_offsets = ?manifest.source_offsets,
+                    max_parallelism = ?manifest.max_parallelism,
+                    prev_total_workers = ?manifest.total_workers,
                     "resuming from checkpoint #{}", manifest.checkpoint_id
                 );
+
+                // Resuming at a different worker count is normal — that is a
+                // rescale — but worth recording, since it is when key groups
+                // change owner.
+                if let Some(prev_workers) = manifest.total_workers
+                    && prev_workers != controller.total_workers()
+                {
+                    tracing::info!(
+                        from_workers = prev_workers,
+                        to_workers = controller.total_workers(),
+                        "resuming at a different parallelism; key groups will be reassigned"
+                    );
+                }
 
                 // Validate operator names.
                 let prev: std::collections::HashSet<&str> =
@@ -933,6 +1446,9 @@ async fn run_graph(
         source_offsets,
         n_processes: Some(ckpt_n_processes),
         workers_per_process: Some(controller.workers),
+        max_parallelism: Some(controller.max_parallelism()),
+        total_workers: Some(controller.total_workers()),
+        cluster_members: controller.cluster_member_ids(),
     };
 
     crate::task_manager::write_manifest(

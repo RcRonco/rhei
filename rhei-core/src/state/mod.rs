@@ -4,6 +4,8 @@ pub mod backend;
 pub mod context;
 /// Copy-on-write backend for checkpoint fork mode.
 pub mod fork_backend;
+/// Key-group-addressed backend wrapper (rescale-safe state namespacing).
+pub mod key_group_backend;
 /// List-valued typed state wrapper.
 pub mod list_state;
 /// JSON-file-backed local state backend.

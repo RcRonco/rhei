@@ -127,14 +127,20 @@
 - [x] Epoch-carrying checkpoint channel (`u64` epoch instead of `()`)
 
 ### Phase 3: Dynamic control plane (chitchat + OpenRaft)
-- [ ] `PipelineController::reconfigure()` — update topology at runtime (new peers, worker count)
-- [ ] Checkpoint manifest topology metadata (track process count, workers per process)
-- [ ] Manifest merge with non-sequential process IDs (tolerate node replacement)
-- [ ] State repartitioning strategy after topology changes
-  - [ ] Decide approach: lazy migration (read-through old prefix) vs eager compaction
-  - [ ] Decouple state prefix from `(process_id, worker_index)` pair
-- [ ] TaskManager rebuild path: checkpoint → build fresh TaskManager → restart Timely
+
+See [ADR/dynamic-discovery-reshuffling.md](ADR/dynamic-discovery-reshuffling.md).
+
+- [x] Key groups: decouple key ownership from worker count (Flink-compatible assignment)
+- [x] Decouple state prefix from `(process_id, worker_index)` — state addressed as `kg{group}/{op}/{key}`
+- [x] State repartitioning strategy: lazy: ownership moves, bytes stay in shared L3
+- [x] `PipelineController::run_dynamic()` — rescale topology at runtime
+- [x] Checkpoint manifest topology metadata (key groups, worker count, members)
+- [x] Reject restore when `max_parallelism` changed (state would be unreadable)
+- [x] TaskManager rebuild path: checkpoint → build fresh TaskManager → restart Timely
+- [x] chitchat gossip discovery with phi-accrual failure detection
+- [x] Debounced rescale supervision (churn → deliberate topology generations)
+- [x] Dynamic scaling: add/remove nodes with key-group redistribution
+- [ ] Proactive key-group cache warming after a rescale (currently faults in on first access)
 - [ ] Source partition rebalance on scale events (re-trigger Kafka consumer group)
-- [ ] Job Manager integration: chitchat gossip for failure detection, OpenRaft for coordination
-- [ ] Leader election and failure detection
-- [ ] Dynamic scaling: add/remove workers with state redistribution
+- [ ] Job Manager integration: OpenRaft for linearizable job/checkpoint metadata
+- [ ] Leader election

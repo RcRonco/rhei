@@ -32,11 +32,88 @@ pub struct CheckpointManifest {
     /// Workers per process (None for v1 manifests).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workers_per_process: Option<usize>,
+    /// Number of key groups the state in this checkpoint is partitioned into.
+    ///
+    /// Fixed for a pipeline's lifetime. Every key's group is
+    /// `hash(key) % max_parallelism`, so resuming with a different value would
+    /// send every key looking under the wrong prefix — silently reading empty
+    /// state rather than failing. [`Self::validate_compatible`] rejects that.
+    ///
+    /// `None` on manifests written before key groups existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_parallelism: Option<usize>,
+    /// Total worker count of the topology that wrote this checkpoint.
+    ///
+    /// Purely informational — unlike `max_parallelism`, resuming at a different
+    /// worker count is exactly what rescaling is for.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_workers: Option<usize>,
+    /// Node IDs participating in the topology that wrote this checkpoint.
+    ///
+    /// Recorded for operational forensics: it makes the membership history of a
+    /// pipeline visible in its checkpoint trail.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cluster_members: Vec<String>,
 }
+
+/// Why a checkpoint cannot be resumed with the current configuration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CheckpointIncompatibility {
+    /// The manifest's key group count differs from the configured one.
+    MaxParallelismChanged {
+        /// Value recorded in the manifest.
+        manifest: usize,
+        /// Value configured for this run.
+        configured: usize,
+    },
+}
+
+impl std::fmt::Display for CheckpointIncompatibility {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MaxParallelismChanged {
+                manifest,
+                configured,
+            } => write!(
+                f,
+                "checkpoint was written with max_parallelism={manifest} but this run is \
+                 configured for {configured}. Key groups are computed as \
+                 `hash(key) % max_parallelism`, so changing it re-partitions the entire \
+                 key space and orphans all existing state. Either restore the original \
+                 value, or start from an empty checkpoint directory."
+            ),
+        }
+    }
+}
+
+impl std::error::Error for CheckpointIncompatibility {}
 
 const MANIFEST_FILE: &str = "manifest.json";
 
 impl CheckpointManifest {
+    /// Check that this checkpoint can be resumed at `max_parallelism`.
+    ///
+    /// Manifests written before key groups existed carry no `max_parallelism`
+    /// and are accepted: their state predates key-group addressing, so there is
+    /// no recorded value to contradict.
+    ///
+    /// # Errors
+    /// Returns [`CheckpointIncompatibility`] if the key group count differs.
+    pub fn validate_compatible(
+        &self,
+        max_parallelism: usize,
+    ) -> Result<(), CheckpointIncompatibility> {
+        match self.max_parallelism {
+            Some(recorded) if recorded != max_parallelism => {
+                Err(CheckpointIncompatibility::MaxParallelismChanged {
+                    manifest: recorded,
+                    configured: max_parallelism,
+                })
+            }
+            _ => Ok(()),
+        }
+    }
+
     /// Atomically persist the manifest to `{dir}/manifest.json`.
     ///
     /// Writes to a temporary file first, then renames — so readers never
@@ -140,6 +217,9 @@ impl CheckpointManifest {
             source_offsets: merged_offsets,
             n_processes: None,
             workers_per_process: None,
+            max_parallelism: None,
+            total_workers: None,
+            cluster_members: Vec::new(),
         })
     }
 }
@@ -197,6 +277,9 @@ mod tests {
             source_offsets: HashMap::from([("t/0".into(), "99".into())]),
             n_processes: None,
             workers_per_process: None,
+            max_parallelism: None,
+            total_workers: None,
+            cluster_members: Vec::new(),
         };
 
         manifest.save(&dir).unwrap();
@@ -231,6 +314,9 @@ mod tests {
             source_offsets: HashMap::from([("t/0".into(), "50".into())]),
             n_processes: None,
             workers_per_process: None,
+            max_parallelism: None,
+            total_workers: None,
+            cluster_members: Vec::new(),
         };
 
         manifest.save_partial(&dir, 0).unwrap();
@@ -260,6 +346,9 @@ mod tests {
             ]),
             n_processes: None,
             workers_per_process: None,
+            max_parallelism: None,
+            total_workers: None,
+            cluster_members: Vec::new(),
         };
         let p1 = CheckpointManifest {
             version: 1,
@@ -272,6 +361,9 @@ mod tests {
             ]),
             n_processes: None,
             workers_per_process: None,
+            max_parallelism: None,
+            total_workers: None,
+            cluster_members: Vec::new(),
         };
 
         p0.save_partial(&dir, 0).unwrap();
@@ -302,6 +394,9 @@ mod tests {
             source_offsets: HashMap::new(),
             n_processes: None,
             workers_per_process: None,
+            max_parallelism: None,
+            total_workers: None,
+            cluster_members: Vec::new(),
         };
         p0.save_partial(&dir, 0).unwrap();
 
@@ -327,6 +422,9 @@ mod tests {
             ]),
             n_processes: None,
             workers_per_process: None,
+            max_parallelism: None,
+            total_workers: None,
+            cluster_members: Vec::new(),
         };
 
         manifest.save_to_object_store(&store, &path).await.unwrap();
@@ -410,6 +508,9 @@ mod tests {
             source_offsets: HashMap::new(),
             n_processes: Some(2),
             workers_per_process: Some(4),
+            max_parallelism: None,
+            total_workers: None,
+            cluster_members: Vec::new(),
         };
 
         manifest.save(&dir).unwrap();
@@ -418,5 +519,100 @@ mod tests {
         assert_eq!(loaded.workers_per_process, Some(4));
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── Key group compatibility ─────────────────────────────────────
+
+    fn manifest_with_max_parallelism(max_parallelism: Option<usize>) -> CheckpointManifest {
+        CheckpointManifest {
+            version: 1,
+            checkpoint_id: 1,
+            timestamp_ms: 0,
+            operators: vec!["op".to_string()],
+            source_offsets: HashMap::new(),
+            n_processes: Some(1),
+            workers_per_process: Some(2),
+            max_parallelism,
+            total_workers: Some(2),
+            cluster_members: vec!["node-a".to_string()],
+        }
+    }
+
+    #[test]
+    fn matching_max_parallelism_is_compatible() {
+        assert!(
+            manifest_with_max_parallelism(Some(128))
+                .validate_compatible(128)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn changed_max_parallelism_is_rejected() {
+        // Silently accepting this would resume against state that every key
+        // now hashes away from — reading empty values instead of failing.
+        let err = manifest_with_max_parallelism(Some(128))
+            .validate_compatible(256)
+            .unwrap_err();
+        assert_eq!(
+            err,
+            CheckpointIncompatibility::MaxParallelismChanged {
+                manifest: 128,
+                configured: 256,
+            }
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("128") && msg.contains("256"),
+            "unhelpful message: {msg}"
+        );
+    }
+
+    #[test]
+    fn manifests_without_max_parallelism_are_accepted() {
+        // Written before key groups existed: no recorded value to contradict.
+        assert!(
+            manifest_with_max_parallelism(None)
+                .validate_compatible(128)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn worker_count_may_change_freely() {
+        // Resuming at a different parallelism is exactly what rescaling is.
+        let mut manifest = manifest_with_max_parallelism(Some(128));
+        manifest.total_workers = Some(4);
+        manifest.workers_per_process = Some(4);
+        assert!(manifest.validate_compatible(128).is_ok());
+    }
+
+    #[test]
+    fn topology_fields_survive_a_serde_round_trip() {
+        let manifest = manifest_with_max_parallelism(Some(256));
+        let json = serde_json::to_string(&manifest).unwrap();
+        let restored: CheckpointManifest = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.max_parallelism, Some(256));
+        assert_eq!(restored.total_workers, Some(2));
+        assert_eq!(restored.cluster_members, vec!["node-a".to_string()]);
+    }
+
+    #[test]
+    fn old_manifests_still_deserialize() {
+        // Backward compatibility: a manifest written before these fields
+        // existed must still load, with the new fields defaulted.
+        let json = r#"{
+            "version": 1,
+            "checkpoint_id": 7,
+            "timestamp_ms": 100,
+            "operators": ["op"],
+            "source_offsets": {}
+        }"#;
+        let manifest: CheckpointManifest = serde_json::from_str(json).unwrap();
+        assert_eq!(manifest.checkpoint_id, 7);
+        assert_eq!(manifest.max_parallelism, None);
+        assert_eq!(manifest.total_workers, None);
+        assert!(manifest.cluster_members.is_empty());
+        assert!(manifest.validate_compatible(128).is_ok());
     }
 }

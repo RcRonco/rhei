@@ -56,6 +56,12 @@ pub(crate) struct TaskManager {
 
     // Controller-derived fields for checkpoint orchestration
     total_workers: usize,
+    /// Key-group → worker assignment for this topology generation.
+    ///
+    /// Shared by every worker so routing is identical across the process, and
+    /// derived from the same topology on every process so it is identical
+    /// cluster-wide.
+    key_groups: Arc<rhei_core::cluster::KeyGroupAssignment>,
     initial_checkpoint_id: u64,
     checkpoint_dir: PathBuf,
     process_id: Option<usize>,
@@ -220,6 +226,7 @@ impl TaskManager {
             sink_handles,
             dlq_handles,
             total_workers,
+            key_groups: Arc::new(controller.key_group_assignment()?),
             initial_checkpoint_id,
             checkpoint_dir,
             process_id,
@@ -314,6 +321,7 @@ impl TaskManager {
             rt,
             idx,
             self.total_workers,
+            self.key_groups.clone(),
             checkpoint_notify,
             dlq_tx,
             self.last_operator_id,
@@ -342,6 +350,8 @@ impl TaskManager {
             process_id: self.process_id,
             n_processes: self.n_processes,
             workers_per_process: controller.workers,
+            max_parallelism: controller.max_parallelism(),
+            cluster_members: controller.cluster_member_ids(),
         };
 
         // Create a shutdown barrier for coordinated process teardown.
@@ -475,6 +485,10 @@ struct CheckpointTaskConfig {
     process_id: Option<usize>,
     n_processes: usize,
     workers_per_process: usize,
+    /// Key group count, recorded so a restore with a different value is caught.
+    max_parallelism: usize,
+    /// Node IDs of the topology writing these checkpoints.
+    cluster_members: Vec<String>,
 }
 
 /// Set up cross-process checkpoint coordination for cluster mode.
@@ -604,6 +618,9 @@ async fn run_checkpoint_task(
             source_offsets: offsets,
             n_processes: Some(config.n_processes),
             workers_per_process: Some(config.workers_per_process),
+            max_parallelism: Some(config.max_parallelism),
+            total_workers: Some(config.n_processes * config.workers_per_process),
+            cluster_members: config.cluster_members.clone(),
         };
 
         if let Err(e) = write_manifest(

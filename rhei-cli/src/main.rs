@@ -22,6 +22,10 @@ struct Cli {
     command: Commands,
 }
 
+// `Run` carries far more options than the other subcommands, so the variants
+// differ in size. Boxing would buy nothing: this enum is constructed exactly
+// once, at startup, from parsed argv.
+#[allow(clippy::large_enum_variant)]
 #[derive(Subcommand)]
 enum Commands {
     /// Run the current Rhei project
@@ -49,6 +53,9 @@ enum Commands {
         /// Path to hostfile (one host:port per line), alternative to --peers
         #[arg(long, conflicts_with = "peers")]
         hostfile: Option<std::path::PathBuf>,
+
+        #[command(flatten)]
+        discovery: DiscoveryArgs,
 
         /// Path to TOML config file (env vars override config values)
         #[arg(long)]
@@ -80,6 +87,201 @@ enum Commands {
     },
 }
 
+/// Cluster discovery flags for `rhei run`.
+///
+/// Grouped into their own `Args` struct so the `Run` variant stays small and the
+/// gossip options read as one coherent block in `--help`.
+#[derive(clap::Args, Debug, Default)]
+struct DiscoveryArgs {
+    /// Discovery backend: `static` (fixed --peers) or `gossip` (dynamic).
+    ///
+    /// With `gossip`, nodes find each other at runtime and the pipeline
+    /// rescales as membership changes; --process-id and --peers are ignored.
+    #[arg(long, value_parser = ["static", "gossip"])]
+    discovery: Option<String>,
+
+    /// Stable node identifier for gossip discovery (defaults to hostname).
+    ///
+    /// Must be stable across restarts — a changing ID looks like permanent
+    /// join/leave churn to the rest of the cluster.
+    #[arg(long)]
+    node_id: Option<String>,
+
+    /// Cluster name; only nodes sharing it gossip with each other
+    #[arg(long)]
+    cluster_id: Option<String>,
+
+    /// Bind address for the gossip socket (e.g. `0.0.0.0:2201`)
+    #[arg(long)]
+    gossip_addr: Option<String>,
+
+    /// Address peers should gossip with, if different from --gossip-addr
+    #[arg(long)]
+    gossip_advertise_addr: Option<String>,
+
+    /// Timely data-plane address advertised to peers (e.g. `10.0.0.5:2101`)
+    #[arg(long)]
+    data_addr: Option<String>,
+
+    /// Comma-separated gossip seed nodes; only one needs to be reachable
+    #[arg(long, value_delimiter = ',')]
+    seeds: Option<Vec<String>>,
+
+    /// Number of key groups — the ceiling on parallelism this pipeline can
+    /// ever rescale to.
+    ///
+    /// Fixed for the pipeline's lifetime: changing it re-partitions the key
+    /// space and invalidates every existing checkpoint.
+    #[arg(long)]
+    max_parallelism: Option<usize>,
+
+    /// Seconds membership must be stable before rescaling (default: 5)
+    #[arg(long)]
+    rescale_debounce_secs: Option<u64>,
+
+    /// Report membership changes but never rescale automatically
+    #[arg(long)]
+    no_auto_rescale: bool,
+}
+
+/// Cluster discovery settings resolved from CLI flags and the config file.
+///
+/// Forwarded to the pipeline process as environment variables, matching how the
+/// CLI passes every other setting through to `cargo run`.
+#[derive(Debug, Default)]
+struct DiscoverySettings {
+    discovery: Option<String>,
+    node_id: Option<String>,
+    cluster_id: Option<String>,
+    gossip_addr: Option<String>,
+    gossip_advertise_addr: Option<String>,
+    data_addr: Option<String>,
+    seeds: Option<Vec<String>>,
+    max_parallelism: Option<usize>,
+    rescale_debounce_secs: Option<u64>,
+    auto_rescale: Option<bool>,
+}
+
+impl DiscoverySettings {
+    /// Merge CLI flags with the config file's `[cluster]` section.
+    ///
+    /// CLI flags win; the config file fills the gaps.
+    fn resolve(args: DiscoveryArgs, cfg: rhei_core::config::ClusterSection) -> Self {
+        Self {
+            discovery: args.discovery.or(cfg.discovery),
+            node_id: args.node_id.or(cfg.node_id),
+            cluster_id: args.cluster_id.or(cfg.cluster_id),
+            gossip_addr: args.gossip_addr.or(cfg.gossip_addr),
+            gossip_advertise_addr: args.gossip_advertise_addr.or(cfg.gossip_advertise_addr),
+            data_addr: args.data_addr.or(cfg.data_addr),
+            seeds: args.seeds.or(cfg.seeds),
+            max_parallelism: args.max_parallelism.or(cfg.max_parallelism),
+            rescale_debounce_secs: args.rescale_debounce_secs.or(cfg.rescale_debounce_secs),
+            // `--no-auto-rescale` is a flag, so it can only turn the behaviour
+            // off; when absent, the config file decides.
+            auto_rescale: if args.no_auto_rescale {
+                Some(false)
+            } else {
+                cfg.auto_rescale
+            },
+        }
+    }
+
+    /// Whether gossip discovery is requested.
+    fn is_gossip(&self) -> bool {
+        self.discovery
+            .as_deref()
+            .is_some_and(|d| d.eq_ignore_ascii_case("gossip"))
+    }
+
+    /// Check the settings are self-consistent before launching the pipeline.
+    ///
+    /// Catching these here gives a clear message at the CLI instead of an
+    /// obscure bind failure or a node that silently never joins the cluster.
+    fn validate(&self) -> anyhow::Result<()> {
+        if let Some(max_p) = self.max_parallelism {
+            anyhow::ensure!(max_p > 0, "--max-parallelism must be at least 1");
+        }
+
+        if !self.is_gossip() {
+            // Gossip-only options are meaningless without gossip discovery;
+            // silently ignoring them would hide a misconfigured deployment.
+            let stray = [
+                ("--gossip-addr", self.gossip_addr.is_some()),
+                (
+                    "--gossip-advertise-addr",
+                    self.gossip_advertise_addr.is_some(),
+                ),
+                ("--seeds", self.seeds.is_some()),
+                ("--data-addr", self.data_addr.is_some()),
+            ];
+            if let Some((flag, _)) = stray.iter().find(|(_, set)| *set) {
+                anyhow::bail!(
+                    "{flag} requires --discovery gossip \
+                     (without it, the cluster shape comes from --peers)"
+                );
+            }
+            return Ok(());
+        }
+
+        // Gossip needs somewhere to listen and an address to hand peers for the
+        // data plane; neither has a safe default.
+        anyhow::ensure!(
+            self.gossip_addr.is_some(),
+            "--discovery gossip requires --gossip-addr (e.g. 0.0.0.0:2201)"
+        );
+        anyhow::ensure!(
+            self.data_addr.is_some(),
+            "--discovery gossip requires --data-addr — the Timely address peers \
+             will connect to (e.g. 10.0.0.5:2101)"
+        );
+
+        if self.seeds.as_ref().is_none_or(Vec::is_empty) {
+            // Legal — this is how the first node of a new cluster starts — but
+            // a silent typo here leaves a node gossiping alone forever.
+            tracing::warn!(
+                "no --seeds given; this node will form a new cluster of its own. \
+                 Pass --seeds with an existing node's gossip address to join one."
+            );
+        }
+        Ok(())
+    }
+
+    /// Forward these settings to the pipeline process as environment variables.
+    fn apply_env(&self, cmd: &mut Command) {
+        if let Some(ref v) = self.discovery {
+            cmd.env("RHEI_DISCOVERY", v);
+        }
+        if let Some(ref v) = self.node_id {
+            cmd.env("RHEI_NODE_ID", v);
+        }
+        if let Some(ref v) = self.cluster_id {
+            cmd.env("RHEI_CLUSTER_ID", v);
+        }
+        if let Some(ref v) = self.gossip_addr {
+            cmd.env("RHEI_GOSSIP_ADDR", v);
+        }
+        if let Some(ref v) = self.gossip_advertise_addr {
+            cmd.env("RHEI_GOSSIP_ADVERTISE_ADDR", v);
+        }
+        if let Some(ref v) = self.data_addr {
+            cmd.env("RHEI_DATA_ADDR", v);
+        }
+        if let Some(ref v) = self.seeds {
+            cmd.env("RHEI_SEEDS", v.join(","));
+        }
+        if let Some(v) = self.max_parallelism {
+            cmd.env("RHEI_MAX_PARALLELISM", v.to_string());
+        }
+        if let Some(v) = self.rescale_debounce_secs {
+            cmd.env("RHEI_RESCALE_DEBOUNCE_SECS", v.to_string());
+        }
+        if let Some(v) = self.auto_rescale {
+            cmd.env("RHEI_AUTO_RESCALE", if v { "1" } else { "0" });
+        }
+    }
+}
+
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
@@ -94,6 +296,7 @@ fn main() -> anyhow::Result<()> {
             process_id,
             peers,
             hostfile,
+            discovery,
             config,
         } => {
             // Load TOML config if --config is specified, then apply env overrides.
@@ -134,6 +337,8 @@ fn main() -> anyhow::Result<()> {
                     tui: false,
                 })?;
 
+            let file_cluster = file_config.as_ref().map(|c| c.cluster.clone());
+
             // Resolve peers from --peers, --hostfile, or config file.
             let resolved_peers = if let Some(peers) = peers {
                 Some(peers)
@@ -153,11 +358,15 @@ fn main() -> anyhow::Result<()> {
                 file_config.and_then(|c| c.cluster.peers)
             };
 
+            let discovery = DiscoverySettings::resolve(discovery, file_cluster.unwrap_or_default());
+            discovery.validate()?;
+
             cmd_run(
                 effective_workers,
                 effective_metrics_addr,
                 effective_process_id,
                 resolved_peers,
+                &discovery,
             )
         }
         Commands::New { name, path } => scaffold::create_project(&name, path.as_deref()),
@@ -171,6 +380,7 @@ fn cmd_run(
     metrics_addr: Option<std::net::SocketAddr>,
     process_id: Option<usize>,
     peers: Option<Vec<String>>,
+    discovery: &DiscoverySettings,
 ) -> anyhow::Result<()> {
     if !Path::new("Cargo.toml").exists() {
         anyhow::bail!("No Cargo.toml found. Are you in a Rhei project directory?");
@@ -189,6 +399,7 @@ fn cmd_run(
     if let Some(ref peers) = peers {
         cmd.env("RHEI_PEERS", peers.join(","));
     }
+    discovery.apply_env(&mut cmd);
 
     let status = cmd.status()?;
 
@@ -438,4 +649,148 @@ async fn run_demo_with_executor(
     tokio::time::sleep(std::time::Duration::from_secs(5)).await;
     tracing::info!("pipeline completed");
     Ok(())
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    fn gossip() -> DiscoverySettings {
+        DiscoverySettings {
+            discovery: Some("gossip".to_string()),
+            gossip_addr: Some("0.0.0.0:2201".to_string()),
+            data_addr: Some("10.0.0.5:2101".to_string()),
+            seeds: Some(vec!["10.0.0.4:2201".to_string()]),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn cli_definition_is_valid() {
+        // Catches conflicting flag names and bad value parsers at test time
+        // rather than on first run.
+        Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn static_discovery_is_the_default() {
+        let settings = DiscoverySettings::default();
+        assert!(!settings.is_gossip());
+        settings.validate().unwrap();
+    }
+
+    #[test]
+    fn gossip_settings_validate() {
+        assert!(gossip().is_gossip());
+        gossip().validate().unwrap();
+    }
+
+    #[test]
+    fn gossip_requires_a_gossip_address() {
+        let settings = DiscoverySettings {
+            gossip_addr: None,
+            ..gossip()
+        };
+        let err = settings.validate().unwrap_err().to_string();
+        assert!(err.contains("--gossip-addr"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn gossip_requires_a_data_address() {
+        // Without it, peers have no address to open the Timely connection to.
+        let settings = DiscoverySettings {
+            data_addr: None,
+            ..gossip()
+        };
+        let err = settings.validate().unwrap_err().to_string();
+        assert!(err.contains("--data-addr"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn seedless_gossip_is_allowed() {
+        // This is how the first node of a brand-new cluster starts.
+        let settings = DiscoverySettings {
+            seeds: None,
+            ..gossip()
+        };
+        settings.validate().unwrap();
+    }
+
+    #[test]
+    fn gossip_flags_without_gossip_discovery_are_rejected() {
+        // Silently ignoring them would hide a misconfigured deployment that
+        // never actually forms a cluster.
+        for settings in [
+            DiscoverySettings {
+                gossip_addr: Some("0.0.0.0:2201".into()),
+                ..Default::default()
+            },
+            DiscoverySettings {
+                seeds: Some(vec!["h:2201".into()]),
+                ..Default::default()
+            },
+            DiscoverySettings {
+                data_addr: Some("h:2101".into()),
+                ..Default::default()
+            },
+        ] {
+            let err = settings.validate().unwrap_err().to_string();
+            assert!(
+                err.contains("--discovery gossip"),
+                "unexpected error: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn zero_max_parallelism_is_rejected() {
+        let settings = DiscoverySettings {
+            max_parallelism: Some(0),
+            ..Default::default()
+        };
+        assert!(settings.validate().is_err());
+    }
+
+    #[test]
+    fn settings_are_forwarded_as_env_vars() {
+        let mut cmd = Command::new("true");
+        let settings = DiscoverySettings {
+            node_id: Some("node-a".into()),
+            cluster_id: Some("prod".into()),
+            max_parallelism: Some(256),
+            rescale_debounce_secs: Some(30),
+            auto_rescale: Some(false),
+            ..gossip()
+        };
+        settings.apply_env(&mut cmd);
+
+        let envs: std::collections::HashMap<String, Option<String>> = cmd
+            .get_envs()
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().into_owned(),
+                    v.map(|v| v.to_string_lossy().into_owned()),
+                )
+            })
+            .collect();
+
+        assert_eq!(envs["RHEI_DISCOVERY"].as_deref(), Some("gossip"));
+        assert_eq!(envs["RHEI_NODE_ID"].as_deref(), Some("node-a"));
+        assert_eq!(envs["RHEI_CLUSTER_ID"].as_deref(), Some("prod"));
+        assert_eq!(envs["RHEI_GOSSIP_ADDR"].as_deref(), Some("0.0.0.0:2201"));
+        assert_eq!(envs["RHEI_DATA_ADDR"].as_deref(), Some("10.0.0.5:2101"));
+        assert_eq!(envs["RHEI_SEEDS"].as_deref(), Some("10.0.0.4:2201"));
+        assert_eq!(envs["RHEI_MAX_PARALLELISM"].as_deref(), Some("256"));
+        assert_eq!(envs["RHEI_RESCALE_DEBOUNCE_SECS"].as_deref(), Some("30"));
+        assert_eq!(envs["RHEI_AUTO_RESCALE"].as_deref(), Some("0"));
+    }
+
+    #[test]
+    fn unset_settings_are_not_forwarded() {
+        let mut cmd = Command::new("true");
+        DiscoverySettings::default().apply_env(&mut cmd);
+        assert_eq!(cmd.get_envs().count(), 0);
+    }
 }
