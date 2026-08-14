@@ -114,7 +114,20 @@ py-clippy:
 py-fmt-check:
     cd {{ py_dir }} && cargo fmt -- --check
 
+# ── Documentation ───────────────────────────────────────────────────
+
+# Verify documentation invariants (wiring, justified `ignore`, quick start sync)
+docs-check:
+    python3 scripts/check-doc-blocks.py
+
+# Compile every Rust example in README.md, API.md and docs/getting-started.md
+docs-test:
+    cargo test --doc --workspace
+
+# Both documentation checks
+docs: docs-check docs-test
+
 # ── CI (mirrors GitHub Actions) ─────────────────────────────────────
 
 # Run the full CI suite locally
-ci: check fmt-check clippy deny test e2e
+ci: check fmt-check clippy deny test docs e2e

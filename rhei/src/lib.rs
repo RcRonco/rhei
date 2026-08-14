@@ -7,6 +7,21 @@
 // Re-export macros
 pub use rhei_macros::{RheiSchema, op, pipeline};
 
+// The repository's user-facing Markdown documentation is compiled as doctests
+// so that documented APIs cannot drift from the real ones. Verified by
+// `cargo test --doc -p rhei` in CI. See DOCS-AUDIT.md.
+#[cfg(doctest)]
+#[doc = include_str!("../../README.md")]
+pub struct ReadmeDocs;
+
+#[cfg(doctest)]
+#[doc = include_str!("../../API.md")]
+pub struct ApiDocs;
+
+#[cfg(doctest)]
+#[doc = include_str!("../../docs/getting-started.md")]
+pub struct GettingStartedDocs;
+
 // Arrow primitives and batch traits
 pub use rhei_core::arrow::{
     BufferOutput, OperatorContext, OperatorMetrics, RheiBuffer, RheiBuilder, RheiIter,

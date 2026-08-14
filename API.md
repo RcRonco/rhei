@@ -1,12 +1,16 @@
-# Rhei API Design
+# Rhei API Reference
+
+Reference for the public pipeline-building API. Every Rust example here is compiled by CI as a doctest (`cargo test --doc -p rhei`); blocks that cannot be compiled are marked `ignore` with a comment saying why.
+
+For a tutorial, start with [docs/getting-started.md](docs/getting-started.md). For design rationale, see [ARCHITECTURE.md](ARCHITECTURE.md) and the [ADR/](ADR/) directory.
 
 ## Philosophy
 
-Rhei exposes **one** API for building stream processing pipelines. There is no "simple mode" vs "advanced mode" — the same constructs handle single-threaded development, multi-worker production, and eventually distributed execution.
+Rhei exposes **one** API for building stream processing pipelines. There is no "simple mode" vs "advanced mode" — the same constructs handle single-threaded development, multi-worker production, and multi-process execution.
 
-The API is built on **dataflow variables**. Each operation returns a typed stream handle that can be reused, branched, and merged. The executor compiles the dataflow graph and determines execution strategy (exchange pacts, worker assignment, checkpointing) automatically.
+The API is built on **dataflow variables**. Each operation returns a typed stream handle that can be reused, branched, and merged. The runtime compiles the dataflow graph and determines execution strategy (exchange pacts, worker assignment, checkpointing).
 
-Users never interact with Timely Dataflow, exchange pacts, capabilities, or worker threads directly. These are internal execution details.
+Users do not interact with Timely Dataflow, exchange pacts, capabilities, or worker threads directly.
 
 ---
 
@@ -14,47 +18,67 @@ Users never interact with Timely Dataflow, exchange pacts, capabilities, or work
 
 ### `Stream<'a, T>`
 
-A lightweight, copyable handle representing a point in the dataflow graph. `T` is the element type flowing through that point.
+A `Copy` handle representing a point in the dataflow graph. `T` is the `RheiSchema` element type flowing through that point.
 
-```rust
-let graph = DataflowGraph::new();
-let orders: Stream<Order> = graph.source(kafka_orders);
-let parsed: Stream<ParsedOrder> = orders.map(parse_order);
+```rust,no_run
+use rhei::{DataflowGraph, PrintSink, Stream, VecSource};
+
+#[derive(Clone, rhei::RheiSchema)]
+struct Order {
+    customer_id: String,
+    amount: f64,
+}
+
+fn build(graph: &DataflowGraph) {
+    let orders: Stream<'_, Order> = graph.source(VecSource::new(vec![Order {
+        customer_id: "c1".into(),
+        amount: 10.0,
+    }]));
+
+    // `Stream` is `Copy`, so reusing a handle creates fan-out.
+    orders.filter_fn(|o| o.amount > 100.0).sink(PrintSink::<Order>::new());
+    orders.sink(PrintSink::<Order>::new());
+}
 ```
 
-`Stream` is `Copy` — using it multiple times creates fan-out:
+Both consumers receive every row from `orders`; the runtime duplicates the data via Timely's internal tee.
 
-```rust
-let alerts = parsed.filter(|o| o.amount > 10_000.0);
-let logged = parsed.map(|o| format!("{o}"));
-// Both `alerts` and `logged` consume from `parsed` — the executor handles the split.
+**There is no `KeyedStream` type.** Keying is expressed by calling `.key_by()`, which returns another `Stream<'a, T>`. Stateful operators are available on any stream — see [Stateful operators](#stateful-operators) for what that means in practice.
+
+### `DataflowGraph`
+
+Container for the topology. Streams borrow from it, so it must outlive them. `graph.validate()` runs before execution and rejects graphs with unreachable or dangling nodes.
+
+### `PipelineController`
+
+Configures workers, checkpointing, DLQ, and cluster settings, then compiles and runs a `DataflowGraph`.
+
+```rust,no_run
+use rhei::{DataflowGraph, PipelineController, PrintSink, VecSource};
+
+#[derive(Clone, rhei::RheiSchema)]
+struct Order {
+    customer_id: String,
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let graph = DataflowGraph::new();
+    graph
+        .source(VecSource::new(vec![Order { customer_id: "c1".into() }]))
+        .sink(PrintSink::<Order>::new());
+
+    let controller = PipelineController::builder()
+        .checkpoint_dir("./checkpoints")
+        .workers(4)
+        .build()?;
+
+    controller.run(graph).await?;
+    Ok(())
+}
 ```
 
-### `KeyedStream<'a, T>`
-
-A stream that has been partitioned by a key. Only `KeyedStream` supports stateful operators. Returned by `.key_by()`.
-
-```rust
-let keyed: KeyedStream<Order> = orders.key_by(|o| o.customer_id.clone());
-let enriched: KeyedStream<EnrichedOrder> = keyed.operator("enrich", EnrichOp);
-```
-
-`KeyedStream` also supports stateless transforms (`.map()`, `.filter()`, `.flat_map()`), which preserve the partitioning — data stays on the same worker.
-
-### `Executor`
-
-Configures workers and checkpointing. Compiles and runs a `DataflowGraph`.
-
-```rust
-let executor = Executor::builder()
-    .checkpoint_dir("./checkpoints")
-    .workers(4)
-    .build();
-
-// ... build dataflow on a DataflowGraph ...
-
-executor.run(graph).await?;
-```
+`build()` returns `anyhow::Result<PipelineController>`. The shorthand `PipelineController::new(path)` takes a `PathBuf` and is paired with `.with_workers(n)`.
 
 ---
 
@@ -62,297 +86,382 @@ executor.run(graph).await?;
 
 ### Sources
 
-```rust
-let orders = graph.source(KafkaSource::new(broker, group, &["orders"])?);
-let readings = graph.source(VecSource::new(data));
+```rust,no_run
+use rhei::{DataflowGraph, PrintSink, VecSource};
+
+#[derive(Clone, rhei::RheiSchema)]
+struct Reading {
+    value: f64,
+}
+
+fn build(graph: &DataflowGraph) {
+    let readings = graph.source(VecSource::new(vec![Reading { value: 1.0 }]));
+    readings.sink(PrintSink::<Reading>::new());
+}
 ```
 
-A source produces a `Stream<S::Output>`. Multiple sources are independent — they run concurrently.
+A source produces a `Stream<'_, S::Output>`. Multiple sources are independent and run concurrently. Sources implement the `Source` trait, which also carries watermark emission (`current_watermark`), offset tracking (`current_offsets` / `restore_offsets`), and optional partitioning (`partition_count` / `create_partition_source`).
 
-### Stateless Transforms
+Built-in sources: `VecSource`, `PartitionedVecSource`, and `KafkaSource` (behind the `kafka` feature).
 
-Available on both `Stream<T>` and `KeyedStream<T>`.
+### Stateless transforms
 
-```rust
-// Transform each element
-let parsed = raw.map(|msg: KafkaMessage| parse(msg));
+Closures receive a **zero-copy view** of each row, not an owned value:
 
-// Drop elements
-let valid = parsed.filter(|r: &Record| r.is_valid());
+| Method | Closure signature | Notes |
+|--------|-------------------|-------|
+| `map` | `Fn(T::View<'_>) -> O` | Per-row transform into a new schema |
+| `flat_map` | `Fn(T::View<'_>) -> Vec<O>` | One-to-many |
+| `filter_fn` | `Fn(&T::View<'_>) -> bool` | Builds a selection mask; no data copied |
+| `filter` | takes an `Expr` | Evaluated as an Arrow kernel over the batch |
+| `inspect` | `Fn(&T::View<'_>)` | Side-effect only, passes rows through |
+| `distinct_by` | `Fn(&T::View<'_>) -> String` | Deduplicates by derived key |
+| `limit` | `usize` | Caps total rows |
+| `batch` | `usize` | Re-batches rows into a target size |
+| `name` | `&str` | Labels the node for debugging and the TUI graph |
 
-// One-to-many
-let words = lines.flat_map(|line: String| {
-    line.split_whitespace().map(String::from).collect()
-});
+```rust,no_run
+use rhei::{DataflowGraph, PrintSink, VecSource, col, lit_f64};
+
+#[derive(Clone, rhei::RheiSchema)]
+struct Reading {
+    sensor_id: String,
+    value: f64,
+}
+
+#[derive(Clone, rhei::RheiSchema)]
+struct Label {
+    text: String,
+}
+
+fn build(graph: &DataflowGraph) {
+    let readings = graph.source(VecSource::new(vec![Reading {
+        sensor_id: "a".into(),
+        value: 1.0,
+    }]));
+
+    // Closure predicate.
+    let hot = readings.filter_fn(|r| r.value > 20.0);
+
+    // Column expression, evaluated with Arrow compute kernels.
+    let also_hot = readings.filter(col("value").gt(lit_f64(20.0)));
+
+    hot.map(|r| Label { text: r.sensor_id.to_string() })
+        .name("labels")
+        .sink(PrintSink::<Label>::new());
+    also_hot.sink(PrintSink::<Reading>::new());
+}
 ```
 
-On `Stream`: data stays wherever it is (no exchange).
-On `KeyedStream`: data stays on the same worker — **partitioning is preserved**.
+Expression builders: `col`, `lit_i64`, `lit_u64`, `lit_f64`, `lit_str`, `lit_bool`, combined with `gt`, `gt_eq`, `lt`, `lt_eq`, `eq`, `not_eq`, `and`, `or`, `negate`.
+
+Stateless transforms never move data between workers — they run wherever the data already is.
 
 ### Keying (`key_by`)
 
-Declares how data should be partitioned across workers. Returns a `KeyedStream`.
+Declares how data is partitioned across workers. The key function takes a row view and returns a `String`.
 
-```rust
-let keyed = orders.key_by(|o: &Order| o.customer_id.clone());
+```rust,no_run
+use rhei::{DataflowGraph, PrintSink, VecSource};
+
+#[derive(Clone, rhei::RheiSchema)]
+struct Order {
+    customer_id: String,
+}
+
+fn build(graph: &DataflowGraph) {
+    graph
+        .source(VecSource::new(vec![Order { customer_id: "c1".into() }]))
+        .key_by(|o| o.customer_id.to_string())
+        .sink(PrintSink::<Order>::new());
+}
 ```
 
-The key function returns a `String`. The executor hashes it to determine worker assignment. All elements with the same key are guaranteed to land on the same worker.
+**Every `key_by()` is an exchange point.** Rows are partitioned by `seahash(key) % workers` and routed via a Timely Exchange pact. With one worker the exchange exists but moves nothing between threads.
 
-**Every `key_by()` is an exchange point.** When workers > 1, the executor redistributes data across workers at this point. When workers == 1, it's a no-op.
+Re-keying is supported — a second `key_by()` triggers a new exchange.
 
-Re-keying is supported — a second `key_by()` triggers a new exchange:
+### Stateful operators
 
-```rust
-let by_customer = orders.key_by(|o| o.customer_id.clone());
-let aggregated = by_customer.operator("agg", CustomerAgg);
-let by_region = aggregated.key_by(|a| a.region.clone());  // re-partition
-let regional = by_region.operator("regional", RegionalAgg);
+`.operator(name, op)` attaches a `StreamFunction`. The operator must implement `StreamFunction<Input = T> + Clone + Send + 'static`; it is cloned once per worker.
+
+```rust,no_run
+use rhei::arrow::{
+    BufferOutput, OperatorContext, RheiBuffer, RheiBuilder, RheiSchema, StreamFunction,
+};
+use rhei::{DataflowGraph, KeyedState, PrintSink, VecSource};
+
+#[derive(Clone, rhei::RheiSchema)]
+struct Order {
+    customer_id: String,
+}
+
+#[derive(Clone, rhei::RheiSchema)]
+struct Total {
+    customer_id: String,
+    orders: u64,
+}
+
+#[derive(Clone)]
+struct CustomerAgg;
+
+#[async_trait::async_trait]
+impl StreamFunction for CustomerAgg {
+    type Input = Order;
+    type Output = Total;
+
+    async fn process(
+        &mut self,
+        input: RheiBuffer<Order>,
+        ctx: &mut OperatorContext,
+    ) -> anyhow::Result<BufferOutput<Total>> {
+        let mut builder = Total::builder(input.len());
+        let mut state = KeyedState::<String, u64>::new(&mut ctx.state, "orders");
+
+        for view in &input {
+            let customer_id = view.customer_id.to_string();
+            let orders = state.get(&customer_id).await?.unwrap_or(0) + 1;
+            state.put(&customer_id, &orders)?;
+            builder.append(Total { customer_id, orders });
+        }
+
+        Ok(BufferOutput::Single(RheiBuffer::from_builder(builder)))
+    }
+}
+
+fn build(graph: &DataflowGraph) {
+    graph
+        .source(VecSource::new(vec![Order { customer_id: "c1".into() }]))
+        .key_by(|o| o.customer_id.to_string()) // required for correct state
+        .operator("agg", CustomerAgg)
+        .sink(PrintSink::<Total>::new());
+}
 ```
 
-### Stateful Operators
+> **`.operator()` is available on unkeyed streams and Rhei will not stop you.**
+> This is *not* a compile-time-enforced invariant. If you attach a stateful
+> operator without a preceding `key_by()`, the code compiles and runs, but with
+> more than one worker each worker sees an arbitrary subset of keys and the
+> state is wrong. Always key first.
 
-**Only available on `KeyedStream`.** This is enforced at compile time — calling `.operator()` on an unkeyed `Stream` is a type error.
+The runtime automatically:
 
-```rust
-let keyed = readings.key_by(|r| r.sensor_id.clone());
-let windowed = keyed.operator("tumbling_window", TumblingWindow::builder()
-    .window_size(10)
-    .key_fn(|r: &Reading| r.sensor_id.clone())
-    .time_fn(|r: &Reading| r.timestamp)
-    .aggregator(Avg::new(|r: &Reading| r.value))
-    .build(),
-);
-```
-
-The executor automatically:
-1. Creates per-worker `StateContext` instances (isolated L1/L2/L3 state)
+1. Creates a per-worker `StateContext` (isolated L1/L2 with a shared L3)
 2. Clones the operator for each worker
-3. Routes data by key so each worker owns a disjoint key partition
+3. Routes data by key so each worker owns a disjoint set of key groups
 
-Users never create `StateContext` manually.
+You never construct `StateContext` yourself — it arrives on `OperatorContext::state`.
 
-### Fan-In (`merge`)
+Beyond `process`, `StreamFunction` has defaulted hooks: `open`, `close`, `on_watermark` (used by window operators to close windows), `on_timer`, and `on_error`.
 
-Combines two streams of the same type into one. The result is an unkeyed `Stream`.
+### Built-in operators
 
-```rust
-let left = orders.map(|o| JoinSide::Left(o));
-let right = shipments.map(|s| JoinSide::Right(s));
-let combined: Stream<JoinSide<Order, Shipment>> = left.merge(right);
+Window and join operators are constructed with `::new(...)` taking positional closures. **They do not have builders.**
+
+| Operator | Constructor shape |
+|----------|-------------------|
+| `TumblingWindow` | `new(size, key_fn, time_fn, accumulate_fn, output_fn)` |
+| `SlidingWindow` | `new(size, slide, key_fn, time_fn, accumulate_fn, output_fn)` |
+| `SessionWindow` | `new(gap, key_fn, time_fn, accumulate_fn, output_fn)` |
+| `CountWindow` | count-triggered, same closure shape |
+| `TemporalJoin` | key/join closures over a merged `Side<L, R>` stream |
+| `SequenceDetect` | ordered pattern matching with `AfterMatch` semantics |
+| `ReduceOp`, `RollingAggregateOp` | incremental aggregation |
+
+See [`rhei/examples/batch_window_agg.rs`](rhei/examples/batch_window_agg.rs) and [`rhei-runtime/examples/temporal_join.rs`](rhei-runtime/examples/temporal_join.rs) for complete, compiled usages, and each operator's source in `rhei-core/src/operators/` for exact signatures.
+
+Windows support a configurable `allowed_lateness`; events later than that are dropped and counted in `late_events_dropped_total`. Routing late events to a side output is **not implemented**.
+
+### Fan-in (`merge`)
+
+Combines two streams of the same type.
+
+```rust,no_run
+use rhei::{DataflowGraph, PrintSink, VecSource};
+
+#[derive(Clone, rhei::RheiSchema)]
+struct Event {
+    id: i64,
+}
+
+fn build(graph: &DataflowGraph) {
+    let a = graph.source(VecSource::new(vec![Event { id: 1 }]));
+    let b = graph.source(VecSource::new(vec![Event { id: 2 }]));
+    a.merge(b).sink(PrintSink::<Event>::new());
+}
 ```
 
-If a stateful operator follows a merge, you must `key_by()` first.
+Merging discards any partitioning the inputs had, so `key_by()` again before a stateful operator.
 
-### Fan-Out
+### Fan-out
 
-Implicit via variable reuse:
-
-```rust
-let parsed = raw.map(parse);
-
-// Fan-out: two independent consumers
-let alerts = parsed.filter(|r| r.is_critical()).sink(alert_sink);
-let archive = parsed.sink(archive_sink);
-```
-
-The executor duplicates data to both consumers.
+Implicit via handle reuse, because `Stream` is `Copy` — see the [`Stream`](#streama-t) example above.
 
 ### Sinks
 
-Terminal nodes in the dataflow. A stream can feed multiple sinks.
+Terminal nodes. A stream can feed multiple sinks. Sinks implement the `Sink` trait (`write_batch` plus an optional `flush`).
 
-```rust
-enriched.sink(KafkaSink::new(broker, "output-topic")?);
-enriched.sink(PrintSink::new());
+```rust,no_run
+use rhei::{DataflowGraph, PrintSink, VecSource};
+
+#[derive(Clone, rhei::RheiSchema)]
+struct Event {
+    id: i64,
+}
+
+fn build(graph: &DataflowGraph) {
+    let events = graph.source(VecSource::new(vec![Event { id: 1 }]));
+    events.sink(PrintSink::<Event>::new().with_prefix("out"));
+}
 ```
+
+Built-in sinks: `PrintSink`, and `KafkaSink` (behind the `kafka` feature).
 
 ---
 
 ## Execution
 
-### Building and Running
+### Running
 
-```rust
-let graph = DataflowGraph::new();
-let orders = graph.source(kafka_source);
-let processed = orders
-    .map(parse)
-    .key_by(|o| o.customer_id.clone())
-    .operator("enrich", EnrichOp)
-    .map(format_output);
-processed.sink(kafka_sink);
+`run()` validates the graph, compiles it into a Timely dataflow, and executes it. It returns when all sources are exhausted or shutdown is triggered.
 
-let executor = Executor::builder()
-    .checkpoint_dir("./checkpoints")
-    .workers(4)
-    .build();
-
-executor.run(graph).await?;
+```rust,ignore
+// not-compiled: needs a ShutdownHandle wired to a real signal source.
+controller.run_with_shutdown(graph, shutdown_handle).await?;
 ```
 
-`.run()` compiles the dataflow graph, validates it (every stream must reach a sink or be explicitly dropped), and executes it. The method returns when all sources are exhausted or shutdown is triggered.
+On shutdown: finish in-flight batches, checkpoint operators, commit source offsets, flush sinks, return.
 
-### Shutdown
+`run_dynamic()` additionally supports rescaling the topology at runtime by rebuilding the `TaskManager` between topology generations.
 
-```rust
-executor.run_with_shutdown(graph, shutdown_handle).await?;
-```
+### Delivery semantics
 
-On shutdown signal: finish current batches, checkpoint all operators, commit source offsets, flush sinks, return.
+Rhei provides **at-least-once** delivery. Source offsets are committed after a checkpoint completes, so a crash between processing and checkpointing replays the affected records. Exactly-once would require a transactional producer sink and two-phase commit; both are on the roadmap and unimplemented.
 
 ---
 
 ## How Timely Mechanics Are Abstracted
 
-Users never see Timely. The executor translates the dataflow graph into an execution plan:
+The runtime translates the dataflow graph into a Timely execution plan:
 
-### Exchange Pact Insertion
+### Exchange pact insertion
 
-The rule is simple and deterministic:
-
-| Operation | Pact | Data Movement |
+| Operation | Pact | Data movement |
 |-----------|------|---------------|
-| `map`, `filter`, `flat_map` | Pipeline | None — data stays on current worker |
-| `key_by` | Exchange | Data redistributed by `hash(key) % workers` |
-| `operator` (on `KeyedStream`) | Pipeline | None — data already partitioned by preceding `key_by` |
-| `merge` | Pipeline | Both inputs feed into same downstream workers |
+| `map`, `filter`, `filter_fn`, `flat_map`, `inspect` | Pipeline | None — data stays on the current worker |
+| `key_by` | Exchange | Redistributed by `seahash(key) % workers` |
+| `operator` | Pipeline | None — operates on whatever the worker holds |
+| `merge` | Pipeline | Both inputs feed the same downstream workers |
 | `sink` | Pipeline | Each worker writes its own partition |
 
-**Stateless operations never move data.** They run wherever the data already is.
+`key_by()` is the only operation that moves data between workers.
 
-**`key_by()` is the only operation that moves data between workers.** It inserts an Exchange pact. If the data is already partitioned by the same key (e.g., two `key_by` calls with the same function), the executor can elide the exchange.
+Note the asymmetry with the previous table row for `operator`: because there is no `KeyedStream` type, the runtime cannot verify that a stateful operator is preceded by an exchange. It compiles the graph you describe.
 
-**Stateful operators require keyed streams.** This is a compile-time guarantee. Because `operator()` is only on `KeyedStream`, every stateful operator is guaranteed to have an exchange before it (the one from `key_by()`). The executor doesn't need to guess — the structure is explicit.
+### Worker assignment
 
-### Worker Assignment
+- **Sources**: by default a source runs on worker 0. Sources implementing `partition_count()` and `create_partition_source()` — such as `KafkaSource` and `PartitionedVecSource` — are consumed in parallel, one reader per worker with partitions assigned round-robin.
+- **Stateless ops before the first `key_by`**: run on the worker holding the data.
+- **After `key_by`**: all workers process their key partition.
+- **Sinks**: each worker writes independently.
 
-- **Sources**: Each source runs on one designated worker (worker 0 by default). Source parallelism (e.g., Kafka partition assignment) is a future extension.
-- **Stateless ops before first `key_by`**: Run on the source worker only.
-- **After `key_by`**: All workers process their key partition.
-- **Sinks**: Each worker writes independently. The sink implementation handles merging if needed (e.g., Kafka sink — each worker produces to the same topic).
+### State addressing
 
-### State Management
+State keys are namespaced by **key group**, not by worker index:
 
-Per-worker state is created automatically:
-- State path: `w{worker_index}/{operator_name}/{user_key}`
-- Each worker has isolated L1 memtable and L2 cache
-- L3 (SlateDB) is shared via `Arc` with key-prefix isolation
-- Checkpointing is coordinated: all workers checkpoint at the same epoch boundary
+```text
+kg{key_group}/{operator_name}/{user_key}
+```
 
-### Single Worker (workers = 1)
+Key groups decouple key ownership from worker count (the same scheme Flink uses), so the number of workers can change between runs without rewriting state. The number of key groups is fixed by `max_parallelism` at pipeline creation; restoring a checkpoint with a different `max_parallelism` is rejected.
 
-When `workers == 1`, the entire pipeline runs as a simple async loop. No threads, no channels, no exchange overhead. `key_by()` is semantically present (for correctness) but triggers no data movement. This is the development/testing default.
+Each worker has its own L1 memtable and L2 cache. L3 (SlateDB) is shared, with key-prefix isolation. Checkpoints are coordinated so all workers checkpoint at the same epoch boundary.
+
+### Single worker
+
+With `workers == 1` the pipeline still runs as a Timely dataflow — there is one worker thread rather than a special non-Timely code path. `key_by()` is present in the graph but moves no data between threads.
 
 ---
 
 ## Complete Example
 
-Two Kafka topics, per-leg transforms, temporal join on composite key, custom stateful enrichment, Kafka sink:
+Two Kafka topics, per-leg transforms, temporal join, custom stateful enrichment, Kafka sink.
 
-```rust
+<!-- not-compiled: requires the `kafka` feature and librdkafka. The compiled
+     equivalents are rhei-runtime/examples/kafka_transform.rs (Kafka wiring)
+     and rhei-runtime/examples/temporal_join.rs (join wiring). -->
+
+```rust,ignore
 let graph = DataflowGraph::new();
 
-// Sources
-let raw_orders = graph.source(
-    KafkaSource::new("localhost:9092", "rhei-app", &["orders"])?
-);
-let raw_shipments = graph.source(
-    KafkaSource::new("localhost:9092", "rhei-app", &["shipments"])?
-);
+let raw_orders = graph.source(KafkaSource::new("localhost:9092", "rhei-app", &["orders"])?);
+let raw_shipments = graph.source(KafkaSource::new("localhost:9092", "rhei-app", &["shipments"])?);
 
-// Parse each leg
-let orders = raw_orders.map(|msg: KafkaMessage| {
-    let o: Order = serde_json::from_slice(&msg.payload.unwrap()).unwrap();
-    JoinSide::Left(o)
-});
-
+let orders = raw_orders.map(|msg| parse_order(msg));
 let shipments = raw_shipments
-    .map(|msg: KafkaMessage| {
-        let s: Shipment = serde_json::from_slice(&msg.payload.unwrap()).unwrap();
-        JoinSide::Right(s)
-    })
-    .filter(|side| match side {
-        JoinSide::Right(s) => s.status != "CANCELLED",
-        _ => true,
-    });
+    .map(|msg| parse_shipment(msg))
+    .filter_fn(|s| s.status != "CANCELLED");
 
-// Merge and join on composite key
 let joined = orders
     .merge(shipments)
-    .key_by(|side: &JoinSide<Order, Shipment>| match side {
-        JoinSide::Left(o) => format!("{}:{}:{}", o.customer_id, o.region, o.date),
-        JoinSide::Right(s) => format!("{}:{}:{}", s.customer_id, s.region, s.date),
-    })
-    .operator("temporal_join", TemporalJoin::builder()
-        .key_fn(|side: &JoinSide<Order, Shipment>| match side {
-            JoinSide::Left(o) => format!("{}:{}:{}", o.customer_id, o.region, o.date),
-            JoinSide::Right(s) => format!("{}:{}:{}", s.customer_id, s.region, s.date),
-        })
-        .join_fn(|order, shipment| JoinedRecord::new(order, shipment))
-        .build(),
-    );
+    .key_by(|side| join_key(side))
+    .operator("temporal_join", temporal_join);
 
-// Custom stateful enrichment (re-key by customer)
 let enriched = joined
-    .key_by(|r: &JoinedRecord| r.customer_id.clone())
+    .key_by(|r| r.customer_id.to_string()) // re-key: new exchange
     .operator("customer_enrichment", CustomerEnrichment);
 
-// Output
-let output = enriched.map(|r: EnrichedRecord| {
-    KafkaRecord::new(serde_json::to_vec(&r).unwrap())
-});
-output.sink(KafkaSink::new("localhost:9092", "enriched-orders")?);
+enriched
+    .map(|r| to_kafka_record(r))
+    .sink(KafkaSink::new("localhost:9092", "enriched-orders")?);
 
-// Run
-let executor = Executor::builder()
+let controller = PipelineController::builder()
     .checkpoint_dir("./checkpoints")
     .workers(8)
-    .build();
-
-executor.run(graph).await?;
+    .build()?;
+controller.run(graph).await?;
 ```
 
-Execution plan compiled by the executor (8 workers):
+Compiled execution plan with 8 workers:
 
-```
-Worker 0: KafkaSource("orders") → parse → ─┐
-                                             ├─ Exchange(composite_key) → TemporalJoin
+```text
+Worker 0: KafkaSource("orders")    → parse ─────────┐
+                                                     ├─ Exchange(join_key) → TemporalJoin
 Worker 0: KafkaSource("shipments") → parse → filter ─┘         │
-                                                      Exchange(customer_id)
-                                                                │
-Workers 0-7:                                    CustomerEnrichment → format → KafkaSink
+                                                     Exchange(customer_id)
+                                                               │
+Workers 0-7:                                  CustomerEnrichment → map → KafkaSink
 ```
+
+(With a partitioned Kafka source, the source stages spread across workers rather than sitting on worker 0.)
 
 ---
 
 ## Alternatives Considered
 
-### Option A: Graph-Based API
+### Option A: Graph-based API
 
-Build a `StreamGraph` object by adding named nodes and connecting them:
+Build a `StreamGraph` by adding named nodes and connecting them:
 
-```rust
+```rust,ignore
+// not-compiled: a rejected design, shown for contrast. This API does not exist.
 let mut graph = StreamGraph::new();
 let orders = graph.source("orders", kafka_orders);
 let parsed = graph.map("parse", orders, |msg| parse(msg));
-let joined = graph.keyed_operator("join", merged, key_fn, join_op);
-graph.sink("output", joined, kafka_sink);
+graph.sink("output", parsed, kafka_sink);
 executor.run_graph(graph).await?;
 ```
 
-**Why we didn't choose this:** Node handles are opaque identifiers, not typed. Connecting a `Stream<Order>` to an operator expecting `Stream<Shipment>` is a runtime error, not a compile-time error. In Rust, losing compile-time type safety is a significant cost. The string-based naming also makes refactoring fragile.
+**Why not:** node handles are opaque identifiers, not typed. Connecting a `Stream<Order>` to an operator expecting `Stream<Shipment>` becomes a runtime error rather than a compile error, and string-based naming makes refactoring fragile.
 
-### Option C: Fluent Chain with Combinators
+### Option C: Fluent chain with combinators
 
-Single expression pipeline with specialized methods for multi-input topologies:
-
-```rust
+```rust,ignore
+// not-compiled: a rejected design, shown for contrast. This API does not exist.
 executor
     .pipeline_2(source_a, source_b)
     .map_left(parse_order)
     .map_right(parse_shipment)
-    .filter_right(|s| s.status != "CANCELLED")
     .merge()
     .key_by(key_fn)
     .operator("join", join_op)
@@ -360,4 +469,8 @@ executor
     .await?;
 ```
 
-**Why we didn't choose this:** Doesn't scale beyond trivial topologies. Every new pattern (3 sources, fan-out to 2 sinks, diamond joins) requires new combinator methods (`pipeline_3`, `map_middle`, `split`, etc.). The API surface becomes unpredictable and users can't tell what's available without reading docs. DAGs with shared intermediate results are impossible to express in a single chain.
+**Why not:** it does not scale past trivial topologies. Every new shape (3 sources, fan-out to 2 sinks, diamond joins) needs new combinator methods, and DAGs with shared intermediate results cannot be written as a single chain.
+
+### What was actually built
+
+The current API keeps typed handles (Option A's weakness) and arbitrary DAGs (Option C's weakness) — but it drops the `KeyedStream` type that earlier drafts of this document described. That type would have made "stateful operators require keying" a compile-time guarantee. It is not implemented, so the guarantee is a convention today. See [ROADMAP.md](ROADMAP.md).

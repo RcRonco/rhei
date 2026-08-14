@@ -70,6 +70,30 @@ jobs:
           report_paths: target/nextest/ci/junit.xml
           check_name: Test Results (${{ matrix.toolchain }})
 
+  docs:
+    name: Documentation
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+      - name: Cache dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: stable
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      # Structural checks: docs stay wired into the doctest harness, `ignore`
+      # blocks stay justified, README quick start stays in sync with the
+      # compiled example. See DOCS-AUDIT.md.
+      - name: Check documentation invariants
+        run: python3 scripts/check-doc-blocks.py
+      # Compiles every Rust block in README.md, API.md and
+      # docs/getting-started.md. nextest cannot run doctests, so this is the
+      # only job that catches documented APIs drifting from real ones.
+      - name: Compile documentation examples
+        run: cargo test --doc --workspace
+
   fmt:
     name: Format
     runs-on: ubuntu-latest
