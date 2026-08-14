@@ -123,6 +123,10 @@ pub(crate) struct DataflowExecutor {
     data: Option<ExecutorData>,
     /// Shutdown barrier for coordinated process teardown (cluster mode only).
     shutdown_barrier: Option<Arc<std::sync::Mutex<Option<std::sync::mpsc::Receiver<()>>>>>,
+    /// Liveness heartbeat slots shared with the health endpoint.
+    heartbeats: crate::health::WorkerHeartbeats,
+    /// This worker's slot in `heartbeats` (local index, not cluster-wide).
+    heartbeat_slot: usize,
 }
 
 impl DataflowExecutor {
@@ -143,6 +147,8 @@ impl DataflowExecutor {
         local_first_worker: usize,
         data: ExecutorData,
         shutdown_barrier: Option<Arc<std::sync::Mutex<Option<std::sync::mpsc::Receiver<()>>>>>,
+        heartbeats: crate::health::WorkerHeartbeats,
+        heartbeat_slot: usize,
     ) -> Self {
         let sink_senders: HashMap<NodeId, flume::Sender<crate::erased_buffer::ErasedBuffer>> =
             data.sink_senders.clone();
@@ -166,6 +172,8 @@ impl DataflowExecutor {
             local_first_worker,
             data: Some(data),
             shutdown_barrier,
+            heartbeats,
+            heartbeat_slot,
         }
     }
 
@@ -192,9 +200,17 @@ impl DataflowExecutor {
         let dataflow_index = worker.next_dataflow_index();
         let probe = worker.dataflow::<u64, _, _>(|scope| self.compile(scope, &mut data));
 
+        // Stamp a heartbeat on every turn of the loop. If an operator, sink,
+        // or state backend wedges, `step()` stops returning and the stamp goes
+        // stale — which is what `/healthz` reports so an orchestrator can
+        // restart a process that will not recover on its own.
         while !probe.done() {
+            self.heartbeats.beat(self.heartbeat_slot);
             worker.step();
         }
+        // One final beat: the loop has exited normally, so the worker is not
+        // wedged even though it is about to stop beating.
+        self.heartbeats.beat(self.heartbeat_slot);
 
         // Coordinated shutdown barrier: the first local worker on each
         // process signals readiness and waits for all processes to be

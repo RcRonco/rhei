@@ -595,6 +595,10 @@ fn cmd_demo(workers: usize, addr: std::net::SocketAddr) -> anyhow::Result<()> {
             pipeline_name: Some("sensor-demo".to_string()),
             workers,
             checkpoint_dir: None,
+            // `rhei demo` exists to drive the local web dashboard, so allow
+            // the Vite dev server's origin alongside anything set in the
+            // environment. Everything else stays at the closed default.
+            access: demo_access_config(),
         });
 
         eprintln!("Rhei demo pipeline starting on http://{addr}");
@@ -649,6 +653,25 @@ async fn run_demo_with_executor(
     tokio::time::sleep(std::time::Duration::from_secs(5)).await;
     tracing::info!("pipeline completed");
     Ok(())
+}
+
+/// Access settings for the `rhei demo` HTTP server.
+///
+/// The demo's whole purpose is to back the local web dashboard, which runs on
+/// the Vite dev server at a different origin, so those two localhost origins
+/// are allowed in addition to anything set via `RHEI_ALLOWED_ORIGINS`.
+/// Authentication and the state explorer keep their closed defaults.
+fn demo_access_config() -> rhei_runtime::http_server::AccessConfig {
+    let mut access = rhei_runtime::http_server::AccessConfig::from_env();
+    for origin in [
+        "http://localhost:5173".to_string(),
+        "http://127.0.0.1:5173".to_string(),
+    ] {
+        if !access.allowed_origins.contains(&origin) {
+            access.allowed_origins.push(origin);
+        }
+    }
+    access
 }
 
 #[cfg(test)]

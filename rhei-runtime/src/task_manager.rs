@@ -66,6 +66,11 @@ pub(crate) struct TaskManager {
     checkpoint_dir: PathBuf,
     process_id: Option<usize>,
     n_processes: usize,
+    /// Liveness heartbeat slots, one per local worker.
+    heartbeats: crate::health::WorkerHeartbeats,
+    /// Cluster-wide index of this process's first worker, used to map a
+    /// Timely worker index onto a local heartbeat slot.
+    local_worker_offset: usize,
 }
 
 /// Per-executor data extracted from the shared Mutex vectors.
@@ -231,6 +236,8 @@ impl TaskManager {
             checkpoint_dir,
             process_id,
             n_processes,
+            heartbeats: controller.health.heartbeats(),
+            local_worker_offset: local_range.start,
         })
     }
 
@@ -329,6 +336,10 @@ impl TaskManager {
             local_first_worker,
             data,
             shutdown_barrier,
+            self.heartbeats.clone(),
+            // Timely worker indices are cluster-wide; heartbeat slots are
+            // per-process, so shift into local space.
+            idx.saturating_sub(self.local_worker_offset),
         )
     }
 
@@ -694,11 +705,11 @@ pub(crate) fn write_manifest(
 
         // Process 0 merges all partial manifests into the final manifest.
         if pid == 0 {
-            let merged = CheckpointManifest::merge_partials(checkpoint_dir, n_processes);
-            if let Some(merged) = merged {
+            if let Some(merged) = CheckpointManifest::merge_partials(checkpoint_dir, n_processes)? {
                 merged.save(checkpoint_dir)?;
                 tracing::debug!(
                     checkpoint_id = merged.checkpoint_id,
+                    max_parallelism = ?merged.max_parallelism,
                     "merged checkpoint saved"
                 );
             } else {

@@ -252,6 +252,12 @@ pub struct PipelineControllerBuilder {
     #[cfg(feature = "remote-state")]
     from_checkpoint: Option<String>,
     offset_delta: i64,
+    /// Environment variables that were set but unparseable.
+    ///
+    /// Collected rather than ignored so [`PipelineControllerBuilder::build`]
+    /// can fail with all of them at once instead of the pipeline starting up
+    /// with silently-defaulted settings.
+    env_errors: Vec<String>,
 }
 
 impl std::fmt::Debug for PipelineControllerBuilder {
@@ -263,6 +269,18 @@ impl std::fmt::Debug for PipelineControllerBuilder {
             .field("dlq_sink", &self.dlq_sink.as_ref().map(|_| "..."))
             .finish_non_exhaustive()
     }
+}
+
+/// Read an environment variable, treating empty and whitespace-only values as
+/// unset.
+///
+/// Container orchestrators routinely inject `VAR=""` for an unset optional
+/// value; treating that as a real setting would turn every such deployment
+/// into a config error.
+fn read_env(name: &str) -> Option<String> {
+    let raw = std::env::var(name).ok()?;
+    let trimmed = raw.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
 impl PipelineControllerBuilder {
@@ -431,30 +449,55 @@ impl PipelineControllerBuilder {
     /// - `RHEI_OFFSET_DELTA`: signed offset delta for fork mode
     pub fn from_env(mut self) -> Self {
         if self.workers == 1
-            && let Ok(val) = std::env::var("RHEI_WORKERS")
-            && let Ok(n) = val.parse::<usize>()
+            && let Some(val) = read_env("RHEI_WORKERS")
         {
-            self.workers = n;
+            match val.parse::<usize>() {
+                Ok(n) => self.workers = n,
+                Err(e) => self.env_error("RHEI_WORKERS", &val, &format!("{e}; expected a number")),
+            }
         }
         if self.process_id.is_none()
-            && let Ok(val) = std::env::var("RHEI_PROCESS_ID")
-            && let Ok(id) = val.parse::<usize>()
+            && let Some(val) = read_env("RHEI_PROCESS_ID")
         {
-            self.process_id = Some(id);
+            match val.parse::<usize>() {
+                Ok(id) => self.process_id = Some(id),
+                Err(e) => {
+                    self.env_error("RHEI_PROCESS_ID", &val, &format!("{e}; expected a number"));
+                }
+            }
         }
         if self.peers.is_none()
-            && let Ok(val) = std::env::var("RHEI_PEERS")
+            && let Some(val) = read_env("RHEI_PEERS")
         {
-            let peers: Vec<String> = val.split(',').map(|s| s.trim().to_string()).collect();
-            if !peers.is_empty() {
+            // `"".split(',')` yields one empty element, so an empty variable
+            // would otherwise produce a cluster with one nameless peer.
+            let peers: Vec<String> = val
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(ToString::to_string)
+                .collect();
+            if peers.is_empty() {
+                self.env_error(
+                    "RHEI_PEERS",
+                    &val,
+                    "no peer addresses found; expected a comma-separated list of host:port",
+                );
+            } else {
                 self.peers = Some(peers);
             }
         }
         if self.metrics_addr.is_none()
-            && let Ok(val) = std::env::var("RHEI_METRICS_ADDR")
-            && let Ok(addr) = val.parse::<std::net::SocketAddr>()
+            && let Some(val) = read_env("RHEI_METRICS_ADDR")
         {
-            self.metrics_addr = Some(addr);
+            match val.parse::<std::net::SocketAddr>() {
+                Ok(addr) => self.metrics_addr = Some(addr),
+                Err(e) => self.env_error(
+                    "RHEI_METRICS_ADDR",
+                    &val,
+                    &format!("{e}; expected host:port, e.g. 0.0.0.0:9090"),
+                ),
+            }
         }
         if self.pipeline_name.is_none()
             && let Ok(val) = std::env::var("RHEI_PIPELINE_NAME")
@@ -482,20 +525,77 @@ impl PipelineControllerBuilder {
             self.from_checkpoint = Some(val);
         }
         if self.offset_delta == 0
-            && let Ok(val) = std::env::var("RHEI_OFFSET_DELTA")
-            && let Ok(delta) = val.parse::<i64>()
+            && let Some(val) = read_env("RHEI_OFFSET_DELTA")
         {
-            self.offset_delta = delta;
+            match val.parse::<i64>() {
+                Ok(delta) => self.offset_delta = delta,
+                Err(e) => self.env_error(
+                    "RHEI_OFFSET_DELTA",
+                    &val,
+                    &format!("{e}; expected a signed integer"),
+                ),
+            }
         }
         self
+    }
+
+    /// Record a malformed environment variable for [`Self::build`] to report.
+    ///
+    /// Logged immediately as well, because the error surfaces at `build()` and
+    /// the log line is what ties it back to the offending variable in a crash
+    /// loop.
+    fn env_error(&mut self, var: &str, value: &str, reason: &str) {
+        tracing::error!(var, value, reason, "invalid environment variable");
+        self.env_errors
+            .push(format!("{var}={value:?} is invalid: {reason}"));
     }
 
     /// Build the controller.
     ///
     /// # Errors
-    /// Returns an error if `peers` is set but `process_id` is missing or out of range.
+    /// Returns an error if any environment variable read by [`Self::from_env`]
+    /// was malformed, or if the resulting configuration is invalid — a zero
+    /// worker count, a non-positive checkpoint interval, a `max_parallelism`
+    /// below the total worker count, or a `peers`/`process_id` mismatch.
     pub fn build(self) -> anyhow::Result<PipelineController> {
+        // Surface malformed environment variables before anything else: a
+        // typo'd RHEI_WORKERS must not silently leave the pipeline at its
+        // default parallelism.
+        if !self.env_errors.is_empty() {
+            anyhow::bail!(
+                "invalid environment configuration:\n  - {}",
+                self.env_errors.join("\n  - ")
+            );
+        }
+
+        anyhow::ensure!(
+            self.workers > 0,
+            "workers must be at least 1, got {}. A pipeline with no workers can never \
+             process anything.",
+            self.workers
+        );
+        anyhow::ensure!(
+            self.checkpoint_interval > 0,
+            "checkpoint_interval must be at least 1 batch, got 0. A zero interval would \
+             checkpoint on every frontier advance and never let the pipeline make progress."
+        );
+
         if let Some(ref peers) = self.peers {
+            anyhow::ensure!(
+                !peers.is_empty(),
+                "peers was set but is empty. Leave it unset for single-process mode, or list \
+                 every process in the cluster (including this one)."
+            );
+            for peer in peers {
+                anyhow::ensure!(
+                    !peer.trim().is_empty(),
+                    "peers contains an empty address. Check for a stray comma in RHEI_PEERS."
+                );
+                anyhow::ensure!(
+                    peer.contains(':'),
+                    "peer address {peer:?} has no port. Cluster peers must be `host:port`."
+                );
+            }
             let pid = self
                 .process_id
                 .ok_or_else(|| anyhow::anyhow!("process_id is required when peers are set"))?;
@@ -505,6 +605,20 @@ impl PipelineControllerBuilder {
                 peers.len()
             );
         }
+
+        let total_workers = self.workers * self.peers.as_ref().map_or(1, Vec::len);
+        anyhow::ensure!(
+            self.max_parallelism >= total_workers,
+            "max_parallelism ({}) is below the total worker count ({total_workers}). Key groups \
+             are distributed across workers, so workers beyond the key group count would sit \
+             permanently idle. Raise max_parallelism — but note it is fixed for a pipeline's \
+             lifetime and cannot be changed once state exists.",
+            self.max_parallelism
+        );
+
+        // Size the liveness heartbeat slots to this process's local workers.
+        let health = self.health.with_workers(self.workers);
+
         Ok(PipelineController {
             checkpoint_dir: self.checkpoint_dir,
             tiered: self.tiered,
@@ -512,7 +626,7 @@ impl PipelineControllerBuilder {
             checkpoint_interval: self.checkpoint_interval,
             error_policy: self.error_policy,
             dlq_sink: std::sync::Mutex::new(self.dlq_sink),
-            health: self.health,
+            health,
             process_id: self.process_id,
             peers: self.peers,
             memtable_config: self.memtable_config,
@@ -556,6 +670,7 @@ impl PipelineController {
             #[cfg(feature = "remote-state")]
             from_checkpoint: None,
             offset_delta: 0,
+            env_errors: Vec::new(),
         }
     }
 
@@ -1036,6 +1151,7 @@ impl PipelineController {
             pipeline_name: self.pipeline_name.clone(),
             workers: self.workers,
             checkpoint_dir: Some(self.checkpoint_dir.clone()),
+            access: crate::http_server::AccessConfig::from_env(),
         });
 
         Ok(Some(http_handle))
@@ -1313,11 +1429,17 @@ async fn run_graph(
 
             let object_store = remote_cfg.build_object_store()?;
             let path = object_store::path::Path::from(manifest_path.as_str());
-            let manifest = CheckpointManifest::load_from_object_store(object_store.as_ref(), &path)
-                .await
-                .ok_or_else(|| {
-                    anyhow::anyhow!("checkpoint manifest not found at {manifest_path}")
-                })?;
+            let manifest =
+                CheckpointManifest::load_from_object_store_checked(object_store.as_ref(), &path)
+                    .await?
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("checkpoint manifest not found at {manifest_path}")
+                    })?;
+
+            // A fork inherits the parent's key space, so it must inherit its
+            // key group count too — otherwise every key lands in a different
+            // group and the forked state reads back empty.
+            manifest.validate_compatible(controller.max_parallelism)?;
 
             // Validate topology if manifest includes it.
             if let Some(manifest_workers) = manifest.workers_per_process
@@ -1362,7 +1484,9 @@ async fn run_graph(
         {
             if let Some(fork) = fork_data {
                 fork
-            } else if let Some(manifest) = CheckpointManifest::load(&controller.checkpoint_dir) {
+            } else if let Some(manifest) =
+                CheckpointManifest::load_checked(&controller.checkpoint_dir)?
+            {
                 // A different key group count means every key hashes into a
                 // different group, so the stored state is unreadable. Fail loudly
                 // rather than silently resuming from what looks like empty state.
@@ -1415,7 +1539,7 @@ async fn run_graph(
 
         #[cfg(not(feature = "remote-state"))]
         {
-            if let Some(manifest) = CheckpointManifest::load(&controller.checkpoint_dir) {
+            if let Some(manifest) = CheckpointManifest::load_checked(&controller.checkpoint_dir)? {
                 // A different key group count means every key hashes into a
                 // different group, so the stored state is unreadable. Fail loudly
                 // rather than silently resuming from what looks like empty state.

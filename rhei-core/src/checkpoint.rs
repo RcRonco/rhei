@@ -11,8 +11,9 @@ use serde::{Deserialize, Serialize};
 
 /// Persistent record of a completed checkpoint.
 ///
-/// Written atomically (temp-file + rename) after every checkpoint cycle so
-/// that a crash mid-write never leaves a corrupt manifest on disk.
+/// Written durably after every checkpoint cycle (temp file → fsync → rename →
+/// directory fsync), so neither a concurrent reader nor a crash mid-write can
+/// observe a partial manifest.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CheckpointManifest {
     /// Schema version (currently `1`).
@@ -90,6 +91,94 @@ impl std::error::Error for CheckpointIncompatibility {}
 
 const MANIFEST_FILE: &str = "manifest.json";
 
+/// Highest manifest schema version this build knows how to read.
+///
+/// A manifest carrying a higher version was written by a newer Rhei and may use
+/// fields this build would silently ignore, so [`CheckpointManifest::load_checked`]
+/// refuses it rather than resuming against a half-understood checkpoint.
+pub const MANIFEST_VERSION: u32 = 1;
+
+/// Write `bytes` to `path` durably: fsync the file, rename it over `target`,
+/// then fsync the containing directory so the rename itself survives a crash.
+///
+/// `std::fs::rename` alone makes the swap atomic *for a concurrent reader*, but
+/// says nothing about what survives power loss: without the fsyncs the rename
+/// can reach disk before the data it points at, leaving a manifest that is
+/// present, valid-looking, and empty.
+fn write_file_durably(dir: &Path, filename: &str, bytes: &[u8]) -> anyhow::Result<()> {
+    use std::io::Write;
+
+    let target = dir.join(filename);
+    let tmp = dir.join(format!(".{filename}.tmp"));
+
+    {
+        let mut file = std::fs::File::create(&tmp)?;
+        file.write_all(bytes)?;
+        file.flush()?;
+        // Force the data out before the rename can publish it.
+        file.sync_all()?;
+    }
+
+    std::fs::rename(&tmp, &target)?;
+
+    // Persist the directory entry created by the rename. Without this the file
+    // contents are durable but the name pointing at them may not be.
+    // Directory fsync is not supported on every platform/filesystem, so a
+    // failure here is logged rather than fatal — the data write above already
+    // succeeded.
+    match std::fs::File::open(dir) {
+        Ok(dir_handle) => {
+            if let Err(e) = dir_handle.sync_all() {
+                tracing::debug!(error = %e, dir = %dir.display(), "directory fsync unsupported");
+            }
+        }
+        Err(e) => {
+            tracing::debug!(error = %e, dir = %dir.display(), "could not open directory for fsync");
+        }
+    }
+
+    Ok(())
+}
+
+/// Read and parse a manifest file, distinguishing "absent" from "unreadable".
+///
+/// Returns `Ok(None)` only when the file genuinely does not exist. Every other
+/// failure — I/O error, malformed JSON, unknown schema version — is an `Err`,
+/// because a checkpoint that cannot be read is never the same thing as a
+/// pipeline that has never checkpointed.
+fn read_manifest_file(path: &Path) -> anyhow::Result<Option<CheckpointManifest>> {
+    let data = match std::fs::read_to_string(path) {
+        Ok(data) => data,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => {
+            return Err(anyhow::Error::from(e)
+                .context(format!("reading checkpoint manifest {}", path.display())));
+        }
+    };
+
+    let manifest: CheckpointManifest = serde_json::from_str(&data).map_err(|e| {
+        anyhow::anyhow!(
+            "checkpoint manifest {} is corrupt and cannot be parsed: {e}. Refusing to start: \
+             resuming would silently discard all checkpointed state and reprocess from the \
+             beginning. Restore the file from backup, or delete the checkpoint directory to \
+             deliberately start fresh.",
+            path.display()
+        )
+    })?;
+
+    anyhow::ensure!(
+        manifest.version <= MANIFEST_VERSION,
+        "checkpoint manifest {} has schema version {} but this build understands at most {}. \
+         It was written by a newer Rhei; upgrade this binary rather than resuming against a \
+         manifest whose fields it would ignore.",
+        path.display(),
+        manifest.version,
+        MANIFEST_VERSION
+    );
+
+    Ok(Some(manifest))
+}
+
 impl CheckpointManifest {
     /// Check that this checkpoint can be resumed at `max_parallelism`.
     ///
@@ -114,48 +203,88 @@ impl CheckpointManifest {
         }
     }
 
-    /// Atomically persist the manifest to `{dir}/manifest.json`.
+    /// Durably persist the manifest to `{dir}/manifest.json`.
     ///
-    /// Writes to a temporary file first, then renames — so readers never
-    /// observe a partially-written file.
+    /// Writes to a temporary file, fsyncs it, renames it into place, then
+    /// fsyncs the directory. A reader never observes a partially-written file,
+    /// and a crash at any point leaves either the previous manifest or the new
+    /// one — never a truncated or empty one.
     pub fn save(&self, dir: &Path) -> anyhow::Result<()> {
         std::fs::create_dir_all(dir)?;
-        let target = dir.join(MANIFEST_FILE);
-        let tmp = dir.join(format!(".{MANIFEST_FILE}.tmp"));
         let json = serde_json::to_string_pretty(self)?;
-        std::fs::write(&tmp, json)?;
-        std::fs::rename(&tmp, &target)?;
-        Ok(())
+        write_file_durably(dir, MANIFEST_FILE, json.as_bytes())
     }
 
-    /// Load a manifest from `{dir}/manifest.json`, returning `None` if the
-    /// file does not exist.
+    /// Load a manifest from `{dir}/manifest.json`.
+    ///
+    /// Returns `Ok(None)` only when no manifest exists — a pipeline that has
+    /// never checkpointed. A manifest that exists but cannot be read is an
+    /// `Err`, so a corrupt file fails the startup instead of silently
+    /// reprocessing the stream from offset zero.
+    ///
+    /// # Errors
+    /// Returns an error if the file exists but cannot be read, does not parse,
+    /// or carries a schema version newer than [`MANIFEST_VERSION`].
+    pub fn load_checked(dir: &Path) -> anyhow::Result<Option<Self>> {
+        read_manifest_file(&dir.join(MANIFEST_FILE))
+    }
+
+    /// Best-effort load that maps every failure to `None`.
+    ///
+    /// Intended for read-only inspection surfaces (dashboards, the state
+    /// explorer) where "no manifest" and "unreadable manifest" are both just
+    /// "nothing to show". **Recovery paths must use [`Self::load_checked`]**:
+    /// treating a corrupt manifest as absent there restarts the pipeline from
+    /// scratch without telling anyone.
     pub fn load(dir: &Path) -> Option<Self> {
-        let path = dir.join(MANIFEST_FILE);
-        let data = std::fs::read_to_string(path).ok()?;
-        serde_json::from_str(&data).ok()
+        match Self::load_checked(dir) {
+            Ok(manifest) => manifest,
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    dir = %dir.display(),
+                    "checkpoint manifest could not be read; reporting as absent"
+                );
+                None
+            }
+        }
     }
 
     /// Save a per-process partial manifest as `{dir}/manifest_p{process_id}.json`.
     ///
     /// Used in cluster mode: each process writes its own partial manifest,
-    /// and process 0 merges them into the final `manifest.json`.
+    /// and process 0 merges them into the final `manifest.json`. Durability
+    /// matches [`Self::save`].
     pub fn save_partial(&self, dir: &Path, process_id: usize) -> anyhow::Result<()> {
         std::fs::create_dir_all(dir)?;
-        let filename = format!("manifest_p{process_id}.json");
-        let target = dir.join(&filename);
-        let tmp = dir.join(format!(".{filename}.tmp"));
         let json = serde_json::to_string_pretty(self)?;
-        std::fs::write(&tmp, json)?;
-        std::fs::rename(&tmp, &target)?;
-        Ok(())
+        write_file_durably(dir, &partial_filename(process_id), json.as_bytes())
     }
 
-    /// Load a per-process partial manifest from `{dir}/manifest_p{process_id}.json`.
+    /// Load a per-process partial manifest, distinguishing absent from corrupt.
+    ///
+    /// # Errors
+    /// Returns an error if the partial exists but cannot be read or parsed.
+    pub fn load_partial_checked(dir: &Path, process_id: usize) -> anyhow::Result<Option<Self>> {
+        read_manifest_file(&dir.join(partial_filename(process_id)))
+    }
+
+    /// Best-effort partial load that maps every failure to `None`.
+    ///
+    /// See [`Self::load`] for why recovery paths should prefer
+    /// [`Self::load_partial_checked`].
     pub fn load_partial(dir: &Path, process_id: usize) -> Option<Self> {
-        let path = dir.join(format!("manifest_p{process_id}.json"));
-        let data = std::fs::read_to_string(path).ok()?;
-        serde_json::from_str(&data).ok()
+        match Self::load_partial_checked(dir, process_id) {
+            Ok(manifest) => manifest,
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    process_id,
+                    "partial checkpoint manifest could not be read; reporting as absent"
+                );
+                None
+            }
+        }
     }
 
     /// Persist the manifest to an object store at the given path.
@@ -174,54 +303,163 @@ impl CheckpointManifest {
         Ok(())
     }
 
-    /// Load a manifest from an object store, returning `None` if the object
-    /// does not exist.
+    /// Load a manifest from an object store.
+    ///
+    /// Returns `Ok(None)` only when the object does not exist. A present but
+    /// unreadable object is an `Err`, for the same reason as
+    /// [`Self::load_checked`].
+    ///
+    /// # Errors
+    /// Returns an error if the object exists but cannot be fetched, does not
+    /// parse, or carries a schema version newer than [`MANIFEST_VERSION`].
+    pub async fn load_from_object_store_checked(
+        store: &dyn object_store::ObjectStore,
+        path: &object_store::path::Path,
+    ) -> anyhow::Result<Option<Self>> {
+        let result = match store.get(path).await {
+            Ok(result) => result,
+            Err(object_store::Error::NotFound { .. }) => return Ok(None),
+            Err(e) => {
+                return Err(
+                    anyhow::Error::from(e).context(format!("fetching checkpoint manifest {path}"))
+                );
+            }
+        };
+
+        let bytes = result
+            .bytes()
+            .await
+            .map_err(|e| anyhow::Error::from(e).context(format!("reading manifest body {path}")))?;
+
+        let manifest: Self = serde_json::from_slice(&bytes).map_err(|e| {
+            anyhow::anyhow!(
+                "checkpoint manifest {path} is corrupt and cannot be parsed: {e}. Refusing to \
+                 start: resuming would silently discard all checkpointed state and reprocess \
+                 from the beginning."
+            )
+        })?;
+
+        anyhow::ensure!(
+            manifest.version <= MANIFEST_VERSION,
+            "checkpoint manifest {path} has schema version {} but this build understands at \
+             most {MANIFEST_VERSION}. It was written by a newer Rhei; upgrade this binary.",
+            manifest.version
+        );
+
+        Ok(Some(manifest))
+    }
+
+    /// Best-effort object-store load that maps every failure to `None`.
+    ///
+    /// See [`Self::load`] for why recovery paths should prefer
+    /// [`Self::load_from_object_store_checked`].
     pub async fn load_from_object_store(
         store: &dyn object_store::ObjectStore,
         path: &object_store::path::Path,
     ) -> Option<Self> {
-        let result = store.get(path).await.ok()?;
-        let bytes = result.bytes().await.ok()?;
-        serde_json::from_slice(&bytes).ok()
+        match Self::load_from_object_store_checked(store, path).await {
+            Ok(manifest) => manifest,
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    %path,
+                    "remote checkpoint manifest could not be read; reporting as absent"
+                );
+                None
+            }
+        }
     }
 
     /// Merge partial manifests from all processes into a single manifest.
     ///
-    /// Returns `None` if any partial manifest is missing. Source offsets
-    /// from all partials are combined (later processes overwrite duplicate keys).
-    pub fn merge_partials(dir: &Path, n_processes: usize) -> Option<Self> {
+    /// Returns `Ok(None)` if any partial manifest has not been written yet —
+    /// the normal race during a checkpoint cycle. Source offsets from all
+    /// partials are combined, and the cluster shape fields (`max_parallelism`,
+    /// `n_processes`, `workers_per_process`, `total_workers`, `cluster_members`)
+    /// are carried through to the merged manifest.
+    ///
+    /// Carrying `max_parallelism` through is what keeps
+    /// [`Self::validate_compatible`] meaningful in cluster mode: the merged
+    /// manifest is the one a restart reads, so dropping the field there would
+    /// disable the key-group safety check on exactly the deployments that need
+    /// it most.
+    ///
+    /// # Errors
+    /// Returns an error if a partial cannot be read, or if the partials
+    /// disagree on `max_parallelism` — processes in one cluster must share a
+    /// key-group count, and disagreement means their state is partitioned
+    /// incompatibly.
+    pub fn merge_partials(dir: &Path, n_processes: usize) -> anyhow::Result<Option<Self>> {
         let mut partials = Vec::with_capacity(n_processes);
         for pid in 0..n_processes {
-            partials.push(Self::load_partial(dir, pid)?);
+            match Self::load_partial_checked(dir, pid)? {
+                Some(partial) => partials.push(partial),
+                // Not written yet — the caller retries on the next cycle.
+                None => return Ok(None),
+            }
         }
 
         let mut merged_offsets = HashMap::new();
         let mut max_checkpoint_id = 0u64;
         let mut max_timestamp_ms = 0u64;
-        let mut operators = Vec::new();
+        let mut operators: Vec<String> = Vec::new();
+        let mut members: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        let mut max_parallelism: Option<usize> = None;
+        let mut workers_per_process: Option<usize> = None;
+        let mut total_workers = 0usize;
+        let mut saw_worker_counts = false;
 
-        for partial in &partials {
+        for (pid, partial) in partials.iter().enumerate() {
             merged_offsets.extend(partial.source_offsets.clone());
             max_checkpoint_id = max_checkpoint_id.max(partial.checkpoint_id);
             max_timestamp_ms = max_timestamp_ms.max(partial.timestamp_ms);
             if operators.is_empty() {
                 operators.clone_from(&partial.operators);
             }
+            members.extend(partial.cluster_members.iter().cloned());
+
+            // Every process must agree on the key group count. A mismatch means
+            // the processes partition the key space differently, so their state
+            // cannot be merged into one checkpoint.
+            match (max_parallelism, partial.max_parallelism) {
+                (Some(existing), Some(found)) => anyhow::ensure!(
+                    existing == found,
+                    "partial checkpoint manifests disagree on max_parallelism: process {pid} \
+                     recorded {found}, an earlier process recorded {existing}. All processes in \
+                     a cluster must run with the same key group count."
+                ),
+                (None, found @ Some(_)) => max_parallelism = found,
+                _ => {}
+            }
+
+            if let Some(wpp) = partial.workers_per_process {
+                workers_per_process = Some(workers_per_process.map_or(wpp, |w: usize| w.max(wpp)));
+            }
+            if let Some(tw) = partial.total_workers {
+                // Prefer the recorded topology-wide total when present.
+                total_workers = total_workers.max(tw);
+                saw_worker_counts = true;
+            }
         }
 
-        Some(Self {
-            version: 1,
+        Ok(Some(Self {
+            version: MANIFEST_VERSION,
             checkpoint_id: max_checkpoint_id,
             timestamp_ms: max_timestamp_ms,
             operators,
             source_offsets: merged_offsets,
-            n_processes: None,
-            workers_per_process: None,
-            max_parallelism: None,
-            total_workers: None,
-            cluster_members: Vec::new(),
-        })
+            n_processes: Some(n_processes),
+            workers_per_process,
+            max_parallelism,
+            total_workers: saw_worker_counts.then_some(total_workers),
+            cluster_members: members.into_iter().collect(),
+        }))
     }
+}
+
+/// Filename for a process's partial manifest.
+fn partial_filename(process_id: usize) -> String {
+    format!("manifest_p{process_id}.json")
 }
 
 /// Load operator state from a checkpoint file.
@@ -369,7 +607,9 @@ mod tests {
         p0.save_partial(&dir, 0).unwrap();
         p1.save_partial(&dir, 1).unwrap();
 
-        let merged = CheckpointManifest::merge_partials(&dir, 2).expect("merge should succeed");
+        let merged = CheckpointManifest::merge_partials(&dir, 2)
+            .expect("merge should not error")
+            .expect("all partials present");
         assert_eq!(merged.checkpoint_id, 5);
         assert_eq!(merged.timestamp_ms, 1_100); // max
         assert_eq!(merged.source_offsets.len(), 4);
@@ -401,7 +641,11 @@ mod tests {
         p0.save_partial(&dir, 0).unwrap();
 
         // Only 1 of 3 partial manifests exist.
-        assert!(CheckpointManifest::merge_partials(&dir, 3).is_none());
+        assert!(
+            CheckpointManifest::merge_partials(&dir, 3)
+                .expect("missing partials are not an error")
+                .is_none()
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -614,5 +858,208 @@ mod tests {
         assert_eq!(manifest.total_workers, None);
         assert!(manifest.cluster_members.is_empty());
         assert!(manifest.validate_compatible(128).is_ok());
+    }
+
+    // ── Corruption is never mistaken for "no checkpoint" ─────────────────
+
+    /// Build a manifest with the given key group count.
+    fn manifest_with(max_parallelism: Option<usize>) -> CheckpointManifest {
+        CheckpointManifest {
+            version: MANIFEST_VERSION,
+            checkpoint_id: 7,
+            timestamp_ms: 1_234,
+            operators: vec!["counter".to_string()],
+            source_offsets: HashMap::new(),
+            n_processes: Some(2),
+            workers_per_process: Some(4),
+            max_parallelism,
+            total_workers: Some(8),
+            cluster_members: vec!["node-a".to_string()],
+        }
+    }
+
+    #[test]
+    fn load_checked_reports_absent_manifest_as_none() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(
+            CheckpointManifest::load_checked(dir.path())
+                .expect("absent manifest is not an error")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn load_checked_errors_on_corrupt_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("manifest.json"), b"{not valid json").unwrap();
+
+        // The whole point: a corrupt manifest must not look like a fresh start,
+        // or the pipeline silently reprocesses the stream from the beginning.
+        let err = CheckpointManifest::load_checked(dir.path())
+            .expect_err("corrupt manifest must be an error");
+        assert!(err.to_string().contains("corrupt"), "got: {err}");
+    }
+
+    #[test]
+    fn load_checked_errors_on_truncated_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        // The exact shape a non-durable write leaves behind after power loss:
+        // the file exists, but its contents never reached the disk.
+        std::fs::write(dir.path().join("manifest.json"), b"").unwrap();
+
+        assert!(CheckpointManifest::load_checked(dir.path()).is_err());
+    }
+
+    #[test]
+    fn load_checked_rejects_future_schema_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut manifest = manifest_with(Some(128));
+        manifest.version = MANIFEST_VERSION + 1;
+        manifest.save(dir.path()).unwrap();
+
+        let err = CheckpointManifest::load_checked(dir.path())
+            .expect_err("a newer schema version must be rejected");
+        assert!(err.to_string().contains("schema version"), "got: {err}");
+    }
+
+    #[test]
+    fn lossy_load_maps_corruption_to_none() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("manifest.json"), b"garbage").unwrap();
+
+        // `load` stays lossy for read-only surfaces, but recovery paths use
+        // `load_checked` — see the doc comment on `load`.
+        assert!(CheckpointManifest::load(dir.path()).is_none());
+    }
+
+    #[test]
+    fn saved_manifest_round_trips_through_load_checked() {
+        let dir = tempfile::tempdir().unwrap();
+        manifest_with(Some(256)).save(dir.path()).unwrap();
+
+        let loaded = CheckpointManifest::load_checked(dir.path())
+            .unwrap()
+            .expect("manifest should exist");
+        assert_eq!(loaded.checkpoint_id, 7);
+        assert_eq!(loaded.max_parallelism, Some(256));
+    }
+
+    #[test]
+    fn save_leaves_no_temp_file_behind() {
+        let dir = tempfile::tempdir().unwrap();
+        manifest_with(Some(128)).save(dir.path()).unwrap();
+
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|name| {
+                std::path::Path::new(name)
+                    .extension()
+                    .is_some_and(|e| e == "tmp")
+            })
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "temp files left behind: {leftovers:?}"
+        );
+    }
+
+    // ── Merged cluster manifests keep their key group count ──────────────
+
+    #[test]
+    fn merge_partials_preserves_max_parallelism() {
+        let dir = tempfile::tempdir().unwrap();
+        manifest_with(Some(128))
+            .save_partial(dir.path(), 0)
+            .unwrap();
+        manifest_with(Some(128))
+            .save_partial(dir.path(), 1)
+            .unwrap();
+
+        let merged = CheckpointManifest::merge_partials(dir.path(), 2)
+            .unwrap()
+            .expect("all partials present");
+
+        // Dropping this field is what silently disabled the key-group safety
+        // check in cluster mode.
+        assert_eq!(merged.max_parallelism, Some(128));
+        assert_eq!(merged.n_processes, Some(2));
+        assert_eq!(merged.workers_per_process, Some(4));
+        assert_eq!(merged.total_workers, Some(8));
+        assert_eq!(merged.cluster_members, vec!["node-a".to_string()]);
+    }
+
+    #[test]
+    fn merged_manifest_still_rejects_changed_key_group_count() {
+        // End-to-end regression for the cluster-mode gap: write partials,
+        // merge them the way process 0 does, reload, and confirm the restart
+        // check still fires.
+        let dir = tempfile::tempdir().unwrap();
+        manifest_with(Some(128))
+            .save_partial(dir.path(), 0)
+            .unwrap();
+        manifest_with(Some(128))
+            .save_partial(dir.path(), 1)
+            .unwrap();
+        CheckpointManifest::merge_partials(dir.path(), 2)
+            .unwrap()
+            .unwrap()
+            .save(dir.path())
+            .unwrap();
+
+        let reloaded = CheckpointManifest::load_checked(dir.path())
+            .unwrap()
+            .expect("merged manifest should exist");
+
+        assert!(reloaded.validate_compatible(128).is_ok());
+        assert_eq!(
+            reloaded.validate_compatible(256),
+            Err(CheckpointIncompatibility::MaxParallelismChanged {
+                manifest: 128,
+                configured: 256,
+            })
+        );
+    }
+
+    #[test]
+    fn merge_partials_rejects_disagreeing_max_parallelism() {
+        let dir = tempfile::tempdir().unwrap();
+        manifest_with(Some(128))
+            .save_partial(dir.path(), 0)
+            .unwrap();
+        manifest_with(Some(256))
+            .save_partial(dir.path(), 1)
+            .unwrap();
+
+        let err = CheckpointManifest::merge_partials(dir.path(), 2)
+            .expect_err("processes must agree on the key group count");
+        assert!(err.to_string().contains("max_parallelism"), "got: {err}");
+    }
+
+    #[test]
+    fn merge_partials_errors_on_corrupt_partial() {
+        let dir = tempfile::tempdir().unwrap();
+        manifest_with(Some(128))
+            .save_partial(dir.path(), 0)
+            .unwrap();
+        std::fs::write(dir.path().join("manifest_p1.json"), b"{{{").unwrap();
+
+        // A corrupt partial must not be silently treated as "not written yet",
+        // which would let the merge quietly skip a process's offsets.
+        assert!(CheckpointManifest::merge_partials(dir.path(), 2).is_err());
+    }
+
+    #[test]
+    fn merge_partials_tolerates_legacy_partials_without_key_groups() {
+        let dir = tempfile::tempdir().unwrap();
+        manifest_with(None).save_partial(dir.path(), 0).unwrap();
+        manifest_with(None).save_partial(dir.path(), 1).unwrap();
+
+        let merged = CheckpointManifest::merge_partials(dir.path(), 2)
+            .unwrap()
+            .expect("all partials present");
+        assert_eq!(merged.max_parallelism, None);
+        assert!(merged.validate_compatible(64).is_ok());
     }
 }

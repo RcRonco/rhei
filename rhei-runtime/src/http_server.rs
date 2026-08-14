@@ -1,7 +1,7 @@
 //! HTTP server for health checks, Prometheus metrics, and JSON API.
 //!
 //! Provides:
-//! - `GET /healthz` — liveness probe (always 200 while the process is alive)
+//! - `GET /healthz` — liveness probe (503 when a worker has stopped making progress)
 //! - `GET /readyz` — readiness probe (200 when `Running`, 503 otherwise)
 //! - `GET /metrics` — Prometheus exposition format via `metrics-exporter-prometheus`
 //! - `GET /api/metrics` — structured JSON [`MetricsSnapshot`]
@@ -10,6 +10,14 @@
 //! - `GET /api/topology` — serializable pipeline DAG (nodes + edges)
 //! - `GET /api/metrics/history?since=<ms>` — ring buffer of timestamped snapshots
 //! - `GET /api/info` — pipeline identity: name, version, workers, uptime
+//! - `GET /api/state/**` — checkpointed state explorer (opt-in, see [`AccessConfig`])
+//!
+//! # Access control
+//!
+//! Probes are always unauthenticated. Everything else requires a bearer token
+//! when one is configured, cross-origin access is denied unless origins are
+//! listed, and the state explorer — which returns application data — is off
+//! unless explicitly enabled. See [`AccessConfig`].
 
 use std::collections::VecDeque;
 use std::net::SocketAddr;
@@ -28,7 +36,7 @@ use tower_http::cors::CorsLayer;
 use rhei_core::checkpoint::{CheckpointManifest, load_operator_state};
 
 use crate::compiler::ApiTopology;
-use crate::health::{HealthState, PipelineStatus};
+use crate::health::{HealthState, Liveness, PipelineStatus};
 use crate::metrics_snapshot::{MetricsHandle, MetricsSnapshot};
 use crate::tracing_capture::LogEntry;
 
@@ -159,6 +167,105 @@ pub struct HttpServerConfig {
     pub workers: usize,
     /// Checkpoint directory for state explorer endpoints.
     pub checkpoint_dir: Option<std::path::PathBuf>,
+    /// Access controls for the served endpoints.
+    pub access: AccessConfig,
+}
+
+// ─── Access control ─────────────────────────────────────────────────────────
+
+/// Who may reach the HTTP surface, and which parts of it.
+///
+/// The endpoints are not uniformly sensitive. `/healthz`, `/readyz` and
+/// `/metrics` are the operational surface an orchestrator and a Prometheus
+/// scraper need. `/api/state/**` is different in kind: it reads checkpointed
+/// **application data** — whatever the pipeline is keyed on and whatever it
+/// stores, which in practice means customer records. It stays off unless
+/// explicitly enabled.
+#[derive(Debug, Clone, Default)]
+pub struct AccessConfig {
+    /// Bearer token required on every request. `None` disables authentication.
+    ///
+    /// Read from `RHEI_METRICS_TOKEN`.
+    pub token: Option<String>,
+    /// Whether to serve the `/api/state/**` state explorer endpoints.
+    ///
+    /// Off by default. Enable with `RHEI_STATE_EXPLORER=1` — and pair it with
+    /// a token, because these endpoints return application data verbatim.
+    pub state_explorer: bool,
+    /// Browser origins allowed to call the API, for the web dashboard.
+    ///
+    /// Empty means no cross-origin access, which is the right default for a
+    /// server with no same-origin UI. Set from `RHEI_ALLOWED_ORIGINS`.
+    pub allowed_origins: Vec<String>,
+}
+
+impl AccessConfig {
+    /// Read access settings from the environment.
+    ///
+    /// | Variable | Effect |
+    /// |----------|--------|
+    /// | `RHEI_METRICS_TOKEN` | Require `Authorization: Bearer <token>` |
+    /// | `RHEI_STATE_EXPLORER` | `1`/`true` serves `/api/state/**` |
+    /// | `RHEI_ALLOWED_ORIGINS` | Comma-separated CORS origins |
+    pub fn from_env() -> Self {
+        let token = std::env::var("RHEI_METRICS_TOKEN")
+            .ok()
+            .map(|t| t.trim().to_string())
+            .filter(|t| !t.is_empty());
+
+        let state_explorer = std::env::var("RHEI_STATE_EXPLORER")
+            .is_ok_and(|v| matches!(v.trim(), "1" | "true" | "yes"));
+
+        let allowed_origins = std::env::var("RHEI_ALLOWED_ORIGINS")
+            .ok()
+            .map(|v| {
+                v.split(',')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(ToString::to_string)
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        Self {
+            token,
+            state_explorer,
+            allowed_origins,
+        }
+    }
+
+    /// Warn about combinations that expose data unintentionally.
+    ///
+    /// Called once at startup. These are warnings rather than errors because a
+    /// closed network is a legitimate deployment; the point is that nobody
+    /// should discover the exposure from someone else.
+    pub fn warn_on_risky_exposure(&self, addr: SocketAddr) {
+        let public = !addr.ip().is_loopback();
+
+        if public && self.token.is_none() {
+            tracing::warn!(
+                %addr,
+                "HTTP server is bound to a non-loopback address with no authentication. \
+                 Anyone who can reach this port can read pipeline metrics and logs. Set \
+                 RHEI_METRICS_TOKEN, or bind to 127.0.0.1 and front it with a proxy."
+            );
+        }
+
+        if self.state_explorer && self.token.is_none() {
+            tracing::warn!(
+                "state explorer is enabled without authentication. /api/state/** returns \
+                 checkpointed application data — including keys and values — to any caller. \
+                 Set RHEI_METRICS_TOKEN."
+            );
+        }
+
+        if self.allowed_origins.iter().any(|o| o == "*") {
+            tracing::warn!(
+                "RHEI_ALLOWED_ORIGINS contains '*', so any website a user visits can read \
+                 this API from their browser. List explicit origins instead."
+            );
+        }
+    }
 }
 
 // ─── App state ──────────────────────────────────────────────────────────────
@@ -182,6 +289,18 @@ struct AppState {
 #[derive(Serialize, Deserialize)]
 struct HealthResponse {
     status: String,
+}
+
+/// JSON response body for `/healthz`, carrying why liveness failed.
+#[derive(Serialize, Deserialize)]
+struct LivenessResponse {
+    /// Lifecycle status: `starting`, `running`, `draining`, `stopped`.
+    status: String,
+    /// Whether the process should be left running.
+    live: bool,
+    /// Human-readable stall reason, present only when `live` is false.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    detail: Option<String>,
 }
 
 /// JSON response body for the `/api/health` endpoint.
@@ -313,26 +432,59 @@ pub fn start(config: HttpServerConfig) -> tokio::task::JoinHandle<()> {
         checkpoint_dir: config.checkpoint_dir,
     });
 
-    let app = Router::new()
+    let addr = config.addr;
+    let access = config.access.clone();
+    access.warn_on_risky_exposure(addr);
+
+    // Probes stay unauthenticated: kubelet does not send an Authorization
+    // header, and these endpoints reveal only whether the process is healthy.
+    let probes = Router::new()
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))
+        .with_state(state.clone());
+
+    // Everything below is authenticated when a token is configured.
+    let mut api = Router::new()
         .route("/metrics", get(metrics))
         .route("/api/metrics", get(api_metrics))
         .route("/api/metrics/history", get(api_metrics_history))
         .route("/api/logs", get(api_logs))
         .route("/api/health", get(api_health))
         .route("/api/topology", get(api_topology))
-        .route("/api/info", get(api_info))
-        .route("/api/state/operators", get(api_state_operators))
-        .route("/api/state/operators/{name}", get(api_state_entries))
-        .route(
-            "/api/state/operators/{name}/keys/{*key}",
-            get(api_state_key),
-        )
-        .layer(CorsLayer::permissive())
-        .with_state(state);
+        .route("/api/info", get(api_info));
 
-    let addr = config.addr;
+    // The state explorer serves application data, so it is opt-in rather than
+    // merely authenticated — a deployment that never enables it cannot leak
+    // through it regardless of how the token is managed.
+    if access.state_explorer {
+        tracing::info!("state explorer enabled: /api/state/** will serve checkpointed state");
+        api = api
+            .route("/api/state/operators", get(api_state_operators))
+            .route("/api/state/operators/{name}", get(api_state_entries))
+            .route(
+                "/api/state/operators/{name}/keys/{*key}",
+                get(api_state_key),
+            );
+    }
+
+    let api = api.with_state(state);
+    let api = match access.token.clone() {
+        Some(token) => api.layer(axum::middleware::from_fn(move |req, next| {
+            let token = token.clone();
+            async move { require_bearer_token(&token, req, next).await }
+        })),
+        None => api,
+    };
+
+    let app = probes
+        .merge(api)
+        .layer(build_cors_layer(&access.allowed_origins))
+        // Bound how long a slow or stuck handler can hold a connection.
+        .layer(tower_http::timeout::TimeoutLayer::with_status_code(
+            StatusCode::SERVICE_UNAVAILABLE,
+            std::time::Duration::from_secs(30),
+        ));
+
     tokio::spawn(async move {
         let listener = match tokio::net::TcpListener::bind(addr).await {
             Ok(l) => l,
@@ -341,20 +493,119 @@ pub fn start(config: HttpServerConfig) -> tokio::task::JoinHandle<()> {
                 return;
             }
         };
-        tracing::info!(%addr, "HTTP server started");
+        tracing::info!(
+            %addr,
+            authenticated = access.token.is_some(),
+            state_explorer = access.state_explorer,
+            "HTTP server started"
+        );
         if let Err(e) = axum::serve(listener, app).await {
             tracing::error!(error = %e, "HTTP server error");
         }
     })
 }
 
+/// Build a CORS layer from the configured origin allowlist.
+///
+/// An empty allowlist yields a layer that permits no cross-origin requests.
+/// This replaces a previously permissive policy, which let any website read
+/// the API — including pipeline state — from a visitor's browser.
+fn build_cors_layer(allowed_origins: &[String]) -> CorsLayer {
+    use axum::http::HeaderValue;
+
+    if allowed_origins.is_empty() {
+        return CorsLayer::new();
+    }
+
+    if allowed_origins.iter().any(|o| o == "*") {
+        return CorsLayer::new()
+            .allow_origin(tower_http::cors::Any)
+            .allow_methods([axum::http::Method::GET]);
+    }
+
+    let origins: Vec<HeaderValue> = allowed_origins
+        .iter()
+        .filter_map(|origin| match HeaderValue::from_str(origin) {
+            Ok(value) => Some(value),
+            Err(e) => {
+                tracing::warn!(origin, error = %e, "ignoring malformed CORS origin");
+                None
+            }
+        })
+        .collect();
+
+    CorsLayer::new()
+        .allow_origin(origins)
+        .allow_methods([axum::http::Method::GET])
+        .allow_headers([axum::http::header::AUTHORIZATION])
+}
+
+/// Reject requests without a matching `Authorization: Bearer <token>` header.
+async fn require_bearer_token(
+    expected: &str,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let presented = request
+        .headers()
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .map(str::trim);
+
+    let authorized = presented.is_some_and(|token| constant_time_eq(token, expected));
+
+    if authorized {
+        next.run(request).await
+    } else {
+        (
+            StatusCode::UNAUTHORIZED,
+            [("www-authenticate", "Bearer")],
+            axum::Json(serde_json::json!({ "error": "missing or invalid bearer token" })),
+        )
+            .into_response()
+    }
+}
+
+/// Compare two secrets without leaking their contents through timing.
+///
+/// Length is not secret here (the operator chose it), but the byte comparison
+/// must not short-circuit on the first mismatch.
+fn constant_time_eq(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
 // ─── Existing handlers ──────────────────────────────────────────────────────
 
-/// Liveness probe — always 200 while the process is alive.
-async fn healthz(State(state): State<Arc<AppState>>) -> axum::Json<HealthResponse> {
-    axum::Json(HealthResponse {
-        status: state.health.status().to_string(),
-    })
+/// Liveness probe — 200 while the workers are turning, 503 when one is wedged.
+///
+/// Deliberately *not* "200 while the process is alive": a pipeline whose
+/// dataflow loop has stopped still answers TCP, so a probe that only checks
+/// reachability leaves a dead pipeline running forever. Returning 503 here is
+/// what lets an orchestrator restart it.
+async fn healthz(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let liveness = state.health.liveness();
+    let code = if liveness.is_live() {
+        StatusCode::OK
+    } else {
+        tracing::error!(reason = %liveness, "liveness probe failed");
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    (
+        code,
+        axum::Json(LivenessResponse {
+            status: state.health.status().to_string(),
+            live: liveness.is_live(),
+            detail: match &liveness {
+                Liveness::Live => None,
+                stalled @ Liveness::Stalled { .. } => Some(stalled.to_string()),
+            },
+        }),
+    )
 }
 
 /// Readiness probe — 200 when running, 503 otherwise.
@@ -819,5 +1070,205 @@ mod tests {
         }
         assert_eq!(history.entries.len(), METRICS_HISTORY_CAPACITY);
         assert_eq!(history.entries.front().unwrap().0, 10);
+    }
+
+    // ── Liveness probe ───────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn healthz_returns_503_when_a_worker_is_wedged() {
+        let health = HealthState::new()
+            .with_workers(1)
+            .with_liveness_timeout(std::time::Duration::from_millis(1));
+        health.set_status(PipelineStatus::Running);
+        // No beat has happened for longer than the timeout.
+        std::thread::sleep(std::time::Duration::from_millis(5));
+
+        let mut state = (*test_state()).clone();
+        state.health = health;
+        let response = healthz(State(Arc::new(state))).await.into_response();
+
+        // 503 is what lets an orchestrator restart a pipeline that is up but
+        // no longer processing.
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn healthz_body_explains_the_stall() {
+        let health = HealthState::new()
+            .with_workers(1)
+            .with_liveness_timeout(std::time::Duration::from_millis(1));
+        health.set_status(PipelineStatus::Running);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+
+        let mut state = (*test_state()).clone();
+        state.health = health;
+        let response = healthz(State(Arc::new(state))).await.into_response();
+        let body = to_bytes(response.into_body(), 4096).await.unwrap();
+        let parsed: LivenessResponse = serde_json::from_slice(&body).unwrap();
+
+        assert!(!parsed.live);
+        assert!(parsed.detail.unwrap().contains("worker 0"));
+    }
+
+    #[tokio::test]
+    async fn healthz_stays_200_while_workers_beat() {
+        let health = HealthState::new().with_workers(2);
+        health.set_status(PipelineStatus::Running);
+        health.heartbeats().beat(0);
+        health.heartbeats().beat(1);
+
+        let mut state = (*test_state()).clone();
+        state.health = health;
+        let response = healthz(State(Arc::new(state))).await.into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    // ── Access control ───────────────────────────────────────────────────
+
+    #[test]
+    fn access_defaults_are_closed() {
+        let access = AccessConfig::default();
+        assert!(access.token.is_none());
+        // The state explorer serves application data, so it must not be on by
+        // default.
+        assert!(!access.state_explorer);
+        assert!(access.allowed_origins.is_empty());
+    }
+
+    #[test]
+    fn constant_time_eq_matches_string_equality() {
+        assert!(constant_time_eq("secret", "secret"));
+        assert!(!constant_time_eq("secret", "secrez"));
+        assert!(!constant_time_eq("secret", "secre"));
+        assert!(!constant_time_eq("", "x"));
+        assert!(constant_time_eq("", ""));
+    }
+
+    /// Build a router the way `start` does, so the tests exercise real routing.
+    fn router_with(access: &AccessConfig) -> Router {
+        let state = test_state();
+        let probes = Router::new()
+            .route("/healthz", get(healthz))
+            .with_state(state.clone());
+        let mut api = Router::new().route("/api/info", get(api_info));
+        if access.state_explorer {
+            api = api.route("/api/state/operators", get(api_state_operators));
+        }
+        let api = api.with_state(state);
+        let api = match access.token.clone() {
+            Some(token) => api.layer(axum::middleware::from_fn(move |req, next| {
+                let token = token.clone();
+                async move { require_bearer_token(&token, req, next).await }
+            })),
+            None => api,
+        };
+        probes.merge(api)
+    }
+
+    async fn get_status(router: Router, uri: &str, auth: Option<&str>) -> StatusCode {
+        use tower::ServiceExt;
+        let mut builder = axum::http::Request::builder().uri(uri);
+        if let Some(token) = auth {
+            builder = builder.header("authorization", format!("Bearer {token}"));
+        }
+        let request = builder.body(axum::body::Body::empty()).unwrap();
+        router.oneshot(request).await.unwrap().status()
+    }
+
+    #[tokio::test]
+    async fn api_requires_a_token_when_one_is_configured() {
+        let access = AccessConfig {
+            token: Some("s3cret".to_string()),
+            ..AccessConfig::default()
+        };
+        assert_eq!(
+            get_status(router_with(&access), "/api/info", None).await,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            get_status(router_with(&access), "/api/info", Some("wrong")).await,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            get_status(router_with(&access), "/api/info", Some("s3cret")).await,
+            StatusCode::OK
+        );
+    }
+
+    #[tokio::test]
+    async fn probes_stay_reachable_without_a_token() {
+        // kubelet does not send an Authorization header, so gating probes
+        // behind the token would make every authenticated deployment unhealthy.
+        let access = AccessConfig {
+            token: Some("s3cret".to_string()),
+            ..AccessConfig::default()
+        };
+        assert_eq!(
+            get_status(router_with(&access), "/healthz", None).await,
+            StatusCode::OK
+        );
+    }
+
+    #[tokio::test]
+    async fn state_explorer_is_absent_unless_enabled() {
+        // A checkpoint dir with a real manifest, so an enabled explorer has
+        // something to return and the two cases are distinguishable.
+        let dir = tempfile::tempdir().unwrap();
+        CheckpointManifest {
+            version: 1,
+            checkpoint_id: 1,
+            timestamp_ms: 1,
+            operators: vec!["counter".to_string()],
+            source_offsets: std::collections::HashMap::new(),
+            n_processes: None,
+            workers_per_process: None,
+            max_parallelism: Some(128),
+            total_workers: None,
+            cluster_members: Vec::new(),
+        }
+        .save(dir.path())
+        .unwrap();
+
+        let mut base = (*test_state()).clone();
+        base.checkpoint_dir = Some(dir.path().to_path_buf());
+        let base = Arc::new(base);
+
+        let build = |access: &AccessConfig| {
+            let mut api = Router::new();
+            if access.state_explorer {
+                api = api.route("/api/state/operators", get(api_state_operators));
+            }
+            api.with_state(base.clone())
+        };
+
+        // Disabled: the route does not exist at all, so no token handling or
+        // handler bug can expose application state.
+        assert_eq!(
+            get_status(
+                build(&AccessConfig::default()),
+                "/api/state/operators",
+                None
+            )
+            .await,
+            StatusCode::NOT_FOUND
+        );
+
+        let open = AccessConfig {
+            state_explorer: true,
+            ..AccessConfig::default()
+        };
+        assert_eq!(
+            get_status(build(&open), "/api/state/operators", None).await,
+            StatusCode::OK
+        );
+    }
+
+    #[test]
+    fn empty_origin_list_denies_cross_origin_access() {
+        // Smoke test that the closed default builds; the permissive layer it
+        // replaced allowed any website to read this API.
+        let _layer = build_cors_layer(&[]);
+        let _explicit = build_cors_layer(&["https://ops.example.com".to_string()]);
+        let _malformed = build_cors_layer(&["not a header value\n".to_string()]);
     }
 }

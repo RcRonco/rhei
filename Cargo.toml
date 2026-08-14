@@ -27,7 +27,7 @@ moka = { version = "0.12.15", features = ["sync"] }
 metrics-exporter-prometheus = "0.18.1"
 ratatui = "0.30.0"
 axum = "0.8"
-tower-http = { version = "0.6", features = ["cors"] }
+tower-http = { version = "0.6", features = ["cors", "timeout"] }
 rdkafka = { version = "0.39.0", features = ["cmake-build"] }
 reqwest = { version = "0.13.2", default-features = false, features = ["json"] }
 tempfile = "3.27.0"
