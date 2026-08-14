@@ -61,6 +61,11 @@
 - [x] JSON metrics API (`/api/metrics`) via fanout recorder
 - [x] Log buffer API (`/api/logs`) with structured log capture
 - [x] S3 (MinIO) E2E test for tiered storage with CI job
+- [x] Cluster metrics: topology, key group ownership, rescale duration, suppressed rescales, gossip membership (see `ADR/dynamic-discovery-reshuffling.md`)
+- [ ] Distributed tracing: OpenTelemetry/OTLP export and cross-process span correlation
+- [ ] Rescale and gossip spans (no spans exist outside the per-worker ones today)
+- [ ] Expose the key group assignment over `/api/topology` — "who owns key group N?" is not answerable over HTTP
+- [ ] TUI cluster panel (topology, membership, key group ownership)
 
 ## Performance
 

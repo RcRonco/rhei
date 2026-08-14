@@ -88,6 +88,38 @@ impl RemoteStateConfig {
 /// Each generation gets its own [`ShutdownHandle`] so a rescale can stop it
 /// without disturbing the caller's; this task bridges the two, and is aborted
 /// when the generation ends.
+/// Record the start of a pipeline generation, closing out the rescale that
+/// preceded it if there was one.
+///
+/// `rescale_started` is `Some` only when this generation is replacing one that
+/// a rescale drained, so the histogram measures real rescale downtime and is
+/// not diluted by the initial startup.
+fn record_generation_start(
+    node_id: &str,
+    generation: u64,
+    topology: &rhei_core::cluster::ClusterTopology,
+    rescale_started: Option<std::time::Instant>,
+) {
+    tracing::info!(
+        node_id,
+        generation,
+        topology = %topology.summary(),
+        "starting pipeline generation"
+    );
+    metrics::gauge!("rhei_cluster_generation").set(generation as f64);
+
+    if let Some(started) = rescale_started {
+        let elapsed = started.elapsed();
+        metrics::histogram!("rhei_cluster_rescale_duration_seconds").record(elapsed.as_secs_f64());
+        tracing::info!(
+            node_id,
+            generation,
+            downtime_secs = elapsed.as_secs_f64(),
+            "rescale complete; pipeline resumed"
+        );
+    }
+}
+
 fn forward_shutdown(
     outer: &ShutdownHandle,
     trigger: Arc<crate::shutdown::ShutdownTrigger>,
@@ -643,11 +675,29 @@ impl PipelineController {
                     .collect::<Vec<_>>()
             )
         })?;
+        // How much of the key space this node is responsible for. Summed across
+        // nodes this reaches max_parallelism; on its own it is the load share,
+        // and comparing it between nodes shows skew that the aggregate
+        // `rhei_cluster_workers` cannot.
+        let owned_key_groups = rhei_core::cluster::KeyGroupAssignment::new(
+            topology.max_parallelism,
+            topology.total_workers(),
+        )
+        .map(|assignment| {
+            let first = process_id * topology.workers_per_process;
+            (first..first + topology.workers_per_process)
+                .map(|w| assignment.range(w).len())
+                .sum::<usize>()
+        })
+        .unwrap_or(0);
+        metrics::gauge!("rhei_cluster_key_groups_owned").set(owned_key_groups as f64);
+
         tracing::info!(
             node_id,
             process_id,
             topology = %topology.summary(),
             fingerprint = topology.fingerprint(),
+            owned_key_groups,
             "installing cluster topology"
         );
         *self
@@ -835,6 +885,11 @@ impl PipelineController {
         let mut supervisor = RescaleSupervisor::new(provider.clone(), policy);
         let mut topology = supervisor.initial_topology().await?;
         let mut generation: u64 = 0;
+        // Set when a rescale decision is taken, consumed when the replacement
+        // generation starts. This spans the drain, the checkpoint and the
+        // rebuild — that is, the whole window in which the pipeline is not
+        // processing, which is what a rescale actually costs.
+        let mut rescale_started: Option<std::time::Instant> = None;
 
         loop {
             self.set_active_topology(topology.clone(), &node_id)?;
@@ -853,13 +908,7 @@ impl PipelineController {
                 .as_ref()
                 .map(|outer| forward_shutdown(outer, gen_trigger.clone()));
 
-            tracing::info!(
-                node_id = %node_id,
-                generation,
-                topology = %topology.summary(),
-                "starting pipeline generation"
-            );
-            metrics::gauge!("rhei_cluster_generation").set(generation as f64);
+            record_generation_start(&node_id, generation, &topology, rescale_started.take());
 
             let run = run_graph(graph, self, Some(gen_shutdown));
             tokio::pin!(run);
@@ -922,6 +971,7 @@ impl PipelineController {
                     metrics::counter!("rhei_cluster_rescales_total").increment(1);
                     metrics::counter!("rhei_cluster_key_groups_moved_total")
                         .increment(moved_key_groups as u64);
+                    rescale_started = Some(std::time::Instant::now());
 
                     // Stop the dataflow gracefully. The executor checkpoints
                     // operator state and commits source offsets on the way out,
@@ -1039,6 +1089,10 @@ impl PipelineController {
             self.max_parallelism,
             self.total_workers(),
         )?;
+        // A non-zero value means the pipeline has stopped scaling: adding nodes
+        // no longer adds keyed throughput. Emitted unconditionally so it can be
+        // alerted on, not only logged at the moment it first happens.
+        metrics::gauge!("rhei_cluster_idle_workers").set(assignment.idle_workers() as f64);
         if assignment.idle_workers() > 0 {
             tracing::warn!(
                 max_parallelism = self.max_parallelism,

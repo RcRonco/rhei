@@ -313,6 +313,68 @@ flowchart TB
     CP -->|"resolved topology<br/>determines peer list<br/>+ key group assignment"| DP
 ```
 
+## Observability
+
+Rescaling is invisible from inside a pipeline — the dataflow restarts, counters
+keep accumulating, and nothing in the data path indicates it happened. These
+metrics are what make it legible from outside.
+
+### Metrics
+
+| Metric | Type | Meaning |
+|---|---|---|
+| `rhei_cluster_generation` | gauge | Current pipeline generation; increments once per rescale |
+| `rhei_cluster_processes` | gauge | Processes in the resolved topology |
+| `rhei_cluster_workers` | gauge | Total workers across the cluster |
+| `rhei_cluster_key_groups_owned` | gauge | Key groups this node owns; compare across nodes to see skew |
+| `rhei_cluster_idle_workers` | gauge | Workers beyond `max_parallelism` that own no keyed state |
+| `rhei_cluster_topology_changes_total` | counter | Membership changes that resolved to a new topology |
+| `rhei_cluster_rescales_total` | counter | Rescales actually executed |
+| `rhei_cluster_rescales_suppressed_total` | counter | Changes that did *not* rescale, by `reason` |
+| `rhei_cluster_key_groups_moved_total` | counter | Cumulative key groups reassigned |
+| `rhei_cluster_no_quorum_total` | counter | Membership resolved to no viable cluster |
+| `rhei_cluster_rescale_duration_seconds` | histogram | Drain → checkpoint → rebuild, i.e. pipeline downtime |
+| `rhei_gossip_members` | gauge | Members usable in the topology |
+| `rhei_gossip_members_live` | gauge | Nodes chitchat considers alive |
+| `rhei_gossip_members_pending` | gauge | Live but not yet advertising `data_addr`/`workers` |
+| `rhei_gossip_members_joined_total` / `_left_total` | counter | Membership arrivals and departures |
+| `rhei_gossip_membership_changes_total` | counter | Distinct membership transitions observed |
+
+Four of these exist to answer questions the obvious ones cannot:
+
+- **`rescale_duration_seconds`** is the only measure of what a rescale costs.
+  Counting rescales says they happened; this says whether they hurt. It is also
+  the baseline any future work on assignment churn or cache warming has to beat,
+  so it needs to exist before that work starts.
+- **`rescales_suppressed_total`** rising while `rescales_total` stays flat is the
+  debounce and fingerprint check earning their keep. The reverse — suppressed
+  flat, rescales climbing — means every membership blip is restarting the
+  pipeline, which looks identical to a healthy cluster in every other metric.
+- **`gossip_members_pending`** covers a failure that is otherwise silent: a node
+  that has joined gossip but not yet advertised a usable `data_addr`/`workers`
+  pair is deliberately excluded from the topology, so it is live to gossip and
+  invisible to the pipeline. Without this gauge that is indistinguishable from a
+  node that never started.
+- **`key_groups_owned`** is per-node, so comparing it across the fleet surfaces
+  load skew. `rhei_cluster_workers` is a cluster-wide aggregate and cannot.
+
+### Log events
+
+`gossip membership changed` carries `joined` and `left` node lists rather than
+just a count, so a flapping node is identifiable from logs alone. `cluster
+topology change detected` carries the before/after summaries and
+`moved_key_groups`; `installing cluster topology` carries the fingerprint and
+this node's `owned_key_groups`; `rescale complete` carries the measured
+downtime. All are captured into the ring buffer served at `/api/logs`.
+
+### Not covered here
+
+Spans and distributed tracing are deliberately out of scope — the workspace has
+no OpenTelemetry dependency, and cross-process correlation is its own piece of
+work. `/api/topology` also still reports processes and worker counts without the
+key group assignment, so "who owns key group 37?" is not yet answerable over
+HTTP; the metrics above give the aggregate but not the mapping.
+
 ## Alternatives considered
 
 ### 1. Consistent hashing instead of key groups

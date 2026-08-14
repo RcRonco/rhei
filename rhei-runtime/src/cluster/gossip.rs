@@ -133,6 +133,9 @@ pub struct GossipMembership {
     watcher: Mutex<
         tokio::sync::watch::Receiver<std::collections::BTreeMap<ChitchatId, chitchat::NodeState>>,
     >,
+    /// Node IDs in the last view we reported on, so a membership change can be
+    /// logged as who joined and who left rather than just a new count.
+    last_members: Mutex<std::collections::BTreeSet<String>>,
 }
 
 impl std::fmt::Debug for GossipMembership {
@@ -204,7 +207,49 @@ impl GossipMembership {
             node_id: config.node_id,
             handle,
             watcher: Mutex::new(watcher),
+            last_members: Mutex::new(std::collections::BTreeSet::new()),
         }))
+    }
+
+    /// Record a freshly observed membership view.
+    ///
+    /// `live` is the number of nodes chitchat considers alive, which is not the
+    /// same as the number in `view`: [`view_from_nodes`](Self::view_from_nodes)
+    /// drops nodes that have not yet gossiped a usable `data_addr`/`workers`
+    /// pair. That gap is worth its own gauge — a node stuck there is live as far
+    /// as gossip is concerned but invisible to the topology, which otherwise
+    /// looks like a node that simply never joined.
+    async fn observe(&self, view: &ClusterView, live: usize) {
+        metrics::gauge!("rhei_gossip_members").set(view.members.len() as f64);
+        metrics::gauge!("rhei_gossip_members_live").set(live as f64);
+        metrics::gauge!("rhei_gossip_members_pending")
+            .set(live.saturating_sub(view.members.len()) as f64);
+
+        let current: std::collections::BTreeSet<String> =
+            view.members.iter().map(|m| m.node_id.clone()).collect();
+
+        let mut last = self.last_members.lock().await;
+        if *last == current {
+            return;
+        }
+
+        let joined: Vec<&str> = current.difference(&*last).map(String::as_str).collect();
+        let left: Vec<&str> = last.difference(&current).map(String::as_str).collect();
+
+        metrics::counter!("rhei_gossip_members_joined_total").increment(joined.len() as u64);
+        metrics::counter!("rhei_gossip_members_left_total").increment(left.len() as u64);
+        metrics::counter!("rhei_gossip_membership_changes_total").increment(1);
+
+        tracing::info!(
+            node_id = %self.node_id,
+            members = current.len(),
+            live,
+            ?joined,
+            ?left,
+            "gossip membership changed"
+        );
+
+        *last = current;
     }
 
     /// Build a [`ClusterView`] from a chitchat live-node map.
@@ -235,7 +280,9 @@ impl GossipMembership {
     /// Current live-node snapshot as a [`ClusterView`].
     async fn snapshot(&self) -> ClusterView {
         let nodes = self.watcher.lock().await.borrow().clone();
-        Self::view_from_nodes(&nodes)
+        let view = Self::view_from_nodes(&nodes);
+        self.observe(&view, nodes.len()).await;
+        view
     }
 }
 
@@ -251,7 +298,12 @@ impl MembershipProvider for GossipMembership {
         // shut down — report end-of-stream rather than spinning.
         watcher.changed().await.ok()?;
         let nodes = watcher.borrow_and_update().clone();
-        Some(Self::view_from_nodes(&nodes))
+        // Drop the watcher lock before `observe` takes the `last_members` lock,
+        // so the two are never held together in any order.
+        drop(watcher);
+        let view = Self::view_from_nodes(&nodes);
+        self.observe(&view, nodes.len()).await;
+        Some(view)
     }
 
     fn node_id(&self) -> &str {

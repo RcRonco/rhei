@@ -209,7 +209,13 @@ impl RescaleSupervisor {
 
         let topology = match view.resolve(self.policy.max_parallelism) {
             Ok(t) => t,
-            Err(e) => return RescaleDecision::NoQuorum(e.to_string()),
+            Err(e) => {
+                // Distinct from a rescale: the cluster went unusable rather than
+                // changing shape. Far more often a partition than a real
+                // shutdown, and worth alerting on separately.
+                metrics::counter!("rhei_cluster_no_quorum_total").increment(1);
+                return RescaleDecision::NoQuorum(e.to_string());
+            }
         };
 
         // A change that resolves to the same execution shape (e.g. a node
@@ -222,6 +228,12 @@ impl RescaleSupervisor {
                 node_id = %self.provider.node_id(),
                 "membership changed but topology fingerprint is unchanged; no rescale"
             );
+            // Churn that cost nothing. A rising count against a flat
+            // `rhei_cluster_rescales_total` is the debounce and fingerprint
+            // check doing their job; if this is flat while rescales climb,
+            // every membership event is restarting the pipeline.
+            metrics::counter!("rhei_cluster_rescales_suppressed_total", "reason" => "unchanged_topology")
+                .increment(1);
             return RescaleDecision::NoChange;
         }
 
@@ -241,8 +253,13 @@ impl RescaleSupervisor {
 
         if !self.policy.automatic {
             tracing::warn!(
+                node_id = %self.provider.node_id(),
+                to = %topology.summary(),
+                moved_key_groups,
                 "automatic rescaling is disabled; pipeline continues on the previous topology"
             );
+            metrics::counter!("rhei_cluster_rescales_suppressed_total", "reason" => "auto_rescale_disabled")
+                .increment(1);
             return RescaleDecision::NoChange;
         }
 
