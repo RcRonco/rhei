@@ -10,6 +10,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use rhei_core::cluster::KeyGroupAssignment;
 use timely::communication::Allocate;
 use timely::dataflow::operators::probe;
 use timely::dataflow::scopes::Child;
@@ -50,13 +51,18 @@ pub(crate) enum Sentinel {
 
 // ── Key partitioning ────────────────────────────────────────────────
 
-/// Deterministic key-to-worker assignment using `seahash`.
+/// Deterministic key-to-worker assignment.
 ///
-/// Uses a fixed, portable hash so the same key always maps to the same
-/// worker index — even across Rust compiler versions and restarts.
-#[allow(clippy::cast_possible_truncation)]
-pub fn partition_key(key: &str, n_workers: usize) -> usize {
-    (seahash::hash(key.as_bytes()) as usize) % n_workers
+/// Routing goes through key groups so that it stays consistent with how state
+/// is addressed on disk: the worker chosen here is by construction the worker
+/// that owns the key's state under `assignment`.
+///
+/// This replaces the earlier `hash(key) % n_workers` rule, which could not
+/// survive a change in worker count — every key moved, and none of the
+/// persisted state moved with it. See [`rhei_core::cluster::key_group`].
+#[must_use]
+pub fn partition_key(key: &str, assignment: &KeyGroupAssignment) -> usize {
+    assignment.worker_for_key(key.as_bytes())
 }
 
 // ── Node kind classification ────────────────────────────────────────
@@ -102,6 +108,11 @@ pub(crate) struct DataflowExecutor {
     rt: tokio::runtime::Handle,
     worker_index: usize,
     num_workers: usize,
+    /// Key-group → worker assignment for this topology generation.
+    ///
+    /// Shared by every worker in the process and identical on every process,
+    /// so routing decisions agree cluster-wide.
+    key_groups: Arc<KeyGroupAssignment>,
     checkpoint_notify: Option<flume::Sender<u64>>,
     dlq_tx: Option<DlqSender>,
     last_operator_id: Option<NodeId>,
@@ -124,6 +135,7 @@ impl DataflowExecutor {
         rt: tokio::runtime::Handle,
         worker_index: usize,
         num_workers: usize,
+        key_groups: Arc<KeyGroupAssignment>,
         checkpoint_notify: Option<flume::Sender<u64>>,
         dlq_tx: Option<DlqSender>,
         last_operator_id: Option<NodeId>,
@@ -134,6 +146,10 @@ impl DataflowExecutor {
     ) -> Self {
         let sink_senders: HashMap<NodeId, flume::Sender<crate::erased_buffer::ErasedBuffer>> =
             data.sink_senders.clone();
+        debug_assert_eq!(
+            key_groups.parallelism, num_workers,
+            "key group assignment must cover exactly the cluster's worker count"
+        );
         Self {
             sink_senders: Arc::new(sink_senders),
             topo_order,
@@ -142,6 +158,7 @@ impl DataflowExecutor {
             rt,
             worker_index,
             num_workers,
+            key_groups,
             checkpoint_notify,
             dlq_tx,
             last_operator_id,
@@ -437,7 +454,7 @@ impl DataflowExecutor {
         let key_fn = key_fns
             .remove(&node_id)
             .expect("missing batch key_fn for node");
-        let num_workers = self.num_workers;
+        let key_groups = self.key_groups.clone();
 
         // Stage 1: Pipeline pact — split each buffer into per-worker sub-buffers.
         let partitioned = input_stream.unary::<CapacityContainerBuilder<
@@ -451,7 +468,7 @@ impl DataflowExecutor {
                     input.for_each(|cap, data| {
                         let mut session = output.session(&cap);
                         for buf in data.drain(..) {
-                            for sub_buf in buf.partition_for_exchange(&key_fn, num_workers) {
+                            for sub_buf in buf.partition_for_exchange(&key_fn, &key_groups) {
                                 session.give(sub_buf);
                             }
                         }
@@ -750,21 +767,40 @@ fn frontier_min_or_max(frontier: timely::progress::frontier::AntichainRef<'_, u6
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, deprecated)]
 mod tests {
+    use rhei_core::cluster::{DEFAULT_MAX_PARALLELISM, KeyGroupAssignment};
+
     #[test]
     fn partition_key_deterministic() {
         // Verify partition_key is deterministic: same key always maps to the same worker.
         for n_workers in [1, 2, 4, 8, 16] {
+            let assignment = KeyGroupAssignment::new(DEFAULT_MAX_PARALLELISM, n_workers).unwrap();
             for key in ["alpha", "beta", "gamma", "hello", "world", "sensor-42"] {
-                let first = super::partition_key(key, n_workers);
+                let first = super::partition_key(key, &assignment);
                 for _ in 0..100 {
                     assert_eq!(
-                        super::partition_key(key, n_workers),
+                        super::partition_key(key, &assignment),
                         first,
                         "partition_key({key:?}, {n_workers}) is not deterministic"
                     );
                 }
                 assert!(first < n_workers);
             }
+        }
+    }
+
+    #[test]
+    fn partition_key_agrees_with_state_ownership() {
+        // Routing and state addressing must pick the same worker for a key —
+        // that equivalence is the entire reason routing goes through key groups.
+        let assignment = KeyGroupAssignment::new(DEFAULT_MAX_PARALLELISM, 6).unwrap();
+        for i in 0..500 {
+            let key = format!("user-{i}");
+            let worker = super::partition_key(&key, &assignment);
+            let kg = rhei_core::cluster::key_group_for(key.as_bytes(), DEFAULT_MAX_PARALLELISM);
+            assert!(
+                assignment.range(worker).contains(kg),
+                "key {key} routed to worker {worker}, which does not own its key group {kg}"
+            );
         }
     }
 

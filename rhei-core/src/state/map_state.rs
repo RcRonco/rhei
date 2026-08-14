@@ -10,6 +10,7 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 
 use super::context::StateContext;
+use super::key_group_addressing::partition_bytes;
 
 /// A typed map state accessor with per-key storage.
 ///
@@ -82,19 +83,22 @@ where
     /// Retrieves the value for the given key, or `None` if absent.
     pub async fn get(&mut self, key: &K) -> anyhow::Result<Option<V>> {
         let sk = self.state_key(key)?;
-        self.ctx.get(&sk).await
+        let partition = partition_bytes(key)?;
+        self.ctx.get_keyed(&partition, &sk).await
     }
 
     /// Stores a key-value pair.
     pub fn put(&mut self, key: &K, value: &V) -> anyhow::Result<()> {
         let sk = self.state_key(key)?;
-        self.ctx.put(&sk, value)
+        let partition = partition_bytes(key)?;
+        self.ctx.put_keyed(&partition, &sk, value)
     }
 
     /// Removes the given key.
     pub fn remove(&mut self, key: &K) -> anyhow::Result<()> {
         let sk = self.state_key(key)?;
-        self.ctx.delete(&sk);
+        let partition = partition_bytes(key)?;
+        self.ctx.delete_keyed(&partition, &sk);
         Ok(())
     }
 }

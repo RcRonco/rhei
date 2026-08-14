@@ -15,6 +15,7 @@ use arrow_array::{BooleanArray, RecordBatch};
 use arrow_schema::Schema;
 
 use rhei_core::arrow::{RheiBuffer, RheiSchema};
+use rhei_core::cluster::KeyGroupAssignment;
 
 /// Type-erased key extraction function: given a `RecordBatch` and row index,
 /// returns the key string for that row. Used by `key_by` exchange.
@@ -164,17 +165,24 @@ impl ErasedBuffer {
         })
     }
 
-    /// Partition this buffer into per-worker sub-buffers based on key hashes.
+    /// Partition this buffer into per-worker sub-buffers by key group.
     ///
-    /// For each row, extracts the key via `key_fn`, hashes it with seahash,
-    /// and assigns it to `hash % num_workers`. Returns one `ErasedBuffer` per
-    /// non-empty partition, tagged with `exchange_target`.
+    /// For each row, extracts the key via `key_fn`, maps it to its key group,
+    /// and routes that group to its owning worker under `assignment`. Returns
+    /// one `ErasedBuffer` per non-empty partition, tagged with
+    /// `exchange_target`.
+    ///
+    /// Routing goes through key groups rather than `hash(key) % num_workers`
+    /// so that it stays consistent with how state is addressed on disk — the
+    /// worker this sends a row to is by construction the worker that owns that
+    /// key's state. See [`rhei_core::cluster::key_group`].
     #[allow(clippy::cast_possible_truncation)]
     pub(crate) fn partition_for_exchange(
         &self,
         key_fn: &KeyFn,
-        num_workers: usize,
+        assignment: &KeyGroupAssignment,
     ) -> Vec<ErasedBuffer> {
+        let num_workers = assignment.parallelism;
         if num_workers <= 1 {
             return vec![self.clone()];
         }
@@ -193,7 +201,7 @@ impl ErasedBuffer {
                 continue;
             }
             let key = key_fn(&self.batch, row_idx);
-            let target = (seahash::hash(key.as_bytes()) as usize) % num_workers;
+            let target = assignment.worker_for_key(key.as_bytes());
             worker_rows[target].push(row_idx);
         }
 
@@ -367,6 +375,16 @@ mod tests {
     use arrow_array::builder::ArrayBuilder;
 
     use super::*;
+
+    /// Key-group assignment over `n_workers`, using the default max parallelism.
+    ///
+    /// Tests assert against the same assignment the engine routes with, rather
+    /// than re-deriving the routing rule — a duplicate rule here would silently
+    /// stop testing the real one.
+    fn assignment(n_workers: usize) -> KeyGroupAssignment {
+        KeyGroupAssignment::new(rhei_core::cluster::DEFAULT_MAX_PARALLELISM, n_workers).unwrap()
+    }
+
     use rhei_core::arrow::{RheiBuilder, RheiSchema};
 
     struct TestRow {
@@ -633,7 +651,7 @@ mod tests {
                 .to_string()
         });
 
-        let partitions = erased.partition_for_exchange(&key_fn, 3);
+        let partitions = erased.partition_for_exchange(&key_fn, &assignment(3));
         let total_rows: usize = partitions.iter().map(ErasedBuffer::num_rows).sum();
         assert_eq!(total_rows, 6, "no rows should be lost during partitioning");
     }
@@ -659,8 +677,8 @@ mod tests {
                 .to_string()
         });
 
-        let p1 = erased.partition_for_exchange(&key_fn, 4);
-        let p2 = erased.partition_for_exchange(&key_fn, 4);
+        let p1 = erased.partition_for_exchange(&key_fn, &assignment(4));
+        let p2 = erased.partition_for_exchange(&key_fn, &assignment(4));
         assert_eq!(
             p1.len(),
             p2.len(),
@@ -695,13 +713,13 @@ mod tests {
                 .to_string()
         });
 
-        let partitions = erased.partition_for_exchange(&key_fn, 4);
+        let partitions = erased.partition_for_exchange(&key_fn, &assignment(4));
         for part in &partitions {
             let target = part.exchange_target().unwrap() as usize;
             // Verify every row in this partition hashes to the same target.
             for row in 0..part.num_rows() {
                 let key = key_fn(part.as_record_batch(), row);
-                let expected = partition_key(&key, 4);
+                let expected = partition_key(&key, &assignment(4));
                 assert_eq!(target, expected, "key '{key}' routed to wrong worker");
             }
         }
@@ -723,7 +741,7 @@ mod tests {
 
         let key_fn: KeyFn = Arc::new(|_batch: &RecordBatch, _row_idx: usize| "any".to_string());
 
-        let partitions = erased.partition_for_exchange(&key_fn, 1);
+        let partitions = erased.partition_for_exchange(&key_fn, &assignment(1));
         assert_eq!(partitions.len(), 1);
         assert_eq!(partitions[0].num_rows(), 2);
     }
@@ -751,7 +769,7 @@ mod tests {
                 .to_string()
         });
 
-        let partitions = erased.partition_for_exchange(&key_fn, 4);
+        let partitions = erased.partition_for_exchange(&key_fn, &assignment(4));
         let total_rows: usize = partitions.iter().map(ErasedBuffer::num_rows).sum();
         // Only 2 rows should be routed (masked rows excluded).
         assert_eq!(total_rows, 2);
@@ -766,6 +784,16 @@ mod tests {
 )]
 mod prop_tests {
     use super::*;
+
+    /// Key-group assignment over `n_workers`, using the default max parallelism.
+    ///
+    /// Tests assert against the same assignment the engine routes with, rather
+    /// than re-deriving the routing rule — a duplicate rule here would silently
+    /// stop testing the real one.
+    fn assignment(n_workers: usize) -> KeyGroupAssignment {
+        KeyGroupAssignment::new(rhei_core::cluster::DEFAULT_MAX_PARALLELISM, n_workers).unwrap()
+    }
+
     use crate::executor::partition_key;
     use arrow_array::Int64Array;
     use arrow_array::cast::AsArray;
@@ -807,9 +835,10 @@ mod prop_tests {
             key in ".{0,32}",
             n_workers in 1usize..16,
         ) {
-            let p = partition_key(&key, n_workers);
+            let assignment = assignment(n_workers);
+            let p = partition_key(&key, &assignment);
             prop_assert!(p < n_workers);
-            prop_assert_eq!(p, partition_key(&key, n_workers));
+            prop_assert_eq!(p, partition_key(&key, &assignment));
         }
 
         /// Exchange partitioning routes every logical row to exactly one worker:
@@ -820,7 +849,8 @@ mod prop_tests {
             n_workers in 1usize..8,
         ) {
             let buf = make_erased(&values);
-            let parts = buf.partition_for_exchange(&value_key_fn(), n_workers);
+            let assignment = assignment(n_workers);
+            let parts = buf.partition_for_exchange(&value_key_fn(), &assignment);
 
             let mut seen: Vec<i64> = parts.iter().flat_map(erased_values).collect();
             let mut expected = values.clone();
@@ -837,13 +867,14 @@ mod prop_tests {
             n_workers in 2usize..8,
         ) {
             let buf = make_erased(&values);
-            let parts = buf.partition_for_exchange(&value_key_fn(), n_workers);
+            let assignment = assignment(n_workers);
+            let parts = buf.partition_for_exchange(&value_key_fn(), &assignment);
 
             for part in &parts {
                 let target = part.exchange_target.unwrap() as usize;
                 prop_assert!(target < n_workers);
                 for v in erased_values(part) {
-                    prop_assert_eq!(partition_key(&v.to_string(), n_workers), target);
+                    prop_assert_eq!(partition_key(&v.to_string(), &assignment), target);
                 }
             }
         }

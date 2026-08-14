@@ -53,6 +53,10 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Run tests
         run: cargo nextest run --workspace --profile ci
+      # Gossip discovery is behind an optional feature (pure Rust + UDP, no
+      # system deps), so it needs an explicit run to be covered at all.
+      - name: Run tests (gossip discovery)
+        run: cargo nextest run -p rhei-runtime --features chitchat --profile ci -E 'test(cluster::)'
       - name: Upload test results
         if: always()
         uses: actions/upload-artifact@v4
@@ -96,6 +100,8 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Run clippy
         run: cargo clippy --workspace --all-targets --no-deps -- -D warnings
+      - name: Run clippy (gossip discovery)
+        run: cargo clippy -p rhei-runtime --all-targets --no-deps --features chitchat -- -D warnings
 
   deny:
     name: Cargo Deny

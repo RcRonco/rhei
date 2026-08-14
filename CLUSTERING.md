@@ -6,12 +6,12 @@ For the full system topology vision, see [ARCHITECTURE.md](ARCHITECTURE.md). For
 
 **Phases at a glance:**
 
-| Phase | Scope | Timely Config | Scaling unit |
-|-------|-------|---------------|--------------|
-| Current | Single thread | `execute_directly()` | 1 worker |
-| 1 | Multi-thread | `Config::process(n)` | N worker threads |
-| 2 | Multi-process | `Config::Cluster { .. }` | N OS processes |
-| 3 | Full control plane | OpenRaft + chitchat | Dynamic worker pool |
+| Phase | Scope | Timely Config | Scaling unit | Status |
+|-------|-------|---------------|--------------|--------|
+| 1 | Multi-thread | `Config::process(n)` | N worker threads | done |
+| 2 | Multi-process | `Config::Cluster { .. }` | N OS processes | done |
+| 3 | Dynamic discovery + rescaling | `Config::Cluster` from gossip | Dynamic worker pool | done |
+| 4 | Job Manager / OpenRaft | — | Managed jobs | planned |
 
 ---
 
@@ -254,14 +254,23 @@ The Job Manager watches chitchat membership events to detect worker failures and
 
 ### Dynamic Scaling
 
-When a new worker joins or an existing worker is removed:
+**Implemented** — see
+[ADR/dynamic-discovery-reshuffling.md](ADR/dynamic-discovery-reshuffling.md).
 
-1. The Job Manager triggers a checkpoint on the running computation.
-2. After the checkpoint commits, the Job Manager computes the new key range assignments.
-3. Workers are notified of their new assignments and restart the computation from the checkpoint.
-4. Each worker pulls state for its assigned key range from L3 (S3).
+When a node joins or leaves, gossip membership changes and
+`RescaleSupervisor` debounces the churn into a single decision. Then:
 
-Because state is disaggregated (L3 is on S3, not local disk), there is no state migration between workers. A worker that receives a new key range simply reads the relevant keys from S3 into its L1/L2 caches on first access. This turns scaling into a cache-warming problem, not a data-transfer problem.
+1. The current generation is checkpointed and drained.
+2. The new membership resolves to a `ClusterTopology` (deterministic: sorted by
+   node ID, so every node computes the same one).
+3. Key group ranges are recomputed for the new worker count.
+4. A fresh dataflow starts from the checkpoint on the new topology.
+5. Workers that gained key groups read them from L3 on first access.
+
+Because state is disaggregated and addressed by key group, there is **no state
+migration**. A worker that receives a new key range simply reads those keys from
+S3 into its L1/L2 caches. Scaling is a cache-warming problem, not a
+data-transfer problem.
 
 ### Leader Election
 
@@ -296,23 +305,44 @@ These decisions apply across all phases.
 
 ### Exchange Pact Key Function
 
-The exchange key function determines which worker processes each element:
+Routing goes through **key groups**, not directly through the worker count:
 
 ```rust
-|element| hash(element.key()) % num_workers
+key_group = seahash(element.key()) % max_parallelism   // fixed for the pipeline's life
+worker    = key_group * parallelism / max_parallelism  // recomputed on rescale
 ```
 
-The hash must be deterministic and consistent across restarts (use a fixed-seed hash like `xxhash` or `seahash`, not `RandomState`). The key function should be derived from the operator's existing `key_fn` parameter, ensuring that the partitioning aligns with the operator's state access pattern.
+The earlier rule — `hash(key) % num_workers` — could not survive a change in
+worker count: every key moved, and none of the persisted state moved with it.
+Because key groups are a fixed space, a key's group never changes; only whole
+groups are reassigned between workers.
+
+The hash must be deterministic and consistent across restarts (`seahash`, not
+`RandomState`). The key function is derived from the operator's existing
+`key_fn`, so partitioning aligns with the operator's state access pattern.
+
+See [ADR/dynamic-discovery-reshuffling.md](ADR/dynamic-discovery-reshuffling.md)
+for the assignment math and why the two directions of the mapping must be exact
+inverses.
 
 ### State Prefix Scheme
 
 ```
-"p{process_id}/w{worker_index}/{operator_name}/{user_key}"
+"kg{key_group:05}/{operator_name}/{user_key}"
 ```
 
-- `process_id` is omitted in Phase 1 (single process).
-- `worker_index` is omitted in the current state (single worker).
-- This scheme guarantees no key collisions across processes and workers, even if they share the same L3 backend on S3.
+State is addressed by **key group**, not by worker coordinate. The group is
+derived from the user key at access time, so the physical key is identical
+regardless of which worker or process performs the access — which is what lets
+ownership move on a rescale without moving any bytes.
+
+The superseded scheme was
+`"p{process_id}/w{worker_index}/{operator_name}/{user_key}"`. It guaranteed no
+collisions, but it made durable state a function of the cluster layout: change
+the worker count and every key landed under a prefix nobody would look up again.
+
+The zero-padded group keeps lexicographic order aligned with numeric order, so
+a worker's owned range is a contiguous scan in ordered stores like SlateDB.
 
 ### Checkpoint Protocol
 

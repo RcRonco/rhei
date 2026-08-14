@@ -15,6 +15,8 @@
 pub mod arrow;
 /// Checkpoint manifest for recording pipeline checkpoint metadata.
 pub mod checkpoint;
+/// Cluster topology: key groups, membership, and dynamic rescaling.
+pub mod cluster;
 /// TOML-based pipeline configuration with environment variable overrides.
 pub mod config;
 /// Built-in source and sink connectors.

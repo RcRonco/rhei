@@ -20,6 +20,7 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 
 use crate::state::context::StateContext;
+use crate::state::key_group_addressing::partition_bytes;
 
 // ── Encoder trait ───────────────────────────────────────────────────
 
@@ -178,10 +179,20 @@ where
         }
     }
 
+    /// The storage key for `key`: `"{prefix}:{encoded_key}"`.
+    fn state_key(&self, key: &K) -> anyhow::Result<String> {
+        Ok(format!("{}:{}", self.prefix, self.encoder.encode_key(key)?))
+    }
+
     /// Retrieves the value for the given key, or `None` if absent.
     pub async fn get(&mut self, key: &K) -> anyhow::Result<Option<V>> {
-        let encoded_key = format!("{}:{}", self.prefix, self.encoder.encode_key(key)?);
-        match self.ctx.get_raw(encoded_key.as_bytes()).await? {
+        let state_key = self.state_key(key)?;
+        let partition = partition_bytes(key)?;
+        match self
+            .ctx
+            .get_raw_keyed(&partition, state_key.as_bytes())
+            .await?
+        {
             Some(bytes) => Ok(Some(self.encoder.decode_value(&bytes)?)),
             None => Ok(None),
         }
@@ -189,16 +200,19 @@ where
 
     /// Stores a key-value pair.
     pub fn put(&mut self, key: &K, value: &V) -> anyhow::Result<()> {
-        let encoded_key = format!("{}:{}", self.prefix, self.encoder.encode_key(key)?);
+        let state_key = self.state_key(key)?;
+        let partition = partition_bytes(key)?;
         let encoded_value = self.encoder.encode_value(value)?;
-        self.ctx.put_raw(encoded_key.as_bytes(), &encoded_value);
+        self.ctx
+            .put_raw_keyed(&partition, state_key.as_bytes(), &encoded_value);
         Ok(())
     }
 
     /// Deletes the given key.
     pub fn delete(&mut self, key: &K) -> anyhow::Result<()> {
-        let encoded_key = format!("{}:{}", self.prefix, self.encoder.encode_key(key)?);
-        self.ctx.delete(encoded_key.as_bytes());
+        let state_key = self.state_key(key)?;
+        let partition = partition_bytes(key)?;
+        self.ctx.delete_keyed(&partition, state_key.as_bytes());
         Ok(())
     }
 }

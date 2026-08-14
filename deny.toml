@@ -6,6 +6,18 @@ ignore = [
     # Transitive dependencies we can't control (no safe upgrade available)
     { id = "RUSTSEC-2025-0141", reason = "bincode 1.3.3 is a transitive dep from foyer/timely, considered complete by maintainers" },
     { id = "RUSTSEC-2024-0436", reason = "paste is a transitive dep from foyer/timely" },
+    # Both quick-xml advisories below are the same situation: a DoS on
+    # *untrusted* XML (0194 quadratic CPU, 0195 unbounded allocation), both
+    # fixed in quick-xml >=0.41. quick-xml reaches us only through
+    # object_store's S3 response parsing, and there is no upgrade path:
+    # object_store 0.12.5 requires quick-xml ^0.38, and we cannot move past
+    # object_store 0.12 while slatedb 0.11.2 links against it — the ObjectStore
+    # trait objects handed to SlateDbBackend::open would no longer typecheck.
+    # The XML we parse comes from the operator's own configured S3 endpoint,
+    # already trusted infrastructure in any deployment. Revisit together when
+    # slatedb bumps object_store.
+    { id = "RUSTSEC-2026-0194", reason = "quick-xml <0.41 via object_store/slatedb; no upgrade path, input is the trusted S3 endpoint" },
+    { id = "RUSTSEC-2026-0195", reason = "quick-xml <0.41 via object_store/slatedb; no upgrade path, input is the trusted S3 endpoint" },
 ]
 
 [licenses]

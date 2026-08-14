@@ -246,6 +246,9 @@ fn manifest_strategy() -> impl Strategy<Value = CheckpointManifest> {
                     source_offsets,
                     n_processes,
                     workers_per_process: wpp,
+                    max_parallelism: None,
+                    total_workers: None,
+                    cluster_members: Vec::new(),
                 }
             },
         )
@@ -325,6 +328,9 @@ fn merge_partials_incomplete_is_none(#[case] present: usize, #[case] expected: u
         source_offsets: HashMap::new(),
         n_processes: None,
         workers_per_process: None,
+        max_parallelism: None,
+        total_workers: None,
+        cluster_members: Vec::new(),
     };
     for pid in 0..present {
         manifest.save_partial(dir.path(), pid).unwrap();
