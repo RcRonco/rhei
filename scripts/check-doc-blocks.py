@@ -27,7 +27,23 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
 
 # Docs whose Rust blocks must be compiled as doctests.
-VERIFIED_DOCS = ["README.md", "API.md", "docs/getting-started.md"]
+VERIFIED_DOCS = [
+    "README.md",
+    "API.md",
+    "docs/getting-started.md",
+    "docs/walkthrough.md",
+    "docs/concepts.md",
+    "docs/operators.md",
+    "docs/time-and-watermarks.md",
+    "docs/exchange-and-partitioning.md",
+    "docs/state-and-checkpointing.md",
+    "docs/deployment.md",
+    "docs/internals.md",
+]
+
+# Every Markdown file under docs/ (plus the root docs) should either be wired
+# into the doctest harness or be listed here as deliberately prose-only.
+PROSE_ONLY_DOCS = ["docs/README.md"]
 
 LIB_RS = Path("rhei/src/lib.rs")
 QUICKSTART_EXAMPLE = Path("rhei/examples/quickstart.rs")
@@ -58,6 +74,31 @@ def check_docs_are_wired_in() -> None:
                 f"{LIB_RS}: missing `{needle}`. {doc} is listed in VERIFIED_DOCS "
                 f"but its Rust blocks are not compiled as doctests."
             )
+
+
+def check_no_unwired_docs() -> None:
+    """Check 4: a new docs/ page cannot quietly escape verification.
+
+    Anything under docs/ must be in VERIFIED_DOCS (compiled) or explicitly
+    declared prose-only. Without this, adding docs/foo.md with broken examples
+    would pass CI simply because nobody wired it in.
+    """
+    known = set(VERIFIED_DOCS) | set(PROSE_ONLY_DOCS)
+    for path in sorted((REPO / "docs").glob("*.md")):
+        rel = f"docs/{path.name}"
+        if rel in known:
+            continue
+        has_rust = any(True for _ in iter_rust_blocks(path.read_text(encoding="utf-8")))
+        fail(
+            f"{rel}: not listed in VERIFIED_DOCS or PROSE_ONLY_DOCS in "
+            f"{Path(__file__).name}"
+            + (
+                ". It contains Rust blocks, so add it to VERIFIED_DOCS and "
+                "include it from rhei/src/lib.rs."
+                if has_rust
+                else ". Add it to PROSE_ONLY_DOCS if it is intentionally prose-only."
+            )
+        )
 
 
 def iter_rust_blocks(text: str):
@@ -148,6 +189,7 @@ def check_readme_quickstart_matches_example() -> None:
 
 def main() -> int:
     check_docs_are_wired_in()
+    check_no_unwired_docs()
     check_ignored_blocks_are_justified()
     check_readme_quickstart_matches_example()
 

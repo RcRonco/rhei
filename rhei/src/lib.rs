@@ -22,6 +22,38 @@ pub struct ApiDocs;
 #[doc = include_str!("../../docs/getting-started.md")]
 pub struct GettingStartedDocs;
 
+#[cfg(doctest)]
+#[doc = include_str!("../../docs/walkthrough.md")]
+pub struct WalkthroughDocs;
+
+#[cfg(doctest)]
+#[doc = include_str!("../../docs/concepts.md")]
+pub struct ConceptsDocs;
+
+#[cfg(doctest)]
+#[doc = include_str!("../../docs/operators.md")]
+pub struct OperatorsDocs;
+
+#[cfg(doctest)]
+#[doc = include_str!("../../docs/time-and-watermarks.md")]
+pub struct TimeDocs;
+
+#[cfg(doctest)]
+#[doc = include_str!("../../docs/exchange-and-partitioning.md")]
+pub struct ExchangeDocs;
+
+#[cfg(doctest)]
+#[doc = include_str!("../../docs/state-and-checkpointing.md")]
+pub struct StateDocs;
+
+#[cfg(doctest)]
+#[doc = include_str!("../../docs/deployment.md")]
+pub struct DeploymentDocs;
+
+#[cfg(doctest)]
+#[doc = include_str!("../../docs/internals.md")]
+pub struct InternalsDocs;
+
 // Arrow primitives and batch traits
 pub use rhei_core::arrow::{
     BufferOutput, OperatorContext, OperatorMetrics, RheiBuffer, RheiBuilder, RheiIter,

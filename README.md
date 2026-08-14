@@ -345,9 +345,19 @@ Or `just ci` to run the whole sequence. Kafka integration requires the `kafka` f
 
 ## Documentation
 
+Start at **[docs/README.md](docs/README.md)** for the full map.
+
 | Document | Contents |
 |----------|----------|
-| [docs/getting-started.md](docs/getting-started.md) | Tutorial: first pipeline, state, windows, testing |
+| [docs/getting-started.md](docs/getting-started.md) | Install, first pipeline, core API, troubleshooting |
+| [docs/concepts.md](docs/concepts.md) | Terminology and mental model, with source references |
+| [docs/walkthrough.md](docs/walkthrough.md) | One pipeline built step by step: schemas → state → windows → tests → deploy |
+| [docs/operators.md](docs/operators.md) | Every operator, exact constructor, compiled example |
+| [docs/time-and-watermarks.md](docs/time-and-watermarks.md) | Event time, watermarks, frontiers, when windows fire, lateness |
+| [docs/exchange-and-partitioning.md](docs/exchange-and-partitioning.md) | `key_by`, key groups, `max_parallelism`, rescaling, skew |
+| [docs/state-and-checkpointing.md](docs/state-and-checkpointing.md) | State tiers, key layout, checkpoint protocol, recovery, tuning |
+| [docs/deployment.md](docs/deployment.md) | Config, scaling modes, metrics, runbook, operational limits |
+| [docs/internals.md](docs/internals.md) | Graph → Timely, async bridge, exchange, state paths, checkpoint flow |
 | [API.md](API.md) | Reference for `DataflowGraph`, `Stream`, `PipelineController` |
 | [ARCHITECTURE.md](ARCHITECTURE.md) | System topology, execution model, data flow paths |
 | [CLUSTERING.md](CLUSTERING.md) | Single-thread → multi-process → control plane plan |

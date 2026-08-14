@@ -135,15 +135,37 @@ damaging, because they are the claims a reader uses to make design decisions.
 | `KNOWN-ISSUES.md` | KI-7 rewritten to match the code (clean entries evicted, dirty entries unbounded); KI-8 API name corrected; KI-11 retitled to state the blocking cold path directly, since other docs now reference it |
 | `CLAUDE.md` | Notes that nextest cannot run doctests; documents the packages outside the workspace; adds a Documentation Accuracy section stating the rules future changes must follow |
 
+### Written
+
+Correcting false claims left a second problem: there was very little
+documentation to begin with. The set below was written against the source, with
+every claim traced to the code that implements it.
+
+| Document | Contents |
+|----------|----------|
+| `docs/README.md` | Documentation map, reading order, and a common-questions index |
+| `docs/concepts.md` | Terminology and mental model — buffers, views, epochs, frontiers, key groups, tiers — each entry pointing at the module that implements it, plus an explicit list of terms Rhei does *not* have |
+| `docs/walkthrough.md` | One pipeline built in eight steps, from schema definition through state, windows, testing, and deployment. Every step is a complete compiled program |
+| `docs/operators.md` | Every built-in operator with its exact constructor, closure signatures, and a compiled example; plus a "choosing an operator" table and how to write your own |
+| `docs/time-and-watermarks.md` | The watermark path traced from `Source::current_watermark()` through the bridge, the epoch, Timely's frontier, and into `on_watermark`; when windows fire; lateness; why a stalled watermark also stalls checkpoints |
+| `docs/exchange-and-partitioning.md` | What `key_by` compiles to (a two-stage split/route), why routing goes through key groups instead of `hash(key) % workers`, the range-assignment math and why the ceiling matters, rescaling, and skew |
+| `docs/state-and-checkpointing.md` | The three tiers and their configuration, physical key layout, the checkpoint sequence and coordination protocol, recovery semantics, fork mode, tuning, and metrics |
+| `docs/deployment.md` | Configuration precedence, every `RHEI_*` variable, the four scaling modes, sizing, observability endpoints and metrics, error handling, containers, and a runbook |
+| `docs/internals.md` | Graph → compiled → Timely construction, the async bridge and its backpressure, exchange internals, operator execution, the epoch timeline, state read/write paths, checkpoint flow, rescaling, and a concurrency map |
+
+Two compiled examples back the prose: `rhei/examples/quickstart.rs` (quoted
+verbatim by the README) and `rhei/examples/walkthrough.rs` (the finished
+walkthrough pipeline, which asserts its own output).
+
 ### Made verifiable
 
-Correcting the docs once does not stop them drifting again. Four mechanisms now
+Correcting the docs once does not stop them drifting again. Five mechanisms now
 close the loop:
 
-1. **Markdown is compiled.** `rhei/src/lib.rs` includes `README.md`, `API.md`,
-   and `docs/getting-started.md` under `#[cfg(doctest)]`, so every Rust block in
-   them is a real doctest. Twenty-four blocks compile today. A rename that
-   breaks a documented API now breaks the build.
+1. **Markdown is compiled.** `rhei/src/lib.rs` includes eleven Markdown
+   documents under `#[cfg(doctest)]`, so every Rust block in them is a real
+   doctest. Fifty-one blocks compile today. A rename that breaks a documented
+   API now breaks the build.
 
 2. **`cargo test --doc --workspace` runs in CI**, in a new `Documentation` job.
    This was the missing step: nextest silently skips doctests, so the workspace
@@ -151,16 +173,28 @@ close the loop:
 
 3. **Opting out requires a reason.** `scripts/check-doc-blocks.py` fails if a
    ```` ```rust ```` block is marked `ignore` without a `not-compiled: <reason>`
-   comment. Six blocks are excluded today — all needing Kafka, `librdkafka`, or
-   showing deliberately-rejected designs — and each carries its justification
-   and a pointer to the compiled equivalent.
+   comment. Eleven blocks are excluded today — needing Kafka, showing
+   macro-generated types that would collide, quoting internal runtime code, or
+   presenting deliberately-rejected designs — and each carries its justification.
 
-4. **The quick start cannot drift.** The README quick start must stay
+4. **New docs cannot escape verification.** Any `docs/*.md` that is neither
+   wired into the doctest harness nor explicitly declared prose-only fails the
+   check. Without this, adding a page with broken examples would pass CI simply
+   because nobody remembered to include it.
+
+5. **The quick start cannot drift.** The README quick start must stay
    byte-identical to the anchored region of `rhei/examples/quickstart.rs`, which
    `cargo check --workspace --all-targets` compiles and `cargo run -p rhei
    --example quickstart` runs. The same script enforces the match.
 
 Run all of it with `just docs`.
+
+The mechanism earns its keep. Writing `docs/operators.md` against the source, it
+caught four errors in the first draft — a `CountWindow` finish closure
+documented with two parameters instead of three, a `TemporalJoin` join closure
+missing its leading key argument, a `tracing` call in a crate that does not
+depend on `tracing`, and an unannotated return type. Every one of those would
+have shipped as confident, wrong documentation under the old process.
 
 ---
 
