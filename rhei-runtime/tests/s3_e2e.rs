@@ -26,7 +26,7 @@ use rhei_core::cluster::DEFAULT_MAX_PARALLELISM;
 use rhei_core::connectors::batch::VecSource;
 use rhei_core::operators::keyed_state::KeyedState;
 use rhei_core::state::backend::{BatchOp, StateBackend};
-use rhei_core::state::key_group_backend::physical_key_for;
+use rhei_core::state::key_group_addressing::keyed_physical_key;
 use rhei_core::state::slatedb_backend::SlateDbBackend;
 use rhei_core::state::tiered_backend::TieredBackendConfig;
 use rhei_runtime::controller::PipelineController;
@@ -469,18 +469,23 @@ async fn s3_tiered_storage_e2e() {
 /// Compute the raw `SlateDB` key under which `KeyedState<String, u64>` (in the
 /// `"counts"` namespace) stores `word`.
 ///
-/// The `KeyedState` namespace (`counts:` + JSON-encoded key) is the *user* key;
-/// `physical_key_for` then applies the key-group addressing that the runtime
-/// itself uses. Deriving the physical layout here by hand is what made this
-/// helper go stale when state moved from per-worker to key-group prefixes, so
-/// it defers to the single definition in `rhei-core`.
+/// The `KeyedState` namespace (`counts:` + JSON-encoded key) is the *storage*
+/// key; the word itself is the partition key, and it alone decides the key
+/// group — the same bytes `key_by` hashed to route the row here. Deriving the
+/// physical layout here by hand is what made this helper go stale once before,
+/// so it defers to the single definition in `rhei-core`.
 ///
-/// Note there is no worker index: key-group addressing is worker-independent
-/// by design, which is exactly what lets ownership move on a rescale without
-/// relocating bytes.
+/// Note there is no worker index: keyed state is worker-independent by design,
+/// which is exactly what lets ownership move on a rescale without relocating
+/// bytes.
 fn state_key(word: &str) -> Vec<u8> {
-    let user_key = format!("counts:{}", serde_json::to_string(word).unwrap());
-    physical_key_for("word_counter", DEFAULT_MAX_PARALLELISM, user_key.as_bytes())
+    let storage_key = format!("counts:{}", serde_json::to_string(word).unwrap());
+    keyed_physical_key(
+        "word_counter",
+        DEFAULT_MAX_PARALLELISM,
+        word.as_bytes(),
+        storage_key.as_bytes(),
+    )
 }
 
 /// Read the persisted count for `word` directly from L3.

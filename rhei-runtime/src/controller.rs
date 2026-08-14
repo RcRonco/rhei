@@ -9,7 +9,7 @@ use std::sync::Arc;
 use rhei_core::checkpoint::CheckpointManifest;
 use rhei_core::dlq::ErrorPolicy;
 use rhei_core::state::context::StateContext;
-use rhei_core::state::key_group_backend::KeyGroupBackend;
+use rhei_core::state::key_group_addressing::StateAddressing;
 use rhei_core::state::local_backend::LocalBackend;
 use rhei_core::state::memtable::MemTableConfig;
 use rhei_core::state::prefixed_backend::PrefixedBackend;
@@ -1073,8 +1073,7 @@ impl PipelineController {
         operator_name: &str,
         worker_index: usize,
     ) -> anyhow::Result<StateContext> {
-        let _ = worker_index;
-        self.create_keyed_context(operator_name)
+        self.create_keyed_context(operator_name, worker_index)
     }
 
     /// The process-wide `LocalBackend` for `operator_name`, creating it on first
@@ -1101,15 +1100,21 @@ impl PipelineController {
 
     /// Create a key-group-addressed `StateContext` for the given operator.
     ///
-    /// Identical to [`create_context`](Self::create_context) except that keys
-    /// are namespaced as `kg{group}/{operator_name}/{user_key}` rather than
-    /// `{operator_name}/{user_key}`, so ownership of a key can move between
-    /// workers without the bytes moving.
-    pub fn create_keyed_context(&self, operator_name: &str) -> anyhow::Result<StateContext> {
-        let max_p = self.max_parallelism;
-        let wrap = |inner: Box<dyn rhei_core::state::backend::StateBackend>| {
-            KeyGroupBackend::new(operator_name, max_p, inner)
-        };
+    /// Identical to [`create_context`](Self::create_context) except that the
+    /// context maps every access to a physical key: state keyed by a record key
+    /// lands under `kg{group}/{operator_name}/{state_key}`, so ownership can
+    /// move between workers without the bytes moving.
+    ///
+    /// No `PrefixedBackend` wraps the store here — [`StateAddressing`] already
+    /// carries the operator name, and it has to, because the key group depends
+    /// on the record's partition key and only the layers above the backend
+    /// still know what that was.
+    pub fn create_keyed_context(
+        &self,
+        operator_name: &str,
+        worker_index: usize,
+    ) -> anyhow::Result<StateContext> {
+        let addressing = StateAddressing::new(operator_name, self.max_parallelism, worker_index)?;
 
         let ctx = {
             #[cfg(feature = "remote-state")]
@@ -1123,30 +1128,28 @@ impl PipelineController {
                         Box::new(self.shared_local_backend(operator_name)?),
                         Box::new(remote_l3.clone()),
                     );
-                    StateContext::new(Box::new(wrap(Box::new(fork))?))
+                    StateContext::new(Box::new(fork))
                 } else if let Some(ref tiered) = self.tiered {
                     let tiered_backend = tiered.shared_l2.create_tiered_backend(tiered.l3.clone());
-                    StateContext::new(Box::new(wrap(Box::new(tiered_backend))?))
+                    StateContext::new(Box::new(tiered_backend))
                 } else {
-                    StateContext::new(Box::new(wrap(Box::new(
-                        self.shared_local_backend(operator_name)?,
-                    ))?))
+                    StateContext::new(Box::new(self.shared_local_backend(operator_name)?))
                 }
             }
             #[cfg(not(feature = "remote-state"))]
             {
                 if let Some(ref tiered) = self.tiered {
                     let tiered_backend = tiered.shared_l2.create_tiered_backend(tiered.l3.clone());
-                    StateContext::new(Box::new(wrap(Box::new(tiered_backend))?))
+                    StateContext::new(Box::new(tiered_backend))
                 } else {
-                    StateContext::new(Box::new(wrap(Box::new(
-                        self.shared_local_backend(operator_name)?,
-                    ))?))
+                    StateContext::new(Box::new(self.shared_local_backend(operator_name)?))
                 }
             }
         };
 
-        Ok(ctx.with_memtable_config(self.memtable_config.clone()))
+        Ok(ctx
+            .with_addressing(addressing)
+            .with_memtable_config(self.memtable_config.clone()))
     }
 
     /// Create a `StateContext` for the given operator.

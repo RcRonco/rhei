@@ -18,8 +18,12 @@
 //! is addressed by worker index — so changing the worker count relocates
 //! essentially every key and orphans all persisted state. With key groups,
 //! only whole groups move, and state is addressed by group (see
-//! [`KeyGroupBackend`](crate::state::key_group_backend::KeyGroupBackend)), so a
-//! worker that gains a range simply reads those groups from shared L3 storage.
+//! [`key_group_addressing`](crate::state::key_group_addressing)), so a worker
+//! that gains a range simply reads those groups from shared L3 storage.
+//!
+//! The group of a record is always computed from the bytes the exchange routed
+//! on — its `key_by` output — never from a key a state wrapper happens to
+//! build, or the two would disagree about who owns what.
 //!
 //! The assignment math is deliberately identical to Flink's
 //! `KeyGroupRangeAssignment`, so the operational model (pick a max parallelism

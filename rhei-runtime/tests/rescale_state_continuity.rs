@@ -324,6 +324,83 @@ async fn keyed_state_survives_rescaling_the_worker_count() {
     }
 }
 
+/// Read every physical key the pipeline persisted for the `key_counter`
+/// operator out of its `LocalBackend` checkpoint file.
+fn persisted_physical_keys(checkpoint_dir: &std::path::Path) -> Vec<String> {
+    let path = checkpoint_dir.join("key_counter.checkpoint.json");
+    let contents = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("reading {}: {e}", path.display()));
+    let entries: Vec<(Vec<u8>, Vec<u8>)> = serde_json::from_str(&contents).unwrap();
+    entries
+        .into_iter()
+        .map(|(k, _)| String::from_utf8(k).expect("physical keys are UTF-8 here"))
+        .collect()
+}
+
+#[tokio::test]
+async fn state_is_filed_in_a_key_group_the_routing_worker_owns() {
+    // The invariant the whole key-group design rests on, checked end to end
+    // against what the runtime actually wrote to disk: for every key, the
+    // worker the exchange routes the row to must be the worker that owns the
+    // key group the row's state landed in.
+    //
+    // This fails if the key group is derived from the *storage* key rather than
+    // the record's partition key. `KeyedState` stores under `counts:"alpha"`,
+    // so hashing that puts the entry in a different group than routing put
+    // `alpha` in — a mismatch that is invisible to correctness tests (every
+    // worker still derives the same physical key, so reads and writes agree)
+    // but silently breaks every per-key-group operation built on top.
+    for workers in [1usize, 2, 3, 5] {
+        let dir = tempfile::tempdir().unwrap();
+        run_once(dir.path(), workers).await;
+
+        let assignment = KeyGroupAssignment::new(DEFAULT_MAX_PARALLELISM, workers).unwrap();
+        let keys = persisted_physical_keys(dir.path());
+        assert!(!keys.is_empty(), "pipeline persisted no state at all");
+
+        let mut checked = 0;
+        for physical in &keys {
+            // Layout: kg{group:05}/{operator}/{namespace}:{json_key}
+            let (group_part, rest) = physical.split_once('/').expect("group component");
+            let group: u16 = group_part
+                .strip_prefix("kg")
+                .expect("kg prefix")
+                .parse()
+                .expect("numeric group");
+            let (_operator, state_key) = rest.split_once('/').expect("operator component");
+            let json_key = state_key
+                .strip_prefix("counts:")
+                .expect("KeyedState namespace");
+            let record_key: String = serde_json::from_str(json_key).expect("json-encoded key");
+
+            let routed_to = assignment.worker_for_key(record_key.as_bytes());
+            let owner_of_state =
+                rhei_core::cluster::worker_for_key_group(DEFAULT_MAX_PARALLELISM, workers, group);
+
+            assert_eq!(
+                owner_of_state, routed_to,
+                "at {workers} worker(s), rows for {record_key:?} route to worker \
+                 {routed_to}, but its state sits in key group {group}, which worker \
+                 {owner_of_state} owns. State must be grouped by the partition key, \
+                 not by the storage key."
+            );
+
+            // And the group must be exactly the one the partition key hashes to.
+            assert_eq!(
+                group,
+                key_group_for(record_key.as_bytes(), DEFAULT_MAX_PARALLELISM),
+                "key {record_key:?} filed in group {group}, not its own key group"
+            );
+            checked += 1;
+        }
+        assert_eq!(
+            checked,
+            KEYS.len(),
+            "expected one persisted entry per key at {workers} worker(s)"
+        );
+    }
+}
+
 #[tokio::test]
 async fn every_key_stays_in_its_key_group_across_rescales() {
     // The routing-side invariant behind the test above: a key's group is a

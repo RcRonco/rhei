@@ -6,6 +6,7 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 
 use super::backend::{BatchOp, StateBackend};
+use super::key_group_addressing::StateAddressing;
 use super::memtable::MemTable;
 use super::timer_service::TimerService;
 
@@ -37,6 +38,10 @@ pub struct StateContext {
     /// Write timestamps for TTL tracking. Only populated when `ttl` is `Some`.
     /// Uses `Instant` (monotonic) to avoid wall-clock drift issues.
     write_times: HashMap<Vec<u8>, Instant>,
+    /// Physical key layout. `None` means keys are stored verbatim, which is
+    /// what the bare [`StateContext::new`] constructor gives tests and any
+    /// caller that has already namespaced its own keys.
+    addressing: Option<StateAddressing>,
 }
 
 impl std::fmt::Debug for StateContext {
@@ -57,7 +62,44 @@ impl StateContext {
             timer_service: None,
             ttl: None,
             write_times: HashMap::new(),
+            addressing: None,
         }
+    }
+
+    /// Address this context's state by key group.
+    ///
+    /// Without this, keys are stored verbatim. With it, every access is mapped
+    /// to a physical key: keyed accesses land under the key group of the
+    /// record's partition key, unpartitioned ones under the worker index. See
+    /// [`key_group_addressing`](super::key_group_addressing) for why the group
+    /// must come from the partition key rather than the storage key.
+    #[must_use]
+    pub fn with_addressing(mut self, addressing: StateAddressing) -> Self {
+        self.addressing = Some(addressing);
+        self
+    }
+
+    /// The physical key layout in use, if any.
+    #[must_use]
+    pub fn addressing(&self) -> Option<&StateAddressing> {
+        self.addressing.as_ref()
+    }
+
+    /// Map a keyed access to its physical key.
+    ///
+    /// `partition_key` is the bytes the exchange routed the record on; it
+    /// chooses the key group and nothing else.
+    fn physical_keyed(&self, partition_key: &[u8], key: &[u8]) -> Vec<u8> {
+        self.addressing
+            .as_ref()
+            .map_or_else(|| key.to_vec(), |a| a.keyed(partition_key, key))
+    }
+
+    /// Map an unpartitioned access to its physical key.
+    fn physical_unpartitioned(&self, key: &[u8]) -> Vec<u8> {
+        self.addressing
+            .as_ref()
+            .map_or_else(|| key.to_vec(), |a| a.unpartitioned(key))
     }
 
     /// Creates a new `StateContext` with a worker label for per-worker metrics.
@@ -85,7 +127,7 @@ impl StateContext {
         self
     }
 
-    /// Get a typed value — deserializes via bincode.
+    /// Get a typed value for state with no partition key — bincode.
     pub async fn get<V: DeserializeOwned>(&mut self, key: &[u8]) -> anyhow::Result<Option<V>> {
         match self.get_raw(key).await? {
             Some(bytes) => Ok(Some(bincode::deserialize(&bytes)?)),
@@ -93,10 +135,34 @@ impl StateContext {
         }
     }
 
-    /// Put a typed value — serializes via bincode.
+    /// Put a typed value for state with no partition key — bincode.
     pub fn put<V: Serialize>(&mut self, key: &[u8], value: &V) -> anyhow::Result<()> {
         let encoded = bincode::serialize(value)?;
         self.put_raw(key, &encoded);
+        Ok(())
+    }
+
+    /// Get a typed value for state keyed by `partition_key` — bincode.
+    pub async fn get_keyed<V: DeserializeOwned>(
+        &mut self,
+        partition_key: &[u8],
+        key: &[u8],
+    ) -> anyhow::Result<Option<V>> {
+        match self.get_raw_keyed(partition_key, key).await? {
+            Some(bytes) => Ok(Some(bincode::deserialize(&bytes)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Put a typed value for state keyed by `partition_key` — bincode.
+    pub fn put_keyed<V: Serialize>(
+        &mut self,
+        partition_key: &[u8],
+        key: &[u8],
+        value: &V,
+    ) -> anyhow::Result<()> {
+        let encoded = bincode::serialize(value)?;
+        self.put_raw_keyed(partition_key, key, &encoded);
         Ok(())
     }
 
@@ -113,11 +179,32 @@ impl StateContext {
         false
     }
 
-    /// Get raw bytes — checks memtable first, then falls back to backend.
+    /// Get raw bytes for state that has no partition key.
+    ///
+    /// Use [`get_raw_keyed`](Self::get_raw_keyed) for state keyed by a record
+    /// key — this variant stores per worker and does not survive a rescale.
     ///
     /// If TTL is configured, expired keys are lazily evicted: they return
     /// `None` and are marked as deleted in the memtable.
     pub async fn get_raw(&mut self, key: &[u8]) -> anyhow::Result<Option<Bytes>> {
+        let physical = self.physical_unpartitioned(key);
+        self.get_physical(&physical).await
+    }
+
+    /// Get raw bytes for state keyed by `partition_key`.
+    ///
+    /// `partition_key` must be the bytes the exchange routed the record on, so
+    /// the entry lands in a key group owned by this worker.
+    pub async fn get_raw_keyed(
+        &mut self,
+        partition_key: &[u8],
+        key: &[u8],
+    ) -> anyhow::Result<Option<Bytes>> {
+        let physical = self.physical_keyed(partition_key, key);
+        self.get_physical(&physical).await
+    }
+
+    async fn get_physical(&mut self, key: &[u8]) -> anyhow::Result<Option<Bytes>> {
         if let Some(ref wl) = self.worker_label {
             metrics::counter!("state_gets_total", "worker" => wl.clone()).increment(1);
         } else {
@@ -191,8 +278,19 @@ impl StateContext {
         result
     }
 
-    /// Put raw bytes — writes to memtable only (synchronous).
+    /// Put raw bytes for state that has no partition key (memtable only).
     pub fn put_raw(&mut self, key: &[u8], value: &[u8]) {
+        let physical = self.physical_unpartitioned(key);
+        self.put_physical(&physical, value);
+    }
+
+    /// Put raw bytes for state keyed by `partition_key` (memtable only).
+    pub fn put_raw_keyed(&mut self, partition_key: &[u8], key: &[u8], value: &[u8]) {
+        let physical = self.physical_keyed(partition_key, key);
+        self.put_physical(&physical, value);
+    }
+
+    fn put_physical(&mut self, key: &[u8], value: &[u8]) {
         if let Some(ref wl) = self.worker_label {
             metrics::counter!("state_puts_total", "worker" => wl.clone()).increment(1);
         } else {
@@ -205,8 +303,19 @@ impl StateContext {
             .put(key.to_vec(), Bytes::copy_from_slice(value));
     }
 
-    /// Delete a key — marks as deleted in memtable.
+    /// Delete a key with no partition key — marks as deleted in memtable.
     pub fn delete(&mut self, key: &[u8]) {
+        let physical = self.physical_unpartitioned(key);
+        self.delete_physical(&physical);
+    }
+
+    /// Delete a key belonging to `partition_key` — marks as deleted in memtable.
+    pub fn delete_keyed(&mut self, partition_key: &[u8], key: &[u8]) {
+        let physical = self.physical_keyed(partition_key, key);
+        self.delete_physical(&physical);
+    }
+
+    fn delete_physical(&mut self, key: &[u8]) {
         if let Some(ref wl) = self.worker_label {
             metrics::counter!("state_deletes_total", "worker" => wl.clone()).increment(1);
         } else {
@@ -217,6 +326,16 @@ impl StateContext {
     }
 
     /// Returns all keys in the memtable that start with the given prefix.
+    ///
+    /// # Prefixes are physical
+    ///
+    /// The memtable holds physical keys, so when this context has addressing
+    /// configured the prefix must be a physical one — build it with
+    /// [`StateAddressing::key_group_prefix`] or
+    /// [`unpartitioned_prefix`](super::key_group_addressing::unpartitioned_prefix).
+    /// A logical prefix such as `b"counts:"` matches nothing, and a logical
+    /// prefix cannot be expressed as a single physical one anyway: keyed
+    /// entries are spread across every key group by design.
     ///
     /// # L1-only limitation
     ///

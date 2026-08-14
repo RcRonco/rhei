@@ -81,22 +81,74 @@ only stateless work.
 
 ### 2. State is addressed by key group
 
-`KeyGroupBackend` (`rhei-core/src/state/key_group_backend.rs`) replaces the
+`StateAddressing` (`rhei-core/src/state/key_group_addressing.rs`) replaces the
 worker-coordinate prefix:
 
 ```text
 before:  p{process_id}/w{worker_index}/{operator}/{user_key}
-after:   kg{group:05}/{operator}/{user_key}
+after:   kg{group:05}/{operator}/{state_key}
 ```
 
-The group is derived from the user key *at access time*, so the physical key is
-identical regardless of which worker or process performs the access. A worker
-that inherits key group 37 issues exactly the reads its previous owner issued.
+The physical key is identical regardless of which worker or process performs
+the access. A worker that inherits key group 37 issues exactly the reads its
+previous owner issued.
 
 **Rescaling therefore moves no bytes.** It reassigns ownership, and the gaining
 worker reads from shared L3 storage on first access — a cache-warming problem,
 not a data-transfer problem. This is the property that makes disaggregated
 state (SlateDB on S3) pay off.
+
+#### The group comes from the partition key, not the storage key
+
+The group must be derived from the same bytes the exchange routed on — the
+record's `key_by` output — and not from the storage key a state wrapper builds.
+
+The first implementation got this wrong, in a way worth recording because it
+produced no visible symptom. A `KeyGroupBackend` wrapped the store and hashed
+whatever key reached it. But `KeyedState` stores under `"{namespace}:{encoded_key}"`,
+so the backend hashed `counts:"alpha"` and filed the entry in a different group
+than routing had put `alpha` in.
+
+Nothing broke immediately. The physical key was still a pure function of the
+logical key, every worker derived it identically, and state still survived a
+rescale — `keyed_state_survives_rescaling_the_worker_count` passed throughout.
+What was silently broken was every *per-key-group* operation, which is the
+reason key groups exist beyond storage layout:
+
+- Warming the groups a worker gains on rescale would prefetch keys belonging to
+  rows that route elsewhere, and miss the ones that route here.
+- A scan of a key group's prefix returns keys the scanning worker does not own.
+
+The fix moves group derivation up to the layer that still knows the logical key.
+`StateContext` carries a `StateAddressing` and exposes keyed accessors that take
+the partition key alongside the storage key; `KeyedState` and `MapState` pass
+the record key, and the backend below is left as a plain store. A backend
+wrapper *cannot* do this correctly — by the time a key reaches it, the partition
+key is gone.
+
+`state_is_filed_in_a_key_group_the_routing_worker_owns` pins the invariant end
+to end: it reads the physical keys the runtime actually persisted and asserts
+that, for every key, the worker the exchange routes the row to is the worker
+that owns the group the state landed in. It fails against the old derivation.
+
+Partition bytes must reproduce exactly what the exchange hashed. `key_by`
+produces a `String` and the exchange hashes its raw UTF-8, so string keys map to
+their own bytes; other key types have no `key_by` counterpart and fall back to a
+canonical JSON form. This is deliberately independent of the `KeyEncoder` used
+for storage: how a key is serialized to disk is a storage decision, while which
+group it belongs to is a routing decision, and the exchange only knew the latter.
+
+#### Unpartitioned state stays per-worker
+
+`ValueState` and `ListState` are scoped to a name rather than a record key, so
+they have no partition key and no meaningful key group. They are addressed
+`w{worker}/{operator}/{state_key}` — per worker, as before key groups existed.
+
+Sharing one instance across workers would expose it to concurrent
+read-modify-write races, so per-worker is the safe reading. The consequence is
+that unpartitioned state does not survive a change in worker count, which is
+inherent rather than incidental: without a key there is nothing to redistribute
+it by.
 
 The zero-padded group keeps lexicographic order aligned with numeric order, so
 an owned range is a contiguous scan in ordered stores.
@@ -362,7 +414,10 @@ than 128 workers.
 |------|--------|
 | `rhei-core/src/cluster/key_group.rs` | New — key group math, ranges, assignment, migration diffs |
 | `rhei-core/src/cluster/membership.rs` | New — `ClusterView`, `ClusterTopology`, `MembershipProvider`, `StaticMembership` |
-| `rhei-core/src/state/key_group_backend.rs` | New — `kg{group}/{operator}/{key}` addressing |
+| `rhei-core/src/state/key_group_addressing.rs` | New — `kg{group}/{operator}/{key}` layout, grouped by partition key |
+| `rhei-core/src/state/context.rs` | Carries `StateAddressing`; keyed vs unpartitioned accessors |
+| `rhei-core/src/operators/keyed_state.rs` | Passes the record key as the partition key |
+| `rhei-core/src/state/map_state.rs` | Passes the record key as the partition key |
 | `rhei-runtime/src/cluster/gossip.rs` | New — chitchat-backed discovery (feature `chitchat`) |
 | `rhei-runtime/src/cluster/rescale.rs` | New — debounced rescale supervision |
 | `rhei-runtime/src/erased_buffer.rs` | `partition_for_exchange` routes by key group |
