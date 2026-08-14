@@ -1,0 +1,32 @@
+# Keep the build context small and the image reproducible.
+
+# Build output — many gigabytes, and host artifacts are useless in the image.
+target/
+**/target/
+
+# Version control and CI.
+.git/
+.github/
+.vscode/
+.claude/
+
+# Node modules for the web dashboard; not part of the pipeline binary.
+rhei-dashboard/node_modules/
+rhei-dashboard/dist/
+
+# Python bindings are excluded from the workspace.
+rhei-python/
+
+# Docs and design material — not needed to compile.
+*.md
+!README.md
+ADR/
+docs/
+tla/
+
+# Local state that must never end up baked into an image.
+checkpoints/
+*.checkpoint.json
+manifest.json
+manifest_p*.json
+.env

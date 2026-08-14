@@ -1,0 +1,196 @@
+# Prometheus scrape config and alert rules for a Rhei pipeline.
+#
+# Every metric referenced here is one Rhei actually emits — see
+# `OPERATIONS.md` for the full list and what each one means.
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: rhei-pipeline
+  labels:
+    app.kubernetes.io/name: rhei-pipeline
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: rhei-pipeline
+  endpoints:
+    - port: http
+      path: /metrics
+      interval: 15s
+      # /metrics is authenticated when RHEI_METRICS_TOKEN is set. Drop this
+      # block if you run without a token.
+      authorization:
+        type: Bearer
+        credentials:
+          name: rhei-pipeline-secrets
+          key: metrics-token
+          optional: true
+---
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: rhei-pipeline
+  labels:
+    app.kubernetes.io/name: rhei-pipeline
+spec:
+  groups:
+    - name: rhei-pipeline.correctness
+      # These fire on data being wrong or lost — page on them.
+      rules:
+        - alert: RheiSinkSendErrors
+          expr: increase(sink_send_errors_total[5m]) > 0
+          for: 0m
+          labels:
+            severity: critical
+          annotations:
+            summary: "Pipeline {{ $labels.pod }} failed to hand records to its sink"
+            description: >-
+              Records reached the end of the dataflow but could not be written.
+              They are gone: the sink channel send failed and there is no
+              retry. Check the sink's own health (broker reachable? topic
+              exists? credentials valid?) before restarting.
+
+        - alert: RheiCheckpointsStalled
+          # A pipeline that is running but not checkpointing is accumulating
+          # unbounded replay: whatever it has processed since the last
+          # checkpoint is redone after any restart.
+          expr: |
+            increase(state_checkpoints_total[15m]) == 0
+            and on(pod) kube_pod_status_ready{condition="true"} == 1
+          for: 15m
+          labels:
+            severity: critical
+          annotations:
+            summary: "Pipeline {{ $labels.pod }} has not checkpointed in 30 minutes"
+            description: >-
+              Source offsets are not being committed, so a restart replays
+              everything since the last successful checkpoint. Common causes:
+              object storage unreachable, credentials expired, or the frontier
+              not advancing because a source has stalled.
+
+        - alert: RheiDeadLetterRate
+          expr: rate(dlq_items_total[5m]) > 1
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Pipeline {{ $labels.pod }} is dead-lettering {{ $value | humanize }} records/s"
+            description: >-
+              Records are failing their operator and being routed to the DLQ.
+              A sustained rate usually means a schema change upstream rather
+              than isolated bad records.
+
+        - alert: RheiLateEventsDropped
+          expr: rate(late_events_dropped_total[10m]) > 0
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Pipeline {{ $labels.pod }} is dropping late events"
+            description: >-
+              Events arrived after their window closed past `allowed_lateness`
+              and were discarded — window results for those keys are
+              incomplete. Either the source is lagging or `allowed_lateness` is
+              tuned too tight for the real event-time skew.
+
+    - name: rhei-pipeline.availability
+      rules:
+        - alert: RheiPipelineNotReady
+          expr: |
+            kube_pod_status_ready{condition="true"} == 0
+            and on(pod) kube_pod_labels{label_app_kubernetes_io_name="rhei-pipeline"} == 1
+          for: 10m
+          labels:
+            severity: critical
+          annotations:
+            summary: "Pipeline {{ $labels.pod }} has been not-ready for 10 minutes"
+            description: >-
+              /readyz is failing. If the pod is restarting repeatedly, check
+              the logs for a configuration error — invalid environment
+              variables and incompatible checkpoints both fail at startup by
+              design.
+
+        - alert: RheiPipelineRestartLoop
+          expr: increase(kube_pod_container_status_restarts_total{container="pipeline"}[30m]) > 3
+          for: 0m
+          labels:
+            severity: critical
+          annotations:
+            summary: "Pipeline {{ $labels.pod }} has restarted {{ $value }} times in 30 minutes"
+            description: >-
+              Either the liveness probe keeps firing (a worker is wedging) or
+              the process is exiting on startup. `kubectl logs --previous`
+              distinguishes them.
+
+        - alert: RheiClusterQuorumLost
+          expr: increase(rhei_cluster_no_quorum_total[10m]) > 0
+          for: 0m
+          labels:
+            severity: critical
+          annotations:
+            summary: "Rhei cluster lost quorum"
+            description: >-
+              Not enough processes are visible to agree on a topology, so
+              rescaling is suspended. Check gossip connectivity between pods.
+
+        - alert: RheiIdleWorkers
+          expr: rhei_cluster_idle_workers > 0
+          for: 30m
+          labels:
+            severity: warning
+          annotations:
+            summary: "{{ $value }} Rhei workers own no key groups"
+            description: >-
+              Workers exist but have nothing assigned, so you are paying for
+              parallelism you do not get. Usually means the worker count now
+              exceeds RHEI_MAX_PARALLELISM — which cannot be raised on a
+              pipeline with existing state.
+
+    - name: rhei-pipeline.performance
+      rules:
+        - alert: RheiStateCacheMissRateHigh
+          # L1+L2 misses fall through to object storage, which is ~1000x
+          # slower. A sustained high miss rate means the working set no longer
+          # fits and throughput will show it.
+          expr: |
+            (
+              rate(state_l3_hits_total[10m]) + rate(state_l3_misses_total[10m])
+            )
+            /
+            clamp_min(rate(state_gets_total[10m]), 1)
+            > 0.1
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: "{{ $value | humanizePercentage }} of state reads on {{ $labels.pod }} reach object storage"
+            description: >-
+              The hot working set has outgrown L1/L2. Raise the memtable
+              budget, grow the L2 NVMe cache, or add processes to spread the
+              key space.
+
+        - alert: RheiCheckpointDurationHigh
+          expr: |
+            histogram_quantile(0.95, rate(state_checkpoint_duration_seconds_bucket[15m])) > 30
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Checkpoints on {{ $labels.pod }} are taking {{ $value | humanizeDuration }} at p95"
+            description: >-
+              Long checkpoints widen the replay window after a restart and can
+              push a worker past its liveness timeout. Check the dirty key
+              count (state_checkpoint_dirty_keys) and object storage latency.
+
+        - alert: RheiRescaleChurn
+          expr: increase(rhei_cluster_rescales_total[1h]) > 6
+          for: 0m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Rhei cluster rescaled {{ $value }} times in an hour"
+            description: >-
+              Every rescale moves key groups and re-reads state from object
+              storage. Repeated rescaling usually means pod churn or unstable
+              node IDs — a node ID that changes across restarts looks like a
+              permanent join/leave cycle.
