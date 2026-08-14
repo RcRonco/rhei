@@ -144,7 +144,7 @@ every claim traced to the code that implements it.
 | Document | Contents |
 |----------|----------|
 | `docs/README.md` | Documentation map, reading order, and a common-questions index |
-| `docs/concepts.md` | Terminology and mental model — buffers, views, epochs, frontiers, key groups, tiers — each entry pointing at the module that implements it, plus an explicit list of terms Rhei does *not* have |
+| `docs/concepts.md` | The design ideas and their consequences: why data moves as columnar batches, why event time is the only clock, why the watermark *is* the dataflow timestamp, why state is addressed by key group rather than by worker, why the tier hierarchy fails as a cliff rather than a slope, and why checkpoint ordering decides the delivery guarantee. Closes with what Rhei deliberately lacks, and a vocabulary lookup table |
 | `docs/walkthrough.md` | One clickstream pipeline built in eight steps, from schema definition through keyed state, session windows, testing, and deployment. Every step is a complete compiled program |
 | `docs/operators.md` | Every built-in operator with its exact constructor, closure signatures, and a compiled example; plus a "choosing an operator" table and how to write your own |
 | `docs/time-and-watermarks.md` | The watermark path traced from `Source::current_watermark()` through the bridge, the epoch, Timely's frontier, and into `on_watermark`; when windows fire; lateness; why a stalled watermark also stalls checkpoints |

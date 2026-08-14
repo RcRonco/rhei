@@ -11,7 +11,7 @@ Every Rust example in these pages is compiled by CI as a doctest. Blocks that ca
 | Order | Page | What it covers |
 |-------|------|----------------|
 | 1 | [getting-started.md](getting-started.md) | Install, first pipeline, core API, troubleshooting |
-| 2 | [concepts.md](concepts.md) | Terminology and the mental model, with source references |
+| 2 | [concepts.md](concepts.md) | The ideas Rhei is built on and what each one costs you — why the API looks the way it does |
 | 3 | [walkthrough.md](walkthrough.md) | One clickstream pipeline built step by step: schemas → state → session windows → tests → deploy |
 
 ## Reference
@@ -20,7 +20,7 @@ Every Rust example in these pages is compiled by CI as a doctest. Blocks that ca
 |------|----------------|
 | [operators.md](operators.md) | Every operator, exact constructor, compiled example |
 | [../API.md](../API.md) | `DataflowGraph`, `Stream`, `PipelineController` |
-| [concepts.md](concepts.md) | Glossary |
+| [concepts.md](concepts.md#vocabulary) | Vocabulary lookup: term → meaning → where it lives |
 
 ## Semantics
 
@@ -65,7 +65,7 @@ Runnable code, verified by `cargo check --workspace --all-targets`:
 
 | Question | Answer |
 |----------|--------|
-| Why does my closure get `&str` instead of `String`? | Closures receive zero-copy views borrowed from Arrow. [concepts.md](concepts.md#view) |
+| Why does my closure get `&str` instead of `String`? | Closures receive zero-copy views borrowed from Arrow. [concepts.md](concepts.md#2-the-unit-of-work-is-a-batch-of-columns-not-a-record) |
 | Why is my count wrong with 4 workers? | Missing `key_by` before a stateful operator. Nothing enforces it. [exchange-and-partitioning.md](exchange-and-partitioning.md#the-missing-guarantee) |
 | Why is there no windowed output? | The source emits no watermarks, or one partition is idle. [time-and-watermarks.md](time-and-watermarks.md#when-windows-fire) |
 | Why did throughput fall off a cliff? | L1 misses block the Timely worker thread. [state-and-checkpointing.md](state-and-checkpointing.md#the-cold-path-blocks) |

@@ -353,7 +353,7 @@ Start at **[docs/README.md](docs/README.md)** for the full map.
 | Document | Contents |
 |----------|----------|
 | [docs/getting-started.md](docs/getting-started.md) | Install, first pipeline, core API, troubleshooting |
-| [docs/concepts.md](docs/concepts.md) | Terminology and mental model, with source references |
+| [docs/concepts.md](docs/concepts.md) | The ideas Rhei is built on and what each one costs you — why the API looks the way it does |
 | [docs/walkthrough.md](docs/walkthrough.md) | One clickstream pipeline built step by step: schemas → state → session windows → tests → deploy |
 | [docs/operators.md](docs/operators.md) | Every operator, exact constructor, compiled example |
 | [docs/time-and-watermarks.md](docs/time-and-watermarks.md) | Event time, watermarks, frontiers, when windows fire, lateness |
