@@ -22,9 +22,11 @@ use object_store::aws::AmazonS3Builder;
 use rhei_core::arrow::{
     BufferOutput, OperatorContext, RheiBuffer, RheiBuilder, RheiSchema, Sink, StreamFunction,
 };
+use rhei_core::cluster::DEFAULT_MAX_PARALLELISM;
 use rhei_core::connectors::batch::VecSource;
 use rhei_core::operators::keyed_state::KeyedState;
 use rhei_core::state::backend::{BatchOp, StateBackend};
+use rhei_core::state::key_group_backend::physical_key_for;
 use rhei_core::state::slatedb_backend::SlateDbBackend;
 use rhei_core::state::tiered_backend::TieredBackendConfig;
 use rhei_runtime::controller::PipelineController;
@@ -417,15 +419,8 @@ async fn s3_tiered_storage_e2e() {
 
     let verify_words = ["alpha", "beta", "cedar", "delta", "ember", "frost"];
     for word in &verify_words {
-        // KeyedState<String, u64> with JsonEncoder stores keys as:
-        //   PrefixedBackend prefix: "word_counter_w0/"
-        //   KeyedState key: "counts:" + serde_json::to_string(word)
-        let keyed_state_key = format!("counts:{}", serde_json::to_string(word).unwrap());
-        let mut key = b"word_counter_w0/".to_vec();
-        key.extend_from_slice(keyed_state_key.as_bytes());
-
         let val = l3_verify
-            .get(&key)
+            .get(&state_key(word))
             .await
             .unwrap_or_else(|e| panic!("failed to read key for {word}: {e}"));
 
@@ -472,20 +467,25 @@ async fn s3_tiered_storage_e2e() {
 // ── Shared helpers ──────────────────────────────────────────────────
 
 /// Compute the raw `SlateDB` key under which `KeyedState<String, u64>` (in the
-/// `"counts"` namespace) stores `word` for the given worker index.
+/// `"counts"` namespace) stores `word`.
 ///
-/// Layout: `word_counter_w{worker}/` (`PrefixedBackend`) + `counts:`
-/// (`KeyedState` namespace) + JSON-encoded key.
-fn state_key(worker: usize, word: &str) -> Vec<u8> {
-    let keyed = format!("counts:{}", serde_json::to_string(word).unwrap());
-    let mut key = format!("word_counter_w{worker}/").into_bytes();
-    key.extend_from_slice(keyed.as_bytes());
-    key
+/// The `KeyedState` namespace (`counts:` + JSON-encoded key) is the *user* key;
+/// `physical_key_for` then applies the key-group addressing that the runtime
+/// itself uses. Deriving the physical layout here by hand is what made this
+/// helper go stale when state moved from per-worker to key-group prefixes, so
+/// it defers to the single definition in `rhei-core`.
+///
+/// Note there is no worker index: key-group addressing is worker-independent
+/// by design, which is exactly what lets ownership move on a rescale without
+/// relocating bytes.
+fn state_key(word: &str) -> Vec<u8> {
+    let user_key = format!("counts:{}", serde_json::to_string(word).unwrap());
+    physical_key_for("word_counter", DEFAULT_MAX_PARALLELISM, user_key.as_bytes())
 }
 
-/// Read the persisted count for `word` on `worker` directly from L3.
-async fn read_count(l3: &SlateDbBackend, worker: usize, word: &str) -> Option<u64> {
-    l3.get(&state_key(worker, word))
+/// Read the persisted count for `word` directly from L3.
+async fn read_count(l3: &SlateDbBackend, word: &str) -> Option<u64> {
+    l3.get(&state_key(word))
         .await
         .unwrap()
         .map(|bytes| serde_json::from_slice(&bytes).unwrap())
@@ -615,7 +615,7 @@ async fn s3_state_recovers_across_restart() {
         .expect("reopen for verification");
     for word in ["alpha", "beta", "cedar", "delta"] {
         assert_eq!(
-            read_count(&l3, 0, word).await,
+            read_count(&l3, word).await,
             Some(10),
             "S3 count for '{word}' after restart"
         );
@@ -659,24 +659,20 @@ async fn s3_tiered_multi_worker_persistence() {
         );
     }
 
-    // Each word must be persisted under exactly one worker prefix in S3.
+    // Each word is persisted exactly once, under its key group rather than
+    // under the index of whichever worker happened to process it. Both workers
+    // therefore derive the same physical key, so the count landing there is the
+    // proof that a single owner accumulated it — a split across workers would
+    // show up as a count below the expected total.
     let l3 = SlateDbBackend::open(slate_path.as_str(), s3.clone())
         .await
         .expect("reopen for verification");
     for (word, count) in &expected {
-        let found: Vec<u64> = [
-            read_count(&l3, 0, word).await,
-            read_count(&l3, 1, word).await,
-        ]
-        .into_iter()
-        .flatten()
-        .collect();
         assert_eq!(
-            found.len(),
-            1,
-            "word '{word}' must live on exactly one worker, found {found:?}"
+            read_count(&l3, word).await,
+            Some(*count),
+            "persisted count for '{word}' (key-group addressed, worker-independent)"
         );
-        assert_eq!(found[0], *count, "persisted count for '{word}'");
     }
     l3.close().await.expect("close verify DB");
 
@@ -728,7 +724,7 @@ async fn s3_tiered_large_state_spills_to_l3() {
     for i in [0usize, n_keys / 2, n_keys - 1] {
         let word = format!("key_{i:06}");
         assert_eq!(
-            read_count(&l3, 0, &word).await,
+            read_count(&l3, &word).await,
             Some(reps as u64),
             "S3 count for spilled key '{word}'"
         );

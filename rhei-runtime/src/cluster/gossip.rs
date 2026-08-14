@@ -164,7 +164,7 @@ impl GossipMembership {
             listen_addr: config.gossip_addr,
             seed_nodes: config.seeds.clone(),
             failure_detector_config: FailureDetectorConfig::default(),
-            marked_for_deletion_grace_period: Duration::from_secs(3600),
+            marked_for_deletion_grace_period: Duration::from_hours(1),
             catchup_callback: None,
             extra_liveness_predicate: None,
             // V1 compresses digests. Safe as a fixed choice because every node
@@ -283,11 +283,11 @@ mod tests {
         let config = ChitchatConfig {
             chitchat_id: ChitchatId::new("probe".to_string(), 0, "127.0.0.1:0".parse().unwrap()),
             cluster_id: "test".to_string(),
-            gossip_interval: Duration::from_secs(3600),
+            gossip_interval: Duration::from_hours(1),
             listen_addr: "127.0.0.1:0".parse().unwrap(),
             seed_nodes: Vec::new(),
             failure_detector_config: FailureDetectorConfig::default(),
-            marked_for_deletion_grace_period: Duration::from_secs(3600),
+            marked_for_deletion_grace_period: Duration::from_hours(1),
             catchup_callback: None,
             extra_liveness_predicate: None,
             protocol_version: chitchat::ProtocolVersion::V1,

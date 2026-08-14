@@ -31,6 +31,32 @@ use crate::cluster::key_group::{KeyGroupId, key_group_for};
 /// Width of the zero-padded key group component. Covers the 32768 upper bound.
 const KEY_GROUP_WIDTH: usize = 5;
 
+/// Physical key prefix for `key_group` under `operator`: `kg{group:05}/{operator}/`.
+///
+/// Free-standing counterpart to [`KeyGroupBackend::key_group_prefix`] for
+/// callers that have no backend instance.
+#[must_use]
+pub fn key_group_prefix_for(operator: &str, key_group: KeyGroupId) -> String {
+    format!("kg{key_group:0KEY_GROUP_WIDTH$}/{operator}/")
+}
+
+/// Physical key under which `key` is stored for `operator`, without needing a
+/// backend instance.
+///
+/// The durable key layout is defined here and nowhere else. Tests and offline
+/// tooling that need to locate a key in storage must call this rather than
+/// re-deriving the format by hand: a second copy of the layout goes stale
+/// silently the moment the layout changes, and the resulting failure looks
+/// like data loss rather than a stale test.
+#[must_use]
+pub fn physical_key_for(operator: &str, max_parallelism: usize, key: &[u8]) -> Vec<u8> {
+    let prefix = key_group_prefix_for(operator, key_group_for(key, max_parallelism));
+    let mut out = Vec::with_capacity(prefix.len() + key.len());
+    out.extend_from_slice(prefix.as_bytes());
+    out.extend_from_slice(key);
+    out
+}
+
 /// A backend wrapper that namespaces keys by key group and operator.
 ///
 /// Unlike `PrefixedBackend`, the prefix is computed per key rather than fixed
@@ -86,20 +112,11 @@ impl KeyGroupBackend {
     /// support prefix iteration.
     #[must_use]
     pub fn key_group_prefix(&self, key_group: KeyGroupId) -> String {
-        format!(
-            "kg{key_group:0width$}/{op}/",
-            width = KEY_GROUP_WIDTH,
-            op = self.operator
-        )
+        key_group_prefix_for(&self.operator, key_group)
     }
 
     fn physical_key(&self, key: &[u8]) -> Vec<u8> {
-        let kg = self.key_group_of(key);
-        let prefix = self.key_group_prefix(kg);
-        let mut out = Vec::with_capacity(prefix.len() + key.len());
-        out.extend_from_slice(prefix.as_bytes());
-        out.extend_from_slice(key);
-        out
+        physical_key_for(&self.operator, self.max_parallelism, key)
     }
 }
 
@@ -239,6 +256,31 @@ mod tests {
             Some(Bytes::from_static(b"val")),
             "expected physical key {expected}"
         );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn physical_key_for_matches_what_the_backend_writes() {
+        // `physical_key_for` exists so external callers (tests, offline tooling)
+        // can locate a key without re-deriving the layout. That is only useful
+        // if it cannot drift from the backend's own mapping — a stale copy of
+        // the layout reads as missing data, not as a stale helper.
+        let path = temp_path("free_fn");
+        let _ = std::fs::remove_file(&path);
+        let shared = Arc::new(LocalBackend::new(path.clone(), None).unwrap());
+        let backend =
+            KeyGroupBackend::new("myop", 128, Box::new(ArcBackend(shared.clone()))).unwrap();
+
+        for key in [b"key".as_slice(), b"another", b"counts:\"alpha\"", b""] {
+            backend.put(key, b"val").await.unwrap();
+            let derived = physical_key_for("myop", 128, key);
+            assert_eq!(
+                shared.get(&derived).await.unwrap(),
+                Some(Bytes::from_static(b"val")),
+                "physical_key_for disagrees with KeyGroupBackend for key {key:?}"
+            );
+        }
 
         let _ = std::fs::remove_file(&path);
     }
