@@ -805,6 +805,40 @@ async fn api_state_operators(State(state): State<Arc<AppState>>) -> impl IntoRes
     )
 }
 
+/// Resolve a caller-supplied operator name against the checkpoint manifest.
+///
+/// The name is used to build a filesystem path, so it is never trusted
+/// directly: `../../../etc/shadow` would otherwise escape the checkpoint
+/// directory and read any `*.checkpoint.json` on the host. Matching against
+/// the manifest's operator list is an allowlist — only names the pipeline
+/// itself recorded can be reached, and no amount of encoding gets past it.
+///
+/// Returns the manifest's own copy of the name so the value that reaches the
+/// filesystem is one the pipeline wrote, not one the caller supplied.
+fn resolve_operator_name(dir: &std::path::Path, requested: &str) -> Option<String> {
+    let manifest = CheckpointManifest::load(dir)?;
+    manifest
+        .operators
+        .into_iter()
+        .find(|known| known == requested)
+}
+
+/// Compile a caller-supplied key filter once.
+///
+/// Compiling inside the per-key filter recompiled the pattern for every entry
+/// in the operator's state, turning one request into as many regex builds as
+/// there are keys. An invalid pattern is now a 400 rather than a filter that
+/// silently matches nothing.
+fn compile_key_filter(pattern: Option<&String>) -> Result<Option<regex::Regex>, StatusCode> {
+    match pattern {
+        None => Ok(None),
+        Some(pattern) => regex::Regex::new(pattern).map(Some).map_err(|e| {
+            tracing::debug!(pattern, error = %e, "rejecting invalid key filter");
+            StatusCode::BAD_REQUEST
+        }),
+    }
+}
+
 /// `GET /api/state/operators/:name` — paginated key-value entries.
 async fn api_state_entries(
     State(state): State<Arc<AppState>>,
@@ -815,6 +849,15 @@ async fn api_state_entries(
         return (StatusCode::NOT_FOUND, axum::Json(None));
     };
 
+    let Some(operator_name) = resolve_operator_name(dir, &operator_name) else {
+        return (StatusCode::NOT_FOUND, axum::Json(None));
+    };
+
+    let key_filter = match compile_key_filter(query.pattern.as_ref()) {
+        Ok(filter) => filter,
+        Err(status) => return (status, axum::Json(None)),
+    };
+
     let entries = match load_operator_state_for_inspection(dir, &operator_name) {
         Ok(entries) => entries,
         Err(e) => return (state_read_error_status(&e), axum::Json(None)),
@@ -823,19 +866,12 @@ async fn api_state_entries(
     let filtered: Vec<_> = entries
         .into_iter()
         .filter(|(key, _)| {
-            if let Some(ref prefix) = query.prefix {
-                key.starts_with(prefix)
-            } else {
-                true
-            }
+            query
+                .prefix
+                .as_ref()
+                .is_none_or(|prefix| key.starts_with(prefix))
         })
-        .filter(|(key, _)| {
-            if let Some(ref pattern) = query.pattern {
-                regex::Regex::new(pattern).is_ok_and(|re| re.is_match(key))
-            } else {
-                true
-            }
-        })
+        .filter(|(key, _)| key_filter.as_ref().is_none_or(|re| re.is_match(key)))
         .collect();
 
     let total = filtered.len();
@@ -876,6 +912,10 @@ async fn api_state_key(
     Query(_query): Query<StateKeyQuery>,
 ) -> impl IntoResponse {
     let Some(ref dir) = state.checkpoint_dir else {
+        return (StatusCode::NOT_FOUND, axum::Json(None));
+    };
+
+    let Some(operator_name) = resolve_operator_name(dir, &operator_name) else {
         return (StatusCode::NOT_FOUND, axum::Json(None));
     };
 
@@ -1294,5 +1334,146 @@ mod tests {
         let _layer = build_cors_layer(&[]);
         let _explicit = build_cors_layer(&["https://ops.example.com".to_string()]);
         let _malformed = build_cors_layer(&["not a header value\n".to_string()]);
+    }
+
+    // ── State explorer input handling (SI-1, SI-3) ───────────────────
+
+    /// A checkpoint dir with one operator named in the manifest.
+    fn state_dir_with_operator(name: &str) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        CheckpointManifest {
+            version: 1,
+            checkpoint_id: 1,
+            timestamp_ms: 1,
+            operators: vec![name.to_string()],
+            source_offsets: std::collections::HashMap::new(),
+            n_processes: None,
+            workers_per_process: None,
+            max_parallelism: Some(128),
+            total_workers: None,
+            cluster_members: Vec::new(),
+        }
+        .save(dir.path())
+        .unwrap();
+
+        let entries: Vec<(Vec<u8>, Vec<u8>)> = vec![
+            (format!("{name}/alice").into_bytes(), b"1".to_vec()),
+            (format!("{name}/bob").into_bytes(), b"2".to_vec()),
+        ];
+        std::fs::write(
+            dir.path().join(format!("{name}.checkpoint.json")),
+            serde_json::to_string(&entries).unwrap(),
+        )
+        .unwrap();
+        dir
+    }
+
+    #[test]
+    fn known_operator_names_resolve() {
+        let dir = state_dir_with_operator("counter");
+        assert_eq!(
+            resolve_operator_name(dir.path(), "counter"),
+            Some("counter".to_string())
+        );
+    }
+
+    #[test]
+    fn traversal_attempts_do_not_resolve() {
+        let dir = state_dir_with_operator("counter");
+
+        // The name is joined onto a filesystem path, so anything the manifest
+        // did not record must be refused — otherwise these read any
+        // `*.checkpoint.json` on the host.
+        for attempt in [
+            "../../../etc/passwd",
+            "..%2f..%2fsecret",
+            "/etc/shadow",
+            "../counter",
+            "counter/../counter",
+            "./counter",
+        ] {
+            assert_eq!(
+                resolve_operator_name(dir.path(), attempt),
+                None,
+                "{attempt:?} must not resolve to an operator"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_operator_names_do_not_resolve() {
+        let dir = state_dir_with_operator("counter");
+        assert_eq!(resolve_operator_name(dir.path(), "not-an-operator"), None);
+        assert_eq!(resolve_operator_name(dir.path(), ""), None);
+    }
+
+    #[tokio::test]
+    async fn state_entries_refuses_a_traversal_path() {
+        let dir = state_dir_with_operator("counter");
+        let mut base = (*test_state()).clone();
+        base.checkpoint_dir = Some(dir.path().to_path_buf());
+
+        let router = Router::new()
+            .route("/api/state/operators/{name}", get(api_state_entries))
+            .with_state(Arc::new(base));
+
+        assert_eq!(
+            get_status(router, "/api/state/operators/..%2F..%2Fescape", None).await,
+            StatusCode::NOT_FOUND
+        );
+    }
+
+    #[test]
+    fn key_filter_compiles_once_and_rejects_invalid_patterns() {
+        assert!(compile_key_filter(None).unwrap().is_none());
+        assert!(
+            compile_key_filter(Some(&"^ali".to_string()))
+                .unwrap()
+                .is_some()
+        );
+
+        // Previously an invalid pattern silently matched nothing, which reads
+        // as "this operator has no keys" rather than "your filter is wrong".
+        assert_eq!(
+            compile_key_filter(Some(&"[unclosed".to_string())).unwrap_err(),
+            StatusCode::BAD_REQUEST
+        );
+    }
+
+    #[tokio::test]
+    async fn state_entries_rejects_an_invalid_key_filter() {
+        let dir = state_dir_with_operator("counter");
+        let mut base = (*test_state()).clone();
+        base.checkpoint_dir = Some(dir.path().to_path_buf());
+
+        let router = Router::new()
+            .route("/api/state/operators/{name}", get(api_state_entries))
+            .with_state(Arc::new(base));
+
+        assert_eq!(
+            get_status(
+                router,
+                "/api/state/operators/counter?pattern=%5Bunclosed",
+                None
+            )
+            .await,
+            StatusCode::BAD_REQUEST
+        );
+    }
+
+    #[tokio::test]
+    async fn state_entries_serves_a_known_operator() {
+        let dir = state_dir_with_operator("counter");
+        let mut base = (*test_state()).clone();
+        base.checkpoint_dir = Some(dir.path().to_path_buf());
+
+        let router = Router::new()
+            .route("/api/state/operators/{name}", get(api_state_entries))
+            .with_state(Arc::new(base));
+
+        assert_eq!(
+            get_status(router, "/api/state/operators/counter", None).await,
+            StatusCode::OK
+        );
     }
 }

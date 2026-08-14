@@ -191,6 +191,9 @@ histogram_quantile(0.95, sum by (le) (rate(state_get_duration_seconds_bucket[5m]
 
 ## Security
 
+Full issue register and hardening checklist: [SECURITY.md](SECURITY.md). The
+short version follows.
+
 The HTTP surface is closed by default and opens only where you say so.
 
 **Authentication.** Set `RHEI_METRICS_TOKEN` and every request to `/metrics`

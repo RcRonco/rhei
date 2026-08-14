@@ -309,7 +309,10 @@ impl<'de> serde::Deserialize<'de> for ErasedBuffer {
             serde::Deserialize::deserialize(deserializer)?;
 
         let batch = deserialize_batch(&ipc_bytes).map_err(serde::de::Error::custom)?;
-        let mask = mask_bytes.map(|b| deserialize_mask(&b));
+        let mask = mask_bytes
+            .map(|b| deserialize_mask(&b))
+            .transpose()
+            .map_err(serde::de::Error::custom)?;
 
         Ok(Self {
             batch,
@@ -353,15 +356,31 @@ fn serialize_mask(mask: &BooleanArray) -> Vec<u8> {
     serialize_batch(&batch).expect("mask serialization cannot fail")
 }
 
-#[allow(clippy::expect_used)]
-fn deserialize_mask(bytes: &[u8]) -> BooleanArray {
-    let batch = deserialize_batch(bytes).expect("mask deserialization cannot fail");
-    batch
-        .column(0)
+/// Decode a selection mask received over the Exchange channel.
+///
+/// Fallible on purpose. These bytes arrive from another process over the
+/// cluster data plane, which is unauthenticated plaintext TCP (see
+/// `SECURITY.md`, SI-2/SI-4): anything that can reach the port can put
+/// arbitrary bytes here. Panicking would let a single malformed frame take
+/// down a worker thread, so a bad mask is reported as a deserialization error
+/// and handled by the caller instead.
+fn deserialize_mask(bytes: &[u8]) -> Result<BooleanArray, arrow::error::ArrowError> {
+    let batch = deserialize_batch(bytes)?;
+
+    let column = batch.columns().first().ok_or_else(|| {
+        arrow::error::ArrowError::IpcError("mask batch has no columns".to_string())
+    })?;
+
+    column
         .as_any()
         .downcast_ref::<BooleanArray>()
-        .expect("mask column must be BooleanArray")
-        .clone()
+        .ok_or_else(|| {
+            arrow::error::ArrowError::IpcError(format!(
+                "mask column must be BooleanArray, got {}",
+                column.data_type()
+            ))
+        })
+        .cloned()
 }
 
 #[cfg(test)]
@@ -773,6 +792,50 @@ mod tests {
         let total_rows: usize = partitions.iter().map(ErasedBuffer::num_rows).sum();
         // Only 2 rows should be routed (masked rows excluded).
         assert_eq!(total_rows, 2);
+    }
+
+    // ── Hostile Exchange payloads (SI-2) ─────────────────────────────
+
+    #[test]
+    fn malformed_mask_is_an_error_not_a_panic() {
+        // These bytes arrive from another process over an unauthenticated
+        // plaintext channel. A panic here takes down a worker thread.
+        let err =
+            deserialize_mask(b"not arrow ipc at all").expect_err("garbage must not deserialize");
+        assert!(!format!("{err}").is_empty());
+    }
+
+    #[test]
+    fn empty_mask_bytes_are_an_error_not_a_panic() {
+        assert!(deserialize_mask(&[]).is_err());
+    }
+
+    #[test]
+    fn mask_with_wrong_column_type_is_rejected() {
+        use arrow_array::Int32Array;
+
+        // Well-formed Arrow IPC, but the mask column is not boolean — the
+        // downcast used to `expect` and panic.
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![arrow_schema::Field::new(
+                "_mask",
+                arrow_schema::DataType::Int32,
+                false,
+            )])),
+            vec![Arc::new(Int32Array::from(vec![1, 0, 1]))],
+        )
+        .unwrap();
+        let bytes = serialize_batch(&batch).unwrap();
+
+        let err = deserialize_mask(&bytes).expect_err("non-boolean mask must be rejected");
+        assert!(format!("{err}").contains("BooleanArray"), "got: {err}");
+    }
+
+    #[test]
+    fn a_valid_mask_still_round_trips() {
+        let mask = BooleanArray::from(vec![true, false, true]);
+        let decoded = deserialize_mask(&serialize_mask(&mask)).expect("valid mask decodes");
+        assert_eq!(decoded, mask);
     }
 }
 

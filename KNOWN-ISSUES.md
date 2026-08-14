@@ -8,6 +8,8 @@ Resolved entries are kept rather than deleted: what a system used to get wrong
 is part of what you need to know when judging it, and a register that only
 lists open items reads as though nothing was ever broken.
 
+Security issues are tracked separately in [SECURITY.md](SECURITY.md) as `SI-N`.
+
 **Still open:** KI-14, KI-18, KI-26, KI-27, and the dirty half of KI-7.
 
 ---
@@ -299,7 +301,7 @@ now reads them too.
 
 ### ~~KI-25: Unauthenticated state explorer with permissive CORS~~ (RESOLVED)
 
-**File:** `rhei-runtime/src/http_server.rs`
+**Tracked as SI-6 in [SECURITY.md](SECURITY.md).** File: `rhei-runtime/src/http_server.rs`
 
 `/api/state/**` returns checkpointed application data — your keys and values —
 and was served to anyone who could reach the port, under
@@ -312,11 +314,12 @@ full state into memory to count entries, and inspection refuses state above
 
 ### KI-26: Cluster data plane has no transport security
 
-**Files:** `rhei-runtime/src/cluster/`, `rhei-runtime/src/checkpoint_coord.rs`
+**Tracked as SI-4 in [SECURITY.md](SECURITY.md).**
 
 The Timely inter-process data plane (port 2101) and the checkpoint coordination
 channel are plaintext TCP with no authentication. Anyone who can reach those
-ports can read pipeline data in flight and inject coordination messages.
+ports can read pipeline data in flight, inject records, and forge checkpoint
+readiness messages.
 
 **Workaround:** run them on a trusted network — a private subnet, a service mesh
 providing mTLS, or a NetworkPolicy restricting 2101 to pods in the same
