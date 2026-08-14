@@ -462,6 +462,72 @@ fn partial_filename(process_id: usize) -> String {
     format!("manifest_p{process_id}.json")
 }
 
+/// Largest operator state file the inspection helpers will read into memory.
+///
+/// [`load_operator_state`] deserialises the whole file at once, so an
+/// unbounded read turns a state-explorer request into an out-of-memory kill of
+/// the pipeline itself. 256 MiB is far above any state worth paging through in
+/// a browser and far below what would threaten a pipeline sized for real work.
+pub const MAX_INSPECTABLE_STATE_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Operator state was too large to load for inspection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StateTooLarge {
+    /// The operator whose state was requested.
+    pub operator: String,
+    /// Size of the checkpoint file on disk.
+    pub size_bytes: u64,
+    /// The limit it exceeded.
+    pub limit_bytes: u64,
+}
+
+impl std::fmt::Display for StateTooLarge {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "operator {:?} has {} MiB of checkpointed state, above the {} MiB inspection limit. \
+             Reading it would materialise the whole file in the pipeline's own memory.",
+            self.operator,
+            self.size_bytes / (1024 * 1024),
+            self.limit_bytes / (1024 * 1024)
+        )
+    }
+}
+
+impl std::error::Error for StateTooLarge {}
+
+/// Size of an operator's checkpoint file, or `None` if it does not exist.
+pub fn operator_state_size(dir: &Path, operator_name: &str) -> Option<u64> {
+    let path = dir.join(format!("{operator_name}.checkpoint.json"));
+    std::fs::metadata(path).ok().map(|m| m.len())
+}
+
+/// Load operator state for inspection, refusing files above
+/// [`MAX_INSPECTABLE_STATE_BYTES`].
+///
+/// Use this on request-driven paths. [`load_operator_state`] is unbounded and
+/// is only safe where the caller controls the state size.
+///
+/// # Errors
+/// Returns [`StateTooLarge`] if the checkpoint file exceeds the limit, or a
+/// parse error if it is malformed.
+pub fn load_operator_state_for_inspection(
+    dir: &Path,
+    operator_name: &str,
+) -> anyhow::Result<Vec<(String, Vec<u8>)>> {
+    if let Some(size) = operator_state_size(dir, operator_name)
+        && size > MAX_INSPECTABLE_STATE_BYTES
+    {
+        return Err(StateTooLarge {
+            operator: operator_name.to_string(),
+            size_bytes: size,
+            limit_bytes: MAX_INSPECTABLE_STATE_BYTES,
+        }
+        .into());
+    }
+    load_operator_state(dir, operator_name)
+}
+
 /// Load operator state from a checkpoint file.
 ///
 /// Reads `{dir}/{operator_name}.checkpoint.json` (`LocalBackend` format),
@@ -469,6 +535,10 @@ fn partial_filename(process_id: usize) -> String {
 /// `(user_key_string, raw_value_bytes)` pairs.
 ///
 /// Returns an empty vec if the file does not exist.
+///
+/// **Unbounded**: the entire file is read and deserialised into memory. On any
+/// path driven by an incoming request, use
+/// [`load_operator_state_for_inspection`] instead.
 pub fn load_operator_state(
     dir: &Path,
     operator_name: &str,
@@ -1061,5 +1131,60 @@ mod tests {
             .expect("all partials present");
         assert_eq!(merged.max_parallelism, None);
         assert!(merged.validate_compatible(64).is_ok());
+    }
+
+    // ── Bounded state inspection ─────────────────────────────────────
+
+    #[test]
+    fn inspection_reads_ordinary_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let entries: Vec<(Vec<u8>, Vec<u8>)> = vec![(b"counter/alice".to_vec(), b"42".to_vec())];
+        std::fs::write(
+            dir.path().join("counter.checkpoint.json"),
+            serde_json::to_string(&entries).unwrap(),
+        )
+        .unwrap();
+
+        let loaded = load_operator_state_for_inspection(dir.path(), "counter").unwrap();
+        assert_eq!(loaded, vec![("alice".to_string(), b"42".to_vec())]);
+    }
+
+    #[test]
+    fn inspection_refuses_oversized_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("huge.checkpoint.json");
+        // Sparse file: big by metadata, cheap on disk. The guard checks size
+        // before reading, which is the whole point — the file is never
+        // materialised in memory.
+        let file = std::fs::File::create(&path).unwrap();
+        file.set_len(MAX_INSPECTABLE_STATE_BYTES + 1).unwrap();
+        drop(file);
+
+        let err = load_operator_state_for_inspection(dir.path(), "huge")
+            .expect_err("oversized state must be refused, not loaded");
+        let too_large = err
+            .downcast_ref::<StateTooLarge>()
+            .expect("should be a StateTooLarge error");
+        assert_eq!(too_large.operator, "huge");
+        assert!(too_large.size_bytes > too_large.limit_bytes);
+    }
+
+    #[test]
+    fn inspection_of_absent_state_is_empty_not_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(
+            load_operator_state_for_inspection(dir.path(), "never-ran")
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn state_size_reports_none_when_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(operator_state_size(dir.path(), "missing"), None);
+
+        std::fs::write(dir.path().join("present.checkpoint.json"), b"[]").unwrap();
+        assert_eq!(operator_state_size(dir.path(), "present"), Some(2));
     }
 }

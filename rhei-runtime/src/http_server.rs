@@ -33,7 +33,9 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 use tower_http::cors::CorsLayer;
 
-use rhei_core::checkpoint::{CheckpointManifest, load_operator_state};
+use rhei_core::checkpoint::{
+    CheckpointManifest, load_operator_state_for_inspection, operator_state_size,
+};
 
 use crate::compiler::ApiTopology;
 use crate::health::{HealthState, Liveness, PipelineStatus};
@@ -341,7 +343,12 @@ struct StateOperatorsResponse {
 #[derive(Serialize, Deserialize)]
 struct OperatorStateInfo {
     name: String,
-    entry_count: usize,
+    /// On-disk size of the operator's checkpoint file.
+    ///
+    /// Reported instead of an entry count: counting requires deserialising the
+    /// whole file, and a listing request must stay cheap regardless of how
+    /// much state an operator holds.
+    size_bytes: u64,
 }
 
 #[derive(Deserialize)]
@@ -751,6 +758,20 @@ fn decode_value(raw: &[u8], format: &str) -> (serde_json::Value, String) {
 
 // ─── State explorer handlers ────────────────────────────────────────────────
 
+/// Map a state-read failure onto a status code.
+///
+/// Oversized state is a request the server declines, not a server fault — the
+/// caller asked for more than the endpoint will materialise.
+fn state_read_error_status(error: &anyhow::Error) -> StatusCode {
+    if error.is::<rhei_core::checkpoint::StateTooLarge>() {
+        tracing::warn!(error = %error, "refusing to load oversized operator state");
+        StatusCode::PAYLOAD_TOO_LARGE
+    } else {
+        tracing::error!(error = %error, "failed to read operator state");
+        StatusCode::INTERNAL_SERVER_ERROR
+    }
+}
+
 /// `GET /api/state/operators` — list operators from last checkpoint.
 async fn api_state_operators(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let Some(ref dir) = state.checkpoint_dir else {
@@ -761,15 +782,16 @@ async fn api_state_operators(State(state): State<Arc<AppState>>) -> impl IntoRes
         return (StatusCode::NOT_FOUND, axum::Json(None));
     };
 
+    // Deliberately does not load each operator's state. Counting entries that
+    // way meant one listing request materialised every operator's entire
+    // checkpoint in the pipeline's memory — the cheapest possible way to kill
+    // a healthy process from an observability endpoint.
     let operators: Vec<OperatorStateInfo> = manifest
         .operators
         .iter()
-        .map(|name| {
-            let entry_count = load_operator_state(dir, name).map_or(0, |entries| entries.len());
-            OperatorStateInfo {
-                name: name.clone(),
-                entry_count,
-            }
+        .map(|name| OperatorStateInfo {
+            name: name.clone(),
+            size_bytes: operator_state_size(dir, name).unwrap_or(0),
         })
         .collect();
 
@@ -793,8 +815,9 @@ async fn api_state_entries(
         return (StatusCode::NOT_FOUND, axum::Json(None));
     };
 
-    let Ok(entries) = load_operator_state(dir, &operator_name) else {
-        return (StatusCode::INTERNAL_SERVER_ERROR, axum::Json(None));
+    let entries = match load_operator_state_for_inspection(dir, &operator_name) {
+        Ok(entries) => entries,
+        Err(e) => return (state_read_error_status(&e), axum::Json(None)),
     };
 
     let filtered: Vec<_> = entries
@@ -856,8 +879,9 @@ async fn api_state_key(
         return (StatusCode::NOT_FOUND, axum::Json(None));
     };
 
-    let Ok(entries) = load_operator_state(dir, &operator_name) else {
-        return (StatusCode::INTERNAL_SERVER_ERROR, axum::Json(None));
+    let entries = match load_operator_state_for_inspection(dir, &operator_name) {
+        Ok(entries) => entries,
+        Err(e) => return (state_read_error_status(&e), axum::Json(None)),
     };
 
     let decoded_key = urlencoding::decode(&key).unwrap_or(std::borrow::Cow::Borrowed(&key));

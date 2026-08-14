@@ -175,6 +175,8 @@ Frontier-based. When Timely's progress frontier advances past an epoch, the exec
 
 In cluster mode, a TCP coordination protocol ensures all processes have flushed state before the checkpoint manifest is committed. Mid-execution checkpoints run concurrently with the dataflow — no stop-the-world pauses.
 
+Delivery is **at-least-once**: source offsets are committed after a checkpoint completes, so a crash replays everything since the last one. Sinks must tolerate duplicates.
+
 ### Clustering
 
 | Mode | Config | What changes |
@@ -334,6 +336,23 @@ rhei demo                     # built-in demo with the HTTP dashboard
 
 The `rhei` CLI is not published to crates.io. Install it from a checkout with `cargo install --path rhei-cli`.
 
+## Running in Production
+
+[docs/deployment.md](docs/deployment.md) covers configuration, probe semantics, metrics, capacity planning, and a runbook. [SECURITY.md](SECURITY.md) tracks security issues and carries a hardening checklist. [KNOWN-ISSUES.md](KNOWN-ISSUES.md) is the honest register of what is and is not finished — read all three before committing to a deployment.
+
+```bash
+docker build -f deploy/Dockerfile --build-arg BIN=my-pipeline -t my-pipeline:v1 .
+kubectl apply -f deploy/kubernetes/statefulset.yaml
+kubectl apply -f deploy/kubernetes/monitoring.yaml
+```
+
+The manifests in `deploy/kubernetes/` are a commented starting point: a StatefulSet with all three probes wired up, a headless Service for the data plane, Prometheus alert rules, and a PodDisruptionBudget.
+
+Two things worth knowing before you deploy:
+
+- **`RHEI_MAX_PARALLELISM` is permanent.** It fixes the key group count, and changing it re-partitions the entire key space. Rhei refuses to start rather than silently read empty state, and there is no migration path — pick a value above the largest worker count you will ever run.
+- **The cluster data plane is unencrypted.** Ports 2101 and the checkpoint coordination port are plaintext TCP with no authentication — anyone who can reach them can read records in flight and inject frames. Keep them on a trusted network. See [SECURITY.md](SECURITY.md) SI-4.
+
 ## Building
 
 ```bash
@@ -365,6 +384,7 @@ Start at **[docs/README.md](docs/README.md)** for the full map.
 | [ARCHITECTURE.md](ARCHITECTURE.md) | System topology, execution model, data flow paths |
 | [CLUSTERING.md](CLUSTERING.md) | Single-thread → multi-process → control plane plan |
 | [KNOWN-ISSUES.md](KNOWN-ISSUES.md) | Tracked gaps and correctness limitations |
+| [SECURITY.md](SECURITY.md) | Security issue register, trust boundaries, hardening checklist |
 | [ROADMAP.md](ROADMAP.md) | Built vs. planned work |
 | [DOCS-AUDIT.md](DOCS-AUDIT.md) | Documentation accuracy audit and enforcement mechanism |
 | [ADR/](ADR/) | Architecture decision records |
