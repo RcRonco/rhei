@@ -1,14 +1,13 @@
 //! Batch tumbling window aggregation example using the Arrow columnar pipeline.
 //!
 //! Sensor readings are aggregated per-sensor over fixed 10-second tumbling
-//! windows using `TumblingWindow` with a sum accumulator.
+//! windows built with the `Window::tumbling` builder and a sum accumulator.
 //! Windows close when data crosses into a new time bucket or on source exhaustion.
 //!
 //! Run with: `cargo run -p rhei --example batch_window_agg`
 
 use rhei::{
-    DataflowGraph, PipelineController, PrintSink, RheiSchema as RheiSchemaDerive, TumblingWindow,
-    VecSource,
+    DataflowGraph, PipelineController, PrintSink, RheiSchema as RheiSchemaDerive, VecSource, Window,
 };
 
 #[derive(Debug, Clone, RheiSchemaDerive)]
@@ -90,22 +89,23 @@ async fn main() -> anyhow::Result<()> {
 
     let source = VecSource::new(readings).with_batch_size(10);
 
-    let window = TumblingWindow::new(
-        10,
-        |view: SensorReadingView<'_>| view.sensor_id.to_string(),
-        |view: SensorReadingView<'_>| view.timestamp,
-        |acc: &mut (f64, u64), view: SensorReadingView<'_>| {
+    let window = Window::tumbling(10)
+        .key(|view: SensorReadingView<'_>| view.sensor_id.to_string())
+        .time(|view: SensorReadingView<'_>| view.timestamp)
+        .accumulate(|acc: &mut (f64, u64), view: SensorReadingView<'_>| {
             acc.0 += view.value;
             acc.1 += 1;
-        },
-        |key: &str, window_start: u64, window_end: u64, acc: &(f64, u64)| WindowResult {
-            sensor_id: key.to_string(),
-            window_start,
-            window_end,
-            sum: acc.0,
-            count: acc.1,
-        },
-    );
+        })
+        .finish(
+            |key: &str, window_start: u64, window_end: u64, acc: &(f64, u64)| WindowResult {
+                sensor_id: key.to_string(),
+                window_start,
+                window_end,
+                sum: acc.0,
+                count: acc.1,
+            },
+        )
+        .build();
 
     let graph = DataflowGraph::new();
     graph

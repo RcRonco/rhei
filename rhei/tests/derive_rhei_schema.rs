@@ -221,3 +221,99 @@ fn buffer_integration() {
     assert_eq!(masked_views[0].id, 1);
     assert_eq!(masked_views[1].id, 3);
 }
+
+// ── Typed column handles ─────────────────────────────────────────────
+
+#[test]
+fn typed_col_handles_carry_field_names() {
+    assert_eq!(SimpleEvent::col().id().name(), "id");
+    assert_eq!(SimpleEvent::col().name().name(), "name");
+    assert_eq!(SimpleEvent::col().score().name(), "score");
+    assert_eq!(SimpleEvent::col().active().name(), "active");
+
+    assert_eq!(ComplexEvent::col().user_id().name(), "user_id");
+    assert_eq!(ComplexEvent::col().email().name(), "email");
+    assert_eq!(ComplexEvent::col().tags().name(), "tags");
+}
+
+#[test]
+fn typed_col_handles_are_typed_by_field() {
+    // Each accessor pins the literal type: these compile only because the
+    // literal matches the field's Rust type.
+    let _: rhei::Col<i64> = SimpleEvent::col().id();
+    let _: rhei::Col<String> = SimpleEvent::col().name();
+    let _: rhei::Col<f64> = SimpleEvent::col().score();
+    let _: rhei::Col<bool> = SimpleEvent::col().active();
+
+    // Option<T> fields compare against plain T.
+    let _: rhei::Col<String> = ComplexEvent::col().email();
+    let _: rhei::Col<i64> = ComplexEvent::col().timestamp();
+    let _: rhei::Col<u64> = ComplexEvent::col().user_id();
+}
+
+#[test]
+fn typed_col_predicates_filter_a_batch() {
+    use rhei::RheiBuffer;
+
+    let mut builder = SimpleEvent::builder(3);
+    builder.append(SimpleEvent {
+        id: 1,
+        name: "a".into(),
+        score: 1.0,
+        active: true,
+    });
+    builder.append(SimpleEvent {
+        id: 2,
+        name: "b".into(),
+        score: 5.0,
+        active: false,
+    });
+    builder.append(SimpleEvent {
+        id: 3,
+        name: "c".into(),
+        score: 9.0,
+        active: true,
+    });
+    let buf = RheiBuffer::<SimpleEvent>::from_builder(builder);
+    let batch = buf.as_record_batch();
+
+    let expr = SimpleEvent::col()
+        .score()
+        .gt(2.0)
+        .and(SimpleEvent::col().name().is_in(["b", "z"]));
+    let mask = rhei_core::operators::filter_expr::eval_predicate(&expr, batch).unwrap();
+    assert_eq!(
+        (0..batch.num_rows())
+            .map(|i| mask.value(i))
+            .collect::<Vec<_>>(),
+        vec![false, true, false]
+    );
+}
+
+#[test]
+fn typed_col_null_predicate_on_optional_field() {
+    use rhei::RheiBuffer;
+
+    let mut builder = ComplexEvent::builder(2);
+    builder.append(ComplexEvent {
+        user_id: 1,
+        email: Some("a@example.com".into()),
+        timestamp: Some(10),
+        tags: vec!["x".into()],
+        scores: vec![1.0],
+    });
+    builder.append(ComplexEvent {
+        user_id: 2,
+        email: None,
+        timestamp: None,
+        tags: vec![],
+        scores: vec![],
+    });
+    let buf = RheiBuffer::<ComplexEvent>::from_builder(builder);
+    let batch = buf.as_record_batch();
+
+    let expr = ComplexEvent::col().email().is_null();
+    let mask = rhei_core::operators::filter_expr::eval_predicate(&expr, batch).unwrap();
+    assert!(!mask.value(0));
+    assert!(mask.value(1));
+}

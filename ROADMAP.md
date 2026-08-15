@@ -11,6 +11,8 @@
   - [x] `KeyedState<K, V>` — typed state wrapper over `StateContext` with automatic serde
   - [x] `Filter`, `Map`, `FlatMap` — stateless combinators
 - [x] Fluent pipeline builder API (`DataflowGraph` with a single `Copy` `Stream<'a, T>` handle)
+- [x] `Window::tumbling/sliding/session/count` builders — name the four window closures, type-state so `build()` requires every slot
+- [x] Typed column handles from `#[derive(RheiSchema)]` — `T::col().field().gt(v)` checks the column name and literal type at compile time
 - [ ] `KeyedStream<T>` type so "stateful operators require keying" is a compile-time guarantee rather than a convention
 - [x] Multi-operator chaining in `run_dataflow` (currently single-operator only)
 - [ ] Hot-reload operator logic without full pipeline restart

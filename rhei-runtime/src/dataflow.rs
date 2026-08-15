@@ -578,7 +578,11 @@ impl<'a, T: RheiSchema + 'static> Stream<'a, T> {
     }
 
     /// Expression-based zero-copy filter using Arrow compute kernels.
-    pub fn filter(self, expr: rhei_core::operators::Expr) -> Stream<'a, T> {
+    ///
+    /// Accepts anything convertible into an `Expr`, so a typed `Col<bool>`
+    /// from `#[derive(RheiSchema)]` can be used as a predicate directly.
+    pub fn filter(self, expr: impl Into<rhei_core::operators::Expr>) -> Stream<'a, T> {
+        let expr = expr.into();
         let node = LazyBatchTransformNode(Box::new(move || {
             let expr = expr.clone();
             Arc::new(move |buf: ErasedBuffer| {

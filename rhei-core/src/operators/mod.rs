@@ -14,10 +14,14 @@ pub mod session_window;
 pub mod sliding_window;
 pub mod temporal_join;
 pub mod tumbling_window;
+pub mod window_builder;
 
 pub use count_window::CountWindow;
 pub use filter::{FilterFnOp, FilterOp};
-pub use filter_expr::{Expr, FilterExprOp, col, lit_bool, lit_f64, lit_i64, lit_str, lit_u64};
+pub use filter_expr::{
+    Col, Expr, FilterExprOp, ScalarLike, ScalarValue, col, lit_bool, lit_f64, lit_i64, lit_str,
+    lit_u64,
+};
 pub use map::{FlatMapOp, MapOp};
 pub use reduce::{ReduceOp, RollingAggregateOp};
 pub use sequence_detect::{AfterMatch, MatchCtx, SequenceDetect};
@@ -25,3 +29,6 @@ pub use session_window::SessionWindow;
 pub use sliding_window::SlidingWindow;
 pub use temporal_join::{Side, TemporalJoin};
 pub use tumbling_window::TumblingWindow;
+pub use window_builder::{
+    CountWindowBuilder, SessionWindowBuilder, SlidingWindowBuilder, TumblingWindowBuilder, Window,
+};

@@ -156,7 +156,11 @@ fn build(graph: &DataflowGraph) {
 }
 ```
 
-Expression builders: `col`, `lit_i64`, `lit_u64`, `lit_f64`, `lit_str`, `lit_bool`, combined with `gt`, `gt_eq`, `lt`, `lt_eq`, `eq`, `not_eq`, `and`, `or`, `negate`.
+Expression builders: `col`, `lit_i64`, `lit_u64`, `lit_f64`, `lit_str`, `lit_bool`, combined with `gt`, `gt_eq`, `lt`, `lt_eq`, `eq`, `not_eq`, `and`, `or`, `negate`, `is_null`, `is_not_null`.
+
+`#[derive(RheiSchema)]` also generates a typed handle per column, so the name
+comes from the schema and the literal from the field type — `views.filter(PageView::col().dwell_ms().gt(3_000.0))`.
+See [docs/operators.md](docs/operators.md#typed-columns).
 
 Stateless transforms never move data between workers — they run wherever the data already is.
 
@@ -259,17 +263,28 @@ Beyond `process`, `StreamFunction` has defaulted hooks: `open`, `close`, `on_wat
 
 ### Built-in operators
 
-Window and join operators are constructed with `::new(...)` taking positional closures. **They do not have builders.**
+Window operators have a fluent builder, `Window`, alongside the positional
+`::new(...)` constructor. Join operators are constructed with `::new(...)` only.
 
-| Operator | Constructor shape |
-|----------|-------------------|
-| `TumblingWindow` | `new(size, key_fn, time_fn, accumulate_fn, output_fn)` |
-| `SlidingWindow` | `new(size, slide, key_fn, time_fn, accumulate_fn, output_fn)` |
-| `SessionWindow` | `new(gap, key_fn, time_fn, accumulate_fn, output_fn)` |
-| `CountWindow` | count-triggered, same closure shape |
-| `TemporalJoin` | key/join closures over a merged `Side<L, R>` stream |
-| `SequenceDetect` | ordered pattern matching with `AfterMatch` semantics |
-| `ReduceOp`, `RollingAggregateOp` | incremental aggregation |
+| Operator | Constructor shape | Builder |
+|----------|-------------------|---------|
+| `TumblingWindow` | `new(size, key_fn, time_fn, accumulate_fn, output_fn)` | `Window::tumbling(size)` |
+| `SlidingWindow` | `new(size, slide, key_fn, time_fn, accumulate_fn, output_fn)` | `Window::sliding(size, slide)` |
+| `SessionWindow` | `new(gap, key_fn, time_fn, accumulate_fn, output_fn)` | `Window::session(gap)` |
+| `CountWindow` | count-triggered, same closure shape | `Window::count(threshold)` |
+| `TemporalJoin` | key/join closures over a merged `Side<L, R>` stream | — |
+| `SequenceDetect` | ordered pattern matching with `AfterMatch` semantics | `SequenceDetect::builder()` |
+| `ReduceOp`, `RollingAggregateOp` | incremental aggregation | — |
+
+The window builder fills the same closures by name, in any order, and only
+exposes `build()` once all of them are set:
+
+```text
+Window::tumbling(60_000)
+    .key(key_fn).time(time_fn).accumulate(accumulate_fn).finish(finish_fn)
+    .allowed_lateness(5_000)
+    .build()
+```
 
 See [`rhei/examples/batch_window_agg.rs`](rhei/examples/batch_window_agg.rs) and [`rhei-runtime/examples/temporal_join.rs`](rhei-runtime/examples/temporal_join.rs) for complete, compiled usages, and each operator's source in `rhei-core/src/operators/` for exact signatures.
 
