@@ -563,7 +563,7 @@ async fn setup_coordination(
 /// Sized for a real orchestrated start, where process 0 may still be pulling
 /// an image or restoring state when its peers come up. Failing after a few
 /// seconds would turn an ordinary staggered rollout into a crash loop.
-const COORDINATOR_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+const COORDINATOR_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_mins(2);
 
 /// Connect to the checkpoint coordinator, retrying with capped exponential
 /// backoff until [`COORDINATOR_CONNECT_TIMEOUT`] elapses.

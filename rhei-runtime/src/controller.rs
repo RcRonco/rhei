@@ -1876,7 +1876,7 @@ mod tests {
             .expect("valid configuration");
         assert_eq!(
             controller.health().liveness_timeout(),
-            std::time::Duration::from_secs(180)
+            std::time::Duration::from_mins(3)
         );
 
         let err = builder_with_env(&[("RHEI_LIVENESS_TIMEOUT_SECS", "0")])

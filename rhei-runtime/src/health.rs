@@ -20,7 +20,7 @@ use std::time::Duration;
 /// worker for a while, and restarting a healthy pipeline mid-flush is worse
 /// than noticing a wedge a minute later. Tune with
 /// [`HealthState::with_liveness_timeout`].
-pub const DEFAULT_LIVENESS_TIMEOUT: Duration = Duration::from_secs(60);
+pub const DEFAULT_LIVENESS_TIMEOUT: Duration = Duration::from_mins(1);
 
 /// Milliseconds since the Unix epoch, saturating at 0 if the clock is before it.
 fn now_millis() -> u64 {
@@ -482,7 +482,7 @@ mod tests {
         let reason = Liveness::Stalled {
             worker: 3,
             stalled_for: Duration::from_secs(90),
-            timeout: Duration::from_secs(60),
+            timeout: Duration::from_mins(1),
         };
         let text = reason.to_string();
         assert!(text.contains("worker 3"), "got: {text}");
