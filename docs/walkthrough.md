@@ -162,7 +162,7 @@ fn build(graph: &DataflowGraph) {
 For simple comparisons there is a second form that runs as an Arrow compute kernel over the whole column rather than row by row:
 
 ```rust,no_run
-use rhei::{DataflowGraph, PrintSink, VecSource, col, lit_u64};
+use rhei::{DataflowGraph, PrintSink, VecSource};
 
 #[derive(Clone, rhei::RheiSchema)]
 struct PageView {
@@ -179,10 +179,16 @@ fn build(graph: &DataflowGraph) {
             ts: 60_000,
         }]))
         // Drop anything before the campaign started.
-        .filter(col("ts").gt_eq(lit_u64(60_000)))
+        .filter(PageView::col().ts().gt_eq(60_000_u64))
         .sink(PrintSink::<PageView>::new());
 }
 ```
+
+`PageView::col()` comes from `#[derive(RheiSchema)]` and returns a typed handle
+per field, so the column name and the literal's type are both checked at compile
+time. There is an untyped spelling — `col("ts").gt_eq(lit_u64(60_000))` — that
+takes any string, and reports a bad column or literal only when the first batch
+arrives; prefer the typed form.
 
 `filter` takes an `Expr`; `filter_fn` takes a closure. Prefer `filter` when the predicate is a plain column comparison, `filter_fn` when it needs real Rust.
 
@@ -381,7 +387,7 @@ Use the trait directly when the operator needs configuration; use the macro when
 A *session* is a burst of activity separated from the next by a gap of inactivity — exactly what `SessionWindow` computes. Unlike tumbling windows, the boundaries come from the data, not from a fixed grid.
 
 ```rust,no_run
-use rhei::{DataflowGraph, PrintSink, SessionWindow, VecSource};
+use rhei::{DataflowGraph, PrintSink, VecSource, Window};
 
 const MINUTE: u64 = 60_000;
 
@@ -401,22 +407,21 @@ struct SessionSummary {
 }
 
 fn build(graph: &DataflowGraph) {
-    let window = SessionWindow::new(
-        30 * MINUTE, // close a session after 30 minutes of inactivity
-        // key_fn: whose session is this?
-        |v: PageViewView<'_>| v.user_id.to_string(),
-        // time_fn: the row's event time
-        |v: PageViewView<'_>| v.ts,
-        // accumulate_fn: fold each row into the accumulator
-        |acc: &mut u64, _v: PageViewView<'_>| *acc += 1,
-        // finish_fn: turn the accumulator into an output row
-        |user_id: &str, started_at: u64, ended_at: u64, views: &u64| SessionSummary {
-            user_id: user_id.to_string(),
-            started_at,
-            ended_at,
-            views: *views,
-        },
-    );
+    // Close a session after 30 minutes of inactivity. The builder names each
+    // closure, so nothing here depends on argument order.
+    let window = Window::session(30 * MINUTE)
+        .key(|v: PageViewView<'_>| v.user_id.to_string())
+        .time(|v: PageViewView<'_>| v.ts)
+        .accumulate(|acc: &mut u64, _v: PageViewView<'_>| *acc += 1)
+        .finish(
+            |user_id: &str, started_at: u64, ended_at: u64, views: &u64| SessionSummary {
+                user_id: user_id.to_string(),
+                started_at,
+                ended_at,
+                views: *views,
+            },
+        )
+        .build();
 
     graph
         .source(VecSource::new(vec![PageView {

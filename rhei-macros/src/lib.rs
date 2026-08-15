@@ -62,7 +62,8 @@ pub fn pipeline(_attr: TokenStream, item: TokenStream) -> TokenStream {
 }
 
 /// Derive the `RheiSchema` trait for a struct, generating Arrow schema,
-/// columnar builder, zero-copy view, typed column accessors, and column constants.
+/// columnar builder, zero-copy view, typed column accessors, filter-expression
+/// handles, and column constants.
 ///
 /// # Example
 ///
@@ -77,8 +78,15 @@ pub fn pipeline(_attr: TokenStream, item: TokenStream) -> TokenStream {
 /// }
 /// ```
 ///
-/// Generates: `WebEventBuilder`, `WebEventView<'a>`, `WebEventColumns<'a>`,
-/// and constants like `WebEvent::USER_ID`, `WebEvent::PATH`, etc.
+/// Generates:
+///
+/// - `WebEventBuilder` — columnar builder over Arrow array builders.
+/// - `WebEventView<'a>` — zero-copy view of one row.
+/// - `WebEventColumns<'a>` — typed Arrow array accessors for the whole batch.
+/// - `WebEventCol` plus `WebEvent::col()` — a typed `Col<T>` handle per field
+///   for building filter expressions, e.g.
+///   `WebEvent::col().user_id().gt(42)`. An `Option<T>` field yields `Col<T>`.
+/// - Column name constants: `WebEvent::USER_ID`, `WebEvent::PATH`, etc.
 #[proc_macro_derive(RheiSchema)]
 pub fn derive_rhei_schema(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);

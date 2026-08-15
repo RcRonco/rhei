@@ -85,7 +85,14 @@ fn build(graph: &DataflowGraph) {
 `filter` takes an `Expr`, evaluated as an Arrow compute kernel over the whole column — cheaper than a per-row closure for plain comparisons.
 
 Builders: `col`, `lit_i64`, `lit_u64`, `lit_f64`, `lit_str`, `lit_bool`.
-Combinators: `gt`, `gt_eq`, `lt`, `lt_eq`, `eq`, `not_eq`, `and`, `or`, `negate`.
+Combinators: `gt`, `gt_eq`, `lt`, `lt_eq`, `eq`, `not_eq`, `and`, `or`, `negate`, `is_null`, `is_not_null`.
+
+Literals are narrowed to the column's Arrow type when the predicate runs, so
+`lit_i64` works against an `Int32` or `UInt16` column. A literal that does not
+fit the column, or one of the wrong kind, is a pipeline error.
+
+The [typed handles](#typed-columns) below check the column name and the literal
+type at compile time and are the preferred form.
 
 ```rust,no_run
 use rhei::{DataflowGraph, PrintSink, VecSource, col, lit_f64, lit_str};
