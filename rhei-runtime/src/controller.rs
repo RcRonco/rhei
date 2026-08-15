@@ -683,13 +683,12 @@ impl PipelineController {
             topology.max_parallelism,
             topology.total_workers(),
         )
-        .map(|assignment| {
+        .map_or(0, |assignment| {
             let first = process_id * topology.workers_per_process;
             (first..first + topology.workers_per_process)
                 .map(|w| assignment.range(w).len())
                 .sum::<usize>()
-        })
-        .unwrap_or(0);
+        });
         metrics::gauge!("rhei_cluster_key_groups_owned").set(owned_key_groups as f64);
 
         tracing::info!(
