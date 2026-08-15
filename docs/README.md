@@ -34,7 +34,8 @@ Every Rust example in these pages is compiled by CI as a doctest. Blocks that ca
 
 | Page | What it covers |
 |------|----------------|
-| [deployment.md](deployment.md) | Config, scaling modes, metrics, runbook, operational limits |
+| [deployment.md](deployment.md) | Config, scaling modes, probes, metrics, containers, runbook, operational limits |
+| [../SECURITY.md](../SECURITY.md) | Security issue register, trust boundaries, hardening checklist |
 
 ## Internals
 
@@ -73,3 +74,6 @@ Runnable code, verified by `cargo check --workspace --all-targets`:
 | Can I get exactly-once? | No. At-least-once only; make sinks idempotent |
 | Where is `TumblingWindow::builder()`? | There is none — windows use `::new(...)`. [operators.md](operators.md#windows) |
 | How do I test a pipeline? | `VecSource` plus a collecting sink; there is no test harness. [walkthrough.md](walkthrough.md#step-7-test-it) |
+| Why does `/healthz` return 503? | A worker stopped making progress. The body names it. [deployment.md](deployment.md#the-two-probes-answer-different-questions) |
+| Why did the process refuse to start? | Malformed config or an unreadable checkpoint — both fail loudly. [deployment.md](deployment.md#the-pipeline-will-not-start) |
+| Is `/api/state/**` safe to expose? | It returns application data and is off unless enabled. [SECURITY.md](../SECURITY.md) |

@@ -224,7 +224,7 @@ Partitioned source and multi-worker checkpoint restart are now covered
 ## Production readiness
 
 Issues found and fixed during a production-readiness review, plus the gaps that
-remain. See [OPERATIONS.md](OPERATIONS.md) for how to run around them.
+remain. See [docs/deployment.md](docs/deployment.md) for how to run around them.
 
 ### ~~KI-19: Cluster checkpoint coordination bound to loopback~~ (RESOLVED)
 

@@ -18,6 +18,28 @@ pipeline.toml  →  RHEI_* environment variables  →  CLI flags
 
 A `#[rhei::pipeline]` binary parses flags itself. `rhei run --config pipeline.toml` loads the file.
 
+`build()` validates the result and returns an error rather than starting with a
+half-understood configuration. A malformed `RHEI_WORKERS` fails the process at
+startup instead of silently running at default parallelism, and every bad
+variable is reported at once so one restart reveals all of them:
+
+```rust,no_run
+use rhei::PipelineController;
+
+fn controller() -> anyhow::Result<PipelineController> {
+    PipelineController::builder()
+        .checkpoint_dir("/var/lib/rhei/checkpoints")
+        .from_env()   // fills gaps from RHEI_* variables
+        .build()      // errors on anything malformed
+}
+```
+
+Rejected at `build()`: a zero worker count, a zero checkpoint interval, a
+`max_parallelism` below the total worker count, a peer list with an empty or
+port-less entry, and any `RHEI_*` value that does not parse. Empty values are
+treated as unset, so an orchestrator injecting `VAR=""` for an absent optional
+setting is not a config error.
+
 ### `pipeline.toml`
 
 ```toml
@@ -82,6 +104,10 @@ auto_rescale = true
 | `RHEI_REMOTE_ENDPOINT` | Custom endpoint (MinIO, Azurite) |
 | `RHEI_REMOTE_REGION` | Cloud region |
 | `RHEI_REMOTE_ALLOW_HTTP` | Permit plain HTTP — local development only |
+| `RHEI_LIVENESS_TIMEOUT_SECS` | Worker silence tolerated by `/healthz` (default 60) |
+| `RHEI_METRICS_TOKEN` | Bearer token required by `/metrics` and `/api/*` |
+| `RHEI_STATE_EXPLORER` | `1` serves `/api/state/**` — off by default |
+| `RHEI_ALLOWED_ORIGINS` | Comma-separated CORS origins — none by default |
 
 Object storage credentials come from the standard environment (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, …) or instance metadata / IAM role. Rhei never takes them as configuration.
 
@@ -174,23 +200,63 @@ More workers than `max_parallelism` is allowed but pointless for stateful work: 
 
 Enable with `--metrics-addr 0.0.0.0:9090`.
 
-| Endpoint | Purpose |
-|----------|---------|
-| `GET /healthz` | Liveness |
-| `GET /readyz` | Readiness — 503 until the pipeline is running |
-| `GET /metrics` | Prometheus exposition |
-| `GET /api/metrics` | JSON metrics snapshot |
-| `GET /api/metrics/history` | Recent metric history |
-| `GET /api/logs` | Structured log buffer |
-| `GET /api/health` | Health detail as JSON |
-| `GET /api/topology` | Pipeline topology |
-| `GET /api/info` | Build and pipeline info |
-| `GET /api/state/operators` | Operators with state |
-| `GET /api/state/operators/{name}` | State entries for one operator |
+| Endpoint | Purpose | Auth |
+|----------|---------|------|
+| `GET /healthz` | Liveness — 503 when a worker has stopped making progress | open |
+| `GET /readyz` | Readiness — 503 unless `Running` | open |
+| `GET /metrics` | Prometheus exposition | token |
+| `GET /api/metrics` | JSON metrics snapshot | token |
+| `GET /api/metrics/history` | Recent metric history | token |
+| `GET /api/logs` | Structured log buffer | token |
+| `GET /api/health` | Health detail as JSON | token |
+| `GET /api/topology` | Pipeline topology | token |
+| `GET /api/info` | Build and pipeline info | token |
+| `GET /api/state/operators` | Operators with state | token, opt-in |
+| `GET /api/state/operators/{name}` | State entries for one operator | token, opt-in |
 
-Use `/healthz` for liveness probes and `/readyz` for readiness — pointing both at `/healthz` means traffic arrives before the dataflow is up.
+"token" means the endpoint requires `Authorization: Bearer <token>` when
+`RHEI_METRICS_TOKEN` is set, and is unauthenticated when it is not. The probes
+are always open: kubelet sends no headers, so gating them would make every
+authenticated deployment permanently unhealthy.
+
+"opt-in" means the route is not served at all unless `RHEI_STATE_EXPLORER=1`.
+Those endpoints return checkpointed **application data** — your keys and your
+values. See [SECURITY.md](../SECURITY.md) for the full posture and a hardening
+checklist.
 
 Note: `/api/topology` does **not** expose key group assignment. "Who owns key group N?" is not answerable over HTTP today.
+
+### The two probes answer different questions
+
+Pointing both at `/healthz` means traffic arrives before the dataflow is up.
+Pointing both at `/readyz` means a wedged pipeline is never restarted.
+
+**`/readyz` — should this process be counted?** 200 while `Running`; 503 while
+`Starting` (restoring from checkpoint), `Draining`, or `Stopped`. The `Draining`
+transition happens the instant `SIGTERM` arrives, *before* the pipeline finishes
+its work — so the orchestrator drops the process from endpoint lists while it is
+still flushing state, rather than discovering it is gone afterwards.
+
+**`/healthz` — is this process wedged?** 200 while every worker's dataflow loop
+is turning; 503 once a worker has gone silent longer than
+`RHEI_LIVENESS_TIMEOUT_SECS`, with a body naming it:
+
+```json
+{ "status": "running", "live": false,
+  "detail": "worker 2 has not made progress for 94.3s (liveness timeout 60.0s)" }
+```
+
+This is a real liveness signal rather than a reachability check. A pipeline whose
+Timely loop has deadlocked — on a blocked sink, a wedged state backend — still
+answers TCP and would pass any probe that merely connects.
+
+A heartbeat means "this worker's loop is turning", not "data flowed", so a
+correctly-idle pipeline stays healthy. Draining and stopped pipelines always
+report live, so an orderly shutdown is never interrupted by a restart.
+
+Raise `RHEI_LIVENESS_TIMEOUT_SECS` above your worst-case checkpoint duration, or
+a slow flush to object storage will look like a wedge. Check the
+`state_checkpoint_duration_seconds` p99 and leave headroom.
 
 ### Metrics that matter
 
@@ -209,6 +275,13 @@ state_get_duration_seconds   state_gets_total / state_puts_total
 ```
 
 A falling L1 hit ratio means the blocking cold path is now on your hot path.
+
+Histograms are exported as buckets rather than summaries, so quantiles combine
+across processes — a cluster-wide p95 is a real number, not one pod's:
+
+```promql
+histogram_quantile(0.95, sum by (le) (rate(state_get_duration_seconds_bucket[5m])))
+```
 
 **Checkpoints**
 
@@ -300,13 +373,36 @@ fn controller() -> anyhow::Result<PipelineController> {
 controller.run_with_shutdown(graph, shutdown_handle).await?;
 ```
 
-On signal: finish in-flight batches, checkpoint, commit offsets, flush sinks, return. Killing a process without this loses everything since the last checkpoint — which is replayed on restart, so it costs time rather than data.
+On signal: report not-ready immediately, finish in-flight batches, checkpoint,
+commit offsets, flush sinks, return. Killing a process without this loses
+everything since the last checkpoint — which is replayed on restart, so it costs
+time rather than data.
 
-Give containers a `terminationGracePeriodSeconds` longer than your checkpoint duration.
+The not-ready flip happens first, before the work finishes, so load balancers and
+endpoint lists drop the process while it is still draining.
+
+Give containers a `terminationGracePeriodSeconds` longer than your checkpoint
+duration, or `SIGKILL` lands mid-flush.
 
 ---
 
 ## Containers
+
+A working image and Kubernetes manifests ship in `deploy/`:
+
+```bash
+docker build -f deploy/Dockerfile --build-arg BIN=my-pipeline -t my-pipeline:v1 .
+kubectl apply -f deploy/kubernetes/statefulset.yaml
+kubectl apply -f deploy/kubernetes/monitoring.yaml
+```
+
+`deploy/Dockerfile` is multi-stage, runs as a non-root UID, and sets no shell
+entrypoint — the process must receive `SIGTERM` directly or the drain above
+never runs. `deploy/kubernetes/statefulset.yaml` is a commented starting point:
+a StatefulSet (ordinals give a stable `RHEI_PROCESS_ID`), a headless Service for
+the data plane, a separate Service for scraping, all three probes, and a
+PodDisruptionBudget. `deploy/kubernetes/monitoring.yaml` carries a ServiceMonitor
+and alert rules built on the metrics above.
 
 Things that bite specifically in containers:
 
@@ -317,11 +413,50 @@ Things that bite specifically in containers:
 - **Stable `process_id` in static mode.** StatefulSet ordinals map naturally.
 - **Memory limits must account for L1 + L2-in-memory + Arrow batches.** Dirty L1 is unbounded between checkpoints (KI-7); an OOM kill mid-interval replays from the last checkpoint.
 
-Ports to expose: Timely data plane (`--peers`, default 2101), checkpoint coordination (`RHEI_CHECKPOINT_PORT`), gossip UDP (`gossip_addr`, e.g. 2201), and metrics HTTP.
+Ports to expose: Timely data plane (`--peers`, default 2101), checkpoint coordination (`RHEI_CHECKPOINT_PORT`), gossip UDP (`gossip_addr`, e.g. 2201), and metrics HTTP. The first three carry no authentication or encryption — expose them *within* the cluster only.
 
 ---
 
 ## Runbook
+
+### The pipeline will not start
+
+Startup fails loudly and specifically rather than starting misconfigured, so the
+log line identifies the cause.
+
+| Log message contains | Cause | Fix |
+|----------------------|-------|-----|
+| `invalid environment configuration` | Malformed `RHEI_*` value, named in the message | Correct the value |
+| `max_parallelism=... but this run is configured for` | `RHEI_MAX_PARALLELISM` changed | Restore the original value |
+| `is corrupt and cannot be parsed` | Damaged checkpoint manifest | See below |
+| `has schema version N but this build understands` | Manifest written by a newer Rhei | Upgrade the binary |
+| `process_id ... must be less than number of peers` | Replica count and `RHEI_PEERS` disagree | Make them match |
+| `max_parallelism ... is below the total worker count` | More workers than key groups | Reduce workers or raise `max_parallelism` |
+| `could not reach the checkpoint coordinator` | Process 0 down, or its address wrong | Check process 0 and the first peer entry |
+
+### A checkpoint manifest is corrupt
+
+Rhei refuses to start. That is deliberate: treating an unreadable manifest as
+"no checkpoint" would silently restart from offset zero and reprocess the whole
+stream.
+
+1. Confirm the damage: `cat $RHEI_CHECKPOINT_DIR/manifest.json`.
+2. Restore that file from backup, or from object storage if remote state is
+   configured, and restart.
+3. With no backup, the call is yours to make explicitly. Deleting the checkpoint
+   directory starts fresh — reprocessing whatever the source still retains and
+   losing all accumulated state. That is a data decision, not an ops one.
+
+Per-process partials (`manifest_p*.json`) are written before the merged
+`manifest.json`, so a recent partial may still hold usable offsets.
+
+### A pod is restarting repeatedly
+
+`kubectl logs <pod> --previous` separates the two cases. Exiting at startup is a
+configuration or checkpoint error — see the table above. Being killed by the
+liveness probe means a worker is wedging; the `/healthz` body names it. Look for
+a blocked sink (`sink_send_errors_total`), object storage timeouts, or a
+checkpoint duration exceeding the liveness timeout.
 
 **Throughput dropped**
 Check the L1 hit ratio first — a working set that outgrew L1 puts the blocking cold path on the hot path. Then check per-worker `executor_elements_total` for skew (one hot key pins one worker; key groups do not fix key skew). Then `state_checkpoint_duration_seconds`.
@@ -343,6 +478,42 @@ KI-7. Shorten `checkpoint_interval` and watch `state_checkpoint_dirty_keys`.
 
 ---
 
+## Upgrades and rollbacks
+
+**Rolling restart.** An ordinary StatefulSet rolling update. Each pod drains on
+`SIGTERM` as described above; keep the grace period above your worst-case
+checkpoint duration.
+
+**Rollback.** Manifests carry a schema version, and an older binary refuses to
+read a newer manifest rather than misinterpreting it. Rolling back across a
+version bump therefore needs the checkpoint directory restored to a manifest the
+older binary understands.
+
+**Changing the pipeline graph.** Adding or removing operators is allowed; Rhei
+logs which operator names appeared and disappeared. State for a removed operator
+is orphaned rather than deleted, and a *renamed* operator loses its state — the
+name is the state's namespace.
+
+---
+
+## Security
+
+Full issue register, trust boundaries, and a hardening checklist:
+[SECURITY.md](../SECURITY.md). The short version:
+
+- Set `RHEI_METRICS_TOKEN`. Without it, anyone who can reach port 9090 reads
+  your metrics and logs. The process warns at startup when bound to a
+  non-loopback address with no token.
+- Leave `RHEI_STATE_EXPLORER` unset unless you need it. It serves application
+  data.
+- The **cluster data plane is unencrypted and unauthenticated**. Ports 2101 and
+  the checkpoint coordination port are plaintext TCP; anyone who can reach them
+  reads records in flight, injects frames, and can forge checkpoint readiness.
+  Keep them on a trusted network — a private subnet, a service mesh with mTLS,
+  or a NetworkPolicy restricting them to pods in the same StatefulSet.
+
+---
+
 ## Operational limits
 
 Know these before you commit to a deployment:
@@ -360,3 +531,5 @@ Know these before you commit to a deployment:
 | **No idle-source detection** | One idle partition stalls every window |
 | **Log entries dropped under load** | KI-14 |
 | **No key group ownership over HTTP** | Debugging ownership needs logs |
+| **No transport security on the data plane** | Ports 2101 and coordination are plaintext and unauthenticated (SI-4) |
+| **No first-class secure-broker config** | Authenticated Kafka needs `from_consumer`/`from_producer` (SI-5) |
