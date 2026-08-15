@@ -137,7 +137,7 @@ Late events are **dropped**, and `late_events_dropped_total` is incremented. The
 Set it per operator:
 
 ```rust,no_run
-use rhei::TumblingWindow;
+use rhei::Window;
 
 #[derive(Clone, rhei::RheiSchema)]
 struct PageView {
@@ -152,17 +152,18 @@ struct ViewsPerMinute {
 }
 
 fn window() -> impl rhei::arrow::StreamFunction<Input = PageView, Output = ViewsPerMinute> {
-    TumblingWindow::new(
-        60_000,
-        |v: PageViewView<'_>| v.user_id.to_string(),
-        |v: PageViewView<'_>| v.ts,
-        |acc: &mut u64, _v: PageViewView<'_>| *acc += 1,
-        |user_id: &str, _start: u64, _end: u64, views: &u64| ViewsPerMinute {
-            user_id: user_id.to_string(),
-            views: *views,
-        },
-    )
-    .with_allowed_lateness(30_000) // tolerate 30s of out-of-order arrival
+    Window::tumbling(60_000)
+        .key(|v: PageViewView<'_>| v.user_id.to_string())
+        .time(|v: PageViewView<'_>| v.ts)
+        .accumulate(|acc: &mut u64, _v: PageViewView<'_>| *acc += 1)
+        .finish(
+            |user_id: &str, _start: u64, _end: u64, views: &u64| ViewsPerMinute {
+                user_id: user_id.to_string(),
+                views: *views,
+            },
+        )
+        .allowed_lateness(30_000) // tolerate 30s of out-of-order arrival
+        .build()
 }
 ```
 

@@ -221,7 +221,9 @@ Built-in operators in `rhei-core`, all re-exported from `rhei`:
 - **Combinators** — `MapOp`, `FlatMapOp`, `FilterOp`, `FilterFnOp`, `FilterExprOp`
 - **State** — `KeyedState<K, V>`, `ValueState`, `ListState`, `MapState`, `TimerService`
 
-Window and join operators are constructed with `::new(...)`, taking key/time/accumulator closures. They do not use a builder pattern. See [`rhei/examples/batch_window_agg.rs`](rhei/examples/batch_window_agg.rs) for a complete `TumblingWindow` setup.
+Windows are built with `Window::tumbling/sliding/session/count`, which name the key/time/accumulate/finish closures and refuse to `build()` until every one is set; the positional `::new(...)` constructor remains available. Join operators take positional closures only. See [`rhei/examples/batch_window_agg.rs`](rhei/examples/batch_window_agg.rs) for a complete `Window::tumbling` setup, and [docs/operators.md](docs/operators.md#windows) for every constructor.
+
+`#[derive(RheiSchema)]` generates a typed handle per column, so filter predicates check the column name and literal type at compile time — `stream.filter(PageView::col().dwell_ms().gt(3_000.0))`.
 
 ### Keying and state
 

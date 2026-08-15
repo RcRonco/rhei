@@ -187,6 +187,19 @@ impl FieldKind {
         }
     }
 
+    /// Rust type used as the parameter of the generated `Col<T>` handle.
+    ///
+    /// `Option<T>` unwraps to `T` — a null-valued column is still compared
+    /// against plain `T` literals — while lists and byte vectors map to their
+    /// owned type, which has no `ScalarLike` impl and therefore only exposes
+    /// the name/null predicates.
+    pub(crate) fn scalar_type(&self) -> TokenStream {
+        match self {
+            Self::Optional(inner) => inner.scalar_type(),
+            other => other.owned_type(),
+        }
+    }
+
     fn owned_type(&self) -> TokenStream {
         match self {
             Self::Primitive(p) => p.rust_type(),

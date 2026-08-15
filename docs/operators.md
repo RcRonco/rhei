@@ -11,7 +11,7 @@ Constructor style is not uniform, and the difference is load-bearing:
 
 | Family | Style |
 |--------|-------|
-| Windows (`TumblingWindow`, `SlidingWindow`, `SessionWindow`, `CountWindow`) | `::new(...)` with positional closures, plus `.with_allowed_lateness(n)` |
+| Windows (`TumblingWindow`, `SlidingWindow`, `SessionWindow`, `CountWindow`) | **builder** — `Window::tumbling(n)....build()`, or `::new(...)` with positional closures plus `.with_allowed_lateness(n)` |
 | `TemporalJoin` | `::new(...)` with positional closures, plus `.with_timeout(n)` |
 | `ReduceOp`, `RollingAggregateOp` | `::new(...)` with positional closures |
 | `SequenceDetect` | **builder** — `::builder()....build()` |
@@ -85,7 +85,14 @@ fn build(graph: &DataflowGraph) {
 `filter` takes an `Expr`, evaluated as an Arrow compute kernel over the whole column — cheaper than a per-row closure for plain comparisons.
 
 Builders: `col`, `lit_i64`, `lit_u64`, `lit_f64`, `lit_str`, `lit_bool`.
-Combinators: `gt`, `gt_eq`, `lt`, `lt_eq`, `eq`, `not_eq`, `and`, `or`, `negate`.
+Combinators: `gt`, `gt_eq`, `lt`, `lt_eq`, `eq`, `not_eq`, `and`, `or`, `negate`, `is_null`, `is_not_null`.
+
+Literals are narrowed to the column's Arrow type when the predicate runs, so
+`lit_i64` works against an `Int32` or `UInt16` column. A literal that does not
+fit the column, or one of the wrong kind, is a pipeline error.
+
+The [typed handles](#typed-columns) below check the column name and the literal
+type at compile time and are the preferred form.
 
 ```rust,no_run
 use rhei::{DataflowGraph, PrintSink, VecSource, col, lit_f64, lit_str};
@@ -112,6 +119,64 @@ fn build(graph: &DataflowGraph) {
 }
 ```
 
+### Typed columns
+
+`col("dwell_ms")` and `lit_f64(..)` are unchecked: a misspelled column or a
+literal of the wrong width is only discovered when the batch is evaluated.
+`#[derive(RheiSchema)]` also generates a typed handle per field, reached
+through the generated `col()` associated function, so the name comes from the
+schema and the literal type comes from the field:
+
+```rust,no_run
+use rhei::{DataflowGraph, PrintSink, VecSource};
+
+#[derive(Clone, rhei::RheiSchema)]
+struct PageView {
+    user_id: String,
+    dwell_ms: f64,
+    referrer: Option<String>,
+}
+
+fn build(graph: &DataflowGraph) {
+    let c = PageView::col();
+    graph
+        .source(VecSource::new(vec![PageView {
+            user_id: "alice".into(),
+            dwell_ms: 4_200.0,
+            referrer: None,
+        }]))
+        .filter(
+            c.dwell_ms()
+                .gt(3_000.0)
+                .and(c.user_id().not_eq("monitoring"))
+                .and(c.referrer().is_not_null()),
+        )
+        .sink(PrintSink::<PageView>::new());
+}
+```
+
+`PageView::col().dwell_ms()` is a `Col<f64>`; `PageView::col().referrer()` is a
+`Col<String>` — an `Option<T>` field compares against plain `T`. Beyond the six
+comparisons, a `Col<T>` offers:
+
+| Method | Meaning |
+|--------|---------|
+| `between(low, high)` | inclusive range, `low <= column <= high` |
+| `is_in([a, b, ..])` | membership; an empty set matches no rows |
+| `is_null()`, `is_not_null()` | null checks, also available on any `Expr` |
+| `expr()`, `name()` | drop down to the untyped `Expr` / the column name |
+
+A `Col<bool>` is a predicate on its own: `filter` takes anything convertible
+into an `Expr`, so `.filter(PageView::col().is_bot())` needs no comparison.
+
+Columns whose type has no scalar form (`Vec<T>`, `Vec<u8>`) still get a handle,
+but only `expr()`, `name()`, and the null checks apply to it.
+
+Literals widen to `i64`/`u64`/`f64` and are narrowed back to the column's Arrow
+type when the predicate runs, so an `i32` or `f32` column compares correctly. A
+literal that does not fit the column — or one of the wrong kind entirely — is a
+pipeline error, not a panic.
+
 ---
 
 ## Windows
@@ -120,11 +185,80 @@ All windows are **event-time** based. They fire when the watermark passes `windo
 
 The accumulator type is inferred from `accumulate_fn` and must implement `Default`.
 
+### Building a window
+
+Every window takes the same four closures, and at a call site four positional
+lambdas are hard to tell apart. `Window` names them:
+
+```text
+Window::tumbling(window_size)        // or ::sliding(size, slide), ::session(gap), ::count(n)
+    .key(key_fn)
+    .time(time_fn)                   // not on ::count
+    .accumulate(accumulate_fn)
+    .finish(finish_fn)
+    .allowed_lateness(lateness)      // optional, default 0; not on ::count
+    .build()
+```
+
+Slots may be filled in any order, and each one is tracked in the builder's
+type: `build()` does not exist until every required closure has been supplied,
+so a forgotten `.time(..)` fails to compile rather than at run time. The result
+is exactly the operator the positional constructor produces — the builder adds
+no runtime cost, and `::new(...)` remains available.
+
+```rust,no_run
+use rhei::{DataflowGraph, PrintSink, VecSource, Window};
+
+#[derive(Clone, rhei::RheiSchema)]
+struct PageView {
+    user_id: String,
+    ts: u64,
+}
+
+#[derive(Clone, rhei::RheiSchema)]
+struct PerMinute {
+    user_id: String,
+    window_start: u64,
+    window_end: u64,
+    views: u64,
+}
+
+fn build(graph: &DataflowGraph) {
+    // Page views per user per minute, tolerating 5s of lateness.
+    let window = Window::tumbling(60_000)
+        .key(|v: PageViewView<'_>| v.user_id.to_string())
+        .time(|v: PageViewView<'_>| v.ts)
+        .accumulate(|acc: &mut u64, _v: PageViewView<'_>| *acc += 1)
+        .finish(|user_id: &str, start: u64, end: u64, views: &u64| PerMinute {
+            user_id: user_id.to_string(),
+            window_start: start,
+            window_end: end,
+            views: *views,
+        })
+        .allowed_lateness(5_000)
+        .build();
+
+    graph
+        .source(VecSource::new(vec![PageView {
+            user_id: "alice".into(),
+            ts: 60_000,
+        }]))
+        .key_by(|v| v.user_id.to_string())
+        .operator("tumble", window)
+        .sink(PrintSink::<PerMinute>::new());
+}
+```
+
+The sections below give each window's parameters and closure signatures using
+the positional constructor; the builder takes the same closures under the names
+above.
+
 ### `TumblingWindow`
 
 Fixed-size, non-overlapping windows. `window_size` must be > 0.
 
 ```text
+Window::tumbling(window_size)....build()
 TumblingWindow::new(window_size, key_fn, time_fn, accumulate_fn, finish_fn)
     .with_allowed_lateness(lateness)   // optional, default 0
 ```
@@ -185,6 +319,7 @@ fn build(graph: &DataflowGraph) {
 Overlapping windows. Each event belongs to `window_size / slide` windows, so cost scales with that ratio.
 
 ```text
+Window::sliding(window_size, slide)....build()
 SlidingWindow::new(window_size, slide, key_fn, time_fn, accumulate_fn, finish_fn)
     .with_allowed_lateness(lateness)
 ```
@@ -244,6 +379,7 @@ fn build(graph: &DataflowGraph) {
 Gap-based: a session closes after `gap` of inactivity for that key. Window bounds are data-driven, not aligned to a grid.
 
 ```text
+Window::session(gap)....build()
 SessionWindow::new(gap, key_fn, time_fn, accumulate_fn, finish_fn)
     .with_allowed_lateness(lateness)
 ```
@@ -296,6 +432,7 @@ fn build(graph: &DataflowGraph) {
 Fires every `threshold` rows per key. **No `time_fn`** — it is count-triggered, so it does not depend on watermarks.
 
 ```text
+Window::count(threshold)....build()
 CountWindow::new(threshold, key_fn, accumulate_fn, finish_fn)
 ```
 

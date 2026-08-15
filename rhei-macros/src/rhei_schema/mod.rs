@@ -60,7 +60,8 @@ pub(crate) fn expand(input: DeriveInput) -> Result<TokenStream, syn::Error> {
         })
         .collect::<Result<Vec<_>, syn::Error>>()?;
 
-    let constants = gen_constants(struct_name, &field_infos);
+    let constants = gen_constants(vis, struct_name, &field_infos);
+    let col_handles = gen_col_handles(vis, struct_name, &field_infos);
     let builder = gen_builder(vis, struct_name, &field_infos);
     let view = gen_view(vis, struct_name, &field_infos);
     let columns = gen_columns(vis, struct_name, &field_infos);
@@ -68,6 +69,7 @@ pub(crate) fn expand(input: DeriveInput) -> Result<TokenStream, syn::Error> {
 
     Ok(quote! {
         #constants
+        #col_handles
         #builder
         #view
         #columns
@@ -89,7 +91,13 @@ fn gen_schema_fields(fields: &[FieldInfo]) -> Vec<TokenStream> {
         .collect()
 }
 
-fn gen_constants(struct_name: &syn::Ident, fields: &[FieldInfo]) -> TokenStream {
+fn gen_constants(
+    vis: &syn::Visibility,
+    struct_name: &syn::Ident,
+    fields: &[FieldInfo],
+) -> TokenStream {
+    let col_struct = format_ident!("{}Col", struct_name);
+
     let consts: Vec<_> = fields
         .iter()
         .map(|f| {
@@ -102,9 +110,64 @@ fn gen_constants(struct_name: &syn::Ident, fields: &[FieldInfo]) -> TokenStream 
         })
         .collect();
 
+    let col_doc = format!(
+        "Typed column handles for building filter expressions.\n\n\
+         Each field of `{struct_name}` has an accessor returning a \
+         [`Col`](::rhei_core::operators::filter_expr::Col) carrying the column \
+         name and its Rust type, so comparisons take plain values:\n\n\
+         ```ignore\n\
+         {struct_name}::col().{}(/* value */)\n\
+         ```",
+        fields[0].name_str,
+    );
+
     quote! {
         impl #struct_name {
             #(#consts)*
+
+            #[doc = #col_doc]
+            #[must_use]
+            #vis const fn col() -> #col_struct {
+                #col_struct
+            }
+        }
+    }
+}
+
+fn gen_col_handles(
+    vis: &syn::Visibility,
+    struct_name: &syn::Ident,
+    fields: &[FieldInfo],
+) -> TokenStream {
+    let col_struct = format_ident!("{}Col", struct_name);
+
+    let accessors: Vec<_> = fields
+        .iter()
+        .map(|f| {
+            let name = &f.name;
+            let name_str = &f.name_str;
+            let ty = f.kind.scalar_type();
+            let doc = format!("Typed handle for the `{name_str}` column.");
+            quote! {
+                #[doc = #doc]
+                #[must_use]
+                #vis const fn #name(self) -> ::rhei_core::operators::filter_expr::Col<#ty> {
+                    ::rhei_core::operators::filter_expr::Col::new(#name_str)
+                }
+            }
+        })
+        .collect();
+
+    let struct_doc =
+        format!("Typed column handles for [`{struct_name}`], returned by `{struct_name}::col()`.");
+
+    quote! {
+        #[doc = #struct_doc]
+        #[derive(Debug, Clone, Copy, Default)]
+        #vis struct #col_struct;
+
+        impl #col_struct {
+            #(#accessors)*
         }
     }
 }

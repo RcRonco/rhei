@@ -91,9 +91,14 @@ pub use rhei_core::connectors::kafka::types::{KafkaHeader, KafkaMessage, KafkaRe
 
 // Batch operators
 pub use rhei_core::operators::{
-    AfterMatch, CountWindow, Expr, FilterExprOp, MatchCtx, ReduceOp, RollingAggregateOp,
-    SequenceDetect, SessionWindow, Side, SlidingWindow, TemporalJoin, TumblingWindow, col,
-    lit_bool, lit_f64, lit_i64, lit_str, lit_u64,
+    AfterMatch, Col, CountWindow, Expr, FilterExprOp, MatchCtx, ReduceOp, RollingAggregateOp,
+    ScalarLike, ScalarValue, SequenceDetect, SessionWindow, Side, SlidingWindow, TemporalJoin,
+    TumblingWindow, col, lit_bool, lit_f64, lit_i64, lit_str, lit_u64,
+};
+
+// Window builders
+pub use rhei_core::operators::window_builder::{
+    CountWindowBuilder, SessionWindowBuilder, SlidingWindowBuilder, TumblingWindowBuilder, Window,
 };
 
 // Batch connectors (partitioned)
