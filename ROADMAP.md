@@ -10,12 +10,13 @@
   - [x] `SequenceDetect` — ordered event sequence matching (MATCH_RECOGNIZE equivalent)
   - [x] `KeyedState<K, V>` — typed state wrapper over `StateContext` with automatic serde
   - [x] `Filter`, `Map`, `FlatMap` — stateless combinators
-- [x] Fluent pipeline builder API (`DataflowGraph` with `Stream<T>` / `KeyedStream<T>`)
+- [x] Fluent pipeline builder API (`DataflowGraph` with a single `Copy` `Stream<'a, T>` handle)
+- [ ] `KeyedStream<T>` type so "stateful operators require keying" is a compile-time guarantee rather than a convention
 - [x] Multi-operator chaining in `run_dataflow` (currently single-operator only)
 - [ ] Hot-reload operator logic without full pipeline restart
-- [x] `rhei run --attach <url>` — connect to a running pipeline and stream health/metrics/logs to TUI
+- [x] `rhei attach <addr>` — connect to a running pipeline and stream health/metrics/logs to TUI
 - [ ] `rhei-cli` improvements: deploy, inspect running pipelines, replay from checkpoint
-- [x] `#[rhei::main]` pipeline binary macro — generates clap CLI with `--workers`, `--from-checkpoint`, `--offset-delta`, `--metrics-addr`, `--process-id`, `--peers` (replaces env-var-based `from_env()`)
+- [x] `#[rhei::pipeline]` pipeline binary macro — generates clap CLI with `--workers`, `--from-checkpoint`, `--offset-delta`, `--metrics-addr`, `--process-id`, `--peers` (replaces env-var-based `from_env()`)
 - [x] Checkpoint fork mode — `--from-checkpoint <s3-url> --offset-delta=<N>` to reproduce production locally
   - [x] `ForkBackend` — copy-on-write `StateBackend` (local writes, read-only remote fallback)
   - [x] Offset delta — adjust manifest source offsets for local Kafka with re-indexed data
@@ -73,7 +74,8 @@
 - [x] Zero-copy filtering via selection vectors (boolean masks, no data copying)
 - [x] Batch-level type erasure (`ErasedBuffer` with Arrow IPC serialization)
 - [x] Zero-copy state reads (`Bytes` instead of `Vec<u8>` cloning)
-- [x] Memtable compaction and eviction policies (bounded memory) (KI-7)
+- [x] Memtable eviction for clean entries — `moka` W-TinyLFU bounded by `MemTableConfig` (KI-7, partial)
+- [ ] Bound dirty (unflushed) memtable entries — they are never evicted, so L1 can still grow without limit between checkpoints (KI-7 remainder)
 - [ ] Async state prefetch — predict upcoming keys and warm L2/L3 cache
 - [ ] DataFusion kernel integration for aggregate/join operators
 - [ ] Vectorized `SequenceDetect` predicates — evaluate step expressions as Arrow boolean masks via DataFusion kernels, feed pre-computed matches into NFA state machine
@@ -98,7 +100,7 @@
 - [x] Propagate DLQ write errors instead of silently dropping (KI-3)
 - [x] Propagate checkpoint failures in single-worker mode (KI-15)
 - [ ] Fix async stash ordering — pending elements can be overtaken by later L1 hits (KI-11)
-- [x] Configurable checkpoint interval via `Executor::builder().checkpoint_interval(n)` (KI-8)
+- [x] Configurable checkpoint interval via `PipelineController::builder().checkpoint_interval(n)` (KI-8)
 - [ ] Fuzz testing for state serialization and checkpoint restore
 - [x] S3/MinIO E2E integration test for tiered storage backend
 - [ ] Integration tests with simulated failures (network partitions, slow backends)

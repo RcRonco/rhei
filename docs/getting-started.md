@@ -2,263 +2,361 @@
 
 This guide walks you through building your first streaming pipeline with Rhei, from installation to a running stateful application.
 
+Every Rust example in this guide is compiled by CI as a doctest (`cargo test --doc -p rhei`). Blocks that cannot be compiled — because they need Kafka or an external service — are marked `ignore` and carry a comment explaining why.
+
 ## Prerequisites
 
 - Rust 1.85+ (edition 2024)
 - `cargo` (comes with Rust)
 
+Rhei is **not published to crates.io**. You need a checkout of this repository, and dependencies are declared as path dependencies.
+
 ## Create a New Project
 
+Install the CLI from a checkout, then scaffold a project:
+
 ```bash
+cargo install --path rhei-cli
 rhei new my-pipeline
 cd my-pipeline
-```
-
-This creates a project with a working `Cargo.toml`, `src/main.rs`, and `pipeline.toml`. You can run it immediately:
-
-```bash
 cargo run
 ```
 
-If you don't have the `rhei` CLI installed, create a project manually:
+`rhei new` writes a `Cargo.toml`, `src/main.rs`, and `pipeline.toml`.
 
-```bash
-cargo init my-pipeline
-cd my-pipeline
-cargo add rhei-core rhei-runtime anyhow async-trait serde tokio --features serde/derive,tokio/full
+To set a project up by hand, point Cargo at your Rhei checkout:
+
+```toml
+# Cargo.toml
+[dependencies]
+rhei = { path = "../rhei/rhei" }
+anyhow = "1"
+tokio = { version = "1", features = ["full"] }
 ```
+
+The `rhei` facade crate re-exports everything you need — `rhei-core` and `rhei-runtime` do not need to be listed separately.
 
 ## Your First Pipeline
 
+Rhei is columnar: data moves through the graph as Apache Arrow batches, not individual rows. Your element types are structs annotated with `#[derive(RheiSchema)]`, which generates the Arrow schema, a columnar builder, and a zero-copy row view.
+
+Note that **primitive types like `String` are not valid stream elements** — every element type must be a struct deriving `RheiSchema`.
+
 Replace `src/main.rs` with:
 
-```rust
-use rhei_core::connectors::print_sink::PrintSink;
-use rhei_core::connectors::vec_source::VecSource;
-use rhei_runtime::dataflow::DataflowGraph;
-use rhei_runtime::Executor;
+```rust,no_run
+use rhei::{DataflowGraph, PipelineController, PrintSink, VecSource};
+
+#[derive(Clone, rhei::RheiSchema)]
+struct PageView {
+    user_id: String,
+    path: String,
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let events = vec![
-        "sensor-1:23.5".to_string(),
-        "sensor-2:18.0".to_string(),
-        "sensor-1:24.1".to_string(),
+    let views = vec![
+        PageView { user_id: "alice".into(), path: "/product".into() },
+        PageView { user_id: "monitoring".into(), path: "/health".into() },
+        PageView { user_id: "bob".into(), path: "/cart".into() },
     ];
 
     let graph = DataflowGraph::new();
     graph
-        .source(VecSource::new(events))
-        .map(|line: String| line.to_uppercase())
-        .sink(PrintSink::<String>::new());
+        .source(VecSource::new(views))
+        .filter_fn(|v| !v.path.starts_with("/health"))
+        .sink(PrintSink::<PageView>::new());
 
-    let executor = Executor::builder()
+    let controller = PipelineController::builder()
         .checkpoint_dir("./checkpoints")
         .build()?;
-    executor.run(graph).await?;
+    controller.run(graph).await?;
     Ok(())
 }
 ```
 
-Run it:
+Run it with `cargo run`. Two page views pass the filter and are printed; the `/health` probe is dropped.
 
-```bash
-cargo run
-```
-
-Output:
-
-```
-SENSOR-1:23.5
-SENSOR-2:18.0
-SENSOR-1:24.1
-```
-
-For full control over workers, checkpointing, and clustering, see [Manual Executor Setup](#manual-executor-setup) below.
+You can skip the `PipelineController` boilerplate with `#[rhei::pipeline]`, which generates `main`, a Tokio runtime, and a clap CLI. See the [quick start](../README.md#quick-start).
 
 ## Core Concepts
 
-### Streams and Types
+### Streams and views
 
-Every operation returns a typed stream handle. The Rust compiler ensures type safety across your entire pipeline:
+Every operation returns a `Stream<'a, T>` — a `Copy` handle to a point in the graph. `T` is checked at compile time:
 
-```rust
-let raw: Stream<String> = graph.source(VecSource::new(data));
-let parsed: Stream<SensorReading> = raw.map(parse);  // type checked at compile time
+```rust,no_run
+use rhei::{DataflowGraph, PrintSink, VecSource};
+
+#[derive(Clone, rhei::RheiSchema)]
+struct Raw {
+    line: String,
+}
+
+#[derive(Clone, rhei::RheiSchema)]
+struct Parsed {
+    user_id: String,
+}
+
+fn build(graph: &DataflowGraph) {
+    let raw = graph.source(VecSource::new(vec![Raw {
+        line: "alice /product".into(),
+    }]));
+    let parsed = raw.map(|r| Parsed {
+        user_id: r.line.split(' ').next().unwrap_or("unknown").to_string(),
+    });
+    parsed.sink(PrintSink::<Parsed>::new());
+}
 ```
 
-### Stream vs KeyedStream
+Closures passed to `map`, `filter_fn`, and `key_by` receive a **zero-copy view**, not an owned value. For `PageView` above, the generated view is:
 
-Rhei has two stream types:
-
-| Type | Created by | Supports |
-|------|-----------|----------|
-| `Stream<T>` | `graph.source()`, `.map()`, `.filter()`, `.merge()` | Stateless transforms, keying, sinking |
-| `KeyedStream<T>` | `.key_by()` | Everything Stream supports + stateful operators |
-
-**Stateful operators require a `KeyedStream`.** This is enforced at compile time -- you cannot call `.operator()` on an unkeyed `Stream`.
-
-### Exchange Points
-
-When running with multiple workers, `key_by()` is the only operation that moves data between workers. All elements with the same key land on the same worker:
-
-```rust
-graph
-    .source(source)
-    .map(parse)              // runs on source worker
-    .key_by(|r| r.sensor_id.clone())  // redistributes by sensor_id
-    .operator("agg", MyAgg)  // runs on worker that owns this key
-    .sink(output);
+```rust,ignore
+// not-compiled: this type is generated by #[derive(RheiSchema)]; redeclaring
+// it here would collide with the real one. Shown for reference only.
+struct PageViewView<'a> {
+    user_id: &'a str,
+    path: &'a str,
+    ts: u64,
+}
 ```
+
+That is why closure bodies call `.to_string()` on string fields: the view borrows directly from the Arrow buffer.
+
+| Method | Closure signature |
+|--------|-------------------|
+| `map` | `Fn(T::View<'_>) -> O` |
+| `flat_map` | `Fn(T::View<'_>) -> Vec<O>` |
+| `filter_fn` | `Fn(&T::View<'_>) -> bool` |
+| `key_by` | `Fn(&T::View<'_>) -> String` |
+| `inspect` | `Fn(&T::View<'_>)` |
+
+`filter` is a separate method taking a column expression (`rhei::col("dwell_ms").gt(rhei::lit_f64(3_000.0))`) that is evaluated as an Arrow kernel over the whole batch. Use `filter_fn` for closures.
+
+### There is only one stream type
+
+Rhei has a single `Stream<'a, T>`. There is **no `KeyedStream` type**, and `.operator()` is available on every stream. Placing a stateful operator on an unkeyed stream compiles and runs — but with more than one worker, each worker will see an arbitrary subset of keys and the state will be wrong.
+
+**Call `.key_by()` before any stateful operator.** The compiler will not do it for you.
+
+### Exchange points
+
+`key_by()` is the only operation that moves data between workers. Rows are partitioned by `seahash(key) % workers`, so all rows with the same key land on the same worker:
+
+```rust,no_run
+use rhei::{DataflowGraph, PrintSink, VecSource};
+
+#[derive(Clone, rhei::RheiSchema)]
+struct PageView {
+    user_id: String,
+    path: String,
+}
+
+fn build(graph: &DataflowGraph) {
+    graph
+        .source(VecSource::new(vec![PageView { user_id: "alice".into(), path: "/product".into() }]))
+        .filter_fn(|v| !v.path.is_empty()) // runs where the data already is
+        .key_by(|v| v.user_id.to_string()) // redistributes across workers
+        .sink(PrintSink::<PageView>::new());
+}
+```
+
+With `workers == 1` the exchange still exists in the Timely dataflow but moves no data between threads.
 
 ## Adding State
 
-Stateful operators implement the `StreamFunction` trait. Use `KeyedState<K, V>` for typed key-value state:
+Stateful operators implement the `StreamFunction` trait, working on a whole `RheiBuffer<T>` at a time. Use `KeyedState<K, V>` for typed key-value state:
 
-```rust
-use async_trait::async_trait;
-use rhei_core::operators::keyed_state::KeyedState;
-use rhei_core::state::context::StateContext;
-use rhei_core::traits::StreamFunction;
+```rust,no_run
+use rhei::arrow::{
+    BufferOutput, OperatorContext, RheiBuffer, RheiBuilder, RheiSchema, StreamFunction,
+};
+use rhei::KeyedState;
 
+#[derive(Clone, rhei::RheiSchema)]
+struct PageView {
+    user_id: String,
+    path: String,
+}
+
+#[derive(Clone, rhei::RheiSchema)]
+struct ViewCount {
+    user_id: String,
+    total: u64,
+}
+
+#[derive(Clone)]
 struct CountEvents;
 
-#[async_trait]
+#[async_trait::async_trait]
 impl StreamFunction for CountEvents {
-    type Input = SensorReading;
-    type Output = String;
+    type Input = PageView;
+    type Output = ViewCount;
 
     async fn process(
         &mut self,
-        input: SensorReading,
-        ctx: &mut StateContext,
-    ) -> anyhow::Result<Vec<String>> {
-        let mut state = KeyedState::<String, u64>::new(ctx, "counts");
-        let count = state.get(&input.sensor_id).await?.unwrap_or(0) + 1;
-        state.put(&input.sensor_id, &count)?;
-        Ok(vec![format!("{}: {} events", input.sensor_id, count)])
+        input: RheiBuffer<PageView>,
+        ctx: &mut OperatorContext,
+    ) -> anyhow::Result<BufferOutput<ViewCount>> {
+        let mut builder = ViewCount::builder(input.len());
+        let mut state = KeyedState::<String, u64>::new(&mut ctx.state, "counts");
+
+        for view in &input {
+            let user_id = view.user_id.to_string();
+            let count = state.get(&user_id).await?.unwrap_or(0) + 1;
+            state.put(&user_id, &count)?;
+            builder.append(ViewCount { user_id, total: count });
+        }
+
+        Ok(BufferOutput::Single(RheiBuffer::from_builder(builder)))
     }
 }
 ```
 
-Wire it into your pipeline:
+Note the details that the type system enforces:
 
-```rust
-graph
-    .source(source)
-    .key_by(|r: &SensorReading| r.sensor_id.clone())
-    .operator("counter", CountEvents)
-    .sink(PrintSink::new());
+- `KeyedState::get` and `put` take `&K`, so a `&str` view field needs `.to_string()` first.
+- `put` returns `anyhow::Result<()>` — it is not infallible.
+- The operator must be `Clone`, because `.operator()` clones it once per worker.
+- `process` returns `BufferOutput<Self::Output>`, constructed with `BufferOutput::Single(...)`, `BufferOutput::Multi(...)`, or `BufferOutput::None`. There is no `BufferOutput::from_builder`; wrap a builder with `RheiBuffer::from_builder` first.
+
+Wire it into a pipeline — always keyed:
+
+```rust,no_run
+use rhei::arrow::{BufferOutput, OperatorContext, RheiBuffer, StreamFunction};
+use rhei::{DataflowGraph, PrintSink, VecSource};
+
+#[derive(Clone, rhei::RheiSchema)]
+struct PageView {
+    user_id: String,
+    path: String,
+}
+
+#[derive(Clone, rhei::RheiSchema)]
+struct ViewCount {
+    user_id: String,
+    total: u64,
+}
+
+#[derive(Clone)]
+struct CountEvents;
+
+#[async_trait::async_trait]
+impl StreamFunction for CountEvents {
+    type Input = PageView;
+    type Output = ViewCount;
+
+    async fn process(
+        &mut self,
+        _input: RheiBuffer<PageView>,
+        _ctx: &mut OperatorContext,
+    ) -> anyhow::Result<BufferOutput<ViewCount>> {
+        // body as above
+        Ok(BufferOutput::None)
+    }
+}
+
+fn build(graph: &DataflowGraph) {
+    graph
+        .source(VecSource::new(vec![PageView { user_id: "alice".into(), path: "/product".into() }]))
+        .key_by(|v| v.user_id.to_string())
+        .operator("counter", CountEvents)
+        .sink(PrintSink::<ViewCount>::new());
+}
 ```
 
 State is automatically:
-- Isolated per worker (each worker owns a disjoint key partition)
-- Tiered across RAM, local NVMe cache, and object storage (S3/GCS/Azure)
+
+- Isolated per key group, so ownership can move between workers without rewriting state
+- Tiered across RAM (L1), local NVMe cache (L2), and object storage (L3)
 - Checkpointed when the dataflow frontier advances
 
-You never create `StateContext` manually -- the executor provides it.
+You never create `StateContext` manually — the executor provides it on `OperatorContext::state`.
+
+Be aware that an L1 miss **blocks the Timely worker thread** while L2/L3 are read. This is a known limitation (KI-11 in [KNOWN-ISSUES.md](../KNOWN-ISSUES.md)), not a design goal.
+
+Besides `KeyedState`, `rhei` re-exports `ValueState`, `ListState`, `MapState`, and `TimerService` for per-key state shapes and event-time timers.
 
 ## Built-in Operators
 
-Rhei includes common streaming operators so you don't have to write them:
+Window and join operators are constructed with `::new(...)` and take closures for key extraction, time extraction, accumulation, and output. **They do not have builders.**
 
 ### Tumbling Windows
 
 Fixed-size, non-overlapping time windows:
 
-```rust
-use rhei_core::operators::{Avg, TumblingWindow};
+```rust,no_run
+use rhei::{DataflowGraph, PrintSink, TumblingWindow, VecSource};
 
-let windowed = keyed_stream.operator(
-    "avg_temp",
-    TumblingWindow::builder()
-        .window_size(60)  // 60-second windows
-        .key_fn(|r: &Reading| r.sensor_id.clone())
-        .time_fn(|r: &Reading| r.timestamp)
-        .aggregator(Avg::new(|r: &Reading| r.value))
-        .build(),
-);
-```
+#[derive(Clone, rhei::RheiSchema)]
+struct PageView {
+    user_id: String,
+    ts: u64,
+}
 
-### Sliding Windows
+#[derive(Clone, rhei::RheiSchema)]
+struct WindowResult {
+    user_id: String,
+    window_start: u64,
+    window_end: u64,
+    views: u64,
+}
 
-Overlapping windows with configurable slide:
-
-```rust
-use rhei_core::operators::SlidingWindow;
-
-SlidingWindow::builder()
-    .window_size(300)  // 5-minute window
-    .slide_size(60)    // slide every minute
-    .key_fn(key_fn)
-    .time_fn(time_fn)
-    .aggregator(aggregator)
-    .build()
-```
-
-### Session Windows
-
-Gap-based windows that close after inactivity:
-
-```rust
-use rhei_core::operators::SessionWindow;
-
-SessionWindow::builder()
-    .gap(120)  // 2-minute inactivity gap
-    .key_fn(key_fn)
-    .time_fn(time_fn)
-    .aggregator(aggregator)
-    .build()
-```
-
-### Temporal Joins
-
-Join two streams by key with a configurable timeout:
-
-```rust
-use rhei_core::operators::TemporalJoin;
-
-// Merge left and right into a single stream first
-let combined = orders.merge(shipments);
-
-let joined = combined
-    .key_by(|side| extract_join_key(side))
-    .operator(
-        "order_shipment_join",
-        TemporalJoin::builder()
-            .key_fn(|side| extract_join_key(side))
-            .join_fn(|order, shipment| JoinedRecord::new(order, shipment))
-            .build(),
+fn build(graph: &DataflowGraph) {
+    let window = TumblingWindow::new(
+        60_000, // window size, in the same unit as the time field
+        |view: PageViewView<'_>| view.user_id.to_string(),
+        |view: PageViewView<'_>| view.ts,
+        |acc: &mut u64, _view: PageViewView<'_>| *acc += 1,
+        |user_id: &str, window_start: u64, window_end: u64, views: &u64| WindowResult {
+            user_id: user_id.to_string(),
+            window_start,
+            window_end,
+            views: *views,
+        },
     );
-```
 
-## Manual Executor Setup
-
-For full control over workers, checkpointing, and clustering:
-
-```rust
-use rhei_runtime::dataflow::DataflowGraph;
-use rhei_runtime::executor::Executor;
-
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    let graph = DataflowGraph::new();
-
-    // ... build your pipeline on graph ...
-
-    let executor = Executor::builder()
-        .checkpoint_dir("./checkpoints")
-        .workers(4)
-        .build()?;
-
-    executor.run(graph).await?;
-    Ok(())
+    graph
+        .source(VecSource::new(vec![PageView {
+            user_id: "alice".into(),
+            ts: 60_000,
+        }]))
+        .key_by(|v| v.user_id.to_string())
+        .operator("views_per_minute", window)
+        .sink(PrintSink::<WindowResult>::new());
 }
 ```
 
-### Configuration
+`PageViewView<'_>` is generated by `#[derive(RheiSchema)]` and is in scope automatically.
 
-Use `pipeline.toml` for persistent configuration:
+`SlidingWindow::new` takes the same arguments plus a slide interval; `SessionWindow::new` takes an inactivity gap instead of a window size; `CountWindow::new` triggers on row counts rather than time. See [`rhei/examples/batch_window_agg.rs`](../rhei/examples/batch_window_agg.rs) for a complete runnable program.
+
+There is no built-in `Avg` aggregator type — accumulation is expressed by the closure you pass in.
+
+### Temporal Joins
+
+`TemporalJoin` joins two streams that have been merged into a single stream of `Side<L, R>` values, keyed on the join key. See [`rhei-runtime/examples/temporal_join.rs`](../rhei-runtime/examples/temporal_join.rs) for a complete, compiled example, and `rhei-core/src/operators/temporal_join.rs` for the constructor signature.
+
+## Configuration
+
+`PipelineController::builder()` carries every runtime setting:
+
+```rust,no_run
+use rhei::PipelineController;
+
+fn build() -> anyhow::Result<PipelineController> {
+    PipelineController::builder()
+        .checkpoint_dir("./checkpoints")
+        .workers(4)
+        .checkpoint_interval(100) // batches between checkpoints
+        .pipeline_name("my-pipeline")
+        .build()
+}
+```
+
+`build()` returns `anyhow::Result<PipelineController>`. Other builder methods include `error_policy`, `dlq_sink`, `metrics_addr`, `process_id`, `peers`, `max_parallelism`, `memtable_config`, `from_checkpoint`, `offset_delta`, and `from_env()`.
+
+A `pipeline.toml` can supply the same values, applied with `.apply_config(&config)`:
 
 ```toml
 [pipeline]
@@ -271,44 +369,43 @@ addr = "0.0.0.0:9090"
 log_level = "info"
 ```
 
-Run with: `rhei run --config pipeline.toml`
-
-Environment variables override config file values (e.g., `RHEI_WORKERS=8`).
+Run with `rhei run --config pipeline.toml`. Environment variables (`RHEI_WORKERS`, `RHEI_CHECKPOINT_DIR`, `RHEI_PEERS`, `RHEI_PROCESS_ID`, …) override config values.
 
 ## Error Handling
 
-### Dead Letter Queues
+### Error policy and dead letter queues
 
-Route operator errors to a DLQ instead of crashing the pipeline:
+DLQ routing is configured on the controller, not on individual streams. There are **no `.dlq()` or `.with_dlq()` stream methods**:
 
-```rust
-// Simple: errors go to a sink
-keyed_stream
-    .operator("process", MyProcessor)
-    .dlq(PrintSink::<String>::new())
-    .sink(output);
+```rust,no_run
+use rhei::PipelineController;
+use rhei_core::dlq::{ErrorPolicy, LogDlqSink};
 
-// Advanced: transform errors before sinking
-keyed_stream
-    .operator("process", MyProcessor)
-    .with_dlq(|errors| {
-        errors
-            .map(|e| format!("ALERT: {e}"))
-            .sink(alert_sink)
-    })
-    .sink(output);
+fn build() -> anyhow::Result<PipelineController> {
+    PipelineController::builder()
+        .checkpoint_dir("./checkpoints")
+        .error_policy(ErrorPolicy::SendToDlq)
+        .dlq_sink(LogDlqSink)
+        .build()
+}
 ```
 
-### Error Classification
+`ErrorPolicy::Skip` (the default) logs a warning and drops the failed batch. `ErrorPolicy::SendToDlq` routes failed records to the configured `DlqSink`. Built-in sinks are `FileDlqSink`, `LogDlqSink`, and `KafkaDlqSink` (behind the `kafka` feature).
 
-Use `PipelineError` to classify errors for structured DLQ routing:
+### Error classification
 
-```rust
-use rhei_core::error::{PipelineError, ErrorClassification};
+`PipelineError` classifies errors so a DLQ consumer can route them:
 
-// In your operator:
-if input.value < 0.0 {
-    return Err(PipelineError::bad_data("negative sensor value").into());
+```rust,no_run
+use rhei_core::error::{ErrorClassification, PipelineError};
+
+fn validate(path: &str) -> anyhow::Result<()> {
+    if !path.starts_with('/') {
+        let err = PipelineError::bad_data("page path is not absolute");
+        assert_eq!(err.classification(), ErrorClassification::BadData);
+        return Err(err.into());
+    }
+    Ok(())
 }
 ```
 
@@ -316,74 +413,124 @@ Classifications: `Retriable` (transient failures), `BadData` (malformed input), 
 
 ## Testing
 
-Rhei provides in-memory test utilities so you can test pipelines without external infrastructure:
+Rhei does **not ship a testing module** — there is no `rhei_core::testing`, no `TestSource`, and no `CollectSink`. Pipelines are tested by pairing `VecSource` with a small sink that collects into a shared `Vec`. This is the pattern used throughout `rhei-runtime/tests/`:
 
-```rust
-use rhei_core::testing::{TestSource, CollectSink};
+```rust,no_run
+use std::sync::{Arc, Mutex};
 
-#[tokio::test]
-async fn test_my_pipeline() {
-    let source = TestSource::from(vec![1, 2, 3, 4, 5]);
-    let sink = CollectSink::<i32>::new();
+use rhei::arrow::{RheiBuffer, Sink};
+use rhei::{DataflowGraph, PipelineController, VecSource};
 
-    // Build and run your graph...
+#[derive(Clone, rhei::RheiSchema)]
+struct PageView {
+    user_id: String,
+    path: String,
+}
 
-    sink.assert_eq(vec![2, 4]);           // order-sensitive
-    sink.assert_eq_unordered(vec![4, 2]); // order-insensitive
-    sink.assert_len(2);
-    sink.assert_contains(&4);
-    sink.assert_all(|x| x % 2 == 0);
-    sink.assert_empty();  // or assert nothing was collected
+#[derive(Clone)]
+struct CollectSink {
+    collected: Arc<Mutex<Vec<String>>>,
+}
+
+#[async_trait::async_trait]
+impl Sink for CollectSink {
+    type Input = PageView;
+
+    async fn write_batch(&mut self, batch: RheiBuffer<PageView>) -> anyhow::Result<()> {
+        let mut out = self.collected.lock().expect("lock poisoned");
+        for view in &batch {
+            out.push(view.user_id.to_string());
+        }
+        Ok(())
+    }
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let collected = Arc::new(Mutex::new(Vec::new()));
+
+    let graph = DataflowGraph::new();
+    graph
+        .source(VecSource::new(vec![
+            PageView { user_id: "alice".into(), path: "/cart".into() },
+            PageView { user_id: "monitoring".into(), path: "/health".into() },
+        ]))
+        .filter_fn(|v| !v.path.starts_with("/health"))
+        .sink(CollectSink { collected: Arc::clone(&collected) });
+
+    let dir = std::env::temp_dir().join("rhei_doc_test");
+    std::fs::create_dir_all(&dir)?;
+    PipelineController::builder()
+        .checkpoint_dir(&dir)
+        .build()?
+        .run(graph)
+        .await?;
+
+    assert_eq!(*collected.lock().expect("lock poisoned"), vec!["a".to_string()]);
+    Ok(())
 }
 ```
 
+Use a fresh temporary checkpoint directory per test so runs do not restore each other's state.
+
 ## Multi-Worker and Clustering
 
-### Multi-Thread (Single Process)
+### Multi-thread (single process)
 
-```rust
-Executor::builder()
-    .workers(4)  // 4 worker threads
-    .build()?;
+```rust,no_run
+use rhei::PipelineController;
+
+fn build() -> anyhow::Result<PipelineController> {
+    PipelineController::builder()
+        .checkpoint_dir("./checkpoints")
+        .workers(4)
+        .build()
+}
 ```
 
-Or: `RHEI_WORKERS=4 cargo run`
+Or `RHEI_WORKERS=4 cargo run` with a `#[rhei::pipeline]` binary.
 
-### Multi-Process (Cluster)
+### Multi-process (cluster)
 
 ```bash
-# Process 0 (coordinator)
+# Process 0
 RHEI_PROCESS_ID=0 RHEI_PEERS=host1:2101,host2:2101 cargo run
 
 # Process 1
 RHEI_PROCESS_ID=1 RHEI_PEERS=host1:2101,host2:2101 cargo run
 ```
 
-State lives in object storage (SlateDB on S3/GCS/Azure). Scaling out means adding processes, not migrating data.
+Processes are started externally — Rhei has no job manager or scheduler. Each process opens SlateDB against the same object store; process 0 coordinates checkpoints over a side TCP channel.
+
+Configuring remote state requires the `remote-state` feature on `rhei-runtime` plus a `RemoteStateConfig`. Without it, state is local to each process and multi-process mode will not share state correctly.
 
 ## Observability
 
-### TUI Dashboard
+### TUI dashboard
 
 ```bash
 rhei run --tui --workers 4
+rhei attach 127.0.0.1:9090   # attach to an already-running pipeline
+rhei demo --workers 4        # built-in demo pipeline
 ```
 
-Displays a live pipeline graph, throughput metrics, state cache hit rates, and per-worker logs.
+`rhei attach` is its own subcommand — it is not a flag on `rhei run`.
 
-### Metrics Server
+### Metrics server
 
 ```bash
 rhei run --metrics-addr 0.0.0.0:9090
 ```
 
 Endpoints:
-- `GET /healthz` -- liveness probe
-- `GET /readyz` -- readiness probe (returns 503 until pipeline is running)
-- `GET /metrics` -- Prometheus metrics
-- `GET /api/metrics` -- JSON metrics snapshot
 
-### Structured Logging
+- `GET /healthz` — liveness probe
+- `GET /readyz` — readiness probe (503 until the pipeline is running)
+- `GET /metrics` — Prometheus metrics
+- `GET /api/metrics` — JSON metrics snapshot
+- `GET /api/logs` — structured log buffer
+
+### Structured logging
 
 ```bash
 rhei run --log-level debug --json-logs
@@ -391,72 +538,55 @@ rhei run --log-level debug --json-logs
 
 ## Troubleshooting
 
-### "type mismatch" on `.operator()`
+### "no method named `builder`" on a window operator
 
-**Symptom:** Compiler error about `StreamFunction::Input` not matching stream type.
+Window and join operators use `::new(...)` with positional closures, not a builder. See [Built-in Operators](#built-in-operators).
 
-**Cause:** The operator's `Input` type doesn't match the element type in the stream.
+### "the trait bound `String: RheiSchema` is not satisfied"
 
-**Fix:** Ensure the stream type matches. Use `.map()` to convert before `.operator()`:
+Stream elements must be structs deriving `RheiSchema`. Wrap primitives in a struct:
 
-```rust
-// Wrong: stream has String but operator expects SensorReading
-stream.key_by(|s| s.clone()).operator("op", MyOp);
-
-// Right: parse first
-stream.map(parse_reading).key_by(|r| r.id.clone()).operator("op", MyOp);
+```rust,no_run
+#[derive(Clone, rhei::RheiSchema)]
+struct Line {
+    text: String,
+}
 ```
 
-### "operator() is not available on Stream"
+### "expected `&String`, found `&str`" in an operator
 
-**Symptom:** No method named `operator` found for `Stream<T>`.
+View fields borrow from the Arrow buffer, so a `String` column reads as `&str`. `KeyedState<String, V>` wants `&String`. Convert first: `let key = view.text.to_string();`.
 
-**Cause:** Stateful operators require a `KeyedStream`. You need `.key_by()` first.
+### "the trait bound `MyOp: Clone` is not satisfied"
 
-**Fix:**
+`.operator()` clones the operator once per worker. Add `#[derive(Clone)]`, or use `#[rhei::op]`, which derives it for you.
 
-```rust
-// Wrong:
-stream.operator("process", MyOp);
+### Stateful results are wrong with more than one worker
 
-// Right:
-stream.key_by(|x| x.key.clone()).operator("process", MyOp);
-```
+You are missing a `.key_by()` before `.operator()`. Rhei does not enforce this at compile time. Add the key, and make sure the key function matches the key you use inside the operator's state.
 
 ### State not persisting across restarts
 
-**Symptom:** State appears empty after restarting the pipeline.
-
-**Cause:** The checkpoint directory was cleaned up, or the pipeline didn't complete a checkpoint before shutdown.
-
-**Fix:**
-1. Use a persistent `checkpoint_dir` (not `/tmp`)
-2. Ensure graceful shutdown with `run_with_shutdown()` so checkpoints complete
+1. Use a persistent `checkpoint_dir` (not a fresh temp directory)
+2. Shut down via `run_with_shutdown()` so a final checkpoint completes
 3. Check logs for checkpoint completion messages
 
 ### Pipeline hangs with no output
 
-**Symptom:** Pipeline starts but produces no output.
+- The source may be empty or waiting for data (a Kafka topic with no messages)
+- A filter may be dropping everything
+- A slow sink may be applying backpressure
 
-**Possible causes:**
-- Source is empty or waiting for data (e.g., Kafka topic has no messages)
-- A filter is dropping all elements
-- Backpressure from a slow sink
-
-**Debug steps:**
-1. Run with `--log-level debug` to see per-batch progress
-2. Check the TUI dashboard (`--tui`) for element counts at each stage
-3. Temporarily replace your sink with `PrintSink` to verify data flow
+Debug with `--log-level debug`, the TUI (`--tui`) element counters, or by swapping in `PrintSink`.
 
 ### "No Cargo.toml found" on `rhei run`
 
-**Cause:** You're not in a Rhei project directory.
-
-**Fix:** `cd` into your project directory, or use `cargo run` directly.
+You are not in a Rhei project directory. `cd` into it, or use `cargo run` directly.
 
 ## Next Steps
 
-- Browse the [API reference](../API.md) for the full `Stream` and `KeyedStream` API
-- Read [ARCHITECTURE.md](../ARCHITECTURE.md) for internals
-- Check [examples](../rhei-runtime/examples/) for complete working pipelines
-- See [ROADMAP.md](../ROADMAP.md) for planned features
+- [API.md](../API.md) — reference for `DataflowGraph`, `Stream`, and `PipelineController`
+- [ARCHITECTURE.md](../ARCHITECTURE.md) — internals
+- [KNOWN-ISSUES.md](../KNOWN-ISSUES.md) — current limitations, read before relying on Rhei
+- Compiled examples: [`rhei/examples/`](../rhei/examples/) and [`rhei-runtime/examples/`](../rhei-runtime/examples/)
+- [ROADMAP.md](../ROADMAP.md) — planned features

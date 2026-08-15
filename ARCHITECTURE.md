@@ -1,6 +1,12 @@
 # Architecture Design: Rhei Overview
 
-Rhei is a distributed, stateful stream processing engine written in Rust. It utilizes a Shared-Nothing, Disaggregated State architecture, separating compute from durable storage to enable instant autoscaling and eliminate heavy local-disk state migrations.
+Rhei is a stateful stream processing engine written in Rust. It uses a Shared-Nothing, Disaggregated State architecture, separating compute from durable storage to reduce local-disk state migrations when the topology changes.
+
+> **Scope of this document.** Everything below describes what is implemented on
+> `main` unless a section is explicitly marked **PLANNED**. Planned components
+> are drawn with dashed borders in the diagrams. For the phased plan see
+> [CLUSTERING.md](CLUSTERING.md); for tracked gaps see
+> [KNOWN-ISSUES.md](KNOWN-ISSUES.md).
 
 ## 1. System Topology
 
@@ -9,6 +15,7 @@ graph TD
     classDef storage fill:#e1f5fe,stroke:#01579b,stroke-width:2px;
     classDef compute fill:#f3e5f5,stroke:#4a148c,stroke-width:2px;
     classDef control fill:#fff3e0,stroke:#e65100,stroke-width:2px;
+    classDef planned fill:#fafafa,stroke:#9e9e9e,stroke-width:2px,stroke-dasharray: 6 4;
     classDef ext fill:#eeeeee,stroke:#616161,stroke-width:1px,stroke-dasharray: 5 5;
 
     subgraph "External Systems"
@@ -17,17 +24,17 @@ graph TD
         S3[Object Storage - e.g., S3]:::ext
     end
 
-    subgraph "Control Plane (JobManager)"
-        API[gRPC API]:::control
-        Sched[Job Scheduler]:::control
-        Raft[OpenRaft Consensus]:::control
+    subgraph "Control Plane (JobManager) — PLANNED, NOT IMPLEMENTED"
+        API[gRPC API]:::planned
+        Sched[Job Scheduler]:::planned
+        Raft[OpenRaft Consensus]:::planned
 
         API --> Sched
         Sched --> Raft
     end
 
     subgraph "Data Plane (TaskManager Worker)"
-        Gossip[Chitchat Discovery]:::control
+        Gossip["Chitchat Discovery<br/>(optional 'chitchat' feature)"]:::control
 
         subgraph "Timely Dataflow Runtime"
             Source[Source Operator]:::compute
@@ -56,13 +63,23 @@ graph TD
         OpLogic --> Sink
     end
 
-    User -->|Submit Graph| API
-    Sched -->|Deploy| Source
+    User -->|"Submit Graph (PLANNED)"| API
+    Sched -->|"Deploy (PLANNED)"| Source
+    User -->|"Today: start processes with --peers / RHEI_PEERS"| Source
     Source <==>|Read/Write| Kafka
     Sink -->|Write| Kafka
     L3 <==>|Async Flush/Fetch| S3
-    Gossip -.->|Heartbeat| Sched
+    Gossip -.->|"Heartbeat (PLANNED target)"| Sched
 ```
+
+**What exists today:** the data plane only. Processes are launched externally
+(by you, a shell script, or an orchestrator) and told about each other through
+`--peers` / `--process-id` flags or the equivalent `RHEI_*` environment
+variables. There is no job submission API, no scheduler, no leader election,
+and no consensus store — `openraft` and `tonic` are not dependencies of any
+crate in this workspace. Gossip-based membership via `chitchat` is implemented
+but gated behind the optional `chitchat` feature on `rhei-runtime`, and it
+reports membership to the running processes rather than to a job manager.
 
 ## 2. Execution Model: Arrow Columnar
 
@@ -104,11 +121,13 @@ Serialization uses Arrow IPC format — fast, self-describing, and columnar-frie
 
 ### Control Plane (Coordination & Metadata)
 
-|Component|Technology|Responsibility|
-|-|-|-|
-|Consensus|openraft|Maintains HA metadata state (active workers, checkpoint IDs, job graphs)|
-|Discovery|chitchat (Gossip)|Fast failure detection and worker discovery|
-|API / RPC|tonic (gRPC)|Client submissions and internal Control-to-Data plane commands|
+|Component|Technology|Responsibility|Status|
+|-|-|-|-|
+|Discovery|chitchat (Gossip)|Failure detection (phi-accrual) and worker discovery, driving debounced rescale|**Implemented**, behind the optional `chitchat` feature on `rhei-runtime`|
+|Checkpoint coordination|Custom TCP protocol|Process 0 collects per-process readiness before committing a merged manifest|**Implemented**|
+|Consensus|openraft|HA metadata state (active workers, checkpoint IDs, job graphs)|**Planned** — not a dependency of any crate|
+|API / RPC|tonic (gRPC)|Client submissions and Control-to-Data plane commands|**Planned** — not a dependency of any crate|
+|Leader election|—|Elect a coordinator rather than hardcoding process 0|**Planned**|
 
 ### Data Plane (Execution Engine)
 
@@ -124,19 +143,35 @@ Serialization uses Arrow IPC format — fast, self-describing, and columnar-frie
 
 |Tier|Technology|Latency|Responsibility|
 |-|-|-|-|
-|L1 (RAM)|`HashMap` memtable|Microseconds|Buffers immediate reads/writes. Flushed to L3 on checkpoint|
-|L2 (Disk)|foyer `HybridCache`|Milliseconds|Local NVMe cache. Handles L1 read misses without network round-trips|
-|L3 (Cloud)|slatedb|10s-100s ms|Source of truth on S3. Enables stateless worker autoscaling|
+|L1 (RAM)|`HashMap` for dirty entries + `moka` W-TinyLFU cache for clean entries|Sub-microsecond|Buffers immediate reads/writes. Dirty entries flush to L3 on checkpoint. Bounded by `MemTableConfig` (`max_entries`, optional `max_bytes`); note that **dirty entries are never evicted**, so L1 can still grow between checkpoints under high write cardinality|
+|L2 (Disk)|foyer `HybridCache`|Sub-ms to ms|Local NVMe cache. Handles L1 read misses without network round-trips|
+|L3 (Cloud)|slatedb|10s-100s ms|Source of truth on object storage. Enables stateless workers|
+
+Latency columns are order-of-magnitude expectations for each backend, not measured
+benchmark results. Run `just bench` for numbers from your own hardware.
+
+State keys are namespaced by key group, not worker index:
+
+```text
+kg{key_group}/{operator_name}/{user_key}
+```
+
+Key groups decouple key ownership from worker count, so the worker count can
+change between runs without rewriting state. The key group count is fixed by
+`max_parallelism`; restoring a checkpoint taken with a different
+`max_parallelism` is rejected.
 
 ## 4. Data Flow Paths
 
 - **Hot Path (Zero I/O):** Batch arrives → operator processes via View iteration → state read/written to L1 MemTable → output buffer emitted.
-- **Cold Path (Async State Fetch):** Operator reads state → L1 miss → `block_in_place` drives async fetch from L2 Foyer / L3 SlateDB → state loaded to L1 → processing continues.
-- **Checkpoint Path:** Frontier advances → L1 dirty keys flush to SlateDB → SlateDB uploads SSTables to S3 → checkpoint manifest written → source offsets committed → next epoch begins.
+- **Cold Path (Blocking State Fetch):** Operator reads state → L1 miss → the Timely worker thread calls `tokio::runtime::Handle::block_on` to drive the L2 Foyer / L3 SlateDB fetch (`rhei-runtime/src/timely_operator.rs`) → state loaded to L1 → processing continues. **This blocks that worker thread for the duration of the fetch**; other workers proceed independently. A non-blocking cold path needs an operator API redesign and is tracked as KI-11 in [KNOWN-ISSUES.md](KNOWN-ISSUES.md).
+- **Checkpoint Path:** Frontier advances → L1 dirty keys flush to SlateDB → SlateDB uploads SSTables to S3 → checkpoint manifest written → source offsets committed → next epoch begins. Because offsets are committed after the checkpoint, delivery is **at-least-once**.
 
 ## 5. Pipeline API
 
-```rust
+```rust,ignore
+// not-compiled: requires the `kafka` feature and librdkafka. For compiled
+// examples see rhei/examples/ and API.md (whose snippets are doctests).
 let graph = DataflowGraph::new();
 
 let orders = graph.source(KafkaSource::new(broker, group, &["orders"])?);
@@ -144,19 +179,29 @@ let orders = graph.source(KafkaSource::new(broker, group, &["orders"])?);
 orders
     .map(|msg| parse_order(msg))
     .filter_fn(|o| o.amount > 50.0)
-    .key_by(|o| o.customer_id.clone())
+    .key_by(|o| o.customer_id.to_string())
     .operator("aggregator", CustomerAggregator)
     .sink(KafkaSink::new(broker, "output")?);
 
-let ctrl = PipelineController::new("./checkpoints")
-    .with_workers(4);
+let ctrl = PipelineController::builder()
+    .checkpoint_dir("./checkpoints")
+    .workers(4)
+    .build()?;
 ctrl.run(graph).await?;
 ```
 
+Closures passed to `map`, `filter_fn`, and `key_by` receive a zero-copy row
+**view** borrowed from the Arrow buffer, not an owned value — hence
+`.to_string()` on the key. `PipelineController::new` takes a `PathBuf` and pairs
+with `.with_workers(n)`; the builder above accepts `impl Into<PathBuf>` and
+returns `anyhow::Result<PipelineController>`.
+
 Key API types:
-- `Stream<'a, T>` — typed handle to a point in the dataflow. Supports `map`, `filter_fn`, `flat_map`, `key_by`, `merge`, `inspect`, `limit`, `distinct_by`, `name`.
+- `Stream<'a, T>` — `Copy` typed handle to a point in the dataflow. Supports `map`, `filter`, `filter_fn`, `flat_map`, `key_by`, `merge`, `inspect`, `limit`, `batch`, `distinct_by`, `name`, `operator`, `sink`. There is no separate `KeyedStream` type, so keying before a stateful operator is a convention the compiler does not enforce.
 - `DataflowGraph` — container for the dataflow topology. Validated before execution.
 - `PipelineController` — configures workers, checkpoint dir, DLQ sink, cluster settings. Compiles and runs the graph.
+
+Full reference: [API.md](API.md).
 
 ## 6. Error Handling
 
@@ -164,15 +209,21 @@ Key API types:
 |-----------|-------------|
 | `ErrorPolicy::Skip` | Log warning and drop the failed element (default) |
 | `ErrorPolicy::SendToDlq` | Route failed elements to a `DlqSink` implementation |
-| `DlqSink` trait | Async trait for dead-letter backends (`FileDlqSink`, `LogDlqSink`, `KafkaDlqSink`) |
-| `on_error()` hook | Per-operator error recovery callback on `StreamFunction` |
+| `DlqSink` trait | Async trait for dead-letter backends (`FileDlqSink`, `LogDlqSink`, `KafkaDlqSink` — the last behind the `kafka` feature) |
+| `on_error()` hook | Per-operator error recovery callback on `StreamFunction`; defaults to propagating the error |
+
+Error policy and DLQ sink are set on `PipelineController::builder()`
+(`.error_policy(..)`, `.dlq_sink(..)`). There are no per-stream `.dlq()` or
+`.with_dlq()` methods.
 
 ## 7. Clustering
 
 | Mode | Config | What changes |
 |------|--------|-------------|
-| Single-thread | Default | One worker, local state |
-| Multi-thread | `.with_workers(4)` | N worker threads, shared-nothing state per worker |
-| Multi-process | `.from_env()` | N processes over TCP, coordinated checkpoints via S3 |
+| Single-thread | Default | One Timely worker, local state |
+| Multi-thread | `.workers(4)` (or `.with_workers(4)` on `PipelineController::new`) | N worker threads, shared-nothing L1/L2 per worker |
+| Multi-process | `.from_env()`, or `.process_id(..)` + `.peers(..)` | N processes over TCP, coordinated checkpoints via shared object storage |
 
-In multi-process mode, each process independently opens SlateDB against the same S3 bucket. Checkpoint coordination via out-of-band TCP — process 0 collects readiness before committing a merged manifest.
+In multi-process mode, each process independently opens SlateDB against the same bucket. Checkpoint coordination is out-of-band over TCP — process 0 collects readiness before committing a merged manifest. Sharing state across processes requires the `remote-state` feature on `rhei-runtime` plus a `RemoteStateConfig`.
+
+Runtime rescaling is available via `PipelineController::run_dynamic()`, which checkpoints, rebuilds the `TaskManager` with a new topology generation, and restarts Timely. Key-group ownership moves; state bytes stay in shared L3 and fault in on first access after a rescale.

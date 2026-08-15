@@ -69,21 +69,32 @@ after `window_end + allowed_lateness <= last_watermark` are dropped with a
 configurable per window operator via the builder API. Side-output routing of late
 events to a separate stream is not yet implemented.
 
-### KI-7: L1 memtable has no size limit or eviction
+### KI-7: L1 memtable dirty entries are unbounded (PARTIALLY RESOLVED)
 
-**File:** `rhei-core/src/state/memtable.rs:8-11`
+**File:** `rhei-core/src/state/memtable.rs`
 
-`MemTable` is a plain `HashMap` with a dirty set. There is no capacity limit,
-eviction policy, or backpressure mechanism. Between checkpoints, L1 can grow
-without bound. Under high cardinality workloads this can exhaust available RAM.
+**Resolved part:** clean entries (already persisted to L2/L3) now live in a
+[`moka`] cache with W-TinyLFU admission and eviction, bounded by
+`MemTableConfig` (`max_entries`, default 500,000, plus optional byte-weighted
+`max_bytes`). Configure it with
+`PipelineController::builder().memtable_config(..)`.
+
+**Remaining:** dirty entries — writes not yet flushed to the backend — are held
+in a plain `HashMap` and are **never evicted**, because evicting them would lose
+data that has not been checkpointed. Between checkpoints, L1 can still grow
+without bound in proportion to the number of distinct keys written. A workload
+with high write cardinality and a long checkpoint interval can exhaust RAM.
+Mitigation today is a shorter `checkpoint_interval`; a real fix needs
+write-triggered flushing or backpressure.
 
 ### ~~KI-8: Checkpoint interval is hardcoded~~ (RESOLVED)
 
 **Fixed in:** `ADR/checkpoint-restore.md`
 
-The checkpoint interval is now configurable via `Executor::builder().checkpoint_interval(n)`.
-Defaults to 100 batches. Both `Executor` and `ExecutorBuilder` carry the field, and the
-multi-worker main loop reads it from the executor at runtime.
+The checkpoint interval is now configurable via
+`PipelineController::builder().checkpoint_interval(n)`. Defaults to 100 batches.
+Both `PipelineController` and `PipelineControllerBuilder` carry the field, and
+the multi-worker main loop reads it from the controller at runtime.
 
 ### ~~KI-9: No merge / fan-in support in executor~~ (RESOLVED)
 
@@ -105,9 +116,15 @@ per key with no eviction when windows close.
 
 ## MEDIUM
 
-### ~~KI-11: Stash ordering under async pending~~ (PARTIALLY RESOLVED)
+### KI-11: State cold path blocks the Timely worker thread (PARTIALLY RESOLVED)
 
-**File:** `rhei-runtime/src/async_operator.rs`
+**File:** `rhei-runtime/src/async_operator.rs`, `rhei-runtime/src/timely_operator.rs:34`
+
+Operator futures are driven with `tokio::runtime::Handle::block_on` from inside
+the Timely operator closure. An L1 state miss therefore **blocks that worker
+thread** for the duration of the L2/L3 fetch. Other workers are unaffected, but
+throughput on the blocked worker stalls. Documentation must not describe the
+cold path as non-blocking.
 
 The `rt = None` data loss path now logs at `error` level with an
 `async_operator_dropped_elements_total` metric. The `let _ = cap` pattern was
