@@ -294,6 +294,7 @@ proptest! {
             p.save_partial(dir.path(), pid).unwrap();
         }
         let merged = CheckpointManifest::merge_partials(dir.path(), partials.len())
+            .expect("merge should not error")
             .expect("all partials present");
 
         let expected_max_ckpt = partials.iter().map(|p| p.checkpoint_id).max().unwrap();
@@ -335,5 +336,9 @@ fn merge_partials_incomplete_is_none(#[case] present: usize, #[case] expected: u
     for pid in 0..present {
         manifest.save_partial(dir.path(), pid).unwrap();
     }
-    assert!(CheckpointManifest::merge_partials(dir.path(), expected).is_none());
+    assert!(
+        CheckpointManifest::merge_partials(dir.path(), expected)
+            .expect("missing partials are not an error")
+            .is_none()
+    );
 }

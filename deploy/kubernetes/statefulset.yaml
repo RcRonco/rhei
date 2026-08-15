@@ -1,0 +1,260 @@
+# Rhei pipeline as a StatefulSet.
+#
+# A StatefulSet rather than a Deployment, for two reasons:
+#
+#  1. Stable ordinals. `RHEI_PROCESS_ID` must be 0..N-1 and must match the
+#     pod's position in `RHEI_PEERS`. StatefulSet pod names end in a stable
+#     ordinal; Deployment pod names do not.
+#  2. Stable storage. Each process keeps its L2 cache and local checkpoint
+#     staging on disk. A per-pod PVC follows the pod across reschedules, so a
+#     restarted process warms from local state instead of refetching from S3.
+#
+# Process 0 is the checkpoint coordinator. It is not special in any other way —
+# it is not a leader, and losing it does not lose state, since state lives in
+# object storage.
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: rhei-pipeline
+  labels:
+    app.kubernetes.io/name: rhei-pipeline
+spec:
+  # Headless: pods need per-pod DNS (rhei-pipeline-0.rhei-pipeline...) so the
+  # peer list resolves to individual processes rather than load-balancing
+  # across them. A load-balanced data plane would shuffle keyed traffic
+  # between workers and break key-group affinity.
+  clusterIP: None
+  publishNotReadyAddresses: true # peers must resolve before any pod is ready
+  selector:
+    app.kubernetes.io/name: rhei-pipeline
+  ports:
+    - name: data
+      port: 2101
+      targetPort: data
+    - name: http
+      port: 9090
+      targetPort: http
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: rhei-pipeline-metrics
+  labels:
+    app.kubernetes.io/name: rhei-pipeline
+spec:
+  # Separate, normal Service for scraping and dashboards. Kept apart from the
+  # headless data-plane Service so that exposing metrics never exposes 2101.
+  selector:
+    app.kubernetes.io/name: rhei-pipeline
+  ports:
+    - name: http
+      port: 9090
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: rhei-pipeline
+  labels:
+    app.kubernetes.io/name: rhei-pipeline
+spec:
+  serviceName: rhei-pipeline
+  replicas: 3
+  podManagementPolicy: Parallel # every peer must come up for the cluster to form
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: rhei-pipeline
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: rhei-pipeline
+    spec:
+      # Long enough for the pipeline to finish its current batch, flush L1
+      # through to object storage, and commit source offsets. Too short and
+      # SIGKILL lands mid-checkpoint: state is safe (the last checkpoint still
+      # stands) but the work since then is reprocessed on restart.
+      terminationGracePeriodSeconds: 120
+
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001 # so the mounted PVC is writable by the non-root user
+        seccompProfile:
+          type: RuntimeDefault
+
+      containers:
+        - name: pipeline
+          image: my-registry/my-pipeline:v1 # built from deploy/Dockerfile
+          imagePullPolicy: IfNotPresent
+
+          ports:
+            - name: http
+              containerPort: 9090
+            - name: data
+              containerPort: 2101
+
+          env:
+            # Derive the process ID from the pod ordinal: rhei-pipeline-2 → 2.
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            # Every process, in ordinal order. This list must match `replicas`
+            # and must be identical on every pod.
+            - name: RHEI_PEERS
+              value: >-
+                rhei-pipeline-0.rhei-pipeline:2101,
+                rhei-pipeline-1.rhei-pipeline:2101,
+                rhei-pipeline-2.rhei-pipeline:2101
+
+            - name: RHEI_WORKERS
+              value: "4" # match the CPU limit below
+
+            # Fixed for the pipeline's lifetime. Changing it re-partitions the
+            # key space and orphans all existing state; the pipeline refuses to
+            # start rather than silently reading empty state. Set it high
+            # enough to cover the largest cluster you will ever scale to.
+            - name: RHEI_MAX_PARALLELISM
+              value: "128"
+
+            - name: RHEI_CHECKPOINT_DIR
+              value: /var/lib/rhei/checkpoints
+            - name: RHEI_METRICS_ADDR
+              value: 0.0.0.0:9090
+            - name: RHEI_JSON_LOGS
+              value: "1"
+            - name: RHEI_LOG_LEVEL
+              value: info
+
+            # Durable state in object storage. Workers stay stateless-ish:
+            # losing a pod costs the warm cache, not the state.
+            - name: RHEI_REMOTE_BUCKET
+              value: my-rhei-state
+            - name: RHEI_REMOTE_PREFIX
+              value: pipelines/my-pipeline
+            - name: RHEI_REMOTE_REGION
+              value: us-east-1
+
+            # Authentication for /metrics and /api/*. Probes stay open.
+            - name: RHEI_METRICS_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: rhei-pipeline-secrets
+                  key: metrics-token
+                  optional: true
+
+            # Object storage credentials. Prefer IRSA / Workload Identity and
+            # drop these entirely.
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: rhei-pipeline-secrets
+                  key: aws-access-key-id
+                  optional: true
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: rhei-pipeline-secrets
+                  key: aws-secret-access-key
+                  optional: true
+
+          command:
+            - /bin/sh
+            - -c
+            # `exec` so the pipeline becomes PID 1 and receives SIGTERM
+            # directly — without it the shell absorbs the signal and the
+            # graceful drain never runs.
+            - |
+              export RHEI_PROCESS_ID="${POD_NAME##*-}"
+              exec /usr/local/bin/pipeline
+
+          # Is the process wedged? /healthz fails when a worker's dataflow loop
+          # stops turning. failureThreshold × periodSeconds (5 × 10s = 50s)
+          # sits above the 60s default liveness timeout deliberately: the
+          # endpoint already applies its own tolerance, and this adds a second
+          # layer so a single slow scrape never restarts a healthy pipeline.
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 5
+
+          # Is the process ready to be counted as part of the pipeline?
+          # /readyz fails while Starting (restoring from checkpoint) and while
+          # Draining, so a terminating pod leaves endpoint lists before it goes.
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 2
+
+          # Restoring a large keyed state from object storage can take a while.
+          # A startup probe gives that phase its own budget (30 × 10s = 5min)
+          # without loosening the liveness timeout for steady state.
+          startupProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 30
+
+          resources:
+            requests:
+              # Keep requests == limits for CPU. Rhei pins workers to cores;
+              # CFS throttling on a burstable pod shows up as latency spikes
+              # and, at the extreme, as liveness failures.
+              cpu: "4"
+              memory: 4Gi
+            limits:
+              cpu: "4"
+              memory: 8Gi
+
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+
+          volumeMounts:
+            - name: state
+              mountPath: /var/lib/rhei
+            - name: tmp
+              mountPath: /tmp
+
+      volumes:
+        - name: tmp # readOnlyRootFilesystem still needs a writable /tmp
+          emptyDir: {}
+
+  volumeClaimTemplates:
+    - metadata:
+        name: state
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        # The L2 cache is latency-sensitive; put it on SSD/NVMe.
+        # storageClassName: fast-ssd
+        resources:
+          requests:
+            storage: 50Gi
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: rhei-pipeline
+spec:
+  # Voluntary disruptions take at most one process at a time. The pipeline
+  # tolerates losing a process, but losing several at once means the survivors
+  # absorb every key group at once — usually a thundering restore from object
+  # storage.
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: rhei-pipeline

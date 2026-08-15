@@ -65,6 +65,13 @@ enum Commands {
     Attach {
         /// Address of the running pipeline's HTTP server (e.g. `127.0.0.1:9090`)
         addr: String,
+
+        /// Bearer token, when the pipeline runs with `RHEI_METRICS_TOKEN` set.
+        ///
+        /// Falls back to the `RHEI_METRICS_TOKEN` environment variable, so
+        /// attaching to a local pipeline usually needs no flag.
+        #[arg(long, env = "RHEI_METRICS_TOKEN", hide_env_values = true)]
+        token: Option<String>,
     },
     /// Create a new Rhei pipeline project
     New {
@@ -370,7 +377,7 @@ fn main() -> anyhow::Result<()> {
             )
         }
         Commands::New { name, path } => scaffold::create_project(&name, path.as_deref()),
-        Commands::Attach { addr } => cmd_attach(addr),
+        Commands::Attach { addr, token } => cmd_attach(addr, token.as_deref()),
         Commands::Demo { workers, addr } => cmd_demo(workers, addr),
     }
 }
@@ -453,7 +460,25 @@ fn cmd_run_tui(log_level: String, workers: usize) -> anyhow::Result<()> {
     })
 }
 
-fn cmd_attach(addr: String) -> anyhow::Result<()> {
+/// Whether a base URL points at this machine.
+///
+/// Used to decide when sending a bearer token over plaintext HTTP is worth
+/// warning about: to localhost it never leaves the host.
+fn is_loopback_url(base_url: &str) -> bool {
+    let rest = base_url
+        .strip_prefix("http://")
+        .or_else(|| base_url.strip_prefix("https://"))
+        .unwrap_or(base_url);
+    let host = rest
+        .split('/')
+        .next()
+        .unwrap_or(rest)
+        .rsplit_once(':')
+        .map_or(rest, |(host, _)| host);
+    matches!(host, "localhost" | "127.0.0.1" | "[::1]" | "::1")
+}
+
+fn cmd_attach(addr: String, token: Option<&str>) -> anyhow::Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
 
     rt.block_on(async {
@@ -463,14 +488,37 @@ fn cmd_attach(addr: String) -> anyhow::Result<()> {
             format!("http://{addr}")
         };
 
+        // The API is plaintext unless the address says otherwise, so a token
+        // sent to a remote host crosses the network in the clear. Front a
+        // remote pipeline with TLS and attach to the https:// address.
+        if token.is_some() && base_url.starts_with("http://") && !is_loopback_url(&base_url) {
+            eprintln!(
+                "warning: sending a bearer token over plaintext HTTP to {addr}. \
+                 Use an https:// address, or an SSH tunnel to localhost."
+            );
+        }
+
         // Verify connectivity before launching TUI
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(5))
-            .build()?;
+        let mut builder = reqwest::Client::builder().timeout(Duration::from_secs(5));
+        if let Some(token) = token {
+            let mut headers = reqwest::header::HeaderMap::new();
+            let mut value = reqwest::header::HeaderValue::from_str(&format!("Bearer {token}"))
+                .map_err(|_| anyhow::anyhow!("token contains characters invalid in a header"))?;
+            value.set_sensitive(true);
+            headers.insert(reqwest::header::AUTHORIZATION, value);
+            builder = builder.default_headers(headers);
+        }
+        let client = builder.build()?;
 
         let health_url = format!("{base_url}/api/health");
         match client.get(&health_url).send().await {
             Ok(resp) if resp.status().is_success() => {}
+            Ok(resp) if resp.status() == reqwest::StatusCode::UNAUTHORIZED => {
+                anyhow::bail!(
+                    "Pipeline at {addr} requires authentication. Pass --token, or set \
+                     RHEI_METRICS_TOKEN to the value the pipeline was started with."
+                );
+            }
             Ok(resp) => {
                 anyhow::bail!(
                     "Pipeline at {addr} returned HTTP {}: is the server running?",
@@ -595,6 +643,10 @@ fn cmd_demo(workers: usize, addr: std::net::SocketAddr) -> anyhow::Result<()> {
             pipeline_name: Some("sensor-demo".to_string()),
             workers,
             checkpoint_dir: None,
+            // `rhei demo` exists to drive the local web dashboard, so allow
+            // the Vite dev server's origin alongside anything set in the
+            // environment. Everything else stays at the closed default.
+            access: demo_access_config(),
         });
 
         eprintln!("Rhei demo pipeline starting on http://{addr}");
@@ -649,6 +701,25 @@ async fn run_demo_with_executor(
     tokio::time::sleep(std::time::Duration::from_secs(5)).await;
     tracing::info!("pipeline completed");
     Ok(())
+}
+
+/// Access settings for the `rhei demo` HTTP server.
+///
+/// The demo's whole purpose is to back the local web dashboard, which runs on
+/// the Vite dev server at a different origin, so those two localhost origins
+/// are allowed in addition to anything set via `RHEI_ALLOWED_ORIGINS`.
+/// Authentication and the state explorer keep their closed defaults.
+fn demo_access_config() -> rhei_runtime::http_server::AccessConfig {
+    let mut access = rhei_runtime::http_server::AccessConfig::from_env();
+    for origin in [
+        "http://localhost:5173".to_string(),
+        "http://127.0.0.1:5173".to_string(),
+    ] {
+        if !access.allowed_origins.contains(&origin) {
+            access.allowed_origins.push(origin);
+        }
+    }
+    access
 }
 
 #[cfg(test)]

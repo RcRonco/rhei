@@ -277,6 +277,55 @@ pub fn coordination_port(peers: &[String]) -> u16 {
     9100 // fallback
 }
 
+/// Split a `host:port` peer address into its host part.
+///
+/// Handles bracketed IPv6 (`[::1]:2101`) as well as `host:port`, so a peer
+/// list written with IPv6 literals resolves to the right host rather than to
+/// a fragment of the address.
+fn peer_host(addr: &str) -> Option<&str> {
+    let addr = addr.trim();
+    if let Some(rest) = addr.strip_prefix('[') {
+        // [::1]:2101 → ::1
+        return rest.split(']').next().filter(|h| !h.is_empty());
+    }
+    addr.rsplit_once(':')
+        .map(|(host, _)| host)
+        .filter(|h| !h.is_empty())
+}
+
+/// Address process 0 binds the checkpoint coordinator on.
+///
+/// Binds all interfaces, not loopback. Peers in a real cluster live on other
+/// hosts, and a coordinator listening only on `127.0.0.1` is reachable from
+/// none of them — coordination would work on a single-host test and fail
+/// everywhere else.
+pub fn coordinator_bind_addr(port: u16) -> String {
+    format!("0.0.0.0:{port}")
+}
+
+/// Address non-zero processes dial to reach the coordinator.
+///
+/// Process 0 runs the coordinator, so this is process 0's host — taken from
+/// the first entry of the peer list — paired with the coordination port.
+/// Falls back to loopback only when the peer list carries no usable host,
+/// which in practice means a single-process configuration.
+pub fn coordinator_connect_addr(peers: &[String], port: u16) -> String {
+    let host = peers.first().and_then(|p| peer_host(p)).unwrap_or_else(|| {
+        tracing::warn!(
+            "peer list has no usable host for process 0; \
+             falling back to loopback for checkpoint coordination"
+        );
+        "127.0.0.1"
+    });
+
+    if host.contains(':') {
+        // Bare IPv6 literal needs brackets before the port is appended.
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    }
+}
+
 /// Local participant channel pair for process 0.
 ///
 /// Process 0 participates in coordination without TCP — it uses in-memory
@@ -406,5 +455,55 @@ mod tests {
         drop(local_part.ready_tx);
         // Coordinator will exit when local channel closes.
         let _ = tokio::time::timeout(std::time::Duration::from_secs(2), coord_handle).await;
+    }
+
+    // ── Coordinator addressing ───────────────────────────────────────
+
+    #[test]
+    fn coordinator_binds_all_interfaces() {
+        // Binding loopback made coordination work on a single host and fail in
+        // every real cluster, since peers dial in from other machines.
+        assert_eq!(coordinator_bind_addr(3101), "0.0.0.0:3101");
+    }
+
+    #[test]
+    fn peers_connect_to_process_zero_not_themselves() {
+        let peers = vec![
+            "rhei-0.rhei:2101".to_string(),
+            "rhei-1.rhei:2101".to_string(),
+        ];
+        // Process 0 runs the coordinator, so every peer dials its host.
+        assert_eq!(coordinator_connect_addr(&peers, 3101), "rhei-0.rhei:3101");
+    }
+
+    #[test]
+    fn connect_addr_uses_the_coordination_port_not_the_data_port() {
+        let peers = vec!["10.0.0.5:2101".to_string()];
+        assert_eq!(coordinator_connect_addr(&peers, 3101), "10.0.0.5:3101");
+    }
+
+    #[test]
+    fn connect_addr_handles_bracketed_ipv6() {
+        let peers = vec!["[2001:db8::1]:2101".to_string()];
+        assert_eq!(coordinator_connect_addr(&peers, 3101), "[2001:db8::1]:3101");
+    }
+
+    #[test]
+    fn connect_addr_falls_back_to_loopback_without_a_host() {
+        assert_eq!(coordinator_connect_addr(&[], 3101), "127.0.0.1:3101");
+        assert_eq!(
+            coordinator_connect_addr(&["nonsense".to_string()], 3101),
+            "127.0.0.1:3101"
+        );
+    }
+
+    #[test]
+    fn peer_host_parses_the_forms_a_peer_list_can_take() {
+        assert_eq!(peer_host("host:2101"), Some("host"));
+        assert_eq!(peer_host("10.0.0.1:2101"), Some("10.0.0.1"));
+        assert_eq!(peer_host("[::1]:2101"), Some("::1"));
+        assert_eq!(peer_host("  host:2101  "), Some("host"));
+        assert_eq!(peer_host("noport"), None);
+        assert_eq!(peer_host(":2101"), None);
     }
 }

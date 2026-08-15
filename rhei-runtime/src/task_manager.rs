@@ -66,6 +66,11 @@ pub(crate) struct TaskManager {
     checkpoint_dir: PathBuf,
     process_id: Option<usize>,
     n_processes: usize,
+    /// Liveness heartbeat slots, one per local worker.
+    heartbeats: crate::health::WorkerHeartbeats,
+    /// Cluster-wide index of this process's first worker, used to map a
+    /// Timely worker index onto a local heartbeat slot.
+    local_worker_offset: usize,
 }
 
 /// Per-executor data extracted from the shared Mutex vectors.
@@ -231,6 +236,8 @@ impl TaskManager {
             checkpoint_dir,
             process_id,
             n_processes,
+            heartbeats: controller.health.heartbeats(),
+            local_worker_offset: local_range.start,
         })
     }
 
@@ -329,6 +336,10 @@ impl TaskManager {
             local_first_worker,
             data,
             shutdown_barrier,
+            self.heartbeats.clone(),
+            // Timely worker indices are cluster-wide; heartbeat slots are
+            // per-process, so shift into local space.
+            idx.saturating_sub(self.local_worker_offset),
         )
     }
 
@@ -515,12 +526,19 @@ async fn setup_coordination(
         .ok_or_else(|| anyhow::anyhow!("process_id should be set in cluster mode"))?;
     let n_processes = peers.len();
     let coord_port = crate::checkpoint_coord::coordination_port(peers);
-    let coord_addr = format!("127.0.0.1:{coord_port}");
 
     if pid == 0 {
         // Process 0: run coordinator + use local channels for self-participation.
+        // Binds all interfaces — peers connect from other hosts.
+        let bind_addr = crate::checkpoint_coord::coordinator_bind_addr(coord_port);
         let (coordinator, channels, local_part) =
-            crate::checkpoint_coord::setup_coordinator_full(&coord_addr, n_processes).await?;
+            crate::checkpoint_coord::setup_coordinator_full(&bind_addr, n_processes)
+                .await
+                .map_err(|e| {
+                    anyhow::anyhow!("failed to bind checkpoint coordinator on {bind_addr}: {e}")
+                })?;
+
+        tracing::info!(%bind_addr, n_processes, "checkpoint coordinator listening");
 
         let handle = tokio::spawn(async move {
             coordinator
@@ -533,31 +551,68 @@ async fn setup_coordination(
             Some(handle),
         ))
     } else {
-        // Non-zero processes: connect as TCP participant with backoff.
-        let mut participant = None;
-        for attempt in 0..20 {
-            match crate::checkpoint_coord::CheckpointParticipant::connect(&coord_addr, pid).await {
-                Ok(p) => {
-                    participant = Some(p);
-                    break;
-                }
-                Err(e) => {
-                    if attempt < 19 {
-                        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-                    } else {
-                        return Err(anyhow::anyhow!(
-                            "failed to connect to checkpoint coordinator at {coord_addr}: {e}"
-                        ));
-                    }
-                }
+        // Non-zero processes dial process 0's host, not their own loopback.
+        let coord_addr = crate::checkpoint_coord::coordinator_connect_addr(peers, coord_port);
+        let participant = connect_to_coordinator(&coord_addr, pid).await?;
+        Ok((Some(CheckpointCoordination::Remote(participant)), None))
+    }
+}
+
+/// Longest a process waits for the checkpoint coordinator to accept it.
+///
+/// Sized for a real orchestrated start, where process 0 may still be pulling
+/// an image or restoring state when its peers come up. Failing after a few
+/// seconds would turn an ordinary staggered rollout into a crash loop.
+const COORDINATOR_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_mins(2);
+
+/// Connect to the checkpoint coordinator, retrying with capped exponential
+/// backoff until [`COORDINATOR_CONNECT_TIMEOUT`] elapses.
+async fn connect_to_coordinator(
+    coord_addr: &str,
+    pid: usize,
+) -> anyhow::Result<crate::checkpoint_coord::CheckpointParticipant> {
+    let deadline = tokio::time::Instant::now() + COORDINATOR_CONNECT_TIMEOUT;
+    let mut backoff = std::time::Duration::from_millis(100);
+    let max_backoff = std::time::Duration::from_secs(5);
+    let mut attempts = 0u32;
+    let mut last_error;
+
+    loop {
+        attempts += 1;
+        match crate::checkpoint_coord::CheckpointParticipant::connect(coord_addr, pid).await {
+            Ok(participant) => {
+                tracing::info!(
+                    %coord_addr,
+                    attempts,
+                    "connected to checkpoint coordinator"
+                );
+                return Ok(participant);
             }
+            Err(e) => last_error = e,
         }
-        Ok((
-            Some(CheckpointCoordination::Remote(participant.unwrap_or_else(
-                || panic!("participant should be connected after retries"),
-            ))),
-            None,
-        ))
+
+        if tokio::time::Instant::now() + backoff >= deadline {
+            return Err(anyhow::anyhow!(
+                "process {pid} could not reach the checkpoint coordinator at {coord_addr} after \
+                 {attempts} attempts over {}s: {last_error}. Process 0 runs the coordinator — \
+                 check that it is running, that the first entry in the peer list is its address, \
+                 and that the port is reachable between processes.",
+                COORDINATOR_CONNECT_TIMEOUT.as_secs()
+            ));
+        }
+
+        // Log sparingly: this is expected during a staggered start, and only
+        // worth reporting once it stops looking routine.
+        if attempts == 5 {
+            tracing::warn!(
+                %coord_addr,
+                error = %last_error,
+                "still waiting for the checkpoint coordinator"
+            );
+        }
+
+        tokio::time::sleep(backoff).await;
+        backoff = (backoff * 2).min(max_backoff);
     }
 }
 
@@ -694,11 +749,11 @@ pub(crate) fn write_manifest(
 
         // Process 0 merges all partial manifests into the final manifest.
         if pid == 0 {
-            let merged = CheckpointManifest::merge_partials(checkpoint_dir, n_processes);
-            if let Some(merged) = merged {
+            if let Some(merged) = CheckpointManifest::merge_partials(checkpoint_dir, n_processes)? {
                 merged.save(checkpoint_dir)?;
                 tracing::debug!(
                     checkpoint_id = merged.checkpoint_id,
+                    max_parallelism = ?merged.max_parallelism,
                     "merged checkpoint saved"
                 );
             } else {

@@ -68,6 +68,8 @@ async-trait.workspace = true
 proptest.workspace = true
 rstest = "0.26.1"
 criterion.workspace = true
+# Exercises the real axum Router (routing + auth middleware) in tests.
+tower = { version = "0.5", features = ["util"] }
 
 [[bench]]
 name = "pipeline_e2e"

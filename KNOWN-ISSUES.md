@@ -4,6 +4,14 @@ Tracked gaps, limitations, and potential correctness issues in the Rhei codebase
 Severity labels: **CRITICAL** (data loss or incorrect results), **HIGH** (resource
 exhaustion, silent misbehaviour), **MEDIUM** (missing feature, workaround exists).
 
+Resolved entries are kept rather than deleted: what a system used to get wrong
+is part of what you need to know when judging it, and a register that only
+lists open items reads as though nothing was ever broken.
+
+Security issues are tracked separately in [SECURITY.md](SECURITY.md) as `SI-N`.
+
+**Still open:** KI-14, KI-18, KI-26, KI-27, and the dirty half of KI-7.
+
 ---
 
 ## CRITICAL
@@ -85,7 +93,8 @@ data that has not been checkpointed. Between checkpoints, L1 can still grow
 without bound in proportion to the number of distinct keys written. A workload
 with high write cardinality and a long checkpoint interval can exhaust RAM.
 Mitigation today is a shorter `checkpoint_interval`; a real fix needs
-write-triggered flushing or backpressure.
+write-triggered flushing or backpressure. See
+[docs/deployment.md](docs/deployment.md#capacity-planning) for how to size it.
 
 ### ~~KI-8: Checkpoint interval is hardcoded~~ (RESOLVED)
 
@@ -104,13 +113,17 @@ The unified Timely DAG executor supports merge nodes via `scope.concatenate()`,
 combining multiple input streams into one. The `stream.merge(other)` API works
 at execution time.
 
-### KI-10: Sliding window unbounded active windows
+### ~~KI-10: Sliding window unbounded active windows~~ (RESOLVED)
 
 **File:** `rhei-core/src/operators/sliding_window.rs`
 
-`ActiveWindows` stores all active window start times per key. With small slide
-intervals relative to window size, thousands of overlapping windows can accumulate
-per key with no eviction when windows close.
+`on_watermark` now closes every window whose end plus `allowed_lateness` has
+passed the watermark: it emits the result, deletes the accumulator, and prunes
+the start time from `ActiveWindows`. A key whose windows have all closed is
+removed from state and from the active key set entirely.
+
+Concurrent windows per key are therefore bounded by
+`window_size / slide_interval`, not by how long the pipeline has run.
 
 ---
 
@@ -205,3 +218,119 @@ Partitioned source and multi-worker checkpoint restart are now covered
 - Checkpoint failure and recovery
 - Network partition behaviour (relevant for Phase 2 multi-process)
 - Source exhaustion during checkpoint cycle
+
+---
+
+## Production readiness
+
+Issues found and fixed during a production-readiness review, plus the gaps that
+remain. See [docs/deployment.md](docs/deployment.md) for how to run around them.
+
+### ~~KI-19: Cluster checkpoint coordination bound to loopback~~ (RESOLVED)
+
+**File:** `rhei-runtime/src/task_manager.rs`, `rhei-runtime/src/checkpoint_coord.rs`
+
+**Severity: CRITICAL.** Process 0 bound the checkpoint coordinator on
+`127.0.0.1`, and every other process dialled `127.0.0.1` — its *own* loopback,
+not process 0's host. Multi-process clustering therefore only worked when every
+process shared a host, which is how the tests ran and why it went unnoticed. Any
+genuinely distributed deployment failed to start with
+`failed to connect to checkpoint coordinator`.
+
+The coordinator now binds all interfaces and peers derive the coordinator's host
+from the first entry of the peer list. The connect retry budget also grew from
+5 seconds to 120 with exponential backoff, so a staggered rollout where process 0
+starts last is not a crash loop.
+
+### ~~KI-20: Merged cluster manifests dropped the key group count~~ (RESOLVED)
+
+**File:** `rhei-core/src/checkpoint.rs`
+
+**Severity: CRITICAL.** `merge_partials` did not carry `max_parallelism` into
+the merged `manifest.json` — the manifest a restart actually reads. Since
+`validate_compatible` accepts a `None` value, the key-group safety check was
+silently disabled in cluster mode, exactly where it matters. Restarting a
+cluster at a different `max_parallelism` re-partitioned the key space and read
+empty state instead of failing.
+
+The merge now carries the cluster shape through and rejects partials that
+disagree on `max_parallelism`.
+
+### ~~KI-21: Corrupt checkpoint manifests read as "no checkpoint"~~ (RESOLVED)
+
+**File:** `rhei-core/src/checkpoint.rs`
+
+**Severity: CRITICAL.** `CheckpointManifest::load` mapped every failure to
+`None`, so a corrupt manifest was indistinguishable from a pipeline that had
+never checkpointed: the pipeline restarted from offset zero and reprocessed the
+entire stream without a word.
+
+Recovery paths now use `load_checked`, which returns `Ok(None)` only for a
+genuinely absent manifest and errors on corruption, I/O failure, or an unknown
+schema version. `load` remains lossy for read-only surfaces and logs.
+
+### ~~KI-22: Checkpoint manifest writes were not durable~~ (RESOLVED)
+
+**File:** `rhei-core/src/checkpoint.rs`
+
+The manifest write claimed crash-safety it did not have. `rename` makes the swap
+atomic for a concurrent *reader* but orders nothing against power loss, so the
+rename could reach disk before the data it points at — leaving a manifest that
+is present, parseable, and empty. Writes now fsync the file before the rename
+and the directory after it.
+
+### ~~KI-23: Liveness probe could not detect a wedged pipeline~~ (RESOLVED)
+
+**File:** `rhei-runtime/src/health.rs`
+
+`/healthz` returned 200 whenever the process was alive. A pipeline whose Timely
+loop had deadlocked still answered TCP, so an orchestrator never restarted it.
+Workers now stamp a heartbeat each turn of the loop and `/healthz` returns 503
+once any worker goes quiet past `RHEI_LIVENESS_TIMEOUT_SECS`.
+
+### ~~KI-24: Malformed environment variables were silently ignored~~ (RESOLVED)
+
+**File:** `rhei-runtime/src/controller.rs`
+
+`from_env` discarded unparseable values, so `RHEI_WORKERS=four` ran at default
+parallelism and a malformed `RHEI_METRICS_ADDR` left monitoring dark with no
+indication. Malformed variables are now collected and reported together by
+`build()`. `RHEI_CHECKPOINT_DIR`, `RHEI_CHECKPOINT_INTERVAL` and
+`RHEI_MAX_PARALLELISM` were also only honoured through the TOML path; `from_env`
+now reads them too.
+
+### ~~KI-25: Unauthenticated state explorer with permissive CORS~~ (RESOLVED)
+
+**Tracked as SI-6 in [SECURITY.md](SECURITY.md).** File: `rhei-runtime/src/http_server.rs`
+
+`/api/state/**` returns checkpointed application data — your keys and values —
+and was served to anyone who could reach the port, under
+`CorsLayer::permissive()`, meaning any website could read it from a visitor's
+browser. The state explorer is now off unless `RHEI_STATE_EXPLORER=1`, CORS
+origins must be listed explicitly, and a bearer token can be required via
+`RHEI_METRICS_TOKEN`. Listing operators also no longer loads every operator's
+full state into memory to count entries, and inspection refuses state above
+`MAX_INSPECTABLE_STATE_BYTES`.
+
+### KI-26: Cluster data plane has no transport security
+
+**Tracked as SI-4 in [SECURITY.md](SECURITY.md).**
+
+The Timely inter-process data plane (port 2101) and the checkpoint coordination
+channel are plaintext TCP with no authentication. Anyone who can reach those
+ports can read pipeline data in flight, inject records, and forge checkpoint
+readiness messages.
+
+**Workaround:** run them on a trusted network — a private subnet, a service mesh
+providing mTLS, or a NetworkPolicy restricting 2101 to pods in the same
+StatefulSet. Do not expose these ports beyond the cluster.
+
+### KI-27: Delivery is at-least-once, not exactly-once
+
+Source offsets are committed after a checkpoint completes, so a crash replays
+everything processed since the last checkpoint. `kafka_e2e.rs` asserts this
+explicitly.
+
+Sinks must tolerate duplicates — idempotent writes or downstream deduplication.
+Rhei should not be deployed behind a sink that assumes each record arrives once.
+
