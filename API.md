@@ -348,13 +348,15 @@ Built-in sinks: `PrintSink`, and `KafkaSink` (behind the `kafka` feature).
 controller.run_with_shutdown(graph, shutdown_handle).await?;
 ```
 
-On shutdown: finish in-flight batches, checkpoint operators, commit source offsets, flush sinks, return.
+With `.coordinated_recovery(true)`, shutdown stops source reads, drains admitted input, snapshots all operators, flushes sinks durably, then publishes the recovery decision before returning.
 
 `run_dynamic()` additionally supports rescaling the topology at runtime by rebuilding the `TaskManager` between topology generations.
 
 ### Delivery semantics
 
-Rhei provides **at-least-once** delivery. Source offsets are committed after a checkpoint completes, so a crash between processing and checkpointing replays the affected records. Exactly-once would require a transactional producer sink and two-phase commit; both are on the roadmap and unimplemented.
+Opt-in `.coordinated_recovery(true)` provides **at-least-once** output for replayable sources and durable sinks. Use a fresh, shared durable checkpoint directory and fixed process/worker/partition assignments. `Source::supports_recovery()` must be true; built-in support includes `VecSource` and partitioned Vec readers with identical input on restart, but not Kafka yet. `Sink::flush()` must make preceding writes durable. Custom operators use `snapshot`/`open` for transient recovery metadata. Restart all participants after failure. See [the protocol ADR](ADR/recovery-protocol.md).
+
+The legacy default does not guarantee a consistent recovery cut. Exactly-once output and coordinated live rescaling remain unimplemented.
 
 ---
 
@@ -391,9 +393,9 @@ State keys are namespaced by **key group**, not by worker index:
 kg{key_group}/{operator_name}/{user_key}
 ```
 
-Key groups decouple key ownership from worker count (the same scheme Flink uses), so the number of workers can change between runs without rewriting state. The number of key groups is fixed by `max_parallelism` at pipeline creation; restoring a checkpoint with a different `max_parallelism` is rejected.
+Key groups provide stable key addresses across worker layouts. This alone does not make checkpoints rescalable: coordinated recovery currently requires identical process and worker counts, because source assignments, timers, and discovery indexes also need migration. `max_parallelism` is fixed and checked on restore.
 
-Each worker has its own L1 memtable and L2 cache. L3 (SlateDB) is shared, with key-prefix isolation. Checkpoints are coordinated so all workers checkpoint at the same epoch boundary.
+Each worker has its own L1 memtable. Coordinated SlateDB recovery uses an isolated database per process/attempt, bypassing the external L2 cache, and snapshots all workers at the same execution-epoch boundary.
 
 ### Single worker
 

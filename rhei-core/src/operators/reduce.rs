@@ -93,7 +93,7 @@ where
         for (key, phys_idx) in &row_data {
             let existing: Option<O> = {
                 let mut state = KeyedState::<String, O>::new(&mut ctx.state, "red");
-                state.get(key).await.unwrap_or(None)
+                state.get(key).await?
             };
 
             let view = I::view(batch, *phys_idx);
@@ -202,7 +202,7 @@ where
         for (key, phys_idx) in &row_data {
             let mut acc: Acc = {
                 let mut state = KeyedState::<String, Acc>::new(&mut ctx.state, "ragg");
-                state.get(key).await.unwrap_or(None).unwrap_or_default()
+                state.get(key).await?.unwrap_or_default()
             };
 
             let view = I::view(batch, *phys_idx);

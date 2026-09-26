@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::Duration;
@@ -23,6 +24,37 @@ pub struct LocalBackend {
 }
 
 impl LocalBackend {
+    /// Restore an immutable snapshot into a separate writable file namespace.
+    /// Missing snapshots are errors, never empty databases.
+    pub fn from_snapshot(snapshot: &std::path::Path, path: PathBuf) -> anyhow::Result<Self> {
+        let contents = std::fs::read(snapshot)?;
+        let entries: Vec<(Vec<u8>, Vec<u8>)> = serde_json::from_slice(&contents)?;
+        Ok(Self {
+            data: Mutex::new(entries.into_iter().collect()),
+            path,
+            latency: None,
+        })
+    }
+
+    /// Write a new immutable snapshot. Existing snapshots cannot be overwritten.
+    pub fn snapshot(&self, path: &std::path::Path) -> anyhow::Result<()> {
+        let data = self
+            .data
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let entries: Vec<_> = data.iter().collect();
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)?;
+        file.write_all(&serde_json::to_vec(&entries)?)?;
+        file.sync_all()?;
+        if let Some(parent) = path.parent() {
+            std::fs::File::open(parent)?.sync_all()?;
+        }
+        Ok(())
+    }
+
     /// Opens or creates a local backend at the given path, optionally with simulated latency.
     pub fn new(path: PathBuf, latency: Option<Duration>) -> anyhow::Result<Self> {
         let data = if path.exists() {

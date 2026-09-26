@@ -139,7 +139,7 @@ graph
 
 For a compiled, runnable version see [`rhei-runtime/examples/kafka_transform.rs`](rhei-runtime/examples/kafka_transform.rs).
 
-Kafka sources support per-partition parallel consumption, header read/write, watermark tracking, and checkpoint-based offset commits. Offsets are committed *after* a checkpoint completes, which gives **at-least-once** delivery — a transactional producer sink for exactly-once is on the roadmap but not implemented.
+Kafka sources support per-partition parallel consumption, header read/write, and watermark tracking. Kafka is not yet supported by the coordinated recovery protocol; the legacy checkpoint path does not guarantee a consistent source/state cut.
 
 ## Architecture
 
@@ -171,11 +171,11 @@ The latency figures above are order-of-magnitude expectations for each backend, 
 
 ### Checkpointing
 
-Frontier-based. When Timely's progress frontier advances past an epoch, the executor triggers a checkpoint: L1 dirty keys flush through to SlateDB, and source offsets are committed. The default interval is every 100 batches, configurable with `PipelineController::builder().checkpoint_interval(n)`.
+Enable recovery explicitly with `PipelineController::builder().coordinated_recovery(true)` and a fresh checkpoint directory. The legacy default does not provide correctness-grade recovery.
 
-In cluster mode, a TCP coordination protocol ensures all processes have flushed state before the checkpoint manifest is committed. Mid-execution checkpoints run concurrently with the dataflow — no stop-the-world pauses.
+The coordinated protocol pauses admission, drains all workers and branches, snapshots state/timers/window indexes, durably flushes sinks, and publishes one immutable recovery cut before resuming. Multiple processes use static peers and a shared durable filesystem with atomic rename, directory fsync, and cross-process locking. Process/worker counts and source assignments must remain fixed.
 
-Delivery is **at-least-once**: source offsets are committed after a checkpoint completes, so a crash replays everything since the last one. Sinks must tolerate duplicates.
+Delivery is **at-least-once**, conditional on replayable sources and durable `Sink::flush`. Built-in support starts with `VecSource` and `PartitionedVecSource` supplied identical input on restart; custom sources must declare `supports_recovery()`. Restart all processes after failure. Sinks must tolerate duplicates. See [the recovery protocol](ADR/recovery-protocol.md) for requirements and limitations.
 
 ### Clustering
 

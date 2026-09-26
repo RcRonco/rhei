@@ -167,74 +167,85 @@ The group is derived from the **partition key** (your `key_by` output), not from
 
 ## Checkpointing
 
-### The trigger
+### Enable the correctness protocol
 
-Checkpoints are **frontier-driven**. When Timely's frontier advances past the last checkpointed epoch, and at least `checkpoint_interval` batches have passed (default 100), a checkpoint fires.
+Set `PipelineController::builder().coordinated_recovery(true)` and use a fresh
+checkpoint directory. Legacy `manifest.json` checkpoints cannot be safely
+migrated; the default legacy executor does not guarantee a consistent recovery cut.
 
-A frontier boundary is exactly the point where "all data up to epoch E has been processed" holds, so the state snapshot and the recorded source offsets describe the same cut of the stream.
+The first implementation supports fixed topology with multiple processes. Use the
+same static peers, process IDs, workers per process, key-group count, graph and
+source partition layout on restart. All processes must share the publication
+directory on a durable filesystem with atomic rename, directory fsync, and
+cross-client exclusive locks. Object-store-only metadata publication is not yet
+supported, even when state itself is stored remotely.
 
-The corollary is important: **if the watermark never advances, checkpoints never fire.** A stalled watermark stalls durability. See [time-and-watermarks.md](time-and-watermarks.md).
+### The trigger and sequence
 
-### The sequence
+Checkpoints use **execution epochs**, independent of event time. A process requests
+a checkpoint after `checkpoint_interval` admitted batches (default 100), on source
+exhaustion, or on the coordinator's one-second idle tick. Stalled event-time
+watermarks do not prevent checkpoints.
 
-```text
-frontier advances
-    │
-    ├─ L1 dirty keys flush → L2/L3
-    ├─ SlateDB uploads SSTables to object storage
-    ├─ (cluster) process reports Ready{process_id, epoch}, waits for Committed
-    ├─ checkpoint manifest written
-    └─ source offsets committed  ← after the manifest, hence at-least-once
-```
+1. Pause admission on every process. Each admitted batch carries its exact
+   post-batch cursor; prefetched batches do not advance checkpoint offsets.
+2. Align admitted-prefix watermarks, advance source capabilities, and drain every
+   worker and branch, including timer and watermark outputs.
+3. Snapshot managed state plus timers, runtime watermarks, and built-in
+   window/join/sequence discovery indexes. Dirty state is only cleared after
+   persistence succeeds.
+4. Durably flush every sink through a FIFO request, then create immutable state
+   snapshots. Every process sends a Prepared acknowledgement for the same epoch.
+5. Process 0 durably publishes `recovery.json` by atomic rename. Only then does it
+   send Commit and allow admission to resume.
 
-Mid-execution checkpoints run concurrently with the dataflow. There is no stop-the-world pause.
+Local snapshots are immutable files. SlateDB snapshots are pinned checkpoint IDs;
+each restart clones the exact checkpoint into a fresh database path. Uncommitted
+writes and old cache contents cannot enter the restored state. Coordinated SlateDB
+execution currently bypasses the external Foyer cache.
 
-### The manifest
+### Publication and coordination
 
-JSON, describing one checkpoint:
+`recovery.json` is the sole authoritative decision. Its version, epoch, topology,
+worker/process/key-group counts, and per-process snapshot references, source
+cursors, watermarks, and partition layout describe one complete cut. Missing or
+malformed snapshots and incompatible layouts fail startup; they never become
+empty state. Prepared attempt directories are not recovery candidates.
 
-| Field | Meaning |
-|-------|---------|
-| `version` | schema version |
-| `checkpoint_id` | monotonically increasing |
-| `timestamp_ms` | wall clock at write time |
-| `operators` | sorted operator names |
-| `source_offsets` | source-defined, e.g. `"topic/partition" → "offset"` |
-| `n_processes`, `workers_per_process`, `total_workers` | topology that wrote it |
-| `max_parallelism` | key group count — **validated on restore** |
-| `cluster_members` | node IDs, for operational forensics |
+Process 0 coordinates over length-prefixed JSON on `RHEI_CHECKPOINT_PORT`, separate
+from Timely. Exclusive directory locks fence competing attempts. Handshakes verify
+topology, prior epoch, and shared-directory visibility. Unexpected phases, stale or
+duplicate acknowledgements, disconnections, and 60-second epoch deadlines fail the
+attempt. There is no leader election: restart **all processes** after failure.
+If a Commit response is lost, restart reads the durable publication to resolve it.
 
-`validate_compatible` rejects a restore where `max_parallelism` differs, because every key would hash into a different group and read empty state instead of failing. A different worker count is fine — that is rescaling.
-
-*Source: `rhei-core/src/checkpoint.rs`.*
-
-### Coordinated checkpoints across processes
-
-Process 0 runs a `CheckpointCoordinator` on a TCP port (`RHEI_CHECKPOINT_PORT`), separate from Timely's data plane.
-
-```text
-Participant → Coordinator :  Ready { process_id, epoch }
-   (once every process has reported for that epoch)
-Coordinator → Participants:  Committed { epoch }
-```
-
-Messages are length-prefixed bincode. Only after `Committed` is the merged manifest written.
-
-Process 0 is the coordinator **by convention** — there is no leader election. If process 0 dies, checkpoint coordination stops.
-
-*Source: `rhei-runtime/src/checkpoint_coord.rs`.*
+*Source: `rhei-runtime/src/recovery.rs` and `recovery/coordination.rs`; design and
+limitations: [ADR/recovery-protocol.md](../ADR/recovery-protocol.md).*
 
 ---
 
 ## Recovery
 
-On startup with a checkpoint present, the runtime loads the manifest, validates `max_parallelism`, extracts `source_offsets`, and calls `source.restore_offsets()` before any batch is read. `KafkaSource` implements this by building a `TopicPartitionList` at `offset + 1` and calling `consumer.assign()`.
+Coordinated recovery restores immutable state and calls `source.restore_offsets()`
+before any source reads. Sources must declare `supports_recovery()`: cursors must
+cover every assigned partition and an empty cursor must mean the same initial
+position on every attempt. `VecSource` and `PartitionedVecSource` readers implement
+this contract when given identical input on restart. Kafka does not yet implement
+the full contract and is rejected in coordinated mode. The protocol does not call
+the legacy live-cursor `on_checkpoint_complete` hook.
 
-Note that assigning explicitly **overrides consumer group rebalancing** for the restored partitions.
+Custom operators must preserve all recovery-relevant metadata through managed
+state and the `snapshot`/`open` hooks. Do not use reserved `__rhei_*` keys. Keep code,
+schemas, source content and window configuration compatible: graph comparison
+cannot detect arbitrary code changes. TTL-dependent recovery is unsupported
+because TTL timestamps are not persisted.
 
 ### What recovery guarantees
 
-**At-least-once.** Offsets are committed after the checkpoint completes, so a crash between processing and committing replays the records in that gap. Downstream effects are re-applied.
+**At-least-once**, conditional on replayable sources and durable `Sink::flush`.
+A crash before publication replays the uncommitted prefix; output already written
+from that prefix can be duplicated. Propagated state/operator/sink errors fail the
+whole attempt. Durable DLQ coordination is not yet supported.
 
 Exactly-once would require a transactional producer sink and two-phase commit across source, state, and sink. Neither is implemented.
 
@@ -243,6 +254,9 @@ If duplicates matter, make your sink idempotent — key writes by something deri
 ---
 
 ## Fork mode
+
+This is a legacy facility, not compatible with coordinated recovery. It does not
+provide the immutable-snapshot guarantees above.
 
 Restore a production checkpoint on your laptop, against local Kafka:
 

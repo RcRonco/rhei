@@ -120,7 +120,7 @@ where
         for (key, phys_idx) in &row_data {
             let mut cs: CountState<Acc> = {
                 let mut state = KeyedState::<String, CountState<Acc>>::new(&mut ctx.state, "cw");
-                state.get(key).await.unwrap_or(None).unwrap_or_default()
+                state.get(key).await?.unwrap_or_default()
             };
 
             let view = I::view(batch, *phys_idx);

@@ -115,9 +115,24 @@ impl MemTable {
         self.dirty.insert(key, None);
     }
 
+    /// Copy pending mutations without acknowledging persistence.
+    ///
+    /// The caller must retain these entries until both the backend write and
+    /// durability barrier succeed. Dropping a failed or cancelled flush must
+    /// leave tombstones and values available for retry.
+    pub(crate) fn pending(&self) -> Vec<(Vec<u8>, Option<Bytes>)> {
+        self.dirty
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect()
+    }
+
     /// Returns dirty entries and clears the dirty set. Flushed values
     /// (non-tombstones) are moved into the clean cache so they remain
     /// available for reads.
+    ///
+    /// Call only after persistence has succeeded; use `pending` to prepare an
+    /// asynchronous write without losing dirty tracking on failure.
     pub fn flush(&mut self) -> Vec<(Vec<u8>, Option<Bytes>)> {
         let entries: Vec<(Vec<u8>, Option<Bytes>)> = self.dirty.drain().collect();
 

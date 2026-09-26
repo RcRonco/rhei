@@ -20,18 +20,32 @@ use crate::compiler::CompiledGraph;
 use crate::controller::PipelineController;
 use crate::dataflow::{BatchTransformFn, LazyBatchTransformNode, NodeId, NodeKind};
 use crate::erased_batch::{ErasedBatchOperator, ErasedSink, ErasedSource};
-use crate::erased_buffer::{ErasedBuffer, KeyFn};
+use crate::erased_buffer::KeyFn;
 use crate::executor::NodeKindTag;
 use crate::shutdown::ShutdownHandle;
 
 /// DLQ channel sender type for per-worker DLQ writes.
 pub(crate) type DlqSender = flume::Sender<rhei_core::dlq::DeadLetterRecord>;
 
+/// Cancel already-spawned bridges if graph extraction fails partway through.
+struct AbortOnBuildFailure(Vec<tokio::task::AbortHandle>);
+
+impl Drop for AbortOnBuildFailure {
+    fn drop(&mut self) {
+        for handle in &self.0 {
+            handle.abort();
+        }
+    }
+}
+
 /// All per-executor data packaged for Timely execution, plus checkpoint orchestration.
 ///
 /// Per-executor data is assembled into [`ExecutorData`] structs and wrapped in a
 /// single `Arc<Mutex<Vec<Option<…>>>>` for one-time handoff into the Timely closure.
 pub(crate) struct TaskManager {
+    recovery: Option<Arc<crate::recovery::Recovery>>,
+    recovery_sinks: Vec<flume::Sender<crate::bridge::SinkMessage>>,
+    source_handles: Vec<JoinHandle<()>>,
     // Per-executor data (sized to total_workers, Some for local, None for remote).
     per_executor: Arc<std::sync::Mutex<Vec<Option<ExecutorData>>>>,
 
@@ -78,6 +92,7 @@ pub(crate) struct TaskManager {
 /// Returned by [`TaskManager::take_executor_data`] for consumption inside a Timely closure.
 #[allow(dead_code)] // some fields are reserved for future batch-path use
 pub(crate) struct ExecutorData {
+    pub recovery: Option<Arc<crate::recovery::Recovery>>,
     pub source_wm: HashMap<NodeId, Arc<AtomicU64>>,
     pub source_offsets: HashMap<NodeId, Arc<std::sync::Mutex<HashMap<String, String>>>>,
     pub shutdown: Option<ShutdownHandle>,
@@ -87,8 +102,22 @@ pub(crate) struct ExecutorData {
     pub transforms: HashMap<NodeId, BatchTransformFn>,
     pub batch_operators: HashMap<NodeId, (String, Box<dyn ErasedBatchOperator>)>,
     pub batch_contexts: HashMap<NodeId, OperatorContext>,
-    pub sink_senders: HashMap<NodeId, flume::Sender<ErasedBuffer>>,
+    pub sink_senders: HashMap<NodeId, flume::Sender<crate::bridge::SinkMessage>>,
     pub key_fns: HashMap<NodeId, KeyFn>,
+}
+
+impl Drop for TaskManager {
+    fn drop(&mut self) {
+        for handle in &self.source_handles {
+            handle.abort();
+        }
+        for handle in &self.sink_handles {
+            handle.abort();
+        }
+        for handle in &self.dlq_handles {
+            handle.abort();
+        }
+    }
 }
 
 impl TaskManager {
@@ -117,10 +146,12 @@ impl TaskManager {
         shutdown: Option<&ShutdownHandle>,
         restored_offsets: HashMap<String, String>,
         initial_checkpoint_id: u64,
+        recovery: Option<Arc<crate::recovery::Recovery>>,
     ) -> anyhow::Result<Self> {
         let total_workers = controller.total_workers();
         let local_range = controller.local_worker_range();
         let n_local = local_range.len();
+        let key_groups = Arc::new(controller.key_group_assignment()?);
 
         // ── DLQ setup ─────────────────────────────────────────────────
         let dlq_sink = controller
@@ -160,6 +191,7 @@ impl TaskManager {
         let mut all_source_watermarks: Vec<Arc<AtomicU64>> = Vec::new();
 
         // ── Batch (Arrow) data extraction ────────────────────────────
+        let mut source_handles = Vec::new();
         let (
             mut per_worker_source_rx,
             mut per_worker_batch_transforms,
@@ -179,13 +211,25 @@ impl TaskManager {
             &mut per_worker_source_offsets,
             &mut all_source_offsets,
             &mut all_source_watermarks,
+            recovery.as_ref(),
+            &mut source_handles,
         )?;
+
+        let recovery_sinks = if recovery.is_some() {
+            per_worker_sink_senders[local_range.start]
+                .values()
+                .cloned()
+                .collect()
+        } else {
+            Vec::new()
+        };
 
         // Assemble per-executor data into ExecutorData structs.
         let mut per_executor: Vec<Option<ExecutorData>> =
             (0..total_workers).map(|_| None).collect();
         for idx in local_range.clone() {
             per_executor[idx] = Some(ExecutorData {
+                recovery: recovery.clone(),
                 source_wm: std::mem::take(&mut per_worker_source_wm[idx]),
                 source_offsets: std::mem::take(&mut per_worker_source_offsets[idx]),
                 shutdown: shutdown.cloned(),
@@ -218,6 +262,9 @@ impl TaskManager {
         );
 
         Ok(TaskManager {
+            recovery,
+            recovery_sinks,
+            source_handles,
             per_executor: Arc::new(std::sync::Mutex::new(per_executor)),
             all_source_watermarks,
             checkpoint_notify_rx: std::sync::Mutex::new(Some(checkpoint_notify_rx)),
@@ -231,7 +278,7 @@ impl TaskManager {
             sink_handles,
             dlq_handles,
             total_workers,
-            key_groups: Arc::new(controller.key_group_assignment()?),
+            key_groups,
             initial_checkpoint_id,
             checkpoint_dir,
             process_id,
@@ -242,13 +289,36 @@ impl TaskManager {
     }
 
     /// Join all sink and DLQ async task handles.
-    pub(crate) async fn drain(self) -> anyhow::Result<()> {
-        for handle in self.sink_handles {
-            handle
-                .await
-                .map_err(|e| anyhow::anyhow!("sink task panicked: {e}"))??;
+    pub(crate) async fn drain(mut self) -> anyhow::Result<()> {
+        for handle in self.source_handles.drain(..) {
+            handle.abort();
+            let _ = handle.await;
         }
-        for handle in self.dlq_handles {
+        self.recovery_sinks.clear();
+        if self.recovery.as_ref().is_some_and(|r| r.result().is_err()) {
+            for handle in &self.sink_handles {
+                handle.abort();
+            }
+            for handle in self.sink_handles.drain(..) {
+                let _ = handle.await;
+            }
+            return Ok(());
+        }
+        while let Some(mut handle) = self.sink_handles.pop() {
+            let result = if self.recovery.is_some() {
+                match tokio::time::timeout(std::time::Duration::from_secs(60), &mut handle).await {
+                    Ok(result) => result,
+                    Err(error) => {
+                        handle.abort();
+                        return Err(error.into());
+                    }
+                }
+            } else {
+                handle.await
+            };
+            result.map_err(|e| anyhow::anyhow!("sink task panicked: {e}"))??;
+        }
+        for handle in self.dlq_handles.drain(..) {
             handle
                 .await
                 .map_err(|e| anyhow::anyhow!("DLQ sink task panicked: {e}"))??;
@@ -347,11 +417,16 @@ impl TaskManager {
     ///
     /// Returns the last `checkpoint_id` written during execution. The caller is
     /// responsible for draining sink handles and writing the final manifest.
+    #[allow(clippy::too_many_lines)] // Ordered startup, worker execution, and task teardown.
     pub(crate) async fn run(
         self: Arc<Self>,
         controller: &PipelineController,
     ) -> anyhow::Result<u64> {
-        let (coordination, coord_task_handle) = setup_coordination(controller).await?;
+        let (coordination, coord_task_handle) = if self.recovery.is_some() {
+            (None, None)
+        } else {
+            setup_coordination(controller).await?
+        };
 
         let ckpt_config = CheckpointTaskConfig {
             initial_checkpoint_id: self.initial_checkpoint_id,
@@ -366,19 +441,25 @@ impl TaskManager {
         };
 
         // Create a shutdown barrier for coordinated process teardown.
-        let (barrier_tx, barrier_rx) = if controller.is_cluster() {
+        let (barrier_tx, barrier_rx) = if controller.is_cluster() && self.recovery.is_none() {
             let (tx, rx) = std::sync::mpsc::channel::<()>();
             (Some(tx), Some(rx))
         } else {
             (None, None)
         };
 
+        let timely_config = controller.timely_config()?;
         let checkpoint_rx = self.take_checkpoint_rx();
+        let recovery = self.recovery.clone();
+        let recovery_sinks = self.recovery_sinks.clone();
         let checkpoint_task = tokio::spawn(async move {
-            run_checkpoint_task(checkpoint_rx, ckpt_config, coordination, barrier_tx).await
+            if let Some(recovery) = recovery {
+                recovery.coordinate(recovery_sinks).await
+            } else {
+                Ok(run_checkpoint_task(checkpoint_rx, ckpt_config, coordination, barrier_tx).await)
+            }
         });
 
-        let timely_config = controller.timely_config()?;
         let local_first_worker = controller.local_worker_range().start;
         let rt = tokio::runtime::Handle::current();
 
@@ -399,7 +480,7 @@ impl TaskManager {
             barrier_rx.map(|rx| Arc::new(std::sync::Mutex::new(Some(rx))));
 
         let task_manager = self.clone();
-        tokio::task::spawn_blocking(move || {
+        let execution_result = tokio::task::spawn_blocking(move || {
             let guards = timely::execute::execute(timely_config, move |worker| {
                 let idx = worker.index();
                 let _span = tracing::info_span!("worker", worker = idx).entered();
@@ -412,7 +493,16 @@ impl TaskManager {
                     rt.clone(),
                 );
 
-                executor.run(worker);
+                let recovery = task_manager.recovery.clone();
+                let result =
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| executor.run(worker)));
+                if result.is_err() {
+                    if let Some(recovery) = recovery {
+                        recovery.fail("Timely worker panicked");
+                    } else {
+                        std::panic::resume_unwind(result.err().unwrap_or_else(|| unreachable!()));
+                    }
+                }
             })
             .map_err(|e| anyhow::anyhow!("timely execution failed: {e}"))?;
 
@@ -454,13 +544,17 @@ impl TaskManager {
             anyhow::Ok(())
         })
         .await
-        .map_err(|e| anyhow::anyhow!("spawn_blocking failed: {e}"))??;
+        .map_err(|e| anyhow::anyhow!("spawn_blocking failed: {e}"))
+        .and_then(std::convert::identity);
+        if let (Some(recovery), Err(error)) = (&self.recovery, &execution_result) {
+            recovery.fail(error);
+        }
 
         // Close the checkpoint channel so the task drains remaining notifications
         // and exits cleanly (recv() returns None when all senders are dropped).
         self.close_checkpoint_channel();
         let last_checkpoint_id = match checkpoint_task.await {
-            Ok(id) => id,
+            Ok(id) => id?,
             Err(e) => return Err(anyhow::anyhow!("checkpoint task panicked: {e}")),
         };
 
@@ -470,6 +564,7 @@ impl TaskManager {
             let _ = handle.await;
         }
 
+        execution_result?;
         Ok(last_checkpoint_id)
     }
 }
@@ -563,7 +658,7 @@ async fn setup_coordination(
 /// Sized for a real orchestrated start, where process 0 may still be pulling
 /// an image or restoring state when its peers come up. Failing after a few
 /// seconds would turn an ordinary staggered rollout into a crash loop.
-const COORDINATOR_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_mins(2);
+const COORDINATOR_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
 /// Connect to the checkpoint coordinator, retrying with capped exponential
 /// backoff until [`COORDINATOR_CONNECT_TIMEOUT`] elapses.
@@ -828,16 +923,17 @@ fn extract_batch_per_worker_data(
     >],
     all_source_offsets: &mut Vec<Arc<std::sync::Mutex<HashMap<String, String>>>>,
     all_source_watermarks: &mut Vec<Arc<AtomicU64>>,
+    recovery: Option<&Arc<crate::recovery::Recovery>>,
+    source_handles: &mut Vec<JoinHandle<()>>,
 ) -> anyhow::Result<(
     Vec<HashMap<NodeId, flume::Receiver<crate::bridge::SourceBatch>>>,
     Vec<Option<HashMap<NodeId, BatchTransformFn>>>,
     Vec<Option<HashMap<NodeId, (String, Box<dyn ErasedBatchOperator>)>>>,
     Vec<Option<HashMap<NodeId, OperatorContext>>>,
-    Vec<HashMap<NodeId, flume::Sender<ErasedBuffer>>>,
+    Vec<HashMap<NodeId, flume::Sender<crate::bridge::SinkMessage>>>,
     Vec<Option<HashMap<NodeId, KeyFn>>>,
     Vec<JoinHandle<anyhow::Result<()>>>,
 )> {
-    let rt = tokio::runtime::Handle::current();
     let mut per_worker_source_rx: Vec<
         HashMap<NodeId, flume::Receiver<crate::bridge::SourceBatch>>,
     > = (0..total_workers).map(|_| HashMap::new()).collect();
@@ -848,9 +944,11 @@ fn extract_batch_per_worker_data(
     > = (0..total_workers).map(|_| None).collect();
     let mut per_worker_batch_contexts: Vec<Option<HashMap<NodeId, OperatorContext>>> =
         (0..total_workers).map(|_| None).collect();
-    let mut per_worker_sink_senders: Vec<HashMap<NodeId, flume::Sender<ErasedBuffer>>> =
-        (0..total_workers).map(|_| HashMap::new()).collect();
+    let mut per_worker_sink_senders: Vec<
+        HashMap<NodeId, flume::Sender<crate::bridge::SinkMessage>>,
+    > = (0..total_workers).map(|_| HashMap::new()).collect();
     let mut sink_handles: Vec<JoinHandle<anyhow::Result<()>>> = Vec::new();
+    let mut abort_on_error = AbortOnBuildFailure(Vec::new());
 
     // Collect batch node IDs by kind.
     let source_ids: Vec<NodeId> = graph
@@ -887,8 +985,11 @@ fn extract_batch_per_worker_data(
     // Bridge batch sources: compile, create channel, spawn bridge task.
     for &source_id in &source_ids {
         let source = extract_source(&mut graph.nodes[source_id.0]);
-
-        if let Some(n_partitions) = source.partition_count() {
+        let partitions = source.partition_count();
+        if let Some(recovery) = recovery {
+            recovery.register_layout(source_id.0, partitions);
+        }
+        if let Some(n_partitions) = partitions {
             // Partitioned source: distribute partitions across all workers.
             let partitions_per_worker = assign_partitions(n_partitions, total_workers);
             for worker_idx in local_range.clone() {
@@ -897,6 +998,10 @@ fn extract_batch_per_worker_data(
                     continue;
                 }
                 let Some(partition_source) = source.create_partition_source(assigned) else {
+                    anyhow::ensure!(
+                        recovery.is_none(),
+                        "source failed to create assigned partition reader"
+                    );
                     tracing::warn!(
                         worker = worker_idx,
                         "partitioned source returned None for assigned partitions"
@@ -908,13 +1013,18 @@ fn extract_batch_per_worker_data(
                     Arc::new(std::sync::Mutex::new(HashMap::new()));
                 let wm: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
                 let shutdown_handle = shutdown.cloned();
-                rt.spawn(crate::bridge::local_source_bridge(
+                source_handles.push(spawn_source(
                     partition_source,
                     tx,
                     offsets.clone(),
                     wm.clone(),
                     shutdown_handle,
+                    recovery.cloned(),
+                    format!("{}:{worker_idx}", source_id.0),
                 ));
+                if let Some(handle) = source_handles.last() {
+                    abort_on_error.0.push(handle.abort_handle());
+                }
                 per_worker_source_rx[worker_idx].insert(source_id, rx);
                 per_worker_source_wm[worker_idx].insert(source_id, wm.clone());
                 per_worker_source_offsets[worker_idx].insert(source_id, offsets.clone());
@@ -929,13 +1039,18 @@ fn extract_batch_per_worker_data(
                     Arc::new(std::sync::Mutex::new(HashMap::new()));
                 let wm: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
                 let shutdown_handle = shutdown.cloned();
-                rt.spawn(crate::bridge::local_source_bridge(
+                source_handles.push(spawn_source(
                     source,
                     tx,
                     offsets.clone(),
                     wm.clone(),
                     shutdown_handle,
+                    recovery.cloned(),
+                    format!("{}:0", source_id.0),
                 ));
+                if let Some(handle) = source_handles.last() {
+                    abort_on_error.0.push(handle.abort_handle());
+                }
                 per_worker_source_rx[0].insert(source_id, rx);
                 per_worker_source_wm[0].insert(source_id, wm.clone());
                 per_worker_source_offsets[0].insert(source_id, offsets.clone());
@@ -946,6 +1061,27 @@ fn extract_batch_per_worker_data(
     }
 
     // Extract batch transforms.
+    if let Some(recovery) = recovery {
+        // Empty source assignments still carry epoch capabilities, so idle
+        // workers participate in watermark alignment and recovery barriers.
+        for worker in local_range.clone() {
+            for source in &source_ids {
+                if !per_worker_source_rx[worker].contains_key(source) {
+                    let (tx, rx) = flume::bounded(1);
+                    drop(tx);
+                    recovery.register_source(&format!("{}:{worker}", source.0));
+                    per_worker_source_rx[worker].insert(*source, rx);
+                    per_worker_source_wm[worker].insert(
+                        *source,
+                        Arc::new(AtomicU64::new(
+                            crate::executor::Sentinel::SourceExhausted as u64,
+                        )),
+                    );
+                }
+            }
+        }
+    }
+
     let mut orig_batch_transforms: HashMap<NodeId, BatchTransformFn> = HashMap::new();
     for &nid in &batch_transform_ids {
         orig_batch_transforms.insert(nid, extract_batch_transform(&mut graph.nodes[nid.0]));
@@ -967,12 +1103,27 @@ fn extract_batch_per_worker_data(
     // Bridge batch sinks.
     for &sink_id in &batch_sink_ids {
         let sink = extract_batch_sink(&mut graph.nodes[sink_id.0]);
-        let (tx, rx) = flume::bounded::<ErasedBuffer>(crate::bridge::DEFAULT_CHANNEL_SIZE);
+        let (tx, rx) =
+            flume::bounded::<crate::bridge::SinkMessage>(crate::bridge::DEFAULT_CHANNEL_SIZE);
         // All workers share the same sender (Pipeline pact).
         for idx in local_range.clone() {
             per_worker_sink_senders[idx].insert(sink_id, tx.clone());
         }
-        sink_handles.push(tokio::spawn(crate::bridge::sink_drain(sink, rx)));
+        let recovery = recovery.cloned();
+        sink_handles.push(tokio::spawn(async move {
+            use futures::FutureExt;
+            let result = std::panic::AssertUnwindSafe(crate::bridge::sink_drain(sink, rx))
+                .catch_unwind()
+                .await
+                .unwrap_or_else(|_| Err(anyhow::anyhow!("sink panicked")));
+            if let (Some(recovery), Err(error)) = (&recovery, &result) {
+                recovery.fail(error);
+            }
+            result
+        }));
+        if let Some(handle) = sink_handles.last() {
+            abort_on_error.0.push(handle.abort_handle());
+        }
     }
 
     // Distribute per-worker copies for local workers.
@@ -992,8 +1143,12 @@ fn extract_batch_per_worker_data(
         for &nid in &batch_operator_ids {
             let (ref name, ref op) = orig_batch_operators[&nid];
             let (name, op) = (name.clone(), op.clone_erased());
-            let ctx = controller.create_context_for_worker(&name, worker_idx)?;
-            w_contexts.insert(nid, OperatorContext::new(ctx));
+            let ctx = if let Some(recovery) = recovery {
+                recovery.state(&name, worker_idx)?
+            } else {
+                OperatorContext::new(controller.create_context_for_worker(&name, worker_idx)?)
+            };
+            w_contexts.insert(nid, ctx);
             w_operators.insert(nid, (name, op));
         }
 
@@ -1007,6 +1162,7 @@ fn extract_batch_per_worker_data(
         per_worker_key_fns[worker_idx] = Some(w_key_fns);
     }
 
+    abort_on_error.0.clear();
     Ok((
         per_worker_source_rx,
         per_worker_batch_transforms,
@@ -1019,6 +1175,39 @@ fn extract_batch_per_worker_data(
 }
 
 // ── Batch node extraction helpers ──────────────────────────────────
+
+#[allow(clippy::too_many_arguments)]
+fn spawn_source(
+    mut source: Box<dyn ErasedSource>,
+    tx: flume::Sender<crate::bridge::SourceBatch>,
+    offsets: Arc<std::sync::Mutex<HashMap<String, String>>>,
+    watermark: Arc<AtomicU64>,
+    shutdown: Option<ShutdownHandle>,
+    recovery: Option<Arc<crate::recovery::Recovery>>,
+    id: String,
+) -> JoinHandle<()> {
+    let restored = recovery.as_ref().map(|r| r.register_source(&id));
+    tokio::spawn(async move {
+        use futures::FutureExt;
+        let result = std::panic::AssertUnwindSafe(async {
+            if let Some(restored) = restored {
+                anyhow::ensure!(
+                    source.supports_recovery(),
+                    "source {id} does not support coordinated recovery"
+                );
+                source.restore_offsets(&restored.offsets).await?;
+            }
+            crate::bridge::local_source_bridge(source, tx, offsets, watermark, shutdown).await;
+            anyhow::Ok(())
+        })
+        .catch_unwind()
+        .await
+        .unwrap_or_else(|_| Err(anyhow::anyhow!("source panicked")));
+        if let (Some(recovery), Err(error)) = (recovery, result) {
+            recovery.fail(error);
+        }
+    })
+}
 
 /// Create a lightweight placeholder `NodeKind` for `std::mem::replace`.
 ///

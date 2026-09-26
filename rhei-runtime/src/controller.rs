@@ -161,6 +161,7 @@ pub struct PipelineController {
     pub(crate) tiered: Option<TieredStorageConfig>,
     pub(crate) workers: usize,
     pub(crate) checkpoint_interval: u64,
+    pub(crate) coordinated_recovery: bool,
     pub(crate) error_policy: ErrorPolicy,
     pub(crate) dlq_sink: std::sync::Mutex<Option<Box<dyn rhei_core::dlq::DlqSink>>>,
     pub(crate) health: HealthState,
@@ -237,6 +238,7 @@ pub struct PipelineControllerBuilder {
     checkpoint_dir: std::path::PathBuf,
     workers: usize,
     checkpoint_interval: u64,
+    coordinated_recovery: bool,
     tiered: Option<TieredStorageConfig>,
     error_policy: ErrorPolicy,
     dlq_sink: Option<Box<dyn rhei_core::dlq::DlqSink>>,
@@ -346,6 +348,22 @@ impl PipelineControllerBuilder {
     pub fn checkpoint_interval(mut self, interval: u64) -> Self {
         assert!(interval >= 1, "checkpoint interval must be at least 1");
         self.checkpoint_interval = interval;
+        self
+    }
+
+    /// Enable coordinated, immutable checkpoints for a fixed process/worker topology.
+    ///
+    /// All workers drain an execution epoch, flush state and sinks, and publish
+    /// one recovery decision before admitting more input. Requires replayable
+    /// sources and durable `Sink::flush` implementations for at-least-once output.
+    /// Use a new checkpoint directory; legacy manifests cannot be migrated safely.
+    /// Multiple processes must share this directory on a durable filesystem
+    /// supporting atomic rename, file/directory fsync, and exclusive file locks.
+    /// Sources must opt in through `Source::supports_recovery`; Kafka does not
+    /// support this mode yet. Operator errors fail the attempt; DLQ and dynamic
+    /// rescaling are unsupported. Restart all participants after failure.
+    pub fn coordinated_recovery(mut self, enabled: bool) -> Self {
+        self.coordinated_recovery = enabled;
         self
     }
 
@@ -704,6 +722,7 @@ impl PipelineControllerBuilder {
             tiered: self.tiered,
             workers: self.workers,
             checkpoint_interval: self.checkpoint_interval,
+            coordinated_recovery: self.coordinated_recovery,
             error_policy: self.error_policy,
             dlq_sink: std::sync::Mutex::new(self.dlq_sink),
             health,
@@ -735,6 +754,7 @@ impl PipelineController {
             checkpoint_dir: std::path::PathBuf::from("./checkpoints"),
             workers: 1,
             checkpoint_interval: 100,
+            coordinated_recovery: false,
             tiered: None,
             error_policy: ErrorPolicy::default(),
             dlq_sink: None,
@@ -763,6 +783,7 @@ impl PipelineController {
             tiered: None,
             workers: 1,
             checkpoint_interval: 100,
+            coordinated_recovery: false,
             error_policy: ErrorPolicy::default(),
             dlq_sink: std::sync::Mutex::new(None),
             health: HealthState::new(),
@@ -1066,6 +1087,11 @@ impl PipelineController {
         F: FnMut() -> DataflowGraph + Send,
     {
         use crate::cluster::{RescaleDecision, RescaleSupervisor};
+
+        anyhow::ensure!(
+            !self.coordinated_recovery,
+            "coordinated recovery requires static topology; run_dynamic is not supported"
+        );
 
         anyhow::ensure!(
             policy.max_parallelism == self.max_parallelism,
@@ -1494,6 +1520,10 @@ async fn run_graph(
         e.into_inner()
     }) = Some(compiled.topology.clone());
 
+    if controller.coordinated_recovery {
+        return crate::recovery::run(compiled, controller, shutdown).await;
+    }
+
     let all_operator_names = &compiled.operator_names;
 
     // Fork mode: load remote manifest if --from-checkpoint is set.
@@ -1701,6 +1731,7 @@ async fn run_graph(
             shutdown.as_ref(),
             restored_offsets,
             initial_checkpoint_id,
+            None,
         )
         .await?,
     );
@@ -1876,7 +1907,7 @@ mod tests {
             .expect("valid configuration");
         assert_eq!(
             controller.health().liveness_timeout(),
-            std::time::Duration::from_mins(3)
+            std::time::Duration::from_secs(180)
         );
 
         let err = builder_with_env(&[("RHEI_LIVENESS_TIMEOUT_SECS", "0")])

@@ -101,7 +101,11 @@ impl NodeKindTag {
 /// Each `build_*` method constructs one category of Timely operator.
 #[allow(dead_code)] // some fields are reserved for future use
 pub(crate) struct DataflowExecutor {
-    sink_senders: Arc<HashMap<NodeId, flume::Sender<crate::erased_buffer::ErasedBuffer>>>,
+    sink_senders: Arc<HashMap<NodeId, flume::Sender<crate::bridge::SinkMessage>>>,
+    recovery: Option<Arc<crate::recovery::Recovery>>,
+    recovery_operators: std::cell::RefCell<
+        Vec<std::rc::Rc<std::cell::RefCell<crate::timely_operator::TimelyBatchOperator>>>,
+    >,
     topo_order: Arc<Vec<NodeId>>,
     node_inputs: Arc<HashMap<NodeId, Vec<NodeId>>>,
     node_kinds: Arc<HashMap<NodeId, NodeKindTag>>,
@@ -150,13 +154,15 @@ impl DataflowExecutor {
         heartbeats: crate::health::WorkerHeartbeats,
         heartbeat_slot: usize,
     ) -> Self {
-        let sink_senders: HashMap<NodeId, flume::Sender<crate::erased_buffer::ErasedBuffer>> =
+        let sink_senders: HashMap<NodeId, flume::Sender<crate::bridge::SinkMessage>> =
             data.sink_senders.clone();
         debug_assert_eq!(
             key_groups.parallelism, num_workers,
             "key group assignment must cover exactly the cluster's worker count"
         );
         Self {
+            recovery: data.recovery.clone(),
+            recovery_operators: std::cell::RefCell::new(Vec::new()),
             sink_senders: Arc::new(sink_senders),
             topo_order,
             node_inputs,
@@ -204,9 +210,30 @@ impl DataflowExecutor {
         // or state backend wedges, `step()` stops returning and the stamp goes
         // stale — which is what `/healthz` reports so an orchestrator can
         // restart a process that will not recover on its own.
-        while !probe.done() {
+        let mut prepared_boundary = None;
+        while self
+            .recovery
+            .as_ref()
+            .map_or_else(|| !probe.done(), |r| !r.stopped())
+        {
             self.heartbeats.beat(self.heartbeat_slot);
             worker.step();
+            if let Some(recovery) = &self.recovery
+                && let Some(boundary) = recovery.boundary()
+                && prepared_boundary != Some(boundary)
+                && !probe.less_than(&boundary)
+            {
+                let result = self
+                    .recovery_operators
+                    .borrow()
+                    .iter()
+                    .try_for_each(|op| op.borrow_mut().checkpoint(&self.rt));
+                match result {
+                    Ok(()) => recovery.worker_ready(self.worker_index),
+                    Err(error) => recovery.fail(error),
+                }
+                prepared_boundary = Some(boundary);
+            }
         }
         // One final beat: the loop has exited normally, so the worker is not
         // wedged even though it is about to stop beating.
@@ -217,7 +244,7 @@ impl DataflowExecutor {
         // ready before returning. This ensures WorkerGuards/CommsGuard
         // drop simultaneously across processes, preventing TCP teardown
         // panics from broken pipes.
-        if self.worker_index == self.local_first_worker {
+        if self.recovery.is_none() && self.worker_index == self.local_first_worker {
             if let Some(ref n) = self.checkpoint_notify {
                 let _ = n.send(Sentinel::Shutdown as u64);
             }
@@ -237,6 +264,13 @@ impl DataflowExecutor {
         }
 
         worker.drop_dataflow(dataflow_index);
+        if let Some(recovery) = &self.recovery {
+            for op in self.recovery_operators.borrow().iter() {
+                if let Err(error) = op.borrow_mut().close(&self.rt) {
+                    recovery.fail(error);
+                }
+            }
+        }
     }
 
     /// Build the full Timely dataflow, dispatching to per-node builders.
@@ -292,6 +326,12 @@ impl DataflowExecutor {
                     self.build_batch_sink(node_id, input_stream, &probe);
                 }
             }
+            if self.recovery.is_some()
+                && let Some(stream) = streams.get(&node_id)
+            {
+                use timely::dataflow::operators::core::probe::Probe;
+                stream.clone().probe_with(&probe);
+            }
         }
 
         probe
@@ -300,6 +340,7 @@ impl DataflowExecutor {
     // ── Batch (Arrow) build methods ─────────────────────────────────
 
     /// Build a batch source operator that reads `ErasedBuffer` from a flume channel.
+    #[allow(clippy::too_many_lines)] // Legacy and coordinated source paths share the Timely closure.
     fn build_source<'a, A: Allocate>(
         &self,
         scope: &mut Scope<'a, A>,
@@ -323,6 +364,8 @@ impl DataflowExecutor {
         let worker_label = self.worker_index.to_string();
         let all_wms = self.all_source_watermarks.clone();
         let per_source_wm = source_watermarks.remove(&node_id);
+        let recovery = self.recovery.clone();
+        let source_id = format!("{}:{}", node_id.0, self.worker_index);
 
         source_builder.build_reschedule(move |mut capabilities| {
             #[allow(clippy::expect_used)]
@@ -345,6 +388,32 @@ impl DataflowExecutor {
                     return false;
                 };
 
+                if let Some(recovery) = &recovery {
+                    let exhausted = per_source_wm.as_ref().is_some_and(|wm| {
+                        wm.load(Ordering::Acquire) >= Sentinel::SourceExhausted as u64
+                    });
+                    match recovery.poll_source(&source_id, rx, exhausted) {
+                        crate::recovery::SourceAction::Batch(epoch, buffer) => {
+                            if let Some(c) = cap.as_mut() {
+                                c.downgrade(&epoch);
+                                output.activate().session(c).give(buffer);
+                            }
+                        }
+                        crate::recovery::SourceAction::Advance(epoch) => {
+                            if let Some(c) = cap.as_mut() {
+                                c.downgrade(&epoch);
+                            }
+                        }
+                        crate::recovery::SourceAction::Done => {
+                            cap = None;
+                            return false;
+                        }
+                        crate::recovery::SourceAction::Wait => {}
+                    }
+                    activator.activate();
+                    return true;
+                }
+
                 if draining {
                     if compute_min_watermark(&all_wms) >= Sentinel::SourceExhausted as u64 {
                         cap = None;
@@ -355,7 +424,7 @@ impl DataflowExecutor {
                 }
 
                 match rx.try_recv() {
-                    Ok((buf, wm)) => {
+                    Ok((buf, wm, _offsets)) => {
                         #[allow(clippy::cast_possible_truncation)]
                         let rows = buf.num_rows() as u64;
                         if let Some(ref c) = cap {
@@ -545,13 +614,21 @@ impl DataflowExecutor {
             local_first_worker: self.local_first_worker,
         };
 
+        let recovery = self.recovery.clone();
+        let timely_op = std::rc::Rc::new(std::cell::RefCell::new(
+            crate::timely_operator::TimelyBatchOperator::new(op, ctx),
+        ));
+        timely_op.borrow_mut().recovery.clone_from(&recovery);
+        if recovery.is_some() {
+            self.recovery_operators.borrow_mut().push(timely_op.clone());
+        }
+
         input_stream.unary_frontier::<CapacityContainerBuilder<Vec<crate::erased_buffer::ErasedBuffer>>, _, _, _>(
             Pipeline,
             &format!("BatchOp_{}", node_id.0),
-            move |_init_cap, _info| {
-                let mut timely_op =
-                    crate::timely_operator::TimelyBatchOperator::new(op, ctx);
-                if let Err(e) = timely_op.open(&oc.rt) {
+            move |init_cap, _info| {
+                if let Err(e) = timely_op.borrow_mut().open(&oc.rt) {
+                    if let Some(recovery) = &recovery { recovery.fail(&e); }
                     tracing::error!(
                         error = %e,
                         operator = %op_name,
@@ -563,10 +640,11 @@ impl DataflowExecutor {
                     )
                     .increment(1);
                 }
-                let mut last_watermark: u64 = 0;
-                let mut retained_cap: Option<Capability<u64>> = None;
+                let mut last_watermark = timely_op.borrow().watermark();
+                let mut retained_cap: Option<Capability<u64>> = recovery.as_ref().map(|_| init_cap);
                 let mut closed = false;
                 move |(input, frontier), output| {
+                    let mut timely_op = timely_op.borrow_mut();
                     let mut emit = |bufs: Vec<crate::erased_buffer::ErasedBuffer>,
                                     cap: &Option<Capability<u64>>| {
                         if let Some(c) = cap
@@ -585,6 +663,7 @@ impl DataflowExecutor {
                         for buf in buffers {
                             let (results, errors) = timely_op.process(buf, &oc.rt);
                             for e in &errors {
+                                if let Some(recovery) = &recovery { recovery.fail(e); }
                                 tracing::warn!(
                                     error = %e,
                                     operator = %op_name,
@@ -611,10 +690,13 @@ impl DataflowExecutor {
                         }
                         retained_cap = Some(owned_cap);
                     });
-                    let wm = frontier_min_or_max(frontier.frontier());
-                    let time_results =
-                        timely_op.advance_time(wm, &mut last_watermark, &oc.rt);
-                    emit(time_results, &retained_cap);
+                    let frontier_wm = frontier_min_or_max(frontier.frontier());
+                    let wm = recovery.as_ref().map_or(Some(frontier_wm), |r| r.watermark(frontier_wm));
+                    if let Some(wm) = wm {
+                        let time_results = timely_op.advance_time(wm, &mut last_watermark, &oc.rt);
+                        emit(time_results, &retained_cap);
+                        if let (Some(recovery), Some(error)) = (&recovery, timely_op.take_failure()) { recovery.fail(error); }
+                    }
                     // Keep a capability alive for watermark/timer-driven output
                     // (e.g. window emission) that fires *after* the data epoch
                     // closes — including the final SourceExhausted watermark at
@@ -634,7 +716,7 @@ impl DataflowExecutor {
                         }
                     }
                     let fv: Vec<u64> = frontier.frontier().iter().copied().collect();
-                    if let Some(epoch) = try_batch_checkpoint(
+                    if recovery.is_none() && let Some(epoch) = try_batch_checkpoint(
                         &mut timely_op,
                         &fv,
                         &oc.rt,
@@ -645,7 +727,7 @@ impl DataflowExecutor {
                     {
                         let _ = n.send(epoch);
                     }
-                    if frontier.frontier().is_empty() && !closed {
+                    if recovery.is_none() && frontier.frontier().is_empty() && !closed {
                         if let Err(e) = timely_op.close(&oc.rt) {
                             tracing::error!(
                                 error = %e,
@@ -683,6 +765,7 @@ impl DataflowExecutor {
             .get(&node_id)
             .expect("missing sink sender")
             .clone();
+        let recovery = self.recovery.clone();
 
         input_stream
             .unary::<CapacityContainerBuilder<Vec<crate::erased_buffer::ErasedBuffer>>, _, _, _>(
@@ -693,7 +776,27 @@ impl DataflowExecutor {
                     move |input, _output| {
                         input.for_each(|_cap, data| {
                             for buf in data.drain(..) {
-                                if let Err(e) = sink_tx.send(buf) {
+                                let mut message = crate::bridge::SinkMessage::Batch(buf);
+                                let result = loop {
+                                    if recovery.as_ref().is_some_and(|r| r.stopped()) {
+                                        break Ok(());
+                                    }
+                                    match sink_tx
+                                        .send_timeout(message, std::time::Duration::from_millis(25))
+                                    {
+                                        Ok(()) => break Ok(()),
+                                        Err(flume::SendTimeoutError::Timeout(pending)) => {
+                                            message = pending;
+                                        }
+                                        Err(flume::SendTimeoutError::Disconnected(_)) => {
+                                            break Err(anyhow::anyhow!("sink disconnected"));
+                                        }
+                                    }
+                                };
+                                if let Err(e) = result {
+                                    if let Some(recovery) = &recovery {
+                                        recovery.fail(&e);
+                                    }
                                     tracing::error!(error = %e, "batch sink send failed");
                                     metrics::counter!("sink_send_errors_total").increment(1);
                                 }

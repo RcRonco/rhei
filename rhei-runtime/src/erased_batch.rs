@@ -15,6 +15,10 @@ use crate::erased_buffer::ErasedBuffer;
 /// Type-erased source that produces [`ErasedBuffer`] batches.
 #[async_trait]
 pub trait ErasedSource: Send {
+    /// Whether the source implements the coordinated replay contract.
+    fn supports_recovery(&self) -> bool {
+        false
+    }
     /// Pull the next batch. Returns `None` when exhausted.
     async fn next_batch(&mut self) -> Option<ErasedBuffer>;
     /// Called after a successful checkpoint.
@@ -43,6 +47,9 @@ where
     S: Source + 'static,
     S::Output: Sync,
 {
+    fn supports_recovery(&self) -> bool {
+        self.0.supports_recovery()
+    }
     async fn next_batch(&mut self) -> Option<ErasedBuffer> {
         let buf = self.0.next_batch().await?;
         Some(ErasedBuffer::from_typed(buf))
@@ -83,6 +90,9 @@ struct DynSourceWrapper<T: RheiSchema>(Box<dyn Source<Output = T>>);
 
 #[async_trait]
 impl<T: RheiSchema + Sync> ErasedSource for DynSourceWrapper<T> {
+    fn supports_recovery(&self) -> bool {
+        self.0.supports_recovery()
+    }
     async fn next_batch(&mut self) -> Option<ErasedBuffer> {
         let buf = self.0.next_batch().await?;
         Some(ErasedBuffer::from_typed(buf))
@@ -157,6 +167,10 @@ where
 /// [`add_erased_operator`]: crate::dataflow::DataflowGraph::add_erased_operator
 #[async_trait]
 pub trait ErasedBatchOperator: Send {
+    /// Persist transient recovery metadata before state is snapshotted.
+    async fn snapshot(&mut self, _ctx: &mut OperatorContext) -> anyhow::Result<()> {
+        Ok(())
+    }
     /// Process an input buffer and produce output buffers.
     async fn process(
         &mut self,
@@ -192,6 +206,9 @@ impl<F> ErasedBatchOperator for BatchOperatorWrapper<F>
 where
     F: StreamFunction + Clone + 'static,
 {
+    async fn snapshot(&mut self, ctx: &mut OperatorContext) -> anyhow::Result<()> {
+        self.0.snapshot(ctx).await
+    }
     async fn process(
         &mut self,
         input: ErasedBuffer,

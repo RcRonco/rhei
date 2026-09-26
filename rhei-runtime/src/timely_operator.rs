@@ -11,6 +11,9 @@ pub(crate) struct TimelyBatchOperator {
     op: Box<dyn ErasedBatchOperator>,
     ctx: OperatorContext,
     last_checkpoint_epoch: Option<u64>,
+    failure: Option<String>,
+    watermark: u64,
+    pub recovery: Option<std::sync::Arc<crate::recovery::Recovery>>,
 }
 
 impl TimelyBatchOperator {
@@ -20,7 +23,30 @@ impl TimelyBatchOperator {
             op,
             ctx,
             last_checkpoint_epoch: None,
+            failure: None,
+            watermark: 0,
+            recovery: None,
         }
+    }
+
+    pub fn checkpoint(&mut self, rt: &tokio::runtime::Handle) -> anyhow::Result<()> {
+        wait(
+            self.recovery.as_deref(),
+            rt,
+            self.op.snapshot(&mut self.ctx),
+        )?;
+        self.ctx
+            .state
+            .put(b"__rhei_runtime_watermark_v1", &self.watermark)?;
+        wait(self.recovery.as_deref(), rt, self.ctx.state.checkpoint())
+    }
+
+    pub fn take_failure(&mut self) -> Option<String> {
+        self.failure.take()
+    }
+
+    pub fn watermark(&self) -> u64 {
+        self.watermark
     }
 
     /// Process a type-erased input buffer. Blocks on the Tokio runtime.
@@ -31,7 +57,11 @@ impl TimelyBatchOperator {
         input: ErasedBuffer,
         rt: &tokio::runtime::Handle,
     ) -> (Vec<ErasedBuffer>, Vec<anyhow::Error>) {
-        match rt.block_on(self.op.process(input, &mut self.ctx)) {
+        match wait(
+            self.recovery.as_deref(),
+            rt,
+            self.op.process(input, &mut self.ctx),
+        ) {
             Ok(results) => (results, vec![]),
             Err(e) => (vec![], vec![e]),
         }
@@ -70,9 +100,14 @@ impl TimelyBatchOperator {
         watermark: u64,
         rt: &tokio::runtime::Handle,
     ) -> Vec<ErasedBuffer> {
-        match rt.block_on(self.op.on_watermark(watermark, &mut self.ctx)) {
+        match wait(
+            self.recovery.as_deref(),
+            rt,
+            self.op.on_watermark(watermark, &mut self.ctx),
+        ) {
             Ok(results) => results,
             Err(e) => {
+                self.failure = Some(e.to_string());
                 tracing::error!("batch watermark processing failed: {e}");
                 vec![]
             }
@@ -82,16 +117,26 @@ impl TimelyBatchOperator {
     /// Call the operator's `open` lifecycle hook.
     /// Also restores any persisted timer state from the backend.
     pub fn open(&mut self, rt: &tokio::runtime::Handle) -> anyhow::Result<()> {
-        rt.block_on(self.ctx.state.restore_timers())
-            .map_err(|e| anyhow::anyhow!("timer restore failed: {e}"))?;
-        rt.block_on(self.op.open(&mut self.ctx))
+        self.watermark = wait(
+            self.recovery.as_deref(),
+            rt,
+            self.ctx.state.get(b"__rhei_runtime_watermark_v1"),
+        )?
+        .unwrap_or(0);
+        wait(
+            self.recovery.as_deref(),
+            rt,
+            self.ctx.state.restore_timers(),
+        )
+        .map_err(|e| anyhow::anyhow!("timer restore failed: {e}"))?;
+        wait(self.recovery.as_deref(), rt, self.op.open(&mut self.ctx))
             .map_err(|e| anyhow::anyhow!("batch operator open failed: {e}"))?;
         Ok(())
     }
 
     /// Call the operator's `close` lifecycle hook.
     pub fn close(&mut self, rt: &tokio::runtime::Handle) -> anyhow::Result<()> {
-        rt.block_on(self.op.close())
+        wait(self.recovery.as_deref(), rt, self.op.close())
             .map_err(|e| anyhow::anyhow!("batch operator close failed: {e}"))
     }
 
@@ -108,9 +153,16 @@ impl TimelyBatchOperator {
         let fired = self.ctx.state.timers().drain_fired(watermark);
         let mut outputs = Vec::new();
         for (ts, key) in fired {
-            match rt.block_on(self.op.on_timer(ts, &key, &mut self.ctx)) {
+            match wait(
+                self.recovery.as_deref(),
+                rt,
+                self.op.on_timer(ts, &key, &mut self.ctx),
+            ) {
                 Ok(results) => outputs.extend(results),
-                Err(e) => tracing::error!("batch on_timer failed: {e}"),
+                Err(e) => {
+                    self.failure = Some(e.to_string());
+                    tracing::error!("batch on_timer failed: {e}");
+                }
             }
         }
         outputs
@@ -126,10 +178,22 @@ impl TimelyBatchOperator {
         let mut results = Vec::new();
         if frontier_wm > *last_watermark {
             *last_watermark = frontier_wm;
+            self.watermark = frontier_wm;
             results.extend(self.process_watermark(frontier_wm, rt));
         }
         results.extend(self.process_timers(frontier_wm, rt));
         results
+    }
+}
+
+fn wait<T>(
+    recovery: Option<&crate::recovery::Recovery>,
+    rt: &tokio::runtime::Handle,
+    future: impl std::future::Future<Output = anyhow::Result<T>>,
+) -> anyhow::Result<T> {
+    match recovery {
+        Some(recovery) => rt.block_on(recovery.guard(future)),
+        None => rt.block_on(future),
     }
 }
 

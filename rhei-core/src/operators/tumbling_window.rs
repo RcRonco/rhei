@@ -112,6 +112,21 @@ where
     type Input = I;
     type Output = O;
 
+    async fn open(&mut self, ctx: &mut OperatorContext) -> anyhow::Result<()> {
+        if let Some((watermark, active)) = ctx.state.get(b"__rhei_window_metadata_v1").await? {
+            self.last_watermark = watermark;
+            self.active_windows = active;
+        }
+        Ok(())
+    }
+
+    async fn snapshot(&mut self, ctx: &mut OperatorContext) -> anyhow::Result<()> {
+        ctx.state.put(
+            b"__rhei_window_metadata_v1",
+            &(self.last_watermark, &self.active_windows),
+        )
+    }
+
     async fn process(
         &mut self,
         input: RheiBuffer<I>,
@@ -159,7 +174,7 @@ where
                 let acc_key = format!("{key}:{old_start}");
                 let old_acc: Option<Acc> = {
                     let mut state = KeyedState::<String, Acc>::new(&mut ctx.state, "acc");
-                    state.get(&acc_key).await.unwrap_or(None)
+                    state.get(&acc_key).await?
                 };
                 if let Some(acc) = &old_acc {
                     outputs.push((self.finish_fn)(
@@ -178,11 +193,7 @@ where
             let acc_key = format!("{key}:{window_start}");
             let mut acc: Acc = {
                 let mut state = KeyedState::<String, Acc>::new(&mut ctx.state, "acc");
-                state
-                    .get(&acc_key)
-                    .await
-                    .unwrap_or(None)
-                    .unwrap_or_default()
+                state.get(&acc_key).await?.unwrap_or_default()
             };
 
             // Accumulate — re-access the row by physical index (cheap, no copy).
@@ -224,7 +235,7 @@ where
                 let acc_key = format!("{key}:{win_start}");
                 let acc: Option<Acc> = {
                     let mut state = KeyedState::<String, Acc>::new(&mut ctx.state, "acc");
-                    state.get(&acc_key).await.unwrap_or(None)
+                    state.get(&acc_key).await?
                 };
                 if let Some(acc) = &acc {
                     outputs.push((self.finish_fn)(
