@@ -90,17 +90,23 @@
 - [ ] Exactly-once semantics with two-phase commit on source/sink
 - [ ] Checkpoint versioning and backward-compatible state migration
 - [x] Graceful shutdown: drain in-flight, checkpoint, then exit
-- [x] Restart from checkpoint with offset tracking (Kafka consumer offsets)
+- [ ] Restart legacy/Kafka execution from a correctness-grade checkpoint
   - [x] Checkpoint manifest with source offset persistence
-  - [x] Reload source offsets from manifest on restart (KI-2)
-  - [x] Kafka consumer seek to checkpointed offsets on restart (KI-16)
+  - [ ] Apply source offsets in legacy execution or retire that path (KI-2)
+  - [ ] Kafka complete partition cursors, deterministic initial offsets, and recovery E2E (KI-16)
+- [x] Opt-in fixed-topology multi-process recovery: quiescent epochs, all-worker state/timers/indexes, durable sink flush, immutable snapshots, shared atomic publication
+- [x] Failure tests: partial/cancelled persistence, prefetched offsets, windows/timers, stale acknowledgements, lost commit response, participant kill and whole-cluster restart
+- [ ] Object-store-only conditional checkpoint publication and writer fencing
+- [ ] Checkpoint retention/garbage collection and tunable recovery deadlines (KI-28)
+- [ ] Recovery support for rescaling, TTL, durable DLQ, and state/schema migration (KI-28)
 - [x] Watermark propagation for out-of-order event handling (KI-13)
 - [x] Late-event policy: drop with metric and configurable `allowed_lateness` (KI-6 partial)
 - [ ] Late-event side-output routing (redirect late events to a separate stream)
 - [x] Operator-level error handling (`ErrorPolicy::Skip` or `ErrorPolicy::SendToDlq` with pluggable `DlqSink`)
 - [x] Propagate sink send errors instead of silently dropping (KI-1)
 - [x] Propagate DLQ write errors instead of silently dropping (KI-3)
-- [x] Propagate checkpoint failures in single-worker mode (KI-15)
+- [x] Propagate checkpoint failures across workers/processes in coordinated recovery
+- [ ] Retire or repair legacy checkpoint failure handling (KI-15)
 - [ ] Fix async stash ordering — pending elements can be overtaken by later L1 hits (KI-11)
 - [x] Configurable checkpoint interval via `PipelineController::builder().checkpoint_interval(n)` (KI-8)
 - [ ] Fuzz testing for state serialization and checkpoint restore

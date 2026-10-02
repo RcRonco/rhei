@@ -143,6 +143,21 @@ where
     type Input = I;
     type Output = O;
 
+    async fn open(&mut self, ctx: &mut OperatorContext) -> anyhow::Result<()> {
+        if let Some((watermark, active)) = ctx.state.get(b"__rhei_window_metadata_v1").await? {
+            self.last_watermark = watermark;
+            self.active_keys = active;
+        }
+        Ok(())
+    }
+
+    async fn snapshot(&mut self, ctx: &mut OperatorContext) -> anyhow::Result<()> {
+        ctx.state.put(
+            b"__rhei_window_metadata_v1",
+            &(self.last_watermark, &self.active_keys),
+        )
+    }
+
     async fn process(
         &mut self,
         input: RheiBuffer<I>,
@@ -184,7 +199,7 @@ where
             // Load active windows for this key.
             let mut active: ActiveWindows = {
                 let mut state = KeyedState::<String, ActiveWindows>::new(&mut ctx.state, "sw_act");
-                state.get(key).await.unwrap_or(None).unwrap_or_default()
+                state.get(key).await?.unwrap_or_default()
             };
 
             // Accumulate into each window that contains this timestamp.
@@ -196,11 +211,7 @@ where
                 let acc_key = format!("{key}:{win_start}");
                 let mut acc: Acc = {
                     let mut state = KeyedState::<String, Acc>::new(&mut ctx.state, "sw_acc");
-                    state
-                        .get(&acc_key)
-                        .await
-                        .unwrap_or(None)
-                        .unwrap_or_default()
+                    state.get(&acc_key).await?.unwrap_or_default()
                 };
 
                 let view = I::view(batch, *phys_idx);
@@ -247,7 +258,7 @@ where
         for key in &self.active_keys {
             let mut active: ActiveWindows = {
                 let mut state = KeyedState::<String, ActiveWindows>::new(&mut ctx.state, "sw_act");
-                state.get(key).await.unwrap_or(None).unwrap_or_default()
+                state.get(key).await?.unwrap_or_default()
             };
 
             let mut still_active = Vec::new();
@@ -256,7 +267,7 @@ where
                     let acc_key = format!("{key}:{win_start}");
                     let acc: Option<Acc> = {
                         let mut state = KeyedState::<String, Acc>::new(&mut ctx.state, "sw_acc");
-                        state.get(&acc_key).await.unwrap_or(None)
+                        state.get(&acc_key).await?
                     };
                     if let Some(acc) = &acc {
                         outputs.push((self.finish_fn)(

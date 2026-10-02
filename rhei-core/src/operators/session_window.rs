@@ -112,6 +112,21 @@ where
     type Input = I;
     type Output = O;
 
+    async fn open(&mut self, ctx: &mut OperatorContext) -> anyhow::Result<()> {
+        if let Some((watermark, active)) = ctx.state.get(b"__rhei_window_metadata_v1").await? {
+            self.last_watermark = watermark;
+            self.active_keys = active;
+        }
+        Ok(())
+    }
+
+    async fn snapshot(&mut self, ctx: &mut OperatorContext) -> anyhow::Result<()> {
+        ctx.state.put(
+            b"__rhei_window_metadata_v1",
+            &(self.last_watermark, &self.active_keys),
+        )
+    }
+
     async fn process(
         &mut self,
         input: RheiBuffer<I>,
@@ -142,7 +157,7 @@ where
             let session: Option<SessionState<Acc>> = {
                 let mut state =
                     KeyedState::<String, SessionState<Acc>>::new(&mut ctx.state, "sess");
-                state.get(key).await.unwrap_or(None)
+                state.get(key).await?
             };
 
             let new_session = match session {
@@ -208,7 +223,7 @@ where
             let session: Option<SessionState<Acc>> = {
                 let mut state =
                     KeyedState::<String, SessionState<Acc>>::new(&mut ctx.state, "sess");
-                state.get(key).await.unwrap_or(None)
+                state.get(key).await?
             };
 
             if let Some(s) = session

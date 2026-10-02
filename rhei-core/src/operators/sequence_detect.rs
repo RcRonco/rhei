@@ -407,6 +407,21 @@ where
     type Input = I;
     type Output = O;
 
+    async fn open(&mut self, ctx: &mut OperatorContext) -> anyhow::Result<()> {
+        if let Some((watermark, active)) = ctx.state.get(b"__rhei_sequence_metadata_v1").await? {
+            self.last_watermark = watermark;
+            self.active_partitions = active;
+        }
+        Ok(())
+    }
+
+    async fn snapshot(&mut self, ctx: &mut OperatorContext) -> anyhow::Result<()> {
+        ctx.state.put(
+            b"__rhei_sequence_metadata_v1",
+            &(self.last_watermark, &self.active_partitions),
+        )
+    }
+
     async fn process(
         &mut self,
         input: RheiBuffer<I>,
@@ -969,7 +984,7 @@ mod tests {
                 .step("read", |v: LoginEventView<'_>| v.action == "read")
                 .step("write", |v: LoginEventView<'_>| v.action == "write")
                 .step("rename", |v: LoginEventView<'_>| v.action == "rename")
-                .within(Duration::from_mins(30))
+                .within(Duration::from_secs(1800))
                 .emit(|key: &str, ctx: &MatchCtx| Detection {
                     entity: key.to_string(),
                     matched_at: ctx.last_time(),
@@ -1007,7 +1022,7 @@ mod tests {
                 .step("success", |v: LoginEventView<'_>| {
                     v.action == "LoginSuccess"
                 })
-                .within(Duration::from_mins(30))
+                .within(Duration::from_secs(1800))
                 .after_match(AfterMatch::SkipPastMatch)
                 .emit(|key: &str, ctx: &MatchCtx| Detection {
                     entity: key.to_string(),
@@ -1052,7 +1067,7 @@ mod tests {
                 .step("success", |v: LoginEventView<'_>| {
                     v.action == "LoginSuccess"
                 })
-                .within(Duration::from_mins(30))
+                .within(Duration::from_secs(1800))
                 .emit(|key: &str, ctx: &MatchCtx| Detection {
                     entity: key.to_string(),
                     matched_at: ctx.last_time(),
@@ -1107,7 +1122,7 @@ mod tests {
                 .time_fn(|v: LoginEventView<'_>| v.ts)
                 .step("a", |v: LoginEventView<'_>| v.action == "a")
                 .step("b", |v: LoginEventView<'_>| v.action == "b")
-                .within(Duration::from_mins(1))
+                .within(Duration::from_secs(60))
                 .emit(|key: &str, ctx: &MatchCtx| Detection {
                     entity: key.to_string(),
                     matched_at: ctx.last_time(),
@@ -1134,7 +1149,7 @@ mod tests {
                 .time_fn(|v: LoginEventView<'_>| v.ts)
                 .step("a", |v: LoginEventView<'_>| v.action == "a")
                 .step("b", |v: LoginEventView<'_>| v.action == "b")
-                .within(Duration::from_mins(1))
+                .within(Duration::from_secs(60))
                 .after_match(AfterMatch::SkipPastMatch)
                 .emit(|key: &str, ctx: &MatchCtx| Detection {
                     entity: key.to_string(),
@@ -1167,7 +1182,7 @@ mod tests {
                 .step("step2", |v: LoginEventView<'_>| {
                     v.action.ends_with(":write")
                 })
-                .within(Duration::from_mins(1))
+                .within(Duration::from_secs(60))
                 .emit(|key: &str, ctx: &MatchCtx| Detection {
                     entity: key.to_string(),
                     matched_at: ctx.last_time(),
@@ -1230,7 +1245,7 @@ mod tests {
                 .step("success", |v: LoginEventView<'_>| {
                     v.action == "LoginSuccess"
                 })
-                .within(Duration::from_mins(1))
+                .within(Duration::from_secs(60))
                 .after_match(AfterMatch::SkipPastMatch)
                 .emit(|key: &str, ctx: &MatchCtx| {
                     assert_eq!(ctx.step_count("failed"), 3);
@@ -1273,7 +1288,7 @@ mod tests {
                 .time_fn(|v: LoginEventView<'_>| v.ts)
                 .step("a", |v: LoginEventView<'_>| v.action == "a")
                 .step("b", |v: LoginEventView<'_>| v.action == "b")
-                .within(Duration::from_mins(1))
+                .within(Duration::from_secs(60))
                 .emit(|key: &str, ctx: &MatchCtx| Detection {
                     entity: key.to_string(),
                     matched_at: ctx.last_time(),

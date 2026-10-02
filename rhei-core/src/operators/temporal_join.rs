@@ -135,6 +135,21 @@ where
     type Input = I;
     type Output = O;
 
+    async fn open(&mut self, ctx: &mut OperatorContext) -> anyhow::Result<()> {
+        if let Some((watermark, active)) = ctx.state.get(b"__rhei_join_metadata_v1").await? {
+            self.last_watermark = watermark;
+            self.active_keys = active;
+        }
+        Ok(())
+    }
+
+    async fn snapshot(&mut self, ctx: &mut OperatorContext) -> anyhow::Result<()> {
+        ctx.state.put(
+            b"__rhei_join_metadata_v1",
+            &(self.last_watermark, &self.active_keys),
+        )
+    }
+
     async fn process(
         &mut self,
         input: RheiBuffer<I>,
@@ -168,7 +183,7 @@ where
                     let right: Option<RightStamped<R>> = {
                         let mut state =
                             KeyedState::<String, RightStamped<R>>::new(&mut ctx.state, "tj_r");
-                        state.get(key).await.unwrap_or(None)
+                        state.get(key).await?
                     };
 
                     if let Some(r) = right {
@@ -197,7 +212,7 @@ where
                     let left: Option<LeftStamped<L>> = {
                         let mut state =
                             KeyedState::<String, LeftStamped<L>>::new(&mut ctx.state, "tj_l");
-                        state.get(key).await.unwrap_or(None)
+                        state.get(key).await?
                     };
 
                     if let Some(l) = left {
@@ -250,7 +265,7 @@ where
 
             {
                 let mut state = KeyedState::<String, LeftStamped<L>>::new(&mut ctx.state, "tj_l");
-                if let Some(stamped) = state.get(key).await.unwrap_or(None)
+                if let Some(stamped) = state.get(key).await?
                     && watermark >= stamped.watermark_at_buffer + timeout
                 {
                     state.delete(key)?;
@@ -260,7 +275,7 @@ where
 
             {
                 let mut state = KeyedState::<String, RightStamped<R>>::new(&mut ctx.state, "tj_r");
-                if let Some(stamped) = state.get(key).await.unwrap_or(None)
+                if let Some(stamped) = state.get(key).await?
                     && watermark >= stamped.watermark_at_buffer + timeout
                 {
                     state.delete(key)?;

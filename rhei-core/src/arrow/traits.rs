@@ -49,6 +49,12 @@ pub trait StreamFunction: Send + Sync {
         Ok(())
     }
 
+    /// Copy transient recovery metadata into managed state at a quiescent epoch.
+    /// Implementations must include indexes needed to find restored state.
+    async fn snapshot(&mut self, _ctx: &mut OperatorContext) -> anyhow::Result<()> {
+        Ok(())
+    }
+
     /// Called when a registered timer fires (watermark >= timer timestamp).
     async fn on_timer(
         &mut self,
@@ -101,6 +107,17 @@ pub trait Source: Send + Sync {
         std::collections::HashMap::new()
     }
 
+    /// Opt into coordinated recovery's replay contract (disabled by default).
+    ///
+    /// Offsets must describe the exact prefix returned by `next_batch`, including
+    /// every assigned partition. Restoring them before reading must replay the
+    /// remaining input, with identical source identity and partition assignment.
+    /// The empty map denotes the same initial position on every attempt.
+    /// Errors must not be reported as exhaustion (`None`).
+    fn supports_recovery(&self) -> bool {
+        false
+    }
+
     /// Restore source offsets from a checkpoint manifest.
     async fn restore_offsets(
         &mut self,
@@ -135,7 +152,8 @@ pub trait Sink: Send + Sync {
     /// Write a buffer of rows to the sink.
     async fn write_batch(&mut self, input: RheiBuffer<Self::Input>) -> anyhow::Result<()>;
 
-    /// Flush any buffered data.
+    /// Flush any buffered data. In coordinated recovery, success promises that
+    /// all preceding writes are durable. Replayed writes may be duplicated.
     async fn flush(&mut self) -> anyhow::Result<()> {
         Ok(())
     }

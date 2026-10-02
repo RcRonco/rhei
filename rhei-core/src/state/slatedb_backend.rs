@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use futures::StreamExt;
 
 use super::backend::{BatchOp, StateBackend};
 use slatedb::object_store::path::Path;
@@ -32,6 +33,17 @@ pub struct SlateDbConfig {
 /// so `checkpoint()` is a no-op here.
 pub struct SlateDbBackend {
     db: slatedb::Db,
+    path: Path,
+    object_store: Arc<dyn object_store::ObjectStore>,
+}
+
+/// Durable identity of an immutable `SlateDB` checkpoint.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SlateDbSnapshot {
+    /// Object-store database namespace that owns the checkpoint.
+    pub database_path: String,
+    /// `SlateDB` checkpoint UUID. It is retained until explicitly deleted.
+    pub checkpoint_id: String,
 }
 
 impl std::fmt::Debug for SlateDbBackend {
@@ -47,8 +59,13 @@ impl SlateDbBackend {
         path: impl Into<Path>,
         object_store: Arc<dyn object_store::ObjectStore>,
     ) -> anyhow::Result<Self> {
-        let db = slatedb::Db::open(path, object_store).await?;
-        Ok(Self { db })
+        let path = path.into();
+        let db = slatedb::Db::open(path.clone(), object_store.clone()).await?;
+        Ok(Self {
+            db,
+            path,
+            object_store,
+        })
     }
 
     /// Open (or create) a `SlateDB` database with custom configuration.
@@ -60,11 +77,58 @@ impl SlateDbBackend {
         object_store: Arc<dyn object_store::ObjectStore>,
         config: SlateDbConfig,
     ) -> anyhow::Result<Self> {
-        let db = slatedb::Db::builder(path, object_store)
+        let path = path.into();
+        let db = slatedb::Db::builder(path.clone(), object_store.clone())
             .with_settings(config.settings)
             .build()
             .await?;
-        Ok(Self { db })
+        Ok(Self {
+            db,
+            path,
+            object_store,
+        })
+    }
+
+    /// Capture all prior writes in an immutable checkpoint.
+    /// The caller must first quiesce every writer contributing to the job cut.
+    pub async fn snapshot(&self) -> anyhow::Result<SlateDbSnapshot> {
+        let checkpoint = self
+            .db
+            .create_checkpoint(
+                slatedb::config::CheckpointScope::All,
+                &slatedb::config::CheckpointOptions::default(),
+            )
+            .await?;
+        Ok(SlateDbSnapshot {
+            database_path: self.path.to_string(),
+            checkpoint_id: checkpoint.id.to_string(),
+        })
+    }
+
+    /// Open an isolated attempt, optionally cloned from an exact checkpoint.
+    /// An attempt must use a fresh suffix; the live database is never rolled back.
+    pub async fn recovery_attempt(
+        &self,
+        suffix: &str,
+        snapshot: Option<&SlateDbSnapshot>,
+    ) -> anyhow::Result<Self> {
+        let path = self.path.child("recovery-attempts").child(suffix);
+        anyhow::ensure!(
+            self.object_store.list(Some(&path)).next().await.is_none(),
+            "recovery attempt path already exists: {path}"
+        );
+        if let Some(snapshot) = snapshot {
+            let admin =
+                slatedb::admin::Admin::builder(path.clone(), self.object_store.clone()).build();
+            admin
+                .create_clone(
+                    snapshot.database_path.as_str(),
+                    Some(snapshot.checkpoint_id.parse()?),
+                )
+                .await
+                .map_err(|e| anyhow::anyhow!("SlateDB snapshot restore failed: {e}"))?;
+        }
+        Self::open(path, self.object_store.clone()).await
     }
 
     /// Gracefully close the database, flushing any pending writes.

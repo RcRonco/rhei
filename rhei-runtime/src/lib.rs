@@ -39,6 +39,7 @@ pub mod health;
 pub mod http_server;
 /// Decoupled metrics snapshot data layer for dashboards and exporters.
 pub mod metrics_snapshot;
+mod recovery;
 /// Graceful shutdown coordination.
 pub mod shutdown;
 /// Task management, I/O bridging, and checkpoint orchestration for Timely execution.

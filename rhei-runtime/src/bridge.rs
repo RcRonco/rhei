@@ -13,7 +13,12 @@ pub const DEFAULT_CHANNEL_SIZE: usize = 16;
 
 /// A batch produced by the batch source bridge, carrying an `ErasedBuffer`
 /// and an optional watermark.
-pub(crate) type SourceBatch = (ErasedBuffer, Option<u64>);
+pub(crate) type SourceBatch = (ErasedBuffer, Option<u64>, HashMap<String, String>);
+
+pub(crate) enum SinkMessage {
+    Batch(ErasedBuffer),
+    Flush(tokio::sync::oneshot::Sender<Result<(), String>>),
+}
 
 /// Bridges a type-erased [`ErasedSource`] into a `flume::Sender`,
 /// suitable for `spawn` on the shared Tokio runtime.
@@ -53,15 +58,18 @@ pub(crate) async fn local_source_bridge(
 
         let offsets = source.current_offsets();
         if !offsets.is_empty() {
-            *offsets_writer.lock().unwrap_or_else(|e| {
-                tracing::warn!("offsets_writer mutex poisoned, recovering: {e}");
-                e.into_inner()
-            }) = offsets;
+            offsets_writer
+                .lock()
+                .unwrap_or_else(|e| {
+                    tracing::warn!("offsets_writer mutex poisoned, recovering: {e}");
+                    e.into_inner()
+                })
+                .clone_from(&offsets);
         }
 
         let wm = source.current_watermark();
 
-        if tx.send_async((buf, wm)).await.is_err() {
+        if tx.send_async((buf, wm, offsets)).await.is_err() {
             break;
         }
     }
@@ -77,10 +85,17 @@ pub(crate) async fn local_source_bridge(
 /// Flushes when the channel closes.
 pub(crate) async fn sink_drain(
     mut sink: Box<dyn ErasedSink>,
-    rx: flume::Receiver<ErasedBuffer>,
+    rx: flume::Receiver<SinkMessage>,
 ) -> anyhow::Result<()> {
-    while let Ok(buf) = rx.recv_async().await {
-        sink.write_batch(buf).await?;
+    while let Ok(message) = rx.recv_async().await {
+        match message {
+            SinkMessage::Batch(buf) => sink.write_batch(buf).await?,
+            SinkMessage::Flush(reply) => {
+                let result = sink.flush().await;
+                let _ = reply.send(result.as_ref().copied().map_err(ToString::to_string));
+                result?;
+            }
+        }
     }
     sink.flush().await?;
     Ok(())

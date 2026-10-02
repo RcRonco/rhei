@@ -14,6 +14,7 @@ use crate::arrow::{RheiBuffer, RheiBuilder, RheiSchema, Source};
 pub struct VecSource<T: RheiSchema> {
     items: Vec<T>,
     batch_size: usize,
+    next_index: usize,
     records_since_watermark: usize,
     watermark_interval: usize,
     watermark_pending: bool,
@@ -26,6 +27,7 @@ impl<T: RheiSchema> VecSource<T> {
         Self {
             items,
             batch_size: 1024,
+            next_index: 0,
             records_since_watermark: 0,
             watermark_interval: 10,
             watermark_pending: false,
@@ -35,6 +37,7 @@ impl<T: RheiSchema> VecSource<T> {
 
     /// Sets the number of rows emitted per buffer (default: 1024).
     pub fn with_batch_size(mut self, size: usize) -> Self {
+        assert!(size > 0, "batch size must be positive");
         self.batch_size = size;
         self
     }
@@ -62,6 +65,7 @@ impl<T: RheiSchema + Sync> Source for VecSource<T> {
         }
 
         self.records_since_watermark += count;
+        self.next_index += count;
         if self.records_since_watermark >= self.watermark_interval {
             self.watermark_pending = true;
             self.records_since_watermark = 0;
@@ -72,6 +76,30 @@ impl<T: RheiSchema + Sync> Source for VecSource<T> {
 
     fn should_emit_watermark(&self) -> bool {
         self.watermark_pending
+    }
+
+    fn current_offsets(&self) -> std::collections::HashMap<String, String> {
+        std::collections::HashMap::from([("next_index".into(), self.next_index.to_string())])
+    }
+
+    fn supports_recovery(&self) -> bool {
+        true
+    }
+
+    async fn restore_offsets(
+        &mut self,
+        offsets: &std::collections::HashMap<String, String>,
+    ) -> anyhow::Result<()> {
+        if let Some(index) = offsets.get("next_index") {
+            let next: usize = index.parse()?;
+            anyhow::ensure!(
+                next >= self.next_index && next - self.next_index <= self.items.len(),
+                "VecSource recovery cursor is outside the supplied input"
+            );
+            self.items.drain(..next - self.next_index);
+            self.next_index = next;
+        }
+        Ok(())
     }
 }
 

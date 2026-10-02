@@ -46,7 +46,7 @@ Two packages live in the repo but outside the Cargo workspace: **rhei-python**
 
 **State hierarchy:** L1 `HashMap` memtable (microseconds) → L2 Foyer `HybridCache` on NVMe (milliseconds) → L3 SlateDB on S3 (10s-100s ms). `PrefixedBackend` namespaces keys per operator as `{operator_name}/{user_key}`.
 
-**Checkpointing:** Triggered when Timely frontier advances. L1 dirty keys flush through to SlateDB/S3. Source offsets committed after checkpoint. Checkpoint manifest tracks operators and offsets.
+**Checkpointing:** Opt-in `.coordinated_recovery(true)` pauses admission, drains a logical epoch across all workers/processes, snapshots state/timers/indexes, durably flushes sinks, then publishes `recovery.json` on a shared durable filesystem. Requires fixed topology and replayable sources; Kafka recovery is not yet supported. Legacy default checkpoints do not establish a consistent recovery cut. See `ADR/recovery-protocol.md`.
 
 **Process layering:** Controller (config/lifecycle) → TaskManager (background services, bridging) → DataflowExecutor (per-worker Timely compilation). See `INPROC-ARCH.md`.
 

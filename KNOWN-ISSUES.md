@@ -10,7 +10,7 @@ lists open items reads as though nothing was ever broken.
 
 Security issues are tracked separately in [SECURITY.md](SECURITY.md) as `SI-N`.
 
-**Still open:** KI-14, KI-18, KI-26, KI-27, and the dirty half of KI-7.
+**Still open:** KI-2, KI-14, KI-15, KI-16, KI-18, KI-26, KI-27, KI-28, and the dirty half of KI-7.
 
 ---
 
@@ -24,14 +24,12 @@ Security issues are tracked separately in [SECURITY.md](SECURITY.md) as `SI-N`.
 `sink_send_errors_total` metrics counter. Errors cannot be propagated out of the
 Timely closure, but the sink task error surfaces when its `JoinHandle` is awaited.
 
-### ~~KI-2: Checkpoint source offsets never reloaded on restart~~ (RESOLVED)
+### KI-2: Legacy source offsets are not applied on restart
 
-**Fixed in:** `ADR/checkpoint-restore.md`
-
-On restart, `run_graph` now extracts `source_offsets` from the loaded manifest and
-calls `source.restore_offsets()` before any batches are read. `KafkaSource`
-implements `restore_offsets()` by calling `consumer.assign()` with the checkpointed
-offsets, restoring at-least-once semantics.
+The previous resolution overstated the wiring: legacy execution extracts offsets
+but does not apply them to readers. Opt-in coordinated recovery now restores
+per-reader admitted cursors before the first read. Legacy retirement and Kafka
+integration remain open; see [the protocol ADR](ADR/recovery-protocol.md).
 
 ### ~~KI-3: DLQ write errors silently dropped~~ (RESOLVED)
 
@@ -180,24 +178,18 @@ The tracing capture layer uses non-blocking `try_send`. When the channel is full
 log entries are silently dropped. This is documented and intentional (backpressure),
 but under high log volume it means observability gaps.
 
-### ~~KI-15: No checkpoint failure propagation in single-worker~~ (RESOLVED)
+### KI-15: Legacy checkpoint failures are not reliably propagated
 
-**Fixed in:** `ADR/checkpoint-restore.md`
+Opt-in coordinated recovery fails the attempt on persistence or callback errors,
+across all workers/processes. The legacy path still logs some checkpoint failures
+and continues; its previous resolution did not establish recovery correctness.
 
-Single-worker now creates a `Barrier::new(1)` and `mpsc::channel`, passes them
-into `build_timely_dataflow`. After Timely completes, the executor drains
-checkpoint notifications and writes intermediate manifests with source offsets,
-matching multi-worker behavior.
+### KI-16: Kafka recovery contract is incomplete
 
-### ~~KI-16: Kafka consumer group does not seek on restart~~ (RESOLVED)
-
-**Fixed in:** `ADR/checkpoint-restore.md`
-
-The `Source` trait now has a default no-op `restore_offsets()` method. `KafkaSource`
-implements it by parsing `"topic/partition"` keys from the manifest, building a
-`TopicPartitionList` with `Offset::Offset(offset + 1)`, and calling
-`consumer.assign()` to seek to the correct positions. Note: this overrides consumer
-group rebalancing when restoring from checkpoint.
+Kafka has a restore method but legacy execution does not invoke it. Its partial
+offset map can also omit assigned partitions; initial positions and decode/read
+failures need a replay-safe contract. Coordinated recovery rejects Kafka until
+this is implemented and tested, instead of claiming at-least-once recovery.
 
 ### ~~KI-17: No fan-out support~~ (RESOLVED)
 
@@ -215,7 +207,9 @@ Partitioned source and multi-worker checkpoint restart are now covered
 - Backpressure behaviour when channels fill up
 - DLQ routing under sustained error rates
 - Late event handling across window boundaries
-- Checkpoint failure and recovery
+- More checkpoint failure coverage (new tests cover failed/cancelled writes,
+  source prefetch, timers/open windows, missing snapshots, lost commit responses,
+  and a killed participant during sink flush followed by two-process restart)
 - Network partition behaviour (relevant for Phase 2 multi-process)
 - Source exhaustion during checkpoint cycle
 
@@ -327,10 +321,18 @@ StatefulSet. Do not expose these ports beyond the cluster.
 
 ### KI-27: Delivery is at-least-once, not exactly-once
 
-Source offsets are committed after a checkpoint completes, so a crash replays
-everything processed since the last checkpoint. `kafka_e2e.rs` asserts this
-explicitly.
+Opt-in coordinated recovery provides at-least-once output for replayable sources
+and durable sinks. The legacy default does not provide a consistent recovery cut.
 
 Sinks must tolerate duplicates — idempotent writes or downstream deduplication.
 Rhei should not be deployed behind a sink that assumes each record arrives once.
 
+### KI-28: Coordinated recovery is opt-in and fixed-topology
+
+Enable `.coordinated_recovery(true)` with a fresh shared durable directory. Static
+process/worker/partition assignments are required; restart every process after a
+failure. No live rescaling, legacy migration, TTL recovery, durable DLQ, Kafka
+recovery, object-store-only publication, or checkpoint garbage collection yet.
+SlateDB state uses immutable pinned checkpoints and fresh attempt clones; the
+external Foyer cache is bypassed. Custom sources/operators/sinks must obey the
+contracts in [ADR/recovery-protocol.md](ADR/recovery-protocol.md).

@@ -418,7 +418,7 @@ impl StateContext {
             }
         }
 
-        let dirty = self.memtable.flush();
+        let dirty = self.memtable.pending();
         let dirty_count = dirty.len();
 
         tracing::info!(dirty_keys = dirty_count, "checkpointing state");
@@ -438,15 +438,14 @@ impl StateContext {
         }
 
         // Include timer state in the same batch if dirty.
-        if let Some(ref mut ts) = self.timer_service
+        if let Some(ref ts) = self.timer_service
             && ts.is_dirty()
         {
             let timer_bytes = ts.serialize()?;
             ops.push(BatchOp::Put {
-                key: super::timer_service::TIMER_STATE_KEY.to_vec(),
+                key: self.physical_unpartitioned(super::timer_service::TIMER_STATE_KEY),
                 value: timer_bytes,
             });
-            ts.clear_dirty();
         }
 
         if !ops.is_empty() {
@@ -454,6 +453,14 @@ impl StateContext {
         }
 
         self.backend.checkpoint().await?;
+
+        // `&mut self` excludes concurrent state mutations across both awaits.
+        // A failed or cancelled write/barrier leaves every mutation dirty,
+        // including timer deletions, so a retry replays the entire batch.
+        self.memtable.flush();
+        if let Some(ref mut ts) = self.timer_service {
+            ts.clear_dirty();
+        }
 
         metrics::counter!("state_checkpoints_total").increment(1);
         metrics::histogram!("state_checkpoint_duration_seconds")
